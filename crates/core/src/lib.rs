@@ -16,11 +16,14 @@
 //! - [`sim`] / [`scenario`]：确定性网络仿真与端到端场景。
 //! - [`config`]：客户端与服务端配置。
 
+pub mod adaptive;
 pub mod auth;
 pub mod cluster;
+pub mod codec;
 pub mod config;
 pub mod connect;
 pub mod crypto;
+pub mod desktop_sim;
 pub mod error;
 pub mod file;
 pub mod input;
@@ -28,6 +31,7 @@ pub mod probe;
 pub mod proto;
 pub mod region;
 pub mod scenario;
+pub mod screen;
 pub mod session;
 pub mod sim;
 pub mod time;
