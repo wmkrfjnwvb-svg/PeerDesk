@@ -21,8 +21,11 @@ fn any() -> SocketAddr {
     ([127, 0, 0, 1], 0).into()
 }
 
+/// 每次调用得到一个新目录：测试是并行跑的，不能共用目录。
 fn temp_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("peerdesk-auth-{}-{tag}", std::process::id()));
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("peerdesk-auth-{}-{tag}-{n}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
