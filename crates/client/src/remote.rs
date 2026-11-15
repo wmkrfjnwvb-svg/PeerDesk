@@ -611,6 +611,152 @@ mod tests {
         }
     }
 
+    fn start_host(
+        extra: &[&str],
+        dir: &Path,
+    ) -> (Shared, std::thread::JoinHandle<u8>, String, String) {
+        let out = Shared::default();
+        let mut writer = out.clone();
+        let mut args = strings(&[
+            "host",
+            "--listen",
+            "127.0.0.1:0",
+            "--data-dir",
+            dir.to_str().unwrap(),
+            "--once",
+        ]);
+        args.extend(strings(extra));
+        let thread = std::thread::spawn(move || crate::run(&args, &mut writer));
+        let addr = out.wait_for("监听");
+        let pin = out.wait_for("指纹");
+        (out, thread, addr, pin)
+    }
+
+    #[test]
+    fn password_protected_host_end_to_end() {
+        let (host_dir, ctrl_dir) = (temp_dir("pw-host"), temp_dir("pw-ctrl"));
+        let (host_out, host_thread, addr, pin) = start_host(
+            &["--password", "correct horse", "--no-input", "--no-files"],
+            &host_dir,
+        );
+        let c = ctrl_dir.to_str().unwrap();
+
+        // 密码不对：进不去
+        let (code, text) = run(&[
+            "connect",
+            &addr,
+            "--pin",
+            &pin,
+            "--data-dir",
+            c,
+            "--password",
+            "wrong guess",
+        ]);
+        assert_eq!(code, EXIT_FAILED);
+        assert!(text.contains("密码错误"), "{text}");
+        // 没带密码：进不去
+        let (code, _) = run(&["connect", &addr, "--pin", &pin, "--data-dir", c]);
+        assert_eq!(code, EXIT_FAILED);
+        // 密码正确
+        let (code, text) = run(&[
+            "connect",
+            &addr,
+            "--pin",
+            &pin,
+            "--data-dir",
+            c,
+            "--password",
+            "correct horse",
+            "--seconds",
+            "1",
+        ]);
+        assert_eq!(code, EXIT_OK, "{text}");
+        assert_eq!(host_thread.join().unwrap(), EXIT_OK);
+        let host_text = host_out.text();
+        assert!(host_text.contains("会话失败"), "{host_text}");
+        assert!(host_text.contains("会话结束"), "{host_text}");
+        assert!(!host_text.contains("警告：--open"));
+        for dir in [host_dir, ctrl_dir] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn trusted_device_connects_without_password_and_strangers_cannot() {
+        let (host_dir, friend_dir, stranger_dir) = (
+            temp_dir("tr-host"),
+            temp_dir("tr-friend"),
+            temp_dir("tr-stranger"),
+        );
+        let friend = Identity::load_or_create(&friend_dir).unwrap();
+        let friend_fp = to_hex(&friend.fingerprint());
+        let (host_out, host_thread, addr, pin) = start_host(&["--trust", &friend_fp], &host_dir);
+
+        // 陌生设备：没有密码可用（被控端内部是一个随机密码）
+        let (code, text) = run(&[
+            "connect",
+            &addr,
+            "--pin",
+            &pin,
+            "--data-dir",
+            stranger_dir.to_str().unwrap(),
+            "--password",
+            "anything at all",
+        ]);
+        assert_eq!(code, EXIT_FAILED, "{text}");
+        // 受信任的设备：不需要密码
+        let (code, text) = run(&[
+            "connect",
+            &addr,
+            "--pin",
+            &pin,
+            "--data-dir",
+            friend_dir.to_str().unwrap(),
+            "--seconds",
+            "1",
+        ]);
+        assert_eq!(code, EXIT_OK, "{text}");
+        assert_eq!(host_thread.join().unwrap(), EXIT_OK);
+        assert!(host_out.text().contains(&friend_fp));
+        for dir in [host_dir, friend_dir, stranger_dir] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn host_refuses_to_start_without_an_access_rule() {
+        use crate::EXIT_USAGE;
+        let d = temp_dir("norule");
+        let dir = d.to_str().unwrap();
+        let (code, text) = run(&["host", "--data-dir", dir]);
+        assert_eq!(code, EXIT_USAGE);
+        assert!(text.contains("必须指定谁可以控制这台设备"), "{text}");
+        for bad in [
+            vec!["host", "--data-dir", dir, "--password", "short"],
+            vec![
+                "host",
+                "--data-dir",
+                dir,
+                "--password",
+                "long enough",
+                "--open",
+            ],
+            vec!["host", "--data-dir", dir, "--password"],
+            vec!["host", "--data-dir", dir, "--trust"],
+            vec!["host", "--data-dir", dir, "--trust", "nothex"],
+            vec!["connect", "127.0.0.1:1", "--password"],
+        ] {
+            assert_eq!(run(&bad).0, EXIT_USAGE, "{bad:?}");
+        }
+        // --open 时受信任列表被清空，并给出警告
+        let parsed = parse_host(&strings(&["--open", "--trust", &"ab".repeat(32)])).unwrap();
+        assert!(parsed.trusted.is_empty() && parsed.open);
+        // 只有 --trust 时，内部生成一个随机密码
+        let parsed = parse_host(&strings(&["--trust", &"ab".repeat(32)])).unwrap();
+        assert!(matches!(parsed.auth, Auth::Password(ref p) if p.len() == 64));
+        let _ = std::fs::remove_dir_all(d);
+    }
+
     #[test]
     fn argument_errors() {
         use crate::EXIT_USAGE;
