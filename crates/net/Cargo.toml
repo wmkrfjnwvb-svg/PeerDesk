@@ -1,0 +1,19 @@
+[package]
+name = "peerdesk-net"
+description = "PeerDesk 网络层：基于 QUIC 的真实传输"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+peerdesk-core.workspace = true
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "macros", "io-util"] }
+ring = "0.17"
+bytes = "1"
+
+[lints]
+workspace = true

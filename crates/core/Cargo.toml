@@ -1,0 +1,20 @@
+[package]
+name = "peerdesk-core"
+description = "PeerDesk 核心库：与平台和 IO 无关的协议、状态机与仿真"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+blake3 = { version = "1", default-features = false, features = ["pure"] }
+spake2 = "0.4"
+hmac = "0.12"
+sha2 = "0.10"
+
+[lints]
+workspace = true

@@ -1,0 +1,25 @@
+# PeerDesk 客户端配置示例。未知字段会报错。
+
+# 本机所在区域。
+region = "eu-west"
+# 本区域没有可用服务器时，依次尝试的区域。
+region_fallback = ["us-east"]
+
+# 可用的服务器。选择顺序：内网 > 同区域 > 回退区域；过载的排最后。
+[[servers]]
+addr = "203.0.113.10:4433"
+region = "eu-west"
+
+[[servers]]
+addr = "198.51.100.20:4433"
+region = "us-east"
+
+# 内网地址会被自动识别为内网，优先使用。
+[[servers]]
+addr = "10.1.2.3:4433"
+region = "office"
+
+[crypto]
+# 预设三选一：recommended（默认）、fips、none。
+# none 表示不加密，只应在受信任的内网使用；只有两端都允许时才会生效。
+preset = "recommended"

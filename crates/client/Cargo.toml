@@ -1,0 +1,15 @@
+[package]
+name = "peerdesk"
+description = "PeerDesk 客户端"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+peerdesk-core.workspace = true
+peerdesk-net.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+
+[lints]
+workspace = true

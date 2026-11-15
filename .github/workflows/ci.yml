@@ -1,0 +1,117 @@
+name: CI
+on:
+  push:
+  pull_request:
+
+# 同一个分支上有新的推送时，取消还在跑的旧任务。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  check:
+    name: lint + coverage gate (linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy, llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Build console
+        run: npm ci --no-audit --no-fund && npm run build
+        working-directory: web
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Tests with coverage gate (99% lines)
+        run: ./scripts/coverage.sh
+
+  # 三个系统并行跑全部测试，并产出发布二进制。
+  platforms:
+    name: test + release (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest, macos-13]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace
+      - run: cargo build --release -p peerdesk -p peerdesk-server
+      - name: Smoke test the binaries
+        shell: bash
+        run: |
+          ./target/release/peerdesk version
+          ./target/release/peerdesk probe
+          ./target/release/peerdesk sim --link wifi --frames 60
+          ./target/release/peerdesk bench-transport --packets 600
+      - uses: actions/upload-artifact@v4
+        with:
+          name: peerdesk-${{ matrix.os }}
+          path: |
+            target/release/peerdesk
+            target/release/peerdesk.exe
+            target/release/peerdesk-server
+            target/release/peerdesk-server.exe
+          if-no-files-found: ignore
+
+  # 探测各系统的 CI 机器能不能截屏：决定屏幕采集的代码能否在 CI 里测。
+  # 这个任务失败不算整体失败。
+  screen-probe:
+    name: screen probe (${{ matrix.os }})
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Linux (virtual X11 display)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq xvfb x11-apps imagemagick xdotool
+          Xvfb :99 -screen 0 1920x1080x24 &
+          sleep 2
+          export DISPLAY=:99
+          xdpyinfo | grep -E "dimensions|depth of root"
+          xclock -geometry 400x400+100+100 &
+          sleep 2
+          xdotool mousemove 300 300 click 1 && echo "input injection: ok"
+          import -window root screen.png
+          identify screen.png
+      - name: Windows (interactive desktop)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+          $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+          "screen: $($b.Width)x$($b.Height)"
+          $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
+          $g = [System.Drawing.Graphics]::FromImage($bmp)
+          $g.CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
+          $bmp.Save("screen.png")
+          "saved $((Get-Item screen.png).Length) bytes"
+          Get-CimInstance Win32_VideoController | Select-Object Name, AdapterRAM, VideoProcessor | Format-List
+      - name: macOS (screencapture)
+        if: runner.os == 'macOS'
+        run: |
+          system_profiler SPDisplaysDataType | head -30
+          screencapture -x screen.png
+          ls -l screen.png
+          sips -g pixelWidth -g pixelHeight screen.png
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: screen-${{ matrix.os }}
+          path: screen.png
+          if-no-files-found: warn

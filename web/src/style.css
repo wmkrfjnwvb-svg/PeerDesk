@@ -1,0 +1,70 @@
+:root {
+  --bg: #f7f7f5;
+  --panel: #ffffff;
+  --text: #1c1c1a;
+  --muted: #6b6b66;
+  --line: #e2e2dd;
+  --ok: #1f8a4c;
+  --warn: #b7791f;
+  --bad: #c0392b;
+  color-scheme: light dark;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #161615;
+    --panel: #1f1f1d;
+    --text: #ecece8;
+    --muted: #9a9a94;
+    --line: #33332f;
+    --ok: #4cc38a;
+    --warn: #e0a84a;
+    --bad: #f0786a;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+main { max-width: 60rem; margin: 0 auto; padding: 2rem 1rem 4rem; }
+h1 { margin: 0; font-size: 1.5rem; }
+h2 { font-size: 1.05rem; margin: 0 0 0.75rem; }
+header p { margin: 0.25rem 0 0; color: var(--muted); }
+section {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 1.25rem;
+  margin-top: 1.25rem;
+}
+.scroll { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; white-space: nowrap; }
+th, td { text-align: left; padding: 0.5rem 0.75rem; border-bottom: 1px solid var(--line); }
+th { color: var(--muted); font-weight: 500; font-size: 0.85rem; }
+tr:last-child td { border-bottom: 0; }
+.num { text-align: right; font-variant-numeric: tabular-nums; }
+.mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 0.9em; }
+.tag {
+  margin-left: 0.5rem; padding: 0 0.4rem; border: 1px solid var(--line);
+  border-radius: 999px; color: var(--muted); font-size: 0.75rem;
+}
+.state { font-weight: 600; }
+.state.alive { color: var(--ok); }
+.state.suspect { color: var(--warn); }
+.state.dead { color: var(--bad); }
+.load { display: inline-flex; align-items: center; gap: 0.5rem; font-variant-numeric: tabular-nums; }
+.bar { width: 4rem; height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; }
+.fill { display: block; height: 100%; }
+.fill.ok { background: var(--ok); }
+.fill.warn { background: var(--warn); }
+.fill.bad { background: var(--bad); }
+.route { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin-top: 1rem; }
+.route input, .route button {
+  font: inherit; padding: 0.35rem 0.6rem; border: 1px solid var(--line);
+  border-radius: 6px; background: var(--bg); color: var(--text);
+}
+.route button { cursor: pointer; }
+.route output { font-weight: 600; }
+.error { color: var(--bad); }

@@ -1,0 +1,53 @@
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/net", "crates/client", "crates/server"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.80"
+repository = "https://github.com/peerdesk/peerdesk"
+
+[workspace.dependencies]
+peerdesk-core = { path = "crates/core" }
+peerdesk-net = { path = "crates/net" }
+
+# 编译期检查：所有 crate 通过 `[lints] workspace = true` 继承。
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unreachable_patterns = "deny"
+unused_must_use = "deny"
+unused_results = "allow"
+missing_debug_implementations = "deny"
+trivial_casts = "deny"
+unused_qualifications = "deny"
+
+[workspace.lints.clippy]
+# match 必须逐个列出枚举成员：新增成员时所有 match 都会编译失败，强制处理。
+wildcard_enum_match_arm = "deny"
+match_wildcard_for_single_variants = "deny"
+# 非测试代码不允许可能 panic 的写法：处理的是不可信的网络输入。
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+cast_possible_truncation = "deny"
+cast_sign_loss = "deny"
+cast_possible_wrap = "deny"
+
+# 体积优先的发布配置。
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+debug = false
+incremental = false

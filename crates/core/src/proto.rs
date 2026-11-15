@@ -1,0 +1,631 @@
+//! 线上协议：数据报包头、视频分片头、控制消息。
+//!
+//! 数据报布局：`包头(20 字节) | 载荷`。视频载荷再以 [`VideoHeader`] 开头。
+//! M1 接入 QUIC 后，这些数据报承载在 QUIC 数据报里，控制消息承载在 QUIC 流里，格式不变。
+
+use crate::crypto::Suite;
+use crate::wire::{Reader, Writer};
+use crate::{Error, Time};
+
+/// 包头魔数。
+pub const MAGIC: u8 = 0x50;
+/// 协议版本。
+pub const VERSION: u8 = 1;
+/// 包头长度。
+pub const HEADER_LEN: usize = 20;
+/// 视频分片头长度。
+pub const VIDEO_HEADER_LEN: usize = 12;
+/// 单个数据报的最大长度，避免 IP 分片。
+pub const MAX_DATAGRAM: usize = 1200;
+/// 区域名的最大长度。
+pub const MAX_REGION_LEN: usize = 32;
+/// 一条 Hello 最多携带的套件数。
+pub const MAX_SUITES: usize = 16;
+
+/// 逻辑通道。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Channel {
+    /// 键鼠输入。
+    Input,
+    /// 控制与反馈。
+    Control,
+    /// 光标形状与位置。
+    Cursor,
+    /// 视频。
+    Video,
+    /// 剪贴板。
+    Clipboard,
+    /// 文件。
+    File,
+}
+
+impl Channel {
+    /// 全部通道，按优先级从高到低。
+    pub const ALL: [Channel; 6] = [
+        Channel::Input,
+        Channel::Control,
+        Channel::Cursor,
+        Channel::Video,
+        Channel::Clipboard,
+        Channel::File,
+    ];
+
+    /// 线上编号。
+    #[must_use]
+    pub const fn id(self) -> u8 {
+        match self {
+            Channel::Input => 0,
+            Channel::Control => 1,
+            Channel::Cursor => 2,
+            Channel::Video => 3,
+            Channel::Clipboard => 4,
+            Channel::File => 5,
+        }
+    }
+
+    /// 由线上编号解析。
+    pub const fn from_id(id: u8) -> Result<Self, Error> {
+        match id {
+            0 => Ok(Channel::Input),
+            1 => Ok(Channel::Control),
+            2 => Ok(Channel::Cursor),
+            3 => Ok(Channel::Video),
+            4 => Ok(Channel::Clipboard),
+            5 => Ok(Channel::File),
+            other => Err(Error::UnknownChannel(other)),
+        }
+    }
+
+    /// 调度优先级，0 最高。
+    #[must_use]
+    pub const fn priority(self) -> u8 {
+        self.id()
+    }
+
+    /// 是否要求可靠有序送达。
+    #[must_use]
+    pub const fn reliable(self) -> bool {
+        match self {
+            Channel::Control | Channel::Clipboard | Channel::File => true,
+            Channel::Input | Channel::Cursor | Channel::Video => false,
+        }
+    }
+}
+
+/// 数据报包头。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Header {
+    /// 通道。
+    pub channel: Channel,
+    /// 标志位，目前保留。
+    pub flags: u8,
+    /// 连接标识。会话不绑定 IP 和端口，换路径时保持不变。
+    pub conn_id: u32,
+    /// 包序号。
+    pub seq: u32,
+    /// 发送时间，用于延迟趋势估计。
+    pub send_time: Time,
+}
+
+impl Header {
+    /// 编码到写入器。
+    pub fn encode(&self, w: &mut Writer) {
+        w.u8(MAGIC)
+            .u8(VERSION)
+            .u8(self.channel.id())
+            .u8(self.flags)
+            .u32(self.conn_id)
+            .u32(self.seq)
+            .u64(self.send_time.micros());
+    }
+
+    /// 从读取器解码。
+    pub fn decode(r: &mut Reader<'_>) -> Result<Self, Error> {
+        let magic = r.u8()?;
+        if magic != MAGIC {
+            return Err(Error::BadMagic(magic));
+        }
+        let version = r.u8()?;
+        if version != VERSION {
+            return Err(Error::UnsupportedVersion(version));
+        }
+        let channel = Channel::from_id(r.u8()?)?;
+        let flags = r.u8()?;
+        let conn_id = r.u32()?;
+        let seq = r.u32()?;
+        let send_time = Time(r.u64()?);
+        Ok(Self {
+            channel,
+            flags,
+            conn_id,
+            seq,
+            send_time,
+        })
+    }
+}
+
+/// 把包头和载荷拼成一个数据报，超过 [`MAX_DATAGRAM`] 报错。
+pub fn encode_datagram(header: &Header, payload: &[u8]) -> Result<Vec<u8>, Error> {
+    let len = HEADER_LEN.saturating_add(payload.len());
+    if len > MAX_DATAGRAM {
+        return Err(Error::PayloadTooLarge {
+            len,
+            max: MAX_DATAGRAM,
+        });
+    }
+    let mut w = Writer::new();
+    header.encode(&mut w);
+    w.bytes(payload);
+    Ok(w.into_vec())
+}
+
+/// 拆出包头和载荷。
+pub fn decode_datagram(buf: &[u8]) -> Result<(Header, &[u8]), Error> {
+    if buf.len() > MAX_DATAGRAM {
+        return Err(Error::PayloadTooLarge {
+            len: buf.len(),
+            max: MAX_DATAGRAM,
+        });
+    }
+    let mut r = Reader::new(buf);
+    let header = Header::decode(&mut r)?;
+    Ok((header, r.rest()))
+}
+
+/// 视频分片头。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VideoHeader {
+    /// 帧号。
+    pub frame_id: u32,
+    /// 帧内分片序号，从 0 开始。
+    pub frag_index: u16,
+    /// 帧内分片总数，至少为 1。
+    pub frag_count: u16,
+    /// 本帧参考的帧号；关键帧参考自己。
+    pub ref_frame: u32,
+}
+
+impl VideoHeader {
+    /// 校验分片序号与总数。
+    pub const fn validate(&self) -> Result<(), Error> {
+        if self.frag_count == 0 || self.frag_index >= self.frag_count {
+            return Err(Error::InvalidFragment {
+                index: self.frag_index,
+                count: self.frag_count,
+            });
+        }
+        Ok(())
+    }
+
+    /// 编码。
+    pub fn encode(&self, w: &mut Writer) {
+        w.u32(self.frame_id)
+            .u16(self.frag_index)
+            .u16(self.frag_count)
+            .u32(self.ref_frame);
+    }
+
+    /// 解码并校验。
+    pub fn decode(r: &mut Reader<'_>) -> Result<Self, Error> {
+        let header = Self {
+            frame_id: r.u32()?,
+            frag_index: r.u16()?,
+            frag_count: r.u16()?,
+            ref_frame: r.u32()?,
+        };
+        header.validate()?;
+        Ok(header)
+    }
+}
+
+/// 编解码能力位。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Caps(pub u32);
+
+impl Caps {
+    /// H.264。
+    pub const H264: Caps = Caps(1);
+    /// H.265。
+    pub const H265: Caps = Caps(1 << 1);
+    /// AV1。
+    pub const AV1: Caps = Caps(1 << 2);
+    /// 4:4:4 色度。
+    pub const YUV444: Caps = Caps(1 << 3);
+
+    /// 并集。
+    #[must_use]
+    pub const fn with(self, other: Caps) -> Caps {
+        Caps(self.0 | other.0)
+    }
+
+    /// 交集。
+    #[must_use]
+    pub const fn common(self, other: Caps) -> Caps {
+        Caps(self.0 & other.0)
+    }
+
+    /// 是否包含 `other` 的全部能力。
+    #[must_use]
+    pub const fn has(self, other: Caps) -> bool {
+        self.0 & other.0 == other.0
+    }
+}
+
+/// 拒绝连接的原因。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RejectReason {
+    /// 协议版本不兼容。
+    Version,
+    /// 没有共同的加密套件。
+    NoCommonSuite,
+    /// 被控端正忙。
+    Busy,
+    /// 未授权。
+    Unauthorized,
+    /// 认证失败次数过多，暂时锁定。
+    Locked,
+}
+
+impl RejectReason {
+    /// 全部原因。
+    pub const ALL: [RejectReason; 5] = [
+        RejectReason::Version,
+        RejectReason::NoCommonSuite,
+        RejectReason::Busy,
+        RejectReason::Unauthorized,
+        RejectReason::Locked,
+    ];
+
+    /// 线上编号。
+    #[must_use]
+    pub const fn id(self) -> u8 {
+        match self {
+            RejectReason::Version => 1,
+            RejectReason::NoCommonSuite => 2,
+            RejectReason::Busy => 3,
+            RejectReason::Unauthorized => 4,
+            RejectReason::Locked => 5,
+        }
+    }
+
+    /// 由线上编号解析。
+    pub const fn from_id(id: u8) -> Result<Self, Error> {
+        match id {
+            1 => Ok(RejectReason::Version),
+            2 => Ok(RejectReason::NoCommonSuite),
+            3 => Ok(RejectReason::Busy),
+            4 => Ok(RejectReason::Unauthorized),
+            5 => Ok(RejectReason::Locked),
+            other => Err(Error::UnknownReason(other)),
+        }
+    }
+}
+
+/// 控制消息。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Control {
+    /// 控制端发起。
+    Hello {
+        /// 发起方的协议版本。
+        version: u8,
+        /// 发起方的设备标识。
+        device_id: u64,
+        /// 发起方的编解码能力。
+        caps: Caps,
+        /// 发起方所在区域。
+        region: String,
+        /// 发起方允许的加密套件，按偏好排列。
+        suites: Vec<Suite>,
+    },
+    /// 被控端接受。
+    Accept {
+        /// 选中的加密套件。
+        suite: Suite,
+        /// 会话标识。
+        session_id: u32,
+        /// 两端共同的编解码能力。
+        caps: Caps,
+    },
+    /// 被控端拒绝。
+    Reject {
+        /// 原因。
+        reason: RejectReason,
+    },
+    /// 探活。
+    Ping {
+        /// 回显用的随机数。
+        nonce: u64,
+    },
+    /// 探活应答。
+    Pong {
+        /// 原样返回的随机数。
+        nonce: u64,
+    },
+    /// 结束会话。
+    Bye,
+    /// 密码交换消息。被控端先发（表示需要密码），控制端回一条。
+    AuthStart {
+        /// SPAKE2 消息。
+        msg: Vec<u8>,
+    },
+    /// 密码交换完成后的确认码。
+    AuthProof {
+        /// HMAC-SHA256 确认码。
+        proof: [u8; 32],
+    },
+}
+
+impl Control {
+    /// 消息名，用于日志和错误信息。
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Control::Hello { .. } => "Hello",
+            Control::Accept { .. } => "Accept",
+            Control::Reject { .. } => "Reject",
+            Control::Ping { .. } => "Ping",
+            Control::Pong { .. } => "Pong",
+            Control::Bye => "Bye",
+            Control::AuthStart { .. } => "AuthStart",
+            Control::AuthProof { .. } => "AuthProof",
+        }
+    }
+
+    /// 编码。
+    pub fn encode(&self) -> Result<Vec<u8>, Error> {
+        let mut w = Writer::new();
+        match self {
+            Control::Hello {
+                version,
+                device_id,
+                caps,
+                region,
+                suites,
+            } => {
+                let count = u8::try_from(suites.len())
+                    .ok()
+                    .filter(|c| usize::from(*c) <= MAX_SUITES)
+                    .ok_or(Error::TooManyItems {
+                        len: suites.len(),
+                        max: MAX_SUITES,
+                    })?;
+                w.u8(1).u8(*version).u64(*device_id).u32(caps.0);
+                w.string(region, MAX_REGION_LEN)?;
+                w.u8(count);
+                for suite in suites {
+                    w.u8(suite.id());
+                }
+            }
+            Control::Accept {
+                suite,
+                session_id,
+                caps,
+            } => {
+                w.u8(2).u8(suite.id()).u32(*session_id).u32(caps.0);
+            }
+            Control::Reject { reason } => {
+                w.u8(3).u8(reason.id());
+            }
+            Control::Ping { nonce } => {
+                w.u8(4).u64(*nonce);
+            }
+            Control::Pong { nonce } => {
+                w.u8(5).u64(*nonce);
+            }
+            Control::Bye => {
+                w.u8(6);
+            }
+            Control::AuthStart { msg } => {
+                let len = u8::try_from(msg.len())
+                    .ok()
+                    .filter(|l| usize::from(*l) <= crate::auth::MAX_PAKE_MSG)
+                    .ok_or(Error::PayloadTooLarge {
+                        len: msg.len(),
+                        max: crate::auth::MAX_PAKE_MSG,
+                    })?;
+                w.u8(7).u8(len).bytes(msg);
+            }
+            Control::AuthProof { proof } => {
+                w.u8(8).bytes(proof);
+            }
+        }
+        Ok(w.into_vec())
+    }
+
+    /// 解码。要求恰好用完全部字节。
+    pub fn decode(buf: &[u8]) -> Result<Self, Error> {
+        let mut r = Reader::new(buf);
+        let msg = match r.u8()? {
+            1 => {
+                let version = r.u8()?;
+                let device_id = r.u64()?;
+                let caps = Caps(r.u32()?);
+                let region = r.string(MAX_REGION_LEN)?;
+                let count = usize::from(r.u8()?);
+                if count > MAX_SUITES {
+                    return Err(Error::TooManyItems {
+                        len: count,
+                        max: MAX_SUITES,
+                    });
+                }
+                let mut suites = Vec::with_capacity(count);
+                for _ in 0..count {
+                    suites.push(Suite::from_id(r.u8()?)?);
+                }
+                Control::Hello {
+                    version,
+                    device_id,
+                    caps,
+                    region,
+                    suites,
+                }
+            }
+            2 => Control::Accept {
+                suite: Suite::from_id(r.u8()?)?,
+                session_id: r.u32()?,
+                caps: Caps(r.u32()?),
+            },
+            3 => Control::Reject {
+                reason: RejectReason::from_id(r.u8()?)?,
+            },
+            4 => Control::Ping { nonce: r.u64()? },
+            5 => Control::Pong { nonce: r.u64()? },
+            6 => Control::Bye,
+            7 => {
+                let len = usize::from(r.u8()?);
+                if len > crate::auth::MAX_PAKE_MSG {
+                    return Err(Error::PayloadTooLarge {
+                        len,
+                        max: crate::auth::MAX_PAKE_MSG,
+                    });
+                }
+                Control::AuthStart {
+                    msg: r.take(len)?.to_vec(),
+                }
+            }
+            8 => {
+                let mut proof = [0u8; 32];
+                proof.copy_from_slice(r.take(32)?);
+                Control::AuthProof { proof }
+            }
+            other => return Err(Error::UnknownMessage(other)),
+        };
+        r.finish()?;
+        Ok(msg)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn samples() -> Vec<Control> {
+        vec![
+            Control::Hello {
+                version: VERSION,
+                device_id: 42,
+                caps: Caps::H264.with(Caps::AV1),
+                region: "us-east".into(),
+                suites: vec![Suite::Aes256Gcm, Suite::None],
+            },
+            Control::Accept {
+                suite: Suite::ChaCha20Poly1305,
+                session_id: 7,
+                caps: Caps::H264,
+            },
+            Control::Reject {
+                reason: RejectReason::Busy,
+            },
+            Control::Ping { nonce: 1 },
+            Control::Pong { nonce: u64::MAX },
+            Control::Bye,
+            Control::AuthStart { msg: vec![7; 33] },
+            Control::AuthStart { msg: vec![] },
+            Control::AuthProof { proof: [9; 32] },
+        ]
+    }
+
+    #[test]
+    fn control_roundtrip() {
+        let mut names = Vec::new();
+        for msg in samples() {
+            let bytes = msg.encode().unwrap();
+            assert_eq!(Control::decode(&bytes).unwrap(), msg);
+            names.push(msg.name());
+        }
+        assert_eq!(
+            names,
+            [
+                "Hello",
+                "Accept",
+                "Reject",
+                "Ping",
+                "Pong",
+                "Bye",
+                "AuthStart",
+                "AuthStart",
+                "AuthProof"
+            ]
+        );
+        assert!(matches!(
+            Control::AuthStart { msg: vec![0; 65] }.encode(),
+            Err(Error::PayloadTooLarge { len: 65, max: 64 })
+        ));
+        assert!(matches!(
+            Control::decode(&[7, 65]),
+            Err(Error::PayloadTooLarge { len: 65, max: 64 })
+        ));
+        assert!(matches!(
+            Control::decode(&[7, 5, 1]),
+            Err(Error::Truncated { .. })
+        ));
+        assert!(matches!(
+            Control::decode(&[8, 1, 2]),
+            Err(Error::Truncated { .. })
+        ));
+    }
+
+    #[test]
+    fn channel_properties() {
+        for (i, ch) in Channel::ALL.into_iter().enumerate() {
+            assert_eq!(Channel::from_id(ch.id()).unwrap(), ch);
+            assert_eq!(usize::from(ch.priority()), i);
+        }
+        assert!(Channel::File.reliable());
+        assert!(Channel::Control.reliable());
+        assert!(Channel::Clipboard.reliable());
+        assert!(!Channel::Video.reliable());
+        assert!(!Channel::Input.reliable());
+        assert!(!Channel::Cursor.reliable());
+        assert_eq!(Channel::from_id(6), Err(Error::UnknownChannel(6)));
+    }
+
+    #[test]
+    fn reject_reason_ids() {
+        for reason in RejectReason::ALL {
+            assert_eq!(RejectReason::from_id(reason.id()).unwrap(), reason);
+        }
+        assert_eq!(RejectReason::from_id(0), Err(Error::UnknownReason(0)));
+    }
+
+    #[test]
+    fn caps_set_operations() {
+        let a = Caps::H264.with(Caps::H265);
+        let b = Caps::H265.with(Caps::YUV444);
+        assert_eq!(a.common(b), Caps::H265);
+        assert!(a.has(Caps::H264));
+        assert!(!a.has(Caps::AV1));
+        assert!(a.has(Caps::default()));
+    }
+
+    #[test]
+    fn datagram_roundtrip() {
+        let header = Header {
+            channel: Channel::Video,
+            flags: 0,
+            conn_id: 0xdead_beef,
+            seq: 9,
+            send_time: Time(123_456),
+        };
+        let bytes = encode_datagram(&header, b"abc").unwrap();
+        assert_eq!(bytes.len(), HEADER_LEN + 3);
+        let (decoded, payload) = decode_datagram(&bytes).unwrap();
+        assert_eq!(decoded, header);
+        assert_eq!(payload, b"abc");
+    }
+
+    #[test]
+    fn video_header_roundtrip() {
+        let vh = VideoHeader {
+            frame_id: 1,
+            frag_index: 2,
+            frag_count: 3,
+            ref_frame: 0,
+        };
+        let mut w = Writer::new();
+        vh.encode(&mut w);
+        let bytes = w.into_vec();
+        assert_eq!(bytes.len(), VIDEO_HEADER_LEN);
+        assert_eq!(VideoHeader::decode(&mut Reader::new(&bytes)).unwrap(), vh);
+    }
+}

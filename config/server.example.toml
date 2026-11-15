@@ -1,0 +1,28 @@
+# PeerDesk 服务端配置示例。未知字段会报错。
+
+# 节点标识：集群内唯一，不能为 0。
+node_id = 1
+# 本节点所在区域。同区域的客户端优先连到这里。
+region = "us-east"
+
+# 管理页面与接口。只应暴露给运维网络。
+http_listen = "127.0.0.1:8080"
+# 集群心跳（UDP）。
+cluster_listen = "0.0.0.0:7946"
+# 其他节点用来联系本节点的地址。
+advertise = "10.0.0.1:7946"
+# 启动时已知的其他节点。只要认识一个，就能通过心跳发现全体。
+peers = ["10.0.0.2:7946"]
+
+# 集群共享密钥：所有节点相同，至少 16 个字符。设置后心跳带认证。
+# 不设置时任何能访问集群端口的机器都能伪造节点，只能用于受信任的内网。
+cluster_secret = "change-me-to-a-long-random-string"
+
+# 本区域节点全部过载或不可用时，客户端依次溢出到这些区域。
+region_fallback = ["us-west", "eu-west"]
+
+[crypto]
+# 预设三选一：recommended（默认）、fips、none。
+preset = "recommended"
+# 或者自定义列表（与 preset 二选一），按偏好排列：
+# suites = ["aes-256-gcm", "chacha20-poly1305", "aes-128-gcm"]

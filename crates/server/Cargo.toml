@@ -1,0 +1,14 @@
+[package]
+name = "peerdesk-server"
+description = "PeerDesk 服务端：信令、集群、内嵌管理页面"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+build = "build.rs"
+
+[dependencies]
+peerdesk-core.workspace = true
+
+[lints]
+workspace = true
