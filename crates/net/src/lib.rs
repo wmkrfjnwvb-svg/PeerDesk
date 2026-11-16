@@ -16,6 +16,8 @@ pub mod fs_store;
 pub mod host;
 pub mod identity;
 pub mod node;
+pub mod rendezvous;
+pub mod service;
 pub mod stream;
 mod tls;
 mod tls_verifier;

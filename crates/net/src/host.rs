@@ -355,7 +355,9 @@ pub async fn serve(
                                 Err(NetError::Protocol("没有文件传输权限"))
                             }
                             StreamKind::File => receive_files(send, recv, &root).await,
-                            StreamKind::Control => Err(NetError::Protocol("重复的控制流")),
+                            StreamKind::Control | StreamKind::Signal => {
+                                Err(NetError::Protocol("会话里不该出现这种流"))
+                            }
                         }
                     }));
                 }

@@ -312,6 +312,22 @@ async fn connect_async(args: ConnectArgs, out: &mut dyn Write) -> Result<u8, Net
     let identity = Identity::load_or_create(&args.data_dir)?;
     let upload = args.send.as_deref().map(plan_upload).transpose()?;
     let node = Node::bind(([0, 0, 0, 0], 0).into(), &identity, &policy)?;
+    let result = connect_session(&node, &identity, &policy, args, upload, out).await;
+    // 无论成功失败，都等关闭通知送到对端再退出：
+    // 否则被控端要等到超时才知道这条连接没了，期间不能接待下一个连接。
+    node.close();
+    let _ = tokio::time::timeout(Duration::from_millis(500), node.wait_idle()).await;
+    result
+}
+
+async fn connect_session(
+    node: &Node,
+    identity: &Identity,
+    policy: &Policy,
+    args: ConnectArgs,
+    upload: Option<Upload>,
+    out: &mut dyn Write,
+) -> Result<u8, NetError> {
     let link = node.connect(args.addr, args.pin.as_ref()).await?;
     let _ = writeln!(out, "已连接 {}", link.remote_addr());
     let _ = writeln!(out, "对端指纹 {}", to_hex(link.peer_fingerprint()));
@@ -329,7 +345,7 @@ async fn connect_async(args: ConnectArgs, out: &mut dyn Write) -> Result<u8, Net
     let report = controller::run(
         link,
         ControllerOptions {
-            session: session(&identity, &policy, args.auth.clone()),
+            session: session(identity, policy, args.auth.clone()),
             deadline_us: 100_000,
             duration: Some(Duration::from_secs(args.seconds)),
         },
@@ -338,7 +354,6 @@ async fn connect_async(args: ConnectArgs, out: &mut dyn Write) -> Result<u8, Net
         upload,
     )
     .await?;
-    node.close();
 
     let lines = [
         format!("会话结束      {}", report.end),

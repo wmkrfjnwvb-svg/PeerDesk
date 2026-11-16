@@ -11,6 +11,7 @@ use peerdesk_core::proto::{
 };
 use peerdesk_core::Time;
 use quinn::{RecvStream, SendStream, VarInt};
+use tokio::sync::mpsc;
 
 use crate::identity::{fingerprint_of, to_hex};
 use crate::{Fingerprint, Identity, NetError};
@@ -23,18 +24,50 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
 pub struct Node {
     endpoint: quinn::Endpoint,
     fingerprint: Fingerprint,
+    /// 与 QUIC 端点共用同一个 UDP 端口的另一份句柄，只用来发打洞包。
+    punch: std::net::UdpSocket,
+    /// 后台任务完成握手后把连接放进这个队列。
+    accepted: tokio::sync::Mutex<mpsc::Receiver<Result<Link, NetError>>>,
 }
 
 impl Node {
     /// 绑定本地地址。必须在 tokio 运行时内调用。
     pub fn bind(addr: SocketAddr, identity: &Identity, policy: &Policy) -> Result<Self, NetError> {
         let (server, client) = crate::tls::configs(identity, policy)?;
-        let mut endpoint = quinn::Endpoint::server(server, addr)
-            .map_err(|e| NetError::Io(format!("绑定 {addr} 失败：{e}")))?;
+        let bind_err = |e: std::io::Error| NetError::Io(format!("绑定 {addr} 失败：{e}"));
+        let socket = std::net::UdpSocket::bind(addr).map_err(bind_err)?;
+        let punch = socket.try_clone().map_err(bind_err)?;
+        let runtime =
+            quinn::default_runtime().ok_or_else(|| NetError::Io("没有可用的异步运行时".into()))?;
+        let mut endpoint = quinn::Endpoint::new(
+            quinn::EndpointConfig::default(),
+            Some(server),
+            socket,
+            runtime,
+        )
+        .map_err(bind_err)?;
         endpoint.set_default_client_config(client);
+        // 握手放在后台任务里做：调用方随时可以放弃等待，不会打断正在进行的握手。
+        let (tx, rx) = mpsc::channel(64);
+        let acceptor = endpoint.clone();
+        tokio::spawn(async move {
+            while let Some(incoming) = acceptor.accept().await {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let result = match tokio::time::timeout(HANDSHAKE_TIMEOUT, incoming).await {
+                        Err(_) => Err(NetError::Timeout("握手")),
+                        Ok(Err(e)) => Err(NetError::Connect(e.to_string())),
+                        Ok(Ok(conn)) => Link::new(conn),
+                    };
+                    let _ = tx.send(result).await;
+                });
+            }
+        });
         Ok(Self {
             endpoint,
             fingerprint: identity.fingerprint(),
+            punch,
+            accepted: tokio::sync::Mutex::new(rx),
         })
     }
 
@@ -49,6 +82,25 @@ impl Node {
     #[must_use]
     pub const fn fingerprint(&self) -> &Fingerprint {
         &self.fingerprint
+    }
+
+    /// 向 `addr` 发一个打洞包：从本端点的端口发出一个很小的非 QUIC 包，
+    /// 让本机的 NAT 为这个对端地址建立映射，对端发来的包才进得来。对端会直接丢弃它。
+    pub fn punch(&self, addr: SocketAddr) {
+        // 发不出去（例如地址族不匹配）不是错误：打洞本来就是尽力而为。
+        let _ = self.punch.send_to(&[0], addr);
+    }
+
+    /// 同 [`Node::connect`]，但握手最多等 `timeout`。用于尝试一条可能不通的直连路径。
+    pub async fn connect_within(
+        &self,
+        addr: SocketAddr,
+        pin: Option<&Fingerprint>,
+        timeout: Duration,
+    ) -> Result<Link, NetError> {
+        tokio::time::timeout(timeout, self.connect(addr, pin))
+            .await
+            .map_err(|_| NetError::Timeout("直连"))?
     }
 
     /// 连接对端。给了 `pin` 时，对端指纹必须与之相同，否则立刻断开并报错。
@@ -69,6 +121,9 @@ impl Node {
         if let Some(expected) = pin {
             if link.peer != *expected {
                 link.close("pin mismatch");
+                // 等关闭通知发出去再返回：否则调用方马上退出的话，对端要等到超时才知道连接没了。
+                let _ =
+                    tokio::time::timeout(Duration::from_millis(300), link.closed_locally()).await;
                 return Err(NetError::PinMismatch {
                     expected: to_hex(expected),
                     actual: to_hex(&link.peer),
@@ -79,14 +134,9 @@ impl Node {
     }
 
     /// 等待并接受一个连接。端点关闭后返回 `None`；握手失败的连接返回 `Some(Err)`。
+    /// 可以随时取消（例如放在 `select!` 里），不会丢连接。
     pub async fn accept(&self) -> Option<Result<Link, NetError>> {
-        let incoming = self.endpoint.accept().await?;
-        let result = match tokio::time::timeout(HANDSHAKE_TIMEOUT, incoming).await {
-            Err(_) => Err(NetError::Timeout("握手")),
-            Ok(Err(e)) => Err(NetError::Connect(e.to_string())),
-            Ok(Ok(conn)) => Link::new(conn),
-        };
-        Some(result)
+        self.accepted.lock().await.recv().await
     }
 
     /// 关闭端点和它的所有连接。
@@ -251,6 +301,13 @@ impl Link {
     /// 关闭连接，`reason` 会送达对端。
     pub fn close(&self, reason: &str) {
         self.conn.close(VarInt::from_u32(0), reason.as_bytes());
+    }
+
+    /// 本端关闭连接后，等关闭通知送出。
+    async fn closed_locally(&self) {
+        // 连接关闭后，端点还要把关闭帧发出去；给它一点时间。
+        self.conn.closed().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
     /// 等待连接关闭，返回原因。

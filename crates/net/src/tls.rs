@@ -20,6 +20,8 @@ use crate::{Identity, NetError};
 const ALPN: &[u8] = b"peerdesk/1";
 /// 连接空闲多久后断开（毫秒）。
 const IDLE_TIMEOUT_MS: u32 = 10_000;
+/// QUIC 包的长度上限（字节）。
+const MAX_UDP_PAYLOAD: u16 = 1400;
 /// 保活间隔。
 const KEEP_ALIVE: Duration = Duration::from_secs(2);
 /// 数据报收发缓冲。发送缓冲满时最旧的数据报被丢弃，符合“新帧优先”。
@@ -67,6 +69,9 @@ fn initial_suite() -> Result<rustls::quic::Suite, NetError> {
 }
 
 fn transport() -> Arc<quinn::TransportConfig> {
+    // 包长上限留出余量：经中继时每个包前面还要加中继包头，不能超过常见链路的 MTU。
+    let mut mtu = quinn::MtuDiscoveryConfig::default();
+    mtu.upper_bound(MAX_UDP_PAYLOAD);
     let mut transport = quinn::TransportConfig::default();
     transport
         .max_idle_timeout(Some(quinn::IdleTimeout::from(quinn::VarInt::from_u32(
@@ -74,7 +79,8 @@ fn transport() -> Arc<quinn::TransportConfig> {
         ))))
         .keep_alive_interval(Some(KEEP_ALIVE))
         .datagram_receive_buffer_size(Some(DATAGRAM_BUFFER))
-        .datagram_send_buffer_size(DATAGRAM_BUFFER);
+        .datagram_send_buffer_size(DATAGRAM_BUFFER)
+        .mtu_discovery_config(Some(mtu));
     // M2：在这里接入自研的拥塞控制器（congestion_controller_factory）。
     Arc::new(transport)
 }

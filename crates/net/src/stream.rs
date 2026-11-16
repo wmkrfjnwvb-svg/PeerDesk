@@ -2,6 +2,7 @@
 
 use peerdesk_core::file::{Deframer, FileMsg};
 use peerdesk_core::proto::Control;
+use peerdesk_core::signal::SignalMsg;
 use quinn::{RecvStream, SendStream};
 
 use crate::NetError;
@@ -13,6 +14,8 @@ pub enum StreamKind {
     Control,
     /// 文件传输。
     File,
+    /// 信令（设备与服务器之间）。
+    Signal,
 }
 
 impl StreamKind {
@@ -20,6 +23,7 @@ impl StreamKind {
         match self {
             StreamKind::Control => 1,
             StreamKind::File => 2,
+            StreamKind::Signal => 3,
         }
     }
 
@@ -27,6 +31,7 @@ impl StreamKind {
         match id {
             1 => Some(StreamKind::Control),
             2 => Some(StreamKind::File),
+            3 => Some(StreamKind::Signal),
             _ => None,
         }
     }
@@ -74,6 +79,29 @@ pub async fn read_control(recv: &mut RecvStream) -> Result<Control, NetError> {
     Ok(Control::decode(&body)?)
 }
 
+/// 写一条信令消息（2 字节长度前缀）。
+pub async fn write_signal(send: &mut SendStream, msg: &SignalMsg) -> Result<(), NetError> {
+    let body = msg.encode();
+    let len = u16::try_from(body.len()).map_err(|_| NetError::Protocol("信令消息过长"))?;
+    let mut framed = Vec::with_capacity(body.len().saturating_add(2));
+    framed.extend_from_slice(&len.to_be_bytes());
+    framed.extend_from_slice(&body);
+    send.write_all(&framed).await.map_err(closed)
+}
+
+/// 读一条信令消息。
+pub async fn read_signal(recv: &mut RecvStream) -> Result<SignalMsg, NetError> {
+    let mut len = [0u8; 2];
+    recv.read_exact(&mut len).await.map_err(closed)?;
+    let len = usize::from(u16::from_be_bytes(len));
+    if len > MAX_CONTROL_LEN {
+        return Err(NetError::Protocol("信令消息过长"));
+    }
+    let mut body = vec![0u8; len];
+    recv.read_exact(&mut body).await.map_err(closed)?;
+    Ok(SignalMsg::decode(&body)?)
+}
+
 /// 写一条文件传输消息。
 pub async fn write_file_msg(send: &mut SendStream, msg: &FileMsg) -> Result<(), NetError> {
     send.write_all(&msg.frame()?).await.map_err(closed)
@@ -104,10 +132,10 @@ mod tests {
 
     #[test]
     fn stream_kind_ids() {
-        for kind in [StreamKind::Control, StreamKind::File] {
+        for kind in [StreamKind::Control, StreamKind::File, StreamKind::Signal] {
             assert_eq!(StreamKind::from_id(kind.id()), Some(kind));
         }
         assert_eq!(StreamKind::from_id(0), None);
-        assert_eq!(StreamKind::from_id(3), None);
+        assert_eq!(StreamKind::from_id(4), None);
     }
 }
