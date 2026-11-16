@@ -97,9 +97,10 @@ async fn full_session_video_input_and_files() {
 
     let recorder = Recorder::default();
     let sink = CountSink::new();
-    // 被控端的桌面：打字 20 帧、拖窗口 20 帧，然后静止。会话 600 毫秒，足够它做完并收敛。
+    // 被控端的桌面：打字 10 帧、拖窗口 10 帧，然后静止。会话 1.5 秒：即使定时器粒度很粗
+    // （Windows 上约 15 毫秒一次）也足够它做完并收敛。
     let desktop = DemoDesktop::new(640, 360, 1)
-        .with_script(vec![(Workload::Typing, 20), (Workload::Dragging, 20)]);
+        .with_script(vec![(Workload::Typing, 10), (Workload::Dragging, 10)]);
     let mirror = desktop.mirror();
     let host_task = tokio::spawn(host::serve(
         host_link,
@@ -135,7 +136,7 @@ async fn full_session_video_input_and_files() {
         ControllerOptions {
             session: session(&p.ctrl_id, &policy),
             deadline_us: 200_000,
-            duration: Some(Duration::from_millis(600)),
+            duration: Some(Duration::from_millis(1500)),
         },
         Box::new(sink.clone()),
         rx,
@@ -166,10 +167,10 @@ async fn full_session_video_input_and_files() {
         0,
         "观看端画面与被控端不一致"
     );
-    assert!(host_report.frames_sent >= 40, "{}", host_report.frames_sent);
-    // 桌面静止后不再发帧：帧数远少于 600 毫秒 × 100 帧每秒
+    assert!(host_report.frames_sent >= 20, "{}", host_report.frames_sent);
+    // 桌面静止后不再发帧：帧数远少于 1.5 秒 × 100 帧每秒
     // （机器很慢时个别帧会被判定超时而重发，所以留一些余量。）
-    assert!(host_report.frames_sent < 80, "{}", host_report.frames_sent);
+    assert!(host_report.frames_sent < 60, "{}", host_report.frames_sent);
     assert_eq!(report.frames_delivered, u64::from(host_report.frames_sent));
     assert_eq!(sink.count(), report.frames_delivered);
     assert_eq!(report.video_bytes, host_report.video_bytes);
