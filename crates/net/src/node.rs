@@ -150,6 +150,13 @@ impl Link {
         Ok(out)
     }
 
+    /// 这条连接在网络上实际发出和收到的字节数（含握手、保活、确认等一切开销）。
+    #[must_use]
+    pub fn wire_bytes(&self) -> (u64, u64) {
+        let stats = self.conn.stats();
+        (stats.udp_tx.bytes, stats.udp_rx.bytes)
+    }
+
     /// 当前估计的往返延迟。
     #[must_use]
     pub fn rtt(&self) -> Duration {

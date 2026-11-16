@@ -26,6 +26,8 @@ use crate::{Fingerprint, Link, NetError};
 
 /// 输入包的重发间隔：有未确认的事件时按这个间隔重发。
 const INPUT_RESEND: Duration = Duration::from_millis(20);
+/// 没有新情况时两次反馈之间的间隔（微秒）。
+const IDLE_FEEDBACK_US: u64 = 1_000_000;
 
 /// 画面去向。窗口显示实现这个接口。
 pub trait ScreenSink: Send {
@@ -84,6 +86,8 @@ pub struct ControllerReport {
     pub file_bytes: u64,
     /// 会话结束时的往返延迟估计。
     pub rtt: Duration,
+    /// 网络上实际发出和收到的字节数（含一切开销）。
+    pub wire_bytes: (u64, u64),
     /// 会话为什么结束。
     pub end: String,
     /// 业务追踪。
@@ -166,6 +170,10 @@ pub async fn run(
     let mut tracker = DelayTracker::new(link.now());
     let mut delivery = DeliveryLog::new();
     let (mut bad_frames, mut frames_applied) = (0u64, 0u64);
+    // 反馈只在有新情况时发；什么都没发生时每秒一次，证明自己还在。
+    let mut video_since_feedback = 0u32;
+    let mut reported_floor = 0u32;
+    let mut last_feedback = link.now();
 
     let end = loop {
         if time_up && upload_task.is_none() {
@@ -187,6 +195,7 @@ pub async fn run(
                     Channel::Video => {
                         let now = link.now();
                         tracker.on_packet(now, header.send_time, header.seq, payload.len());
+                        video_since_feedback = video_since_feedback.saturating_add(1);
                         let mut r = Reader::new(&payload);
                         let packet = VideoHeader::decode(&mut r).map(|video| VideoPacket {
                             header: video,
@@ -259,16 +268,22 @@ pub async fn run(
                 if let Some(floor) = reassembler.floor() {
                     delivery.advance(floor);
                 }
-                let sample = tracker.report(now);
                 let (floor, delivered) = delivery.snapshot();
-                let feedback = Feedback {
-                    floor,
-                    delivered,
-                    queue_delay_us: sample.queue_delay_us,
-                    loss_permille: sample.loss_permille,
-                    recv_bytes_per_s: sample.recv_bytes_per_s,
-                };
-                if let Err(e) = link.send(Channel::Control, &feedback.encode()) { break e.to_string(); }
+                let news = video_since_feedback > 0 || floor != reported_floor;
+                if news || now.since(last_feedback) >= IDLE_FEEDBACK_US {
+                    video_since_feedback = 0;
+                    reported_floor = floor;
+                    last_feedback = now;
+                    let sample = tracker.report(now);
+                    let feedback = Feedback {
+                        floor,
+                        delivered,
+                        queue_delay_us: sample.queue_delay_us,
+                        loss_permille: sample.loss_permille,
+                        recv_bytes_per_s: sample.recv_bytes_per_s,
+                    };
+                    if let Err(e) = link.send(Channel::Control, &feedback.encode()) { break e.to_string(); }
+                }
                 if sender.pending() > 0 {
                     let failed = sender.packet()?.and_then(|p| link.send(Channel::Input, &p).err());
              if let Some(e) = failed { break e.to_string(); }
@@ -296,6 +311,7 @@ pub async fn run(
         task.abort();
     }
     let rtt = link.rtt();
+    let wire_bytes = link.wire_bytes();
     // 给对端一点时间读到 Bye，再关闭连接。
     let _ = tokio::time::timeout(Duration::from_millis(500), link.closed()).await;
     link.close("bye");
@@ -321,6 +337,7 @@ pub async fn run(
         files,
         file_bytes,
         rtt,
+        wire_bytes,
         end,
         trace: tracer.dump(),
     })

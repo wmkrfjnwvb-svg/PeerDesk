@@ -512,3 +512,46 @@ async fn transport_benchmark_runs() {
     assert!(result.udp.p50_us <= result.udp.p99_us);
     assert!(result.quic.p99_us < 200_000, "{result:?}");
 }
+
+/// 画面静止时网络上几乎没有流量：这是“静止不发”在真实连接上的验证，不只是仿真里的数字。
+#[tokio::test(flavor = "multi_thread")]
+async fn idle_screen_costs_almost_nothing_on_the_wire() {
+    async fn idle_session(seconds: u64) -> u64 {
+        let policy = Policy::recommended();
+        let p = pair(&policy, &policy);
+        let (host_link, ctrl_link) = links(&p).await;
+        // 脚本为空：桌面从头到尾静止，只有首屏。
+        let desktop = DemoDesktop::new(640, 360, 1).with_script(vec![]);
+        let host_task = tokio::spawn(host::serve(
+            host_link,
+            HostOptions::new(session(&p.host_id, &policy), 30, temp_dir("idle")),
+            Box::new(desktop),
+            Box::new(Recorder::default()),
+        ));
+        let (_tx, rx) = mpsc::channel(1);
+        let report = controller::run(
+            ctrl_link,
+            ControllerOptions {
+                session: session(&p.ctrl_id, &policy),
+                deadline_us: 200_000,
+                duration: Some(Duration::from_secs(seconds)),
+            },
+            Box::new(CountSink::new()),
+            rx,
+            None,
+        )
+        .await
+        .unwrap();
+        host_task.await.unwrap().unwrap();
+        assert!(report.screen.is_some());
+        report.wire_bytes.0 + report.wire_bytes.1
+    }
+    // 两次会话只差 4 秒的静止时间，字节数之差就是静止的代价。
+    let (short, long) = tokio::join!(idle_session(1), idle_session(5));
+    let idle_bytes_per_s = long.saturating_sub(short) / 4;
+    // 目标是 5 kbps（625 字节每秒）以内：只剩保活包和每秒一次的反馈。
+    assert!(
+        idle_bytes_per_s < 625,
+        "静止时每秒 {idle_bytes_per_s} 字节（1 秒会话 {short}，5 秒会话 {long}）"
+    );
+}
