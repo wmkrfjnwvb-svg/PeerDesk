@@ -153,6 +153,8 @@ async fn host_survives_a_hostile_controller() {
     let (header, _) = raw.recv().await.unwrap();
     assert_eq!(header.channel, Channel::Video);
 
+    // 数据报和控制流是两条独立的路：先给被控端留出时间把上面的数据报处理完，再结束会话。
+    tokio::time::sleep(Duration::from_millis(600)).await;
     // 声称长度超限的控制消息：被控端结束会话，而不是去分配内存
     send.write_all(&5000u16.to_be_bytes()).await.unwrap();
     let report = tokio::time::timeout(Duration::from_secs(10), host_task)
@@ -220,7 +222,7 @@ async fn controller_survives_a_hostile_host() {
             break;
         }
     }
-    tokio::time::sleep(Duration::from_millis(120)).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
     write_control(&mut send, &Control::Bye).await.unwrap();
     let report = tokio::time::timeout(Duration::from_secs(10), ctrl_task)
         .await
