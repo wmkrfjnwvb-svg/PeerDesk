@@ -1,0 +1,4 @@
+# 固定工具链版本：覆盖率统计的口径随编译器版本变化，本地和 CI 必须一致。
+[toolchain]
+channel = "1.97.0"
+components = ["rustfmt", "clippy", "llvm-tools-preview"]
