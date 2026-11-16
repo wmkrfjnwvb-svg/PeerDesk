@@ -9,6 +9,7 @@
 
 pub mod bench;
 pub mod controller;
+pub mod demo;
 pub mod error;
 pub mod files;
 pub mod fs_store;

@@ -525,6 +525,16 @@ impl Encoder {
     }
 }
 
+/// 读出一帧码流声明的画面尺寸，不解码。接收端用它创建或重建解码器。
+pub fn frame_size(data: &[u8]) -> Result<(u16, u16), Error> {
+    let mut r = Reader::new(data);
+    let version = r.u8()?;
+    if version != VERSION {
+        return Err(Error::UnsupportedVersion(version));
+    }
+    Ok((r.u16()?, r.u16()?))
+}
+
 /// 解码器：把收到的帧应用到自己的画面上。
 #[derive(Debug, Clone)]
 pub struct Decoder {
@@ -917,5 +927,14 @@ mod tests {
         assert_eq!(dec.apply(&[VERSION, 0, 0, 0, 0, 0, 0]).unwrap(), 0);
         assert!(Grid::new(0, 0).rect(0).is_none());
         assert_eq!(Quality::from_id(2).unwrap(), Quality::Coarse);
+        assert_eq!(frame_size(&[VERSION, 1, 0, 0, 200]).unwrap(), (256, 200));
+        assert_eq!(
+            frame_size(&[9, 0, 0, 0, 0]),
+            Err(Error::UnsupportedVersion(9))
+        );
+        assert!(matches!(
+            frame_size(&[VERSION, 1]),
+            Err(Error::Truncated { .. })
+        ));
     }
 }

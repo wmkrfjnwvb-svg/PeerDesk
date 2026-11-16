@@ -10,11 +10,12 @@ use peerdesk_core::crypto::{Policy, Suite};
 use peerdesk_core::file::Outcome;
 use peerdesk_core::input::InputEvent;
 use peerdesk_core::proto::Caps;
+use peerdesk_core::screen::Workload;
 use peerdesk_core::session::SessionConfig;
-use peerdesk_core::transport::Frame;
-use peerdesk_net::controller::{self, ControllerOptions, FrameSink, Upload};
+use peerdesk_net::controller::{self, ControllerOptions, Upload};
+use peerdesk_net::demo::{CountSink, DemoDesktop};
 use peerdesk_net::fs_store::{scan, PARTIAL_SUFFIX};
-use peerdesk_net::host::{self, FrameSource, HostOptions, InputSink};
+use peerdesk_net::host::{self, HostOptions, InputSink};
 use peerdesk_net::{bench, Identity, Link, NetError, Node};
 use tokio::sync::mpsc;
 
@@ -40,41 +41,11 @@ fn session(id: &Identity, policy: &Policy) -> SessionConfig {
     }
 }
 
-/// 每帧内容由帧号决定，接收端据此校验。
-struct Pattern {
-    remaining: u32,
-    size: usize,
-    n: u32,
-}
-impl FrameSource for Pattern {
-    fn next_frame(&mut self) -> Option<Vec<u8>> {
-        if self.remaining == 0 {
-            return None;
-        }
-        self.remaining -= 1;
-        self.n += 1;
-        Some(vec![u8::try_from(self.n % 251).unwrap(); self.size])
-    }
-}
-
 #[derive(Default, Clone)]
 struct Recorder(Arc<Mutex<Vec<InputEvent>>>);
 impl InputSink for Recorder {
     fn inject(&mut self, event: &InputEvent) {
         self.0.lock().unwrap().push(event.clone());
-    }
-}
-
-#[derive(Default, Clone)]
-struct Checker {
-    good: Arc<Mutex<u32>>,
-    bad: Arc<Mutex<u32>>,
-}
-impl FrameSink for Checker {
-    fn frame(&mut self, frame: &Frame) {
-        let expected = u8::try_from(frame.frame_id % 251).unwrap();
-        let ok = frame.data.iter().all(|b| *b == expected);
-        *(if ok { &self.good } else { &self.bad }).lock().unwrap() += 1;
     }
 }
 
@@ -125,15 +96,15 @@ async fn full_session_video_input_and_files() {
     let files = scan(&src, "up").unwrap();
 
     let recorder = Recorder::default();
-    let checker = Checker::default();
+    let sink = CountSink::new();
+    // 被控端的桌面：打字 20 帧、拖窗口 20 帧，然后静止。会话 600 毫秒，足够它做完并收敛。
+    let desktop = DemoDesktop::new(640, 360, 1)
+        .with_script(vec![(Workload::Typing, 20), (Workload::Dragging, 20)]);
+    let mirror = desktop.mirror();
     let host_task = tokio::spawn(host::serve(
         host_link,
         HostOptions::new(session(&p.host_id, &policy), 100, dst.clone()),
-        Box::new(Pattern {
-            remaining: 10_000,
-            size: 5000,
-            n: 0,
-        }),
+        Box::new(desktop),
         Box::new(recorder.clone()),
     ));
 
@@ -166,7 +137,7 @@ async fn full_session_video_input_and_files() {
             deadline_us: 200_000,
             duration: Some(Duration::from_millis(600)),
         },
-        Box::new(checker.clone()),
+        Box::new(sink.clone()),
         rx,
         Some(Upload {
             root: src.clone(),
@@ -187,15 +158,24 @@ async fn full_session_video_input_and_files() {
     assert_eq!(report.end, "到达时长上限");
     assert_eq!(host_report.end, "对端结束会话");
 
-    // 画面：回环上应当几乎全部送达，内容全部正确
-    assert!(host_report.frames_sent >= 30, "{}", host_report.frames_sent);
-    assert!(report.frames_delivered >= 30, "{report:?}");
-    assert_eq!(*checker.bad.lock().unwrap(), 0);
+    // 画面：观看端最终看到的与被控端的桌面逐像素一致
+    let seen = report.screen.clone().unwrap();
+    assert_eq!((seen.width(), seen.height()), (640, 360));
     assert_eq!(
-        u64::from(*checker.good.lock().unwrap()),
-        report.frames_delivered
+        seen.diff(&mirror.lock().unwrap()),
+        0,
+        "观看端画面与被控端不一致"
     );
-    assert_eq!(report.video_bytes, report.frames_delivered * 5000);
+    assert!(host_report.frames_sent >= 40, "{}", host_report.frames_sent);
+    // 桌面静止后不再发帧：帧数远少于 600 毫秒 × 100 帧每秒
+    // （机器很慢时个别帧会被判定超时而重发，所以留一些余量。）
+    assert!(host_report.frames_sent < 80, "{}", host_report.frames_sent);
+    assert_eq!(report.frames_delivered, u64::from(host_report.frames_sent));
+    assert_eq!(sink.count(), report.frames_delivered);
+    assert_eq!(report.video_bytes, host_report.video_bytes);
+    assert_eq!(report.bad_frames, 0);
+    assert_eq!(host_report.profile, "stable");
+    assert!(host_report.final_rate_bps >= 100_000);
     assert_eq!(report.bad_datagrams, 0);
     assert_eq!(host_report.bad_datagrams, 0);
 
@@ -254,11 +234,7 @@ async fn interrupted_upload_resumes_from_partial_file() {
     let host_task = tokio::spawn(host::serve(
         host_link,
         HostOptions::new(session(&p.host_id, &policy), 30, dst.clone()),
-        Box::new(Pattern {
-            remaining: 10_000,
-            size: 100,
-            n: 0,
-        }),
+        Box::new(DemoDesktop::new(320, 240, 1).with_limit(10_000)),
         Box::new(Recorder::default()),
     ));
     let (_tx, rx) = mpsc::channel(1);
@@ -269,7 +245,7 @@ async fn interrupted_upload_resumes_from_partial_file() {
             deadline_us: 200_000,
             duration: Some(Duration::from_millis(50)),
         },
-        Box::new(Checker::default()),
+        Box::new(CountSink::new()),
         rx,
         Some(Upload {
             root: src.clone(),
@@ -294,11 +270,7 @@ async fn host_ending_first_is_reported_to_controller() {
     let host_task = tokio::spawn(host::serve(
         host_link,
         HostOptions::new(session(&p.host_id, &policy), 200, temp_dir("h")),
-        Box::new(Pattern {
-            remaining: 5,
-            size: 100,
-            n: 0,
-        }),
+        Box::new(DemoDesktop::new(320, 240, 1).with_limit(5)),
         Box::new(Recorder::default()),
     ));
     let (_tx, rx) = mpsc::channel(1);
@@ -309,7 +281,7 @@ async fn host_ending_first_is_reported_to_controller() {
             deadline_us: 100_000,
             duration: None,
         },
-        Box::new(Checker::default()),
+        Box::new(CountSink::new()),
         rx,
         None,
     )
@@ -318,7 +290,12 @@ async fn host_ending_first_is_reported_to_controller() {
     let host_report = host_task.await.unwrap().unwrap();
     assert_eq!(host_report.end, "画面来源结束");
     assert_eq!(host_report.frames_sent, 5);
-    assert_eq!(report.frames_delivered, 5);
+    // 被控端发完最后一帧就结束会话，还在路上的帧可能来不及送达。
+    assert!(
+        (1..=5).contains(&report.frames_delivered),
+        "{}",
+        report.frames_delivered
+    );
     assert!(report.files.is_empty());
 }
 
@@ -395,11 +372,7 @@ async fn application_level_rejection_and_protocol_errors() {
     let host_task = tokio::spawn(host::serve(
         host_link,
         HostOptions::new(session(&p.host_id, &policy), 30, temp_dir("rej")),
-        Box::new(Pattern {
-            remaining: 5,
-            size: 10,
-            n: 0,
-        }),
+        Box::new(DemoDesktop::new(320, 240, 1).with_limit(5)),
         Box::new(Recorder::default()),
     ));
     let (mut send, mut recv) = ctrl_link.open_stream().await.unwrap();
@@ -431,11 +404,7 @@ async fn application_level_rejection_and_protocol_errors() {
     let host_task = tokio::spawn(host::serve(
         host_link,
         HostOptions::new(session(&p.host_id, &policy), 30, temp_dir("rej2")),
-        Box::new(Pattern {
-            remaining: 5,
-            size: 10,
-            n: 0,
-        }),
+        Box::new(DemoDesktop::new(320, 240, 1).with_limit(5)),
         Box::new(Recorder::default()),
     ));
     let (mut send, _recv) = ctrl_link.open_stream().await.unwrap();
@@ -450,11 +419,7 @@ async fn application_level_rejection_and_protocol_errors() {
     let result = host::serve(
         host_link,
         HostOptions::new(session(&p.host_id, &policy), 0, temp_dir("rej3")),
-        Box::new(Pattern {
-            remaining: 0,
-            size: 0,
-            n: 0,
-        }),
+        Box::new(DemoDesktop::new(320, 240, 1).with_limit(0)),
         Box::new(Recorder::default()),
     )
     .await;
@@ -473,11 +438,7 @@ async fn controller_reports_rejection() {
     let host_task = tokio::spawn(host::serve(
         host_link,
         HostOptions::new(session(&p.host_id, &strict), 30, temp_dir("cr")),
-        Box::new(Pattern {
-            remaining: 5,
-            size: 10,
-            n: 0,
-        }),
+        Box::new(DemoDesktop::new(320, 240, 1).with_limit(5)),
         Box::new(Recorder::default()),
     ));
     let (_tx, rx) = mpsc::channel(1);
@@ -488,7 +449,7 @@ async fn controller_reports_rejection() {
             deadline_us: 1,
             duration: None,
         },
-        Box::new(Checker::default()),
+        Box::new(CountSink::new()),
         rx,
         None,
     )

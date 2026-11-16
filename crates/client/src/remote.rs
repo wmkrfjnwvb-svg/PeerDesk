@@ -12,10 +12,10 @@ use peerdesk_core::crypto::Policy;
 use peerdesk_core::input::InputEvent;
 use peerdesk_core::proto::Caps;
 use peerdesk_core::session::SessionConfig;
-use peerdesk_core::transport::Frame;
-use peerdesk_net::controller::{self, ControllerOptions, FrameSink, Upload};
+use peerdesk_net::controller::{self, ControllerOptions, Upload};
+use peerdesk_net::demo::{to_bmp, CountSink, DemoDesktop};
 use peerdesk_net::fs_store::scan;
-use peerdesk_net::host::{self, FrameSource, HostOptions, InputSink, Permissions};
+use peerdesk_net::host::{self, HostOptions, InputSink, Permissions};
 use peerdesk_net::identity::{parse_hex, to_hex};
 use peerdesk_net::{bench, Fingerprint, Identity, NetError, Node};
 
@@ -61,42 +61,12 @@ fn session(identity: &Identity, policy: &Policy, auth: Auth) -> SessionConfig {
     }
 }
 
-/// 测试图样：采集和编码接入之前的画面来源。每帧整帧填同一个由帧号决定的字节。
-struct TestPattern {
-    frame: u32,
-    bytes: usize,
-}
-
-impl FrameSource for TestPattern {
-    fn next_frame(&mut self) -> Option<Vec<u8>> {
-        self.frame = self.frame.wrapping_add(1);
-        Some(vec![
-            u8::try_from(self.frame % 251).unwrap_or(0);
-            self.bytes
-        ])
-    }
-}
-
 /// 输入注入接入之前：只计数。
 struct CountInput(Arc<AtomicU64>);
 
 impl InputSink for CountInput {
     fn inject(&mut self, _event: &InputEvent) {
         self.0.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
-/// 解码和显示接入之前：校验测试图样并计数。
-struct CheckPattern {
-    corrupted: Arc<AtomicU64>,
-}
-
-impl FrameSink for CheckPattern {
-    fn frame(&mut self, frame: &Frame) {
-        let expected = u8::try_from(frame.frame_id % 251).unwrap_or(0);
-        if frame.data.iter().any(|b| *b != expected) {
-            self.corrupted.fetch_add(1, Ordering::Relaxed);
-        }
     }
 }
 
@@ -231,10 +201,7 @@ async fn host_async(args: HostArgs, out: &mut dyn Write) -> Result<u8, NetError>
                     recv_root.clone(),
                 )
             },
-            Box::new(TestPattern {
-                frame: 0,
-                bytes: 6000,
-            }),
+            Box::new(DemoDesktop::new(1280, 720, 1)),
             Box::new(CountInput(Arc::clone(&inputs))),
         )
         .await;
@@ -242,9 +209,13 @@ async fn host_async(args: HostArgs, out: &mut dyn Write) -> Result<u8, NetError>
             Ok(report) => {
                 let _ = writeln!(
                     out,
-                    "会话结束（{}）：发出 {} 帧，注入 {} 个输入事件（拒绝 {} 个），收到 {} 个文件",
+                    "会话结束（{}）：发出 {} 帧共 {} 字节，结束时码率 {} kbps（{}），\
+                     注入 {} 个输入事件（拒绝 {} 个），收到 {} 个文件",
                     report.end,
                     report.frames_sent,
+                    report.video_bytes,
+                    report.final_rate_bps / 1000,
+                    report.profile,
                     report.input_events,
                     report.input_denied,
                     report.files.len()
@@ -287,6 +258,7 @@ struct ConnectArgs {
     seconds: u64,
     send: Option<PathBuf>,
     auth: Auth,
+    snapshot: Option<PathBuf>,
 }
 
 fn parse_connect(args: &[String]) -> Result<ConnectArgs, String> {
@@ -300,6 +272,7 @@ fn parse_connect(args: &[String]) -> Result<ConnectArgs, String> {
         seconds: 5,
         send: None,
         auth: password_from_env().map_or(Auth::Open, Auth::Password),
+        snapshot: None,
     };
     let mut it = rest.iter();
     while let Some(flag) = it.next() {
@@ -311,6 +284,9 @@ fn parse_connect(args: &[String]) -> Result<ConnectArgs, String> {
             "--data-dir" => parsed.data_dir = it.next().ok_or("--data-dir 需要一个值")?.into(),
             "--seconds" => parsed.seconds = parse_number(flag, it.next())?,
             "--send" => parsed.send = Some(it.next().ok_or("--send 需要一个值")?.into()),
+            "--snapshot" => {
+                parsed.snapshot = Some(it.next().ok_or("--snapshot 需要一个值")?.into());
+            }
             "--password" => {
                 parsed.auth = Auth::Password(it.next().ok_or("--password 需要一个值")?.clone());
             }
@@ -347,7 +323,7 @@ async fn connect_async(args: ConnectArgs, out: &mut dyn Write) -> Result<u8, Net
     }
     let _ = out.flush();
 
-    let corrupted = Arc::new(AtomicU64::new(0));
+    let sink = CountSink::new();
     // 输入采集接入之前没有事件可发；发送端保持打开直到会话结束。
     let (_input_tx, input_rx) = tokio::sync::mpsc::channel(64);
     let report = controller::run(
@@ -357,9 +333,7 @@ async fn connect_async(args: ConnectArgs, out: &mut dyn Write) -> Result<u8, Net
             deadline_us: 100_000,
             duration: Some(Duration::from_secs(args.seconds)),
         },
-        Box::new(CheckPattern {
-            corrupted: Arc::clone(&corrupted),
-        }),
+        Box::new(sink.clone()),
         input_rx,
         upload,
     )
@@ -370,17 +344,24 @@ async fn connect_async(args: ConnectArgs, out: &mut dyn Write) -> Result<u8, Net
         format!("会话结束      {}", report.end),
         format!("加密套件      {}", report.suite),
         format!(
-            "帧            送达 {}，作废 {}，内容损坏 {}",
-            report.frames_delivered,
-            report.frames_expired,
-            corrupted.load(Ordering::Relaxed)
+            "帧            送达 {}，作废 {}，解码失败 {}，纠错恢复 {} 个分片",
+            report.frames_delivered, report.frames_expired, report.bad_frames, report.recovered
         ),
+        format!("画面更新      {} 次", sink.count()),
         format!("画面数据      {} 字节", report.video_bytes),
         format!("往返延迟      {} us", report.rtt.as_micros()),
         format!("异常数据报    {}", report.bad_datagrams),
     ];
     for line in lines {
         let _ = writeln!(out, "{line}");
+    }
+    if let Some(screen) = &report.screen {
+        let _ = writeln!(out, "画面尺寸      {}×{}", screen.width(), screen.height());
+        if let Some(path) = &args.snapshot {
+            std::fs::write(path, to_bmp(screen))
+                .map_err(|e| NetError::Io(format!("写入 {} 失败：{e}", path.display())))?;
+            let _ = writeln!(out, "画面已保存    {}", path.display());
+        }
     }
     if !report.files.is_empty() {
         let _ = writeln!(out, "上传          {} 字节", report.file_bytes);
@@ -522,6 +503,8 @@ mod tests {
             &pin,
             "--data-dir",
             ctrl_dir.to_str().unwrap(),
+            "--snapshot",
+            ctrl_dir.join("seen.bmp").to_str().unwrap(),
             "--seconds",
             "1",
             "--send",
@@ -530,7 +513,12 @@ mod tests {
         assert_eq!(code, EXIT_OK, "{text}");
         assert!(text.contains(&format!("对端指纹 {pin}")));
         assert!(text.contains("加密套件      aes-256-gcm"));
-        assert!(text.contains("内容损坏 0"));
+        assert!(text.contains("解码失败 0"));
+        assert!(text.contains("画面尺寸      1280×720"));
+        // 看到的画面存成了一张 1280×720 的 BMP
+        let bmp = std::fs::read(ctrl_dir.join("seen.bmp")).unwrap();
+        assert_eq!(&bmp[..2], b"BM");
+        assert_eq!(bmp.len(), 54 + 1280 * 720 * 3);
         assert!(text.contains("docs/a.txt Some(Done)"));
         assert!(text.contains("docs/b.bin Some(Done)"));
         assert!(!text.contains("警告"));
@@ -775,6 +763,7 @@ mod tests {
             vec!["connect", "127.0.0.1:1", "--data-dir"],
             vec!["connect", "127.0.0.1:1", "--seconds", "x"],
             vec!["connect", "127.0.0.1:1", "--send"],
+            vec!["connect", "127.0.0.1:1", "--snapshot"],
             vec!["connect", "127.0.0.1:1", "--bogus"],
             vec!["bench-transport", "--packets", "0"],
             vec!["bench-transport", "--packets", "x"],
@@ -836,22 +825,6 @@ mod tests {
     #[test]
     fn data_dir_has_a_default() {
         assert!(!default_data_dir().as_os_str().is_empty());
-        let mut pattern = TestPattern { frame: 0, bytes: 4 };
-        assert_eq!(pattern.next_frame().unwrap(), vec![1; 4]);
-        let corrupted = Arc::new(AtomicU64::new(0));
-        let mut check = CheckPattern {
-            corrupted: Arc::clone(&corrupted),
-        };
-        let frame = |data: Vec<u8>| Frame {
-            frame_id: 1,
-            ref_frame: 0,
-            data,
-            first_seen: peerdesk_core::Time(0),
-            completed: peerdesk_core::Time(0),
-        };
-        check.frame(&frame(vec![1, 1]));
-        check.frame(&frame(vec![1, 2]));
-        assert_eq!(corrupted.load(Ordering::Relaxed), 1);
         let count = Arc::new(AtomicU64::new(0));
         CountInput(Arc::clone(&count)).inject(&InputEvent::ReleaseAll);
         assert_eq!(count.load(Ordering::Relaxed), 1);

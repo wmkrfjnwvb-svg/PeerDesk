@@ -11,9 +11,9 @@ use peerdesk_core::crypto::Policy;
 use peerdesk_core::input::InputEvent;
 use peerdesk_core::proto::Caps;
 use peerdesk_core::session::SessionConfig;
-use peerdesk_core::transport::Frame;
-use peerdesk_net::controller::{self, ControllerOptions, ControllerReport, FrameSink, Upload};
-use peerdesk_net::host::{self, FrameSource, HostOptions, HostReport, InputSink, Permissions};
+use peerdesk_net::controller::{self, ControllerOptions, ControllerReport, ScreenSink, Upload};
+use peerdesk_net::demo::DemoDesktop;
+use peerdesk_net::host::{self, HostOptions, HostReport, InputSink, Permissions};
 use peerdesk_net::{Identity, NetError, Node};
 use tokio::sync::mpsc;
 
@@ -31,13 +31,6 @@ fn temp_dir(tag: &str) -> PathBuf {
     dir
 }
 
-struct Frames(u32);
-impl FrameSource for Frames {
-    fn next_frame(&mut self) -> Option<Vec<u8>> {
-        self.0 = self.0.checked_sub(1)?;
-        Some(vec![1; 500])
-    }
-}
 #[derive(Clone, Default)]
 struct Count(Arc<Mutex<u32>>);
 impl InputSink for Count {
@@ -46,8 +39,8 @@ impl InputSink for Count {
     }
 }
 struct Null;
-impl FrameSink for Null {
-    fn frame(&mut self, _: &Frame) {}
+impl ScreenSink for Null {
+    fn present(&mut self, _: &peerdesk_core::screen::Screen) {}
 }
 
 fn cfg(id: &Identity, auth: Auth) -> SessionConfig {
@@ -109,7 +102,7 @@ async fn attempt(
     let host_task = tokio::spawn(host::serve(
         host_link,
         opts,
-        Box::new(Frames(10_000)),
+        Box::new(DemoDesktop::new(320, 240, 1).with_limit(10_000)),
         Box::new(count.clone()),
     ));
     let (tx, rx) = mpsc::channel(8);

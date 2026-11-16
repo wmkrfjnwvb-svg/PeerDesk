@@ -4,13 +4,17 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use peerdesk_core::adaptive::{DelayTracker, DeliveryLog, Feedback};
+use peerdesk_core::codec::{frame_size, Decoder};
 use peerdesk_core::crypto::Suite;
+use peerdesk_core::desktop_sim::FLAG_PARITY;
 use peerdesk_core::file::FileMeta;
 use peerdesk_core::input::{InputEvent, InputSender};
 use peerdesk_core::proto::{Channel, Control, RejectReason, VideoHeader};
+use peerdesk_core::screen::Screen;
 use peerdesk_core::session::{Session, SessionConfig, State};
 use peerdesk_core::trace::{Stage, TraceId, Tracer};
-use peerdesk_core::transport::{Frame, Reassembler, VideoPacket};
+use peerdesk_core::transport::{Reassembler, VideoPacket};
 use peerdesk_core::wire::Reader;
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
@@ -23,10 +27,10 @@ use crate::{Fingerprint, Link, NetError};
 /// 输入包的重发间隔：有未确认的事件时按这个间隔重发。
 const INPUT_RESEND: Duration = Duration::from_millis(20);
 
-/// 画面去向。M1 的解码和渲染实现这个接口。
-pub trait FrameSink: Send {
-    /// 收到完整的一帧。
-    fn frame(&mut self, frame: &Frame);
+/// 画面去向。窗口显示实现这个接口。
+pub trait ScreenSink: Send {
+    /// 画面有更新。`screen` 是解码后的完整画面。
+    fn present(&mut self, screen: &Screen);
 }
 
 /// 要上传的文件。
@@ -62,6 +66,12 @@ pub struct ControllerReport {
     pub frames_expired: u64,
     /// 收到的画面字节数。
     pub video_bytes: u64,
+    /// 无法解码的帧数。
+    pub bad_frames: u64,
+    /// 靠纠错恢复的分片数。
+    pub recovered: u64,
+    /// 会话结束时解码器里的画面；一帧都没收到时为 `None`。
+    pub screen: Option<Screen>,
     /// 无法解析而被丢弃的数据报数。
     pub bad_datagrams: u64,
     /// 发出的输入事件数。
@@ -85,7 +95,7 @@ pub struct ControllerReport {
 pub async fn run(
     link: Link,
     opts: ControllerOptions,
-    mut sink: Box<dyn FrameSink>,
+    mut sink: Box<dyn ScreenSink>,
     mut input: mpsc::Receiver<InputEvent>,
     upload: Option<Upload>,
 ) -> Result<ControllerReport, NetError> {
@@ -152,6 +162,10 @@ pub async fn run(
     let mut sender = InputSender::new();
     let mut reassembler = Reassembler::new(opts.deadline_us, 8);
     let (mut video_bytes, mut bad_datagrams, mut input_sent) = (0u64, 0u64, 0u64);
+    let mut decoder: Option<Decoder> = None;
+    let mut tracker = DelayTracker::new(link.now());
+    let mut delivery = DeliveryLog::new();
+    let (mut bad_frames, mut frames_applied) = (0u64, 0u64);
 
     let end = loop {
         if time_up && upload_task.is_none() {
@@ -171,23 +185,46 @@ pub async fn run(
             datagram = link.recv() => match datagram {
                 Ok((header, payload)) => match header.channel {
                     Channel::Video => {
+                        let now = link.now();
+                        tracker.on_packet(now, header.send_time, header.seq, payload.len());
                         let mut r = Reader::new(&payload);
                         let packet = VideoHeader::decode(&mut r).map(|video| VideoPacket {
                             header: video,
-                            parity: false,
+                            parity: header.flags & FLAG_PARITY != 0,
                             data: r.rest().to_vec(),
                         });
-                        match packet.and_then(|p| reassembler.push(link.now(), p)) {
+                        match packet.and_then(|p| reassembler.push(now, p)) {
                             Ok(Some(frame)) => {
-                                video_bytes = video_bytes
-                                    .saturating_add(u64::try_from(frame.data.len()).unwrap_or(u64::MAX));
-                                tracer.record(
-                                    link.now(),
-                                    trace,
-                                    Stage::FrameDelivered,
-                                    u64::from(frame.frame_id),
-                                );
-                                sink.frame(&frame);
+                                // 画面尺寸变了（或第一帧）：按帧里声明的尺寸建解码器。
+                                let applied = frame_size(&frame.data).and_then(|(w, h)| {
+                                    let fits = decoder
+                                        .as_ref()
+                                        .is_some_and(|d| (d.screen().width(), d.screen().height()) == (w, h));
+                                    let dec = if fits { decoder.as_mut() } else { None };
+                                    let dec = match dec {
+                                        Some(dec) => dec,
+                                        None => decoder.insert(Decoder::new(w, h)),
+                                    };
+                                    dec.apply(&frame.data).map(|_| ())
+                                });
+                                // 解不了的帧也算“有定论”：它带的块由发送端在下一轮重发。
+                                match applied {
+                                    Ok(()) => {
+                                        delivery.delivered(frame.frame_id);
+                                        frames_applied = frames_applied.saturating_add(1);
+                                        video_bytes = video_bytes.saturating_add(
+                                            u64::try_from(frame.data.len()).unwrap_or(u64::MAX),
+                                        );
+                                        tracer.record(now, trace, Stage::FrameDelivered, u64::from(frame.frame_id));
+                                        if let Some(dec) = decoder.as_ref() {
+                                            sink.present(dec.screen());
+                                        }
+                                    }
+                                    Err(_) => {
+                                        delivery.advance(frame.frame_id);
+                                        bad_frames = bad_frames.saturating_add(1);
+                                    }
+                                }
                             }
                             Ok(None) => {}
                             Err(_) => bad_datagrams = bad_datagrams.saturating_add(1),
@@ -214,9 +251,24 @@ pub async fn run(
                 None => input_open = false,
             },
             _ = resend.tick() => {
-                for frame_id in reassembler.expire(link.now()) {
-                    tracer.record(link.now(), trace, Stage::FrameExpired, u64::from(frame_id));
+                let now = link.now();
+                for frame_id in reassembler.expire(now) {
+                    tracer.record(now, trace, Stage::FrameExpired, u64::from(frame_id));
                 }
+                // 反馈：哪些帧到了、排队延迟、丢包率、接收速率。
+                if let Some(floor) = reassembler.floor() {
+                    delivery.advance(floor);
+                }
+                let sample = tracker.report(now);
+                let (floor, delivered) = delivery.snapshot();
+                let feedback = Feedback {
+                    floor,
+                    delivered,
+                    queue_delay_us: sample.queue_delay_us,
+                    loss_permille: sample.loss_permille,
+                    recv_bytes_per_s: sample.recv_bytes_per_s,
+                };
+                if let Err(e) = link.send(Channel::Control, &feedback.encode()) { break e.to_string(); }
                 if sender.pending() > 0 {
                     let failed = sender.packet()?.and_then(|p| link.send(Channel::Input, &p).err());
              if let Some(e) = failed { break e.to_string(); }
@@ -257,9 +309,12 @@ pub async fn run(
     Ok(ControllerReport {
         peer: *link.peer_fingerprint(),
         suite,
-        frames_delivered: stats.delivered,
+        frames_delivered: frames_applied,
         frames_expired: stats.expired,
         video_bytes,
+        bad_frames,
+        recovered: stats.recovered,
+        screen: decoder.map(|d| d.screen().clone()),
         bad_datagrams,
         input_sent,
         input_unacked: sender.pending(),

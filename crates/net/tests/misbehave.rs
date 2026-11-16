@@ -10,10 +10,10 @@ use peerdesk_core::file::{Deframer, FileMeta, FileMsg};
 use peerdesk_core::input::InputEvent;
 use peerdesk_core::proto::{Caps, Channel, Control, VERSION};
 use peerdesk_core::session::SessionConfig;
-use peerdesk_core::transport::Frame;
-use peerdesk_net::controller::{self, ControllerOptions, FrameSink, Upload};
+use peerdesk_net::controller::{self, ControllerOptions, ScreenSink, Upload};
+use peerdesk_net::demo::DemoDesktop;
 use peerdesk_net::files::{receive_files, send_files};
-use peerdesk_net::host::{self, FrameSource, HostOptions, InputSink};
+use peerdesk_net::host::{self, HostOptions, InputSink};
 use peerdesk_net::stream::{
     read_control, read_file_msgs, read_kind, write_control, write_file_msg, write_kind, StreamKind,
 };
@@ -43,18 +43,12 @@ fn cfg() -> SessionConfig {
     }
 }
 
-struct Forever;
-impl FrameSource for Forever {
-    fn next_frame(&mut self) -> Option<Vec<u8>> {
-        Some(vec![1; 3000])
-    }
-}
 struct Null;
 impl InputSink for Null {
     fn inject(&mut self, _: &InputEvent) {}
 }
-impl FrameSink for Null {
-    fn frame(&mut self, _: &Frame) {}
+impl ScreenSink for Null {
+    fn present(&mut self, _: &peerdesk_core::screen::Screen) {}
 }
 
 /// 持有两个端点，保证测试期间它们不被关闭。
@@ -116,7 +110,7 @@ async fn host_survives_a_hostile_controller() {
     let host_task = tokio::spawn(host::serve(
         host_link,
         HostOptions::new(cfg(), 50, temp_dir("h1")),
-        Box::new(Forever),
+        Box::new(DemoDesktop::new(320, 240, 1)),
         Box::new(Null),
     ));
     let (mut send, mut recv) = raw_controller_handshake(&raw).await;
@@ -127,7 +121,9 @@ async fn host_survives_a_hostile_controller() {
     raw.send(Channel::Cursor, b"x").unwrap();
     raw.send(Channel::Input, &[0xff; 9]).unwrap();
     raw.send_raw(vec![0u8; 30]).unwrap(); // 魔数不对
-                                          // 超过连接允许的数据报长度：本地就被拒绝
+    raw.send(Channel::Control, b"not a feedback message")
+        .unwrap();
+    // 超过连接允许的数据报长度：本地就被拒绝
     assert_eq!(
         raw.send_raw(vec![0u8; 60_000]),
         Err(NetError::Protocol("数据报无法发送"))
@@ -165,7 +161,7 @@ async fn host_survives_a_hostile_controller() {
         .unwrap()
         .unwrap();
     assert_eq!(report.end, "对端结束会话");
-    assert_eq!(report.bad_datagrams, 4);
+    assert_eq!(report.bad_datagrams, 5);
     assert_eq!(report.input_events, 0);
     assert!(report.frames_sent > 0);
 }
@@ -201,6 +197,10 @@ async fn controller_survives_a_hostile_host() {
     // 只发一帧的前半：超过截止时间后作废
     raw.send(Channel::Video, &[0, 0, 0, 5, 0, 0, 0, 2, 0, 0, 0, 4, 1, 1])
         .unwrap();
+    // 一帧完整送达，但内容不是合法的码流：解码失败，不影响会话
+    let mut junk_frame = vec![0, 0, 0, 3, 0, 0, 0, 1, 0, 0, 0, 3];
+    junk_frame.extend_from_slice(b"this is not a tile stream");
+    raw.send(Channel::Video, &junk_frame).unwrap();
     // 控制流上不相关的消息被忽略
     write_control(&mut send, &Control::Ping { nonce: 1 })
         .await
@@ -230,6 +230,8 @@ async fn controller_survives_a_hostile_host() {
     assert_eq!(report.end, "对端结束会话");
     assert_eq!(report.bad_datagrams, 5);
     assert_eq!(report.frames_delivered, 0);
+    assert_eq!(report.bad_frames, 1);
+    assert!(report.screen.is_none());
     assert_eq!(report.frames_expired, 1);
     assert!(report.trace.contains("frame_expired"));
     assert_eq!(report.input_sent, 1);
@@ -313,7 +315,7 @@ async fn host_times_out_when_controller_never_opens_control_stream() {
     let result = host::serve(
         host_link,
         HostOptions::new(cfg(), 30, temp_dir("h2")),
-        Box::new(Forever),
+        Box::new(DemoDesktop::new(320, 240, 1)),
         Box::new(Null),
     )
     .await;
@@ -327,7 +329,7 @@ async fn upload_of_a_missing_file_fails_the_session_cleanly() {
     let host_task = tokio::spawn(host::serve(
         host_link,
         HostOptions::new(cfg(), 30, recv_root.clone()),
-        Box::new(Forever),
+        Box::new(DemoDesktop::new(320, 240, 1)),
         Box::new(Null),
     ));
     let (_tx, rx) = mpsc::channel(1);

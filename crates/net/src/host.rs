@@ -1,18 +1,24 @@
 //! 被控端的一次会话：握手，按帧率发送画面，接收输入，接收文件。
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use peerdesk_core::adaptive::{Feedback, Profile, RateController};
 use peerdesk_core::auth::{Auth, Limiter};
+use peerdesk_core::codec::Encoder;
 use peerdesk_core::crypto::Suite;
+use peerdesk_core::desktop_sim::FLAG_PARITY;
 use peerdesk_core::file::FileMsg;
 use peerdesk_core::input::{InputEvent, InputReceiver, KeyState};
 use peerdesk_core::proto::{Channel, Control, RejectReason, VIDEO_HEADER_LEN};
+use peerdesk_core::screen::Screen;
 use peerdesk_core::session::{Session, SessionConfig, State};
 use peerdesk_core::trace::{Stage, TraceId, Tracer};
-use peerdesk_core::transport::fragment;
+use peerdesk_core::transport::{fragment, parity_for, PARITY_PREFIX};
 use peerdesk_core::wire::Writer;
+use peerdesk_core::Time;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
@@ -26,11 +32,20 @@ pub(crate) const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 /// 会话结束时等待进行中的文件传输收尾的时间上限。
 const FILE_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// 画面来源。M1 的采集和编码实现这个接口。
-pub trait FrameSource: Send {
-    /// 取下一帧编码后的数据。返回 `None` 表示没有更多画面，会话结束。
-    fn next_frame(&mut self) -> Option<Vec<u8>>;
+/// 画面来源。屏幕采集实现这个接口；测试和演示用合成桌面。
+pub trait ScreenSource: Send {
+    /// 取当前画面。返回 `None` 表示没有更多画面，会话结束。
+    fn capture(&mut self) -> Option<&Screen>;
 }
+
+/// 起始码率：没有历史数据时从这里起步。
+pub const DEFAULT_START_BPS: u64 = 4_000_000;
+/// 码率上限。
+pub const DEFAULT_MAX_BPS: u64 = 30_000_000;
+/// 码率下限。
+const MIN_BPS: u64 = 100_000;
+/// 一帧在接收端从首个分片到收齐允许的时间，也是发送端判定丢失的基准（微秒）。
+pub const FRAME_DEADLINE_US: u64 = 100_000;
 
 /// 输入去向。M1 的系统输入注入实现这个接口。
 pub trait InputSink: Send {
@@ -67,6 +82,10 @@ pub struct HostOptions {
     pub permissions: Permissions,
     /// 认证失败限制，跨会话共享。
     pub limiter: Arc<Mutex<Limiter>>,
+    /// 起始码率（比特每秒）。
+    pub start_bps: u64,
+    /// 码率上限（比特每秒）。
+    pub max_bps: u64,
     /// 帧率。
     pub fps: u32,
     /// 收到的文件放在哪个目录。
@@ -82,6 +101,8 @@ impl HostOptions {
             trusted: Vec::new(),
             permissions: Permissions::default(),
             limiter: Arc::new(Mutex::new(Limiter::default())),
+            start_bps: DEFAULT_START_BPS,
+            max_bps: DEFAULT_MAX_BPS,
             fps,
             recv_root,
         }
@@ -97,6 +118,14 @@ pub struct HostReport {
     pub suite: Option<Suite>,
     /// 发出的帧数。
     pub frames_sent: u32,
+    /// 发出的画面字节数（编码后，不含包头和纠错）。
+    pub video_bytes: u64,
+    /// 被判定丢失而重新发送内容的帧数。
+    pub frames_repaired: u32,
+    /// 会话结束时的码率（比特每秒）。
+    pub final_rate_bps: u64,
+    /// 使用的码率控制参数名。
+    pub profile: &'static str,
     /// 注入的输入事件数。
     pub input_events: u64,
     /// 因为没有权限而被丢弃的输入事件数。
@@ -128,7 +157,7 @@ pub(crate) fn control_reader(mut recv: quinn::RecvStream) -> mpsc::Receiver<Cont
 pub async fn serve(
     link: Link,
     opts: HostOptions,
-    mut source: Box<dyn FrameSource>,
+    mut source: Box<dyn ScreenSource>,
     mut sink: Box<dyn InputSink>,
 ) -> Result<HostReport, NetError> {
     if opts.fps == 0 {
@@ -211,23 +240,67 @@ pub async fn serve(
     let mut file_tasks: Vec<JoinHandle<Result<Vec<FileResult>, NetError>>> = Vec::new();
     let (mut frames_sent, mut input_events, mut bad_datagrams) = (0u32, 0u64, 0u64);
     let mut input_denied = 0u64;
+    let rtt_us = u64::try_from(link.rtt().as_micros()).unwrap_or(u64::MAX);
+    let mut rate = RateController::new(
+        Profile::select(rtt_us, false, false),
+        opts.start_bps,
+        MIN_BPS,
+        opts.max_bps,
+    );
+    let mut encoder: Option<(u16, u16, Encoder)> = None;
+    let mut unacked: VecDeque<(u32, Time)> = VecDeque::new();
+    let (mut acked_floor, mut video_bytes, mut frames_repaired) = (0u32, 0u64, 0u32);
 
     let end = loop {
         tokio::select! {
             _ = ticker.tick() => {
-                let Some(data) = source.next_frame() else {
+                let Some(screen) = source.capture() else {
                     break "画面来源结束".to_owned();
                 };
-                let max = link.max_payload().saturating_sub(VIDEO_HEADER_LEN);
+                let now = link.now();
+                // 画面尺寸变了（或第一帧）：换一个新的编码器，从整屏开始。
+                let size = (screen.width(), screen.height());
+                if encoder.as_ref().is_none_or(|(w, h, _)| (*w, *h) != size) {
+                    encoder = Some((size.0, size.1, Encoder::new(size.0, size.1)));
+                }
+                let Some((_, _, enc)) = encoder.as_mut() else { continue };
+                // 迟迟等不到反馈的帧按丢失处理，重新发送那些块现在的内容。
+                let rtt = u64::try_from(link.rtt().as_micros()).unwrap_or(u64::MAX);
+                let ack_timeout = FRAME_DEADLINE_US.saturating_add(rtt.saturating_mul(2)).saturating_add(60_000);
+                while let Some((id, at)) = unacked.front().copied() {
+                    if id <= acked_floor {
+                        unacked.pop_front();
+                    } else if now.since(at) >= ack_timeout {
+                        unacked.pop_front();
+                        enc.mark_lost(id);
+                        frames_repaired = frames_repaired.saturating_add(1);
+                    } else {
+                        break;
+                    }
+                }
                 let frame_id = frames_sent.saturating_add(1);
-                let packets = fragment(frame_id, frames_sent, &data, max)?;
+                let Some(encoded) = enc.encode(frame_id, screen, rate.frame_budget(opts.fps)) else {
+                    // 画面没有变化：不发任何数据。
+                    continue;
+                };
+                let max = link
+                    .max_payload()
+                    .saturating_sub(VIDEO_HEADER_LEN)
+                    .saturating_sub(PARITY_PREFIX);
+                let mut packets = fragment(frame_id, frame_id, &encoded.data, max)?;
+                let parity = parity_for(&packets, rate.profile().fec_permille);
+                packets.extend(parity);
                 let sent = packets.into_iter().try_for_each(|packet| {
                     let mut body = Writer::new();
                     packet.header.encode(&mut body);
                     body.bytes(&packet.data);
-                    link.send(Channel::Video, &body.into_vec())
+                    let flags = if packet.parity { FLAG_PARITY } else { 0 };
+                    link.send_flags(Channel::Video, flags, &body.into_vec())
                 });
                 if let Err(e) = sent { break e.to_string(); }
+                video_bytes = video_bytes
+                    .saturating_add(u64::try_from(encoded.data.len()).unwrap_or(u64::MAX));
+                unacked.push_back((frame_id, now));
                 tracer.record(link.now(), trace, Stage::FrameSent, u64::from(frame_id));
                 frames_sent = frame_id;
             }
@@ -251,11 +324,20 @@ pub async fn serve(
                         }
                         Err(_) => bad_datagrams = bad_datagrams.saturating_add(1),
                     },
-                    Channel::Control
-                    | Channel::Cursor
-                    | Channel::Video
-                    | Channel::Clipboard
-                    | Channel::File => bad_datagrams = bad_datagrams.saturating_add(1),
+                    // 控制通道的数据报是观看端的反馈：哪些帧到了、链路有没有积压。
+                    Channel::Control => match Feedback::decode(&payload) {
+                        Ok(feedback) => {
+                            acked_floor = acked_floor.max(feedback.floor);
+                            if let Some((_, _, enc)) = encoder.as_mut() {
+                                enc.on_feedback(feedback.floor, feedback.delivered);
+                            }
+                            rate.on_feedback(link.now(), &feedback);
+                        }
+                        Err(_) => bad_datagrams = bad_datagrams.saturating_add(1),
+                    },
+                    Channel::Cursor | Channel::Video | Channel::Clipboard | Channel::File => {
+                        bad_datagrams = bad_datagrams.saturating_add(1);
+                    }
                 },
                 Err(NetError::Closed(why)) => break why,
                 Err(_) => bad_datagrams = bad_datagrams.saturating_add(1),
@@ -316,6 +398,10 @@ pub async fn serve(
         peer: *link.peer_fingerprint(),
         suite: Some(suite),
         frames_sent,
+        video_bytes,
+        frames_repaired,
+        final_rate_bps: rate.rate_bps(),
+        profile: rate.profile().name,
         input_events,
         input_denied,
         bad_datagrams,

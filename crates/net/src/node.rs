@@ -105,7 +105,8 @@ impl Node {
 pub struct Link {
     conn: quinn::Connection,
     peer: Fingerprint,
-    seq: AtomicU32,
+    /// 每个通道各自的序号：接收端按通道统计丢包，不同通道的包不能共用一个序号。
+    seq: [AtomicU32; 6],
     started: Instant,
 }
 
@@ -122,7 +123,7 @@ impl Link {
         Ok(Self {
             conn,
             peer,
-            seq: AtomicU32::new(0),
+            seq: Default::default(),
             started: Instant::now(),
         })
     }
@@ -181,11 +182,20 @@ impl Link {
 
     /// 在某个通道上发送一个数据报。不等待：发送缓冲满时最旧的数据报被丢弃。
     pub fn send(&self, channel: Channel, payload: &[u8]) -> Result<(), NetError> {
+        self.send_flags(channel, 0, payload)
+    }
+
+    /// 同 [`Link::send`]，并设置包头里的标志位。
+    pub fn send_flags(&self, channel: Channel, flags: u8, payload: &[u8]) -> Result<(), NetError> {
+        let seq = self
+            .seq
+            .get(usize::from(channel.id()))
+            .map_or(0, |counter| counter.fetch_add(1, Ordering::Relaxed));
         let header = Header {
             channel,
-            flags: 0,
+            flags,
             conn_id: 0,
-            seq: self.seq.fetch_add(1, Ordering::Relaxed),
+            seq,
             send_time: self.now(),
         };
         self.send_raw(encode_datagram(&header, payload)?)
