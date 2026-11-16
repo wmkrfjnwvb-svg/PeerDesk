@@ -2,6 +2,7 @@
 
 use serde::Deserialize;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
 use crate::crypto::{Policy, Suite};
 use crate::proto::MAX_REGION_LEN;
@@ -151,12 +152,76 @@ pub struct ServerConfig {
     /// 本区域过载时，客户端依次溢出到的区域。
     #[serde(default)]
     pub region_fallback: Vec<String>,
+    /// 信令的监听地址（UDP，QUIC）。不写时不提供信令。
+    #[serde(default)]
+    pub signal_listen: Option<String>,
+    /// 中继的监听地址（UDP）。需要同时开启信令。
+    #[serde(default)]
+    pub relay_listen: Option<String>,
+    /// 告诉客户端的中继地址（服务器在 NAT 或负载均衡后面时填公网地址）。不写时用实际监听地址。
+    #[serde(default)]
+    pub relay_advertise: Option<String>,
+    /// 保存服务器身份（证书和私钥）的目录。开启信令时必须设置。
+    #[serde(default)]
+    pub data_dir: Option<String>,
     /// 加密配置。
     #[serde(default)]
     pub crypto: CryptoConfig,
 }
 
+/// 解析好的信令配置。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignalConfig {
+    /// 信令的监听地址。
+    pub listen: SocketAddr,
+    /// 保存服务器身份的目录。
+    pub data_dir: PathBuf,
+    /// 中继；`None` 表示不提供。
+    pub relay: Option<RelayConfig>,
+}
+
+/// 解析好的中继配置。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RelayConfig {
+    /// 监听地址。
+    pub listen: SocketAddr,
+    /// 告诉客户端的地址；`None` 表示用实际监听地址。
+    pub advertise: Option<SocketAddr>,
+}
+
 impl ServerConfig {
+    /// 信令和中继的配置。没有开启信令时返回 `None`。
+    pub fn signal(&self) -> Result<Option<SignalConfig>, Error> {
+        let addr = |field: &str, value: &Option<String>| {
+            value.as_deref().map(|a| check_addr(field, a)).transpose()
+        };
+        let relay = match (
+            addr("relay_listen", &self.relay_listen)?,
+            addr("relay_advertise", &self.relay_advertise)?,
+        ) {
+            (Some(listen), advertise) => Some(RelayConfig { listen, advertise }),
+            (None, Some(_)) => {
+                return Err(Error::Config("relay_advertise 需要 relay_listen".into()))
+            }
+            (None, None) => None,
+        };
+        let Some(listen) = addr("signal_listen", &self.signal_listen)? else {
+            return match relay {
+                Some(_) => Err(Error::Config("relay_listen 需要 signal_listen".into())),
+                None => Ok(None),
+            };
+        };
+        let data_dir = self
+            .data_dir
+            .as_ref()
+            .ok_or_else(|| Error::Config("开启信令时必须设置 data_dir（保存服务器身份）".into()))?;
+        Ok(Some(SignalConfig {
+            listen,
+            data_dir: PathBuf::from(data_dir),
+            relay,
+        }))
+    }
+
     /// 解析并校验。
     pub fn from_toml(text: &str) -> Result<Self, Error> {
         let cfg: Self = toml::from_str(text).map_err(|e| Error::Config(e.to_string()))?;
@@ -188,6 +253,7 @@ impl ServerConfig {
                 crate::cluster::MIN_SECRET_LEN
             )));
         }
+        self.signal()?;
         self.crypto.policy().map(|_| ())
     }
 }
@@ -322,5 +388,61 @@ preset = "fips"
                 .as_deref(),
             Some("0123456789abcdef")
         );
+    }
+
+    #[test]
+    fn signal_and_relay_config() {
+        // 不写信令：不开启，data_dir 单独写也无妨
+        let cfg = ServerConfig::from_toml(&format!("data_dir = \"d\"\n{SERVER}")).unwrap();
+        assert_eq!(cfg.signal().unwrap(), None);
+        // 只有信令
+        let only =
+            format!("signal_listen = \"0.0.0.0:4433\"\ndata_dir = \"/var/lib/pd\"\n{SERVER}");
+        let signal = ServerConfig::from_toml(&only)
+            .unwrap()
+            .signal()
+            .unwrap()
+            .unwrap();
+        assert_eq!(signal.listen, "0.0.0.0:4433".parse().unwrap());
+        assert_eq!(signal.data_dir, PathBuf::from("/var/lib/pd"));
+        assert_eq!(signal.relay, None);
+        // 信令加中继，中继有对外地址
+        let full = format!(
+            "relay_listen = \"0.0.0.0:3478\"\nrelay_advertise = \"203.0.113.5:3478\"\n{only}"
+        );
+        let relay = ServerConfig::from_toml(&full)
+            .unwrap()
+            .signal()
+            .unwrap()
+            .unwrap()
+            .relay;
+        assert_eq!(
+            relay,
+            Some(RelayConfig {
+                listen: "0.0.0.0:3478".parse().unwrap(),
+                advertise: Some("203.0.113.5:3478".parse().unwrap()),
+            })
+        );
+        // 错误
+        let no_dir = format!("signal_listen = \"0.0.0.0:4433\"\n{SERVER}");
+        assert!(server_err(&no_dir).contains("data_dir"));
+        assert!(server_err(&only.replace("0.0.0.0:4433", "x")).contains("signal_listen"));
+        assert!(server_err(&full.replace("0.0.0.0:3478", "x")).contains("relay_listen"));
+        assert!(server_err(&full.replace("203.0.113.5:3478", "x")).contains("relay_advertise"));
+        let relay_alone = format!("relay_listen = \"0.0.0.0:3478\"\n{SERVER}");
+        assert!(server_err(&relay_alone).contains("relay_listen 需要 signal_listen"));
+        // 仓库里的示例配置必须有效
+        let example = include_str!("../../../config/server.example.toml");
+        let signal = ServerConfig::from_toml(example)
+            .unwrap()
+            .signal()
+            .unwrap()
+            .unwrap();
+        assert!(signal.relay.unwrap().advertise.is_some());
+        assert!(
+            ClientConfig::from_toml(include_str!("../../../config/client.example.toml")).is_ok()
+        );
+        let advertise_alone = format!("relay_advertise = \"1.2.3.4:5\"\n{SERVER}");
+        assert!(server_err(&advertise_alone).contains("relay_advertise 需要 relay_listen"));
     }
 }

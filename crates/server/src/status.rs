@@ -4,6 +4,7 @@ use std::fmt::Write as _;
 
 use peerdesk_core::cluster::{Cluster, NodeInfo};
 use peerdesk_core::crypto::Policy;
+use peerdesk_core::relay::Usage;
 use peerdesk_core::Time;
 
 use crate::json;
@@ -25,9 +26,24 @@ pub fn node_json(info: &NodeInfo) -> String {
     format!("{{{}}}", node_fields(info))
 }
 
-/// 集群状态的 JSON：本节点、其他成员、加密策略。
+/// 信令和中继的运行数据。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Rendezvous {
+    /// 在线设备数；`None` 表示没有开启信令。
+    pub online: Option<usize>,
+    /// 中继启动以来的转发总量、当前会话数、丢弃的包数；`None` 表示没有开启中继。
+    pub relay: Option<(Usage, usize, u64)>,
+}
+
+/// 集群状态的 JSON：本节点、其他成员、加密策略、信令与中继。
 #[must_use]
-pub fn status_json(cluster: &Cluster, policy: &Policy, now: Time, cluster_auth: bool) -> String {
+pub fn status_json(
+    cluster: &Cluster,
+    policy: &Policy,
+    now: Time,
+    cluster_auth: bool,
+    rendezvous: &Rendezvous,
+) -> String {
     let mut out = String::new();
     // 向 String 写入不会失败。
     let _ = write!(
@@ -57,10 +73,18 @@ pub fn status_json(cluster: &Cluster, policy: &Policy, now: Time, cluster_auth: 
         }
         out.push_str(&json::string(suite.name()));
     }
+    let (usage, sessions, dropped) = rendezvous.relay.unwrap_or_default();
     let _ = write!(
         out,
-        "],\"plaintext_allowed\":{},\"cluster_auth\":{cluster_auth}}}",
-        policy.allows_plaintext()
+        "],\"plaintext_allowed\":{},\"cluster_auth\":{cluster_auth},\
+         \"signal\":{{\"enabled\":{},\"online\":{}}},\
+         \"relay\":{{\"enabled\":{},\"sessions\":{sessions},\"bytes\":{},\"packets\":{},\"dropped\":{dropped}}}}}",
+        policy.allows_plaintext(),
+        rendezvous.online.is_some(),
+        rendezvous.online.unwrap_or(0),
+        rendezvous.relay.is_some(),
+        usage.bytes,
+        usage.packets
     );
     out
 }
@@ -89,6 +113,7 @@ mod tests {
             &Policy::recommended(),
             Time::from_millis(1500),
             true,
+            &Rendezvous::default(),
         );
         assert!(json.starts_with("{\"version\":\""));
         assert!(json.contains("\"uptime_ms\":1500"));
@@ -96,7 +121,11 @@ mod tests {
         assert!(json.contains("\"members\":[]"));
         assert!(json.contains("\"region\":\"us\\\"east\""));
         assert!(json.contains("\"crypto\":[\"aes-256-gcm\",\"chacha20-poly1305\",\"aes-128-gcm\"]"));
-        assert!(json.ends_with("\"plaintext_allowed\":false,\"cluster_auth\":true}"));
+        assert!(json.contains("\"plaintext_allowed\":false,\"cluster_auth\":true,"));
+        assert!(json.ends_with(
+            "\"signal\":{\"enabled\":false,\"online\":0},\"relay\":{\"enabled\":false,\
+             \"sessions\":0,\"bytes\":0,\"packets\":0,\"dropped\":0}}"
+        ));
 
         for id in [2, 3] {
             cluster.on_message(
@@ -107,13 +136,34 @@ mod tests {
                 },
             );
         }
-        let json = status_json(&cluster, &Policy::none(), Time::from_millis(1500), false);
+        let rendezvous = Rendezvous {
+            online: Some(4),
+            relay: Some((
+                Usage {
+                    bytes: 900,
+                    packets: 7,
+                },
+                2,
+                3,
+            )),
+        };
+        let json = status_json(
+            &cluster,
+            &Policy::none(),
+            Time::from_millis(1500),
+            false,
+            &rendezvous,
+        );
         assert!(json.contains("\"alive\":3"));
         assert!(json.contains("\"id\":2,"));
         assert!(json.contains("},{\"id\":3,"));
         assert!(json.contains("\"state\":\"alive\",\"idle_ms\":500"));
         assert!(json.contains("\"crypto\":[\"none\"]"));
-        assert!(json.ends_with("\"plaintext_allowed\":true,\"cluster_auth\":false}"));
+        assert!(json.contains("\"plaintext_allowed\":true,\"cluster_auth\":false,"));
+        assert!(json.ends_with(
+            "\"signal\":{\"enabled\":true,\"online\":4},\"relay\":{\"enabled\":true,\
+             \"sessions\":2,\"bytes\":900,\"packets\":7,\"dropped\":3}}"
+        ));
         assert_eq!(json.matches('{').count(), json.matches('}').count());
     }
 }

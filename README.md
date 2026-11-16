@@ -14,7 +14,7 @@
 | 部分 | 状态 |
 | --- | --- |
 | 协议、加密策略、会话握手 | 完成 |
-| QUIC 传输、设备身份与指纹校验 | 完成（局域网或已知地址直连） |
+| QUIC 传输、设备身份与指纹校验 | 完成 |
 | 访问授权：密码、失败锁定、受信任设备、只读和禁传文件 | 完成 |
 | 软件编解码器：分块、每帧预算、渐进清晰、丢帧修复 | 完成 |
 | 码率自适应、纠错 | 完成 |
@@ -25,7 +25,7 @@
 | 屏幕采集、窗口显示 | 未开始（CI 机器能截屏，可以在 CI 里测） |
 | 系统输入注入、剪贴板 | 未开始 |
 | 硬件编码器（H.264 等） | 未开始（需要带显卡的真机） |
-| 打洞与中继、信令 | 未开始（直连规划逻辑已有） |
+| 信令、打洞、中继（含计量） | 完成：服务端提供信令和中继，客户端 `host --server` / `connect --device` 已接入 |
 | Tauri 界面 | 未开始 |
 | 托管云（账号、计费） | 排在最后 |
 
@@ -33,8 +33,8 @@
 
 | 二进制 | 作用 | 发布体积（Linux x86-64） |
 | --- | --- | --- |
-| `peerdesk` | 客户端。现在是命令行（被控、控制、仿真、探测），之后用 Tauri 加界面 | 约 2.2 MB |
-| `peerdesk-server` | 服务端。集群、区域路由、内嵌 React 管理页面 | 约 0.7 MB |
+| `peerdesk` | 客户端。现在是命令行（被控、控制、仿真、探测），之后用 Tauri 加界面 | 约 2.4 MB |
+| `peerdesk-server` | 服务端。信令、中继、集群、区域路由、内嵌 React 管理页面 | 约 2.1 MB |
 
 ## 目录
 
@@ -63,6 +63,18 @@ peerdesk host --listen 0.0.0.0:4433            # 被控端：会打印监听地�
 peerdesk connect <地址:端口> --pin <指纹> --snapshot seen.bmp --send <文件或目录>   # 控制端
 peerdesk bench-transport                       # 本机回环上对比裸 UDP 和 QUIC 数据报的延迟
 ```
+
+不知道被控端地址（在 NAT 后面）时，通过服务器连接：服务器配置里写上 `signal_listen`、`data_dir`
+（可选 `relay_listen`），启动时会打印信令地址和服务器指纹。
+
+```bash
+peerdesk host --server <服务器地址:端口> --server-pin <服务器指纹>          # 被控端：登记在线
+peerdesk connect --server <服务器地址:端口> --server-pin <服务器指纹> \
+                 --device <被控端指纹>                                   # 先试直连（打洞），不通走中继
+peerdesk connect ... --device <被控端指纹> --relay-only                  # 只走中继（--direct-only 只走直连）
+```
+
+控制端会打印实际走的路径（直连 / 中继）。管理接口的 `/api/status` 里有在线设备数和中继的转发总量。
 
 ```bash
 cargo run -p peerdesk -- sim --link wifi --loss 30 --trace   # 在仿真网络上跑一次完整会话

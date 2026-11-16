@@ -11,10 +11,13 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use peerdesk_core::cluster::{self, Cluster, ClusterConfig, ClusterMsg, NodeInfo};
-use peerdesk_core::config::ServerConfig;
+use peerdesk_core::config::{ServerConfig, SignalConfig};
 use peerdesk_core::crypto::Policy;
 use peerdesk_core::region::NodeId;
 use peerdesk_core::{Error, Time};
+use peerdesk_net::identity::to_hex;
+use peerdesk_net::service::{RelayService, SignalService};
+use peerdesk_net::{Fingerprint, Identity, NetError};
 
 use crate::http::{self, Api, Response, MAX_REQUEST_HEAD};
 use crate::status;
@@ -37,6 +40,59 @@ fn wall_ms() -> u64 {
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
+/// 信令服务的对外信息。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SignalInfo {
+    /// 信令实际监听的地址。
+    pub addr: SocketAddr,
+    /// 服务器的证书指纹，客户端用 `--server-pin` 核对。
+    pub fingerprint: Fingerprint,
+    /// 告诉客户端的中继地址；`None` 表示没有开启中继。
+    pub relay: Option<SocketAddr>,
+}
+
+/// 信令和中继。它们是异步的，跑在自己的运行时上；其余部分仍然是普通线程。
+struct Services {
+    info: SignalInfo,
+    signal: SignalService,
+    relay: Option<Arc<RelayService>>,
+    /// 放在最后：先停服务，再关运行时。
+    _runtime: tokio::runtime::Runtime,
+}
+
+impl Services {
+    fn start(cfg: &SignalConfig, policy: &Policy) -> Result<Self, Error> {
+        let fail = |e: NetError| Error::Config(format!("启动信令服务失败：{e}"));
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .map_err(|e| io_error("启动异步运行时失败", &e))?;
+        let identity = Identity::load_or_create(&cfg.data_dir).map_err(fail)?;
+        let (signal, relay, addr) = runtime
+            .block_on(async {
+                let relay = match cfg.relay {
+                    Some(r) => Some(Arc::new(RelayService::start(r.listen, r.advertise).await?)),
+                    None => None,
+                };
+                let node = Arc::new(peerdesk_net::Node::bind(cfg.listen, &identity, policy)?);
+                let addr = node.local_addr()?;
+                Ok::<_, NetError>((SignalService::start(node, relay.clone()), relay, addr))
+            })
+            .map_err(fail)?;
+        Ok(Self {
+            info: SignalInfo {
+                addr,
+                fingerprint: identity.fingerprint(),
+                relay: relay.as_ref().map(|r| r.addr()),
+            },
+            signal,
+            relay,
+            _runtime: runtime,
+        })
+    }
+}
+
 struct Shared {
     /// 集群共享密钥；`None` 表示心跳不带认证。
     secret: Option<Vec<u8>>,
@@ -45,9 +101,19 @@ struct Shared {
     fallback: Vec<String>,
     started: Instant,
     stop: AtomicBool,
+    services: Option<Services>,
 }
 
 impl Shared {
+    fn rendezvous(&self) -> status::Rendezvous {
+        self.services
+            .as_ref()
+            .map_or_else(status::Rendezvous::default, |s| status::Rendezvous {
+                online: Some(s.signal.online()),
+                relay: s.relay.as_ref().map(|r| r.totals()),
+            })
+    }
+
     fn cluster(&self) -> MutexGuard<'_, Cluster> {
         // 持锁期间不会 panic；即便发生，成员表仍然可用，继续服务比整体停摆好。
         self.cluster.lock().unwrap_or_else(PoisonError::into_inner)
@@ -88,6 +154,7 @@ impl Api for Shared {
             &self.policy,
             self.now(),
             self.secret.is_some(),
+            &self.rendezvous(),
         )
     }
 
@@ -199,7 +266,7 @@ impl std::fmt::Debug for Shared {
 }
 
 impl Node {
-    /// 按配置启动：绑定端口，拉起集群线程和管理接口线程。
+    /// 按配置启动：绑定端口，拉起集群线程和管理接口线程；配置了信令时同时启动信令和中继。
     pub fn start(cfg: &ServerConfig, timing: ClusterConfig) -> Result<Self, Error> {
         let policy = cfg.crypto.policy()?;
         let socket =
@@ -218,6 +285,10 @@ impl Node {
         let http_addr = listener
             .local_addr()
             .map_err(|e| io_error("读取管理端口失败", &e))?;
+        let services = cfg
+            .signal()?
+            .map(|signal| Services::start(&signal, &policy))
+            .transpose()?;
 
         let me = NodeInfo {
             id: NodeId(cfg.node_id),
@@ -233,6 +304,7 @@ impl Node {
             fallback: cfg.region_fallback.clone(),
             started: Instant::now(),
             stop: AtomicBool::new(false),
+            services,
         });
 
         let for_cluster = Arc::clone(&shared);
@@ -259,6 +331,18 @@ impl Node {
     #[must_use]
     pub const fn cluster_addr(&self) -> SocketAddr {
         self.cluster_addr
+    }
+
+    /// 信令服务的地址和指纹；没有开启信令时是 `None`。
+    #[must_use]
+    pub fn signal(&self) -> Option<SignalInfo> {
+        self.shared.services.as_ref().map(|s| s.info)
+    }
+
+    /// 信令和中继的运行数据。
+    #[must_use]
+    pub fn rendezvous(&self) -> status::Rendezvous {
+        self.shared.rendezvous()
     }
 
     /// 存活节点数，包含自己。
@@ -349,6 +433,22 @@ pub fn launch(args: &[String], out: &mut dyn Write) -> Result<Node, u8> {
                 node.http_addr(),
                 node.cluster_addr()
             );
+            match node.signal() {
+                Some(info) => {
+                    let relay = info
+                        .relay
+                        .map_or_else(|| "未开启".to_owned(), |a| a.to_string());
+                    let _ = writeln!(
+                        out,
+                        "信令 {}，服务器指纹 {}\n中继 {relay}",
+                        info.addr,
+                        to_hex(&info.fingerprint)
+                    );
+                }
+                None => {
+                    let _ = writeln!(out, "信令未开启（配置里没有 signal_listen）。");
+                }
+            }
             if node.shared.secret.is_none() {
                 let _ = writeln!(
                     out,

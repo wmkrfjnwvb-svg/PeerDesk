@@ -56,4 +56,5 @@ fn starts_serves_and_exits_cleanly() {
     assert_eq!(code, 0, "{text}");
     assert!(text.contains("已启动"));
     assert!(text.contains("http://127.0.0.1:"));
+    assert!(text.contains("信令未开启"));
 }

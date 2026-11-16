@@ -21,6 +21,16 @@ cluster_secret = "change-me-to-a-long-random-string"
 # 本区域节点全部过载或不可用时，客户端依次溢出到这些区域。
 region_fallback = ["us-west", "eu-west"]
 
+# 信令（UDP，QUIC）：被控端在这里登记，控制端用设备指纹找到它。不写时不提供信令。
+signal_listen = "0.0.0.0:4433"
+# 保存服务器身份（证书和私钥）的目录，开启信令时必须设置。
+# 启动时会打印服务器指纹，客户端用 --server-pin 核对。
+data_dir = "/var/lib/peerdesk-server"
+# 中继（UDP）：直连不通时转发数据并计量。需要同时开启信令；不写时不提供中继。
+relay_listen = "0.0.0.0:3478"
+# 告诉客户端的中继地址。服务器在 NAT 或负载均衡后面时填公网地址；不写时用实际监听地址。
+relay_advertise = "203.0.113.10:3478"
+
 [crypto]
 # 预设三选一：recommended（默认）、fips、none。
 preset = "recommended"

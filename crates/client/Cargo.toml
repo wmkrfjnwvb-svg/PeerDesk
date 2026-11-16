@@ -11,5 +11,8 @@ peerdesk-core.workspace = true
 peerdesk-net.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 
+[dev-dependencies]
+peerdesk-server = { path = "../server" }
+
 [lints]
 workspace = true
