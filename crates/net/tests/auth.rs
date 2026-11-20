@@ -47,7 +47,8 @@ fn cfg(id: &Identity, auth: Auth) -> SessionConfig {
     SessionConfig {
         device_id: id.device_id(),
         region: "t".into(),
-        caps: Caps::H264,
+        // 这组测试用块编码：两种编码路径都要有会话级的测试。
+        caps: Caps(0),
         policy: Policy::recommended(),
         auth,
         binding: Vec::new(),

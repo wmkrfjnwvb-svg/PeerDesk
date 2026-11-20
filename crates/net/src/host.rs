@@ -1,24 +1,21 @@
 //! 被控端的一次会话：握手，按帧率发送画面，接收输入，接收文件。
 
-use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use peerdesk_core::adaptive::{Feedback, Profile, RateController};
+use peerdesk_core::adaptive::{Feedback, Profile};
 use peerdesk_core::auth::{Auth, Limiter};
-use peerdesk_core::codec::Encoder;
 use peerdesk_core::crypto::Suite;
-use peerdesk_core::desktop_sim::FLAG_PARITY;
 use peerdesk_core::file::FileMsg;
 use peerdesk_core::input::{InputEvent, InputReceiver, KeyState};
-use peerdesk_core::proto::{Channel, Control, RejectReason, VIDEO_HEADER_LEN};
+use peerdesk_core::media::{MediaSender, SenderConfig};
+use peerdesk_core::proto::{Caps, Channel, Control, RejectReason};
 use peerdesk_core::screen::Screen;
 use peerdesk_core::session::{Session, SessionConfig, State};
 use peerdesk_core::trace::{Stage, TraceId, Tracer};
-use peerdesk_core::transport::{fragment, parity_for, PARITY_PREFIX};
-use peerdesk_core::wire::Writer;
-use peerdesk_core::Time;
+use peerdesk_core::video::{TileEncoder, VideoEncoder};
+use peerdesk_media::H264Encoder;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
@@ -207,7 +204,7 @@ pub async fn serve(
         link.close("locked");
         return Err(NetError::Connect("认证失败次数过多，暂时锁定".into()));
     }
-    let suite = loop {
+    let (suite, caps) = loop {
         let msg = tokio::time::timeout(HELLO_TIMEOUT, read_control(&mut ctrl_recv))
             .await
             .map_err(|_| NetError::Timeout("等待握手消息"))??;
@@ -215,7 +212,7 @@ pub async fn serve(
             write_control(&mut ctrl_send, &reply).await?;
         }
         match session.state() {
-            State::Established { suite, .. } => break *suite,
+            State::Established { suite, caps, .. } => break (*suite, *caps),
             State::Idle | State::HelloSent | State::AwaitAuth => {}
             State::Rejected(reason) => {
                 if needs_password && *reason == RejectReason::Unauthorized {
@@ -247,72 +244,36 @@ pub async fn serve(
     let mut receiver = InputReceiver::new();
     let mut keys = KeyState::new();
     let mut file_tasks: Vec<JoinHandle<Result<Vec<FileResult>, NetError>>> = Vec::new();
-    let (mut frames_sent, mut input_events, mut bad_datagrams) = (0u32, 0u64, 0u64);
+    let (mut input_events, mut bad_datagrams) = (0u64, 0u64);
     let mut input_denied = 0u64;
     let rtt_us = u64::try_from(link.rtt().as_micros()).unwrap_or(u64::MAX);
-    let mut rate = RateController::new(
-        Profile::select(rtt_us, false, false),
-        opts.start_bps,
-        MIN_BPS,
-        opts.max_bps,
+    // 两端都支持 H.264 就用它，否则用块编码。
+    let encoder: Box<dyn VideoEncoder> = if caps.common(Caps::H264) == Caps::H264 {
+        Box::new(H264Encoder::with_max_bps(opts.fps, opts.max_bps))
+    } else {
+        Box::new(TileEncoder::new())
+    };
+    let mut media = MediaSender::new(
+        SenderConfig {
+            fps: opts.fps,
+            start_bps: opts.start_bps,
+            min_bps: MIN_BPS,
+            max_bps: opts.max_bps,
+            profile: Profile::select(rtt_us, false, false),
+            deadline_us: FRAME_DEADLINE_US,
+            max_payload: link.max_payload(),
+        },
+        encoder,
     );
-    let mut encoder: Option<(u16, u16, Encoder)> = None;
-    let mut unacked: VecDeque<(u32, Time)> = VecDeque::new();
-    let (mut acked_floor, mut video_bytes, mut frames_repaired) = (0u32, 0u64, 0u32);
+    // 判断画面变没变：来源会报告变化计数时用它；否则和上一幅比较。
+    let mut last_seq: Option<u64> = None;
+    let mut last_screen: Option<Screen> = None;
 
     let end = loop {
         tokio::select! {
-            _ = ticker.tick() => {
-                let Some(screen) = source.capture() else {
-                    break "画面来源结束".to_owned();
-                };
-                let now = link.now();
-                // 画面尺寸变了（或第一帧）：换一个新的编码器，从整屏开始。
-                let size = (screen.width(), screen.height());
-                if encoder.as_ref().is_none_or(|(w, h, _)| (*w, *h) != size) {
-                    encoder = Some((size.0, size.1, Encoder::new(size.0, size.1)));
-                }
-                let Some((_, _, enc)) = encoder.as_mut() else { continue };
-                // 迟迟等不到反馈的帧按丢失处理，重新发送那些块现在的内容。
-                let rtt = u64::try_from(link.rtt().as_micros()).unwrap_or(u64::MAX);
-                let ack_timeout = FRAME_DEADLINE_US.saturating_add(rtt.saturating_mul(2)).saturating_add(60_000);
-                while let Some((id, at)) = unacked.front().copied() {
-                    if id <= acked_floor {
-                        unacked.pop_front();
-                    } else if now.since(at) >= ack_timeout {
-                        unacked.pop_front();
-                        enc.mark_lost(id);
-                        frames_repaired = frames_repaired.saturating_add(1);
-                    } else {
-                        break;
-                    }
-                }
-                let frame_id = frames_sent.saturating_add(1);
-                let Some(encoded) = enc.encode(frame_id, screen, rate.frame_budget(opts.fps)) else {
-                    // 画面没有变化：不发任何数据。
-                    continue;
-                };
-                let max = link
-                    .max_payload()
-                    .saturating_sub(VIDEO_HEADER_LEN)
-                    .saturating_sub(PARITY_PREFIX);
-                let mut packets = fragment(frame_id, frame_id, &encoded.data, max)?;
-                let parity = parity_for(&packets, rate.profile().fec_permille);
-                packets.extend(parity);
-                let sent = packets.into_iter().try_for_each(|packet| {
-                    let mut body = Writer::new();
-                    packet.header.encode(&mut body);
-                    body.bytes(&packet.data);
-                    let flags = if packet.parity { FLAG_PARITY } else { 0 };
-                    link.send_flags(Channel::Video, flags, &body.into_vec())
-                });
-                if let Err(e) = sent { break e.to_string(); }
-                video_bytes = video_bytes
-                    .saturating_add(u64::try_from(encoded.data.len()).unwrap_or(u64::MAX));
-                unacked.push_back((frame_id, now));
-                tracer.record(link.now(), trace, Stage::FrameSent, u64::from(frame_id));
-                frames_sent = frame_id;
-            }
+            // 按顺序检查：先处理收到的数据报（输入、反馈）和控制消息，最后才采集、编码下一帧。
+            // 编码可能要好几毫秒；不这样排，编码期间到达的输入要排在后面。
+            biased;
             datagram = link.recv() => match datagram {
                 Ok((header, payload)) => match header.channel {
                     Channel::Input => match receiver.on_packet(&payload) {
@@ -335,13 +296,7 @@ pub async fn serve(
                     },
                     // 控制通道的数据报是观看端的反馈：哪些帧到了、链路有没有积压。
                     Channel::Control => match Feedback::decode(&payload) {
-                        Ok(feedback) => {
-                            acked_floor = acked_floor.max(feedback.floor);
-                            if let Some((_, _, enc)) = encoder.as_mut() {
-                                enc.on_feedback(feedback.floor, feedback.delivered);
-                            }
-                            rate.on_feedback(link.now(), &feedback);
-                        }
+                        Ok(feedback) => media.on_feedback(link.now(), &feedback),
                         Err(_) => bad_datagrams = bad_datagrams.saturating_add(1),
                     },
                     Channel::Cursor | Channel::Video | Channel::Clipboard | Channel::File => {
@@ -387,6 +342,39 @@ pub async fn serve(
                     | Control::AuthProof { .. },
                 ) => {}
             },
+            _ = ticker.tick() => {
+                // 先取变化计数再取画面：中间变了的话，下一帧会再编一次，不会漏。
+                let seq = source.change_seq();
+                let Some(screen) = source.capture() else {
+                    break "画面来源结束".to_owned();
+                };
+                let changed = match seq {
+                    Some(seq) => last_seq.replace(seq) != Some(seq),
+                    None => {
+                        let changed = last_screen.as_ref() != Some(screen);
+                        if changed {
+                            last_screen = Some(screen.clone());
+                        }
+                        changed
+                    }
+                };
+                if !changed && !media.wants_frame() {
+                    continue;
+                }
+                let rtt = u64::try_from(link.rtt().as_micros()).unwrap_or(u64::MAX);
+                let out = match media.on_frame(link.now(), screen, changed, rtt) {
+                    Ok(out) => out,
+                    Err(e) => break e.to_string(),
+                };
+                if out.is_empty() {
+                    continue;
+                }
+                let sent = out
+                    .iter()
+                    .try_for_each(|o| link.send_flags(Channel::Video, o.flags, &o.body));
+                if let Err(e) = sent { break e.to_string(); }
+                tracer.record(link.now(), trace, Stage::FrameSent, u64::from(media.stats().frames));
+            }
         }
     };
 
@@ -408,11 +396,11 @@ pub async fn serve(
     Ok(HostReport {
         peer: *link.peer_fingerprint(),
         suite: Some(suite),
-        frames_sent,
-        video_bytes,
-        frames_repaired,
-        final_rate_bps: rate.rate_bps(),
-        profile: rate.profile().name,
+        frames_sent: media.stats().frames,
+        video_bytes: media.stats().video_bytes,
+        frames_repaired: media.stats().lost,
+        final_rate_bps: media.rate_bps(),
+        profile: media.profile().name,
         input_events,
         input_denied,
         bad_datagrams,

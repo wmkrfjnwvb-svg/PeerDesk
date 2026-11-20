@@ -288,6 +288,10 @@ impl VideoDecoder for H264Decoder {
         self.screen = Some(Screen::from_pixels(header.width, header.height, pixels)?);
         Ok(self.screen.as_ref())
     }
+
+    fn screen(&self) -> Option<&Screen> {
+        self.screen.as_ref()
+    }
 }
 
 #[cfg(test)]

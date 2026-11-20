@@ -139,6 +139,12 @@ impl MediaSender {
         self.encoder.wants_refine()
     }
 
+    /// 网络画像。
+    #[must_use]
+    pub const fn profile(&self) -> &Profile {
+        self.rate.profile()
+    }
+
     /// 改网络画像（例如测出了更大的往返时间）。
     pub const fn set_profile(&mut self, profile: Profile) {
         self.rate.set_profile(profile);
@@ -306,6 +312,18 @@ impl MediaReceiver {
         self.stats
     }
 
+    /// 最近显示的画面。
+    #[must_use]
+    pub fn screen(&self) -> Option<&Screen> {
+        self.decoder.screen()
+    }
+
+    /// 分片重组的计数（例如超时作废了多少帧）。
+    #[must_use]
+    pub const fn reassembly(&self) -> crate::transport::ReassemblyStats {
+        self.reassembler.stats()
+    }
+
     /// 收到一个视频数据报。`send_time`、`seq`、`flags` 来自数据报头。
     /// 收齐并解出一帧时返回它。分片本身不合法时返回错误（调用方计为坏数据报）。
     pub fn on_datagram(
@@ -372,12 +390,18 @@ impl MediaReceiver {
         }
     }
 
-    /// 生成一条反馈，同时让超时的帧作废。
-    pub fn feedback(&mut self, now: Time) -> Feedback {
-        self.reassembler.expire(now);
+    /// 让超时的帧作废。返回反馈里的 `floor`（据此判断有没有新情况要报告）和作废的帧号。
+    pub fn settle(&mut self, now: Time) -> (u32, Vec<u32>) {
+        let expired = self.reassembler.expire(now);
         if let Some(floor) = self.reassembler.floor() {
             self.log.advance(floor);
         }
+        (self.log.snapshot().0, expired)
+    }
+
+    /// 生成一条反馈，同时让超时的帧作废。
+    pub fn feedback(&mut self, now: Time) -> Feedback {
+        self.settle(now);
         let sample = self.tracker.report(now);
         let (floor, delivered) = self.log.snapshot();
         Feedback {
@@ -474,6 +498,9 @@ mod tests {
             }
             self.screen = Some(Screen::new(h.width, h.height, color));
             Ok(self.screen.as_ref())
+        }
+        fn screen(&self) -> Option<&Screen> {
+            self.screen.as_ref()
         }
     }
 

@@ -140,6 +140,9 @@ pub trait VideoEncoder: Send {
 pub trait VideoDecoder: Send {
     /// 解一帧（不带帧头的码流）。返回解出的画面；`None` 表示这一帧没有可显示的新画面。
     fn decode(&mut self, header: &FrameHeader, data: &[u8]) -> Result<Option<&Screen>, Error>;
+
+    /// 最近解出的画面。
+    fn screen(&self) -> Option<&Screen>;
 }
 
 /// 块编码的适配。
@@ -243,6 +246,10 @@ impl VideoDecoder for TileDecoder {
             .get_or_insert_with(|| codec::Decoder::new(header.width, header.height));
         dec.apply(data)?;
         Ok(Some(dec.screen()))
+    }
+
+    fn screen(&self) -> Option<&Screen> {
+        self.inner.as_ref().map(codec::Decoder::screen)
     }
 }
 

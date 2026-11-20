@@ -4,18 +4,16 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use peerdesk_core::adaptive::{DelayTracker, DeliveryLog, Feedback};
-use peerdesk_core::codec::{frame_size, Decoder};
 use peerdesk_core::crypto::Suite;
-use peerdesk_core::desktop_sim::FLAG_PARITY;
 use peerdesk_core::file::FileMeta;
 use peerdesk_core::input::{InputEvent, InputSender};
-use peerdesk_core::proto::{Channel, Control, RejectReason, VideoHeader};
+use peerdesk_core::media::MediaReceiver;
+use peerdesk_core::proto::{Caps, Channel, Control, RejectReason};
 use peerdesk_core::screen::Screen;
 use peerdesk_core::session::{Session, SessionConfig, State};
 use peerdesk_core::trace::{Stage, TraceId, Tracer};
-use peerdesk_core::transport::{Reassembler, VideoPacket};
-use peerdesk_core::wire::Reader;
+use peerdesk_core::video::{TileDecoder, VideoDecoder};
+use peerdesk_media::H264Decoder;
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 
@@ -114,7 +112,7 @@ pub async fn run(
     write_kind(&mut ctrl_send, StreamKind::Control).await?;
     let hello = session.hello(link.now(), &mut tracer)?;
     write_control(&mut ctrl_send, &hello).await?;
-    let suite = loop {
+    let (suite, caps) = loop {
         let msg = tokio::time::timeout(HELLO_TIMEOUT, read_control(&mut ctrl_recv))
             .await
             .map_err(|_| NetError::Timeout("等待握手应答"))??;
@@ -129,7 +127,7 @@ pub async fn run(
             write_control(&mut ctrl_send, reply).await?;
         }
         match session.state() {
-            State::Established { suite, .. } => break *suite,
+            State::Established { suite, caps, .. } => break (*suite, *caps),
             State::HelloSent | State::AwaitAuth => {}
             State::Rejected(reason) => {
                 link.close("rejected");
@@ -164,12 +162,14 @@ pub async fn run(
     let mut input_open = true;
 
     let mut sender = InputSender::new();
-    let mut reassembler = Reassembler::new(opts.deadline_us, 8);
-    let (mut video_bytes, mut bad_datagrams, mut input_sent) = (0u64, 0u64, 0u64);
-    let mut decoder: Option<Decoder> = None;
-    let mut tracker = DelayTracker::new(link.now());
-    let mut delivery = DeliveryLog::new();
-    let (mut bad_frames, mut frames_applied) = (0u64, 0u64);
+    let (mut bad_datagrams, mut input_sent) = (0u64, 0u64);
+    // 两端都支持 H.264 就用它，否则用块编码。
+    let decoder: Box<dyn VideoDecoder> = if caps.common(Caps::H264) == Caps::H264 {
+        Box::new(H264Decoder::new()?)
+    } else {
+        Box::new(TileDecoder::new())
+    };
+    let mut media = MediaReceiver::new(link.now(), opts.deadline_us, decoder);
     // 反馈只在有新情况时发；什么都没发生时每秒一次，证明自己还在。
     let mut video_since_feedback = 0u32;
     let mut reported_floor = 0u32;
@@ -194,46 +194,11 @@ pub async fn run(
                 Ok((header, payload)) => match header.channel {
                     Channel::Video => {
                         let now = link.now();
-                        tracker.on_packet(now, header.send_time, header.seq, payload.len());
                         video_since_feedback = video_since_feedback.saturating_add(1);
-                        let mut r = Reader::new(&payload);
-                        let packet = VideoHeader::decode(&mut r).map(|video| VideoPacket {
-                            header: video,
-                            parity: header.flags & FLAG_PARITY != 0,
-                            data: r.rest().to_vec(),
-                        });
-                        match packet.and_then(|p| reassembler.push(now, p)) {
-                            Ok(Some(frame)) => {
-                                // 画面尺寸变了（或第一帧）：按帧里声明的尺寸建解码器。
-                                let applied = frame_size(&frame.data).and_then(|(w, h)| {
-                                    let fits = decoder
-                                        .as_ref()
-                                        .is_some_and(|d| (d.screen().width(), d.screen().height()) == (w, h));
-                                    let dec = if fits { decoder.as_mut() } else { None };
-                                    let dec = match dec {
-                                        Some(dec) => dec,
-                                        None => decoder.insert(Decoder::new(w, h)),
-                                    };
-                                    dec.apply(&frame.data).map(|_| ())
-                                });
-                                // 解不了的帧也算“有定论”：它带的块由发送端在下一轮重发。
-                                match applied {
-                                    Ok(()) => {
-                                        delivery.delivered(frame.frame_id);
-                                        frames_applied = frames_applied.saturating_add(1);
-                                        video_bytes = video_bytes.saturating_add(
-                                            u64::try_from(frame.data.len()).unwrap_or(u64::MAX),
-                                        );
-                                        tracer.record(now, trace, Stage::FrameDelivered, u64::from(frame.frame_id));
-                                        if let Some(dec) = decoder.as_ref() {
-                                            sink.present(dec.screen());
-                                        }
-                                    }
-                                    Err(_) => {
-                                        delivery.advance(frame.frame_id);
-                                        bad_frames = bad_frames.saturating_add(1);
-                                    }
-                                }
+                        match media.on_datagram(now, header.send_time, header.seq, header.flags, &payload) {
+                            Ok(Some(shown)) => {
+                                tracer.record(now, trace, Stage::FrameDelivered, u64::from(shown.frame_id));
+                                sink.present(shown.screen);
                             }
                             Ok(None) => {}
                             Err(_) => bad_datagrams = bad_datagrams.saturating_add(1),
@@ -261,27 +226,17 @@ pub async fn run(
             },
             _ = resend.tick() => {
                 let now = link.now();
-                for frame_id in reassembler.expire(now) {
+                // 反馈：哪些帧到了、排队延迟、丢包率、接收速率。
+                let (floor, expired) = media.settle(now);
+                for frame_id in expired {
                     tracer.record(now, trace, Stage::FrameExpired, u64::from(frame_id));
                 }
-                // 反馈：哪些帧到了、排队延迟、丢包率、接收速率。
-                if let Some(floor) = reassembler.floor() {
-                    delivery.advance(floor);
-                }
-                let (floor, delivered) = delivery.snapshot();
                 let news = video_since_feedback > 0 || floor != reported_floor;
                 if news || now.since(last_feedback) >= IDLE_FEEDBACK_US {
                     video_since_feedback = 0;
                     reported_floor = floor;
                     last_feedback = now;
-                    let sample = tracker.report(now);
-                    let feedback = Feedback {
-                        floor,
-                        delivered,
-                        queue_delay_us: sample.queue_delay_us,
-                        loss_permille: sample.loss_permille,
-                        recv_bytes_per_s: sample.recv_bytes_per_s,
-                    };
+                    let feedback = media.feedback(now);
                     if let Err(e) = link.send(Channel::Control, &feedback.encode()) { break e.to_string(); }
                 }
                 if sender.pending() > 0 {
@@ -316,7 +271,7 @@ pub async fn run(
     let _ = tokio::time::timeout(Duration::from_millis(500), link.closed()).await;
     link.close("bye");
 
-    let stats = reassembler.stats();
+    let stats = media.reassembly();
     let (files, file_bytes) = match upload_result {
         Some(Ok(done)) => done,
         Some(Err(e)) => return Err(e),
@@ -325,12 +280,12 @@ pub async fn run(
     Ok(ControllerReport {
         peer: *link.peer_fingerprint(),
         suite,
-        frames_delivered: frames_applied,
+        frames_delivered: u64::from(media.stats().decoded),
         frames_expired: stats.expired,
-        video_bytes,
-        bad_frames,
+        video_bytes: media.stats().video_bytes,
+        bad_frames: u64::from(media.stats().bad),
         recovered: stats.recovered,
-        screen: decoder.map(|d| d.screen().clone()),
+        screen: media.screen().cloned(),
         bad_datagrams,
         input_sent,
         input_unacked: sender.pending(),
