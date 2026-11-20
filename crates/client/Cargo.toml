@@ -9,6 +9,7 @@ rust-version.workspace = true
 [dependencies]
 peerdesk-core.workspace = true
 peerdesk-net.workspace = true
+peerdesk-platform.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 
 [dev-dependencies]

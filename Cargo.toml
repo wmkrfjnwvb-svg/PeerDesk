@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/media", "crates/e2e", "crates/net", "crates/client", "crates/server"]
+members = ["crates/core", "crates/media", "crates/e2e", "crates/net", "crates/platform", "crates/client", "crates/server"]
 
 [workspace.package]
 version = "0.1.0"
@@ -13,6 +13,7 @@ repository = "https://github.com/peerdesk/peerdesk"
 peerdesk-core = { path = "crates/core" }
 peerdesk-net = { path = "crates/net" }
 peerdesk-media = { path = "crates/media" }
+peerdesk-platform = { path = "crates/platform" }
 
 # 编译期检查：所有 crate 通过 `[lints] workspace = true` 继承。
 [workspace.lints.rust]
