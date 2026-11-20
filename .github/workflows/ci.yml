@@ -1,7 +1,18 @@
 name: CI
+# 省着用：每次推送只在 Linux 上跑 lint、覆盖率门槛（含全部测试）和端到端测试。
+# Windows / macOS 的测试、平台实机测试、界面截图、安装包按需触发：
+# - 提交信息里写 [full]：全部平台的测试；写 [pkg]：打安装包（两个可以一起写）；
+# - 在 Actions 页面手动运行（Run workflow），选择范围：full / macos-tests / windows-tests / packages。
 on:
   push:
   pull_request:
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: 跑哪些平台任务
+        type: choice
+        options: [full, macos-tests, windows-tests, packages]
+        default: full
 
 # 同一个分支上有新的推送时，取消还在跑的旧任务。
 concurrency:
@@ -33,13 +44,14 @@ jobs:
       - name: Tests with coverage gate (99% lines)
         run: ./scripts/coverage.sh --show-missing-lines
 
-  # 三个系统并行跑全部测试，并产出发布二进制。
+  # Windows / macOS 跑全部测试和发布构建的冒烟测试（Linux 的测试已经在覆盖率任务里跑过）。按需触发。
   platforms:
     name: test + release (${{ matrix.os }})
+    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.scope != 'packages') || contains(github.event.head_commit.message, '[full]') }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: ${{ fromJSON(inputs.scope == 'macos-tests' && '["macos-latest"]' || inputs.scope == 'windows-tests' && '["windows-latest"]' || '["windows-latest","macos-latest"]') }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -54,15 +66,6 @@ jobs:
           ./target/release/peerdesk probe
           ./target/release/peerdesk sim --link wifi --frames 60
           ./target/release/peerdesk bench-transport --packets 600
-      - uses: actions/upload-artifact@v4
-        with:
-          name: peerdesk-${{ matrix.os }}
-          path: |
-            target/release/peerdesk
-            target/release/peerdesk.exe
-            target/release/peerdesk-server
-            target/release/peerdesk-server.exe
-          if-no-files-found: ignore
 
   # 端到端测试：真实编码器 + 仿真网络 + 接近真实的桌面画面。每次都跑，
   # 截图和指标作为构建产物上传，表格贴到运行摘要里。
@@ -96,12 +99,13 @@ jobs:
             echo
             echo "截图在构建产物 e2e-<提交>：每个场景一个目录，左边源画面、中间控制端看到的画面、右边差异（放大 8 倍）。"
           } >> "$GITHUB_STEP_SUMMARY"
+      # 截图几十 MB：只在失败或完整运行时上传。
       - uses: actions/upload-artifact@v4
-        if: always()
+        if: ${{ failure() || (github.event_name == 'workflow_dispatch' && inputs.scope == 'full') || contains(github.event.head_commit.message, '[full]') }}
         with:
           name: e2e-${{ github.sha }}
           path: target/e2e
-          retention-days: 14
+          retention-days: 3
 
   # 平台层实机测试：在三个系统的桌面上真的采集画面、注入键鼠（crates/platform/tests/live.rs），
   # 再用发布版跑一次 screen-check 量采集耗时、保存画面。
@@ -109,6 +113,7 @@ jobs:
   # 这时测试打印说明后跳过，screen-check 报告缺少权限但不算失败（能不能采集本身就是要知道的信息）。
   platform-live:
     name: platform live (${{ matrix.os }})
+    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.scope == 'full') || contains(github.event.head_commit.message, '[full]') }}
     strategy:
       fail-fast: false
       matrix:
@@ -149,6 +154,7 @@ jobs:
   # 每次推送都打一个能下载、安装、在自己机器之间试用的测试包。
   package:
     name: package (${{ matrix.name }})
+    if: ${{ (github.event_name == 'workflow_dispatch' && (inputs.scope == 'packages' || inputs.scope == 'full')) || contains(github.event.head_commit.message, '[pkg]') }}
     strategy:
       fail-fast: false
       matrix:
@@ -187,11 +193,12 @@ jobs:
           name: ${{ env.ARTIFACT }}
           path: dist/*
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 7
 
   # 在虚拟显示器上打开图形界面（自测模式：开启被控并连接本机），截一张图。
   gui-screenshot:
     name: gui screenshot (linux)
+    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.scope == 'full') || contains(github.event.head_commit.message, '[full]') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -226,54 +233,3 @@ jobs:
           name: peerdesk-gui-screenshots
           path: gui-*.png
           retention-days: 14
-
-  # 探测各系统的 CI 机器能不能截屏：决定屏幕采集的代码能否在 CI 里测。
-  # 这个任务失败不算整体失败。
-  screen-probe:
-    name: screen probe (${{ matrix.os }})
-    continue-on-error: true
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - name: Linux (virtual X11 display)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq xvfb x11-apps x11-utils imagemagick xdotool
-          Xvfb :99 -screen 0 1920x1080x24 &
-          sleep 2
-          export DISPLAY=:99
-          xdpyinfo | grep -E "dimensions|depth of root"
-          xclock -geometry 400x400+100+100 &
-          sleep 2
-          xdotool mousemove 300 300 click 1 && echo "input injection: ok"
-          import -window root screen.png
-          identify screen.png
-      - name: Windows (interactive desktop)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          Add-Type -AssemblyName System.Windows.Forms, System.Drawing
-          $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
-          "screen: $($b.Width)x$($b.Height)"
-          $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
-          $g = [System.Drawing.Graphics]::FromImage($bmp)
-          $g.CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
-          $bmp.Save("screen.png")
-          "saved $((Get-Item screen.png).Length) bytes"
-          Get-CimInstance Win32_VideoController | Select-Object Name, AdapterRAM, VideoProcessor | Format-List
-      - name: macOS (screencapture)
-        if: runner.os == 'macOS'
-        run: |
-          system_profiler SPDisplaysDataType | head -30
-          screencapture -x screen.png
-          ls -l screen.png
-          sips -g pixelWidth -g pixelHeight screen.png
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: screen-${{ matrix.os }}
-          path: screen.png
-          if-no-files-found: warn
