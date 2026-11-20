@@ -15,7 +15,7 @@ use crate::proto::{VideoHeader, MAX_DATAGRAM};
 use crate::screen::Screen;
 use crate::time::Time;
 use crate::transport::{fragment, parity_for, Reassembler, VideoPacket, PARITY_PREFIX};
-use crate::video::{Codec, FrameHeader, VideoDecoder, VideoEncoder};
+use crate::video::{Codec, EncodedFrame, FrameHeader, VideoDecoder, VideoEncoder};
 use crate::wire::{Reader, Writer};
 
 pub use crate::desktop_sim::FLAG_PARITY;
@@ -128,10 +128,51 @@ pub struct SenderStats {
     pub retransmitted: u32,
 }
 
+/// 交给编码器的一帧任务。编码可以在别的线程上做：任务里带着上次之后发送端判定的丢失和收到的确认，
+/// 编码器先处理它们再编码（见 [`encode_job`]）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrameJob {
+    /// 帧号。
+    pub frame_id: u32,
+    /// 字节预算。
+    pub budget: usize,
+    /// 上次之后判定丢失的帧。
+    pub lost: Vec<u32>,
+    /// 上次之后最新的确认 `(floor, mask)`。
+    pub feedback: Option<(u32, u32)>,
+}
+
+/// 在编码器所在的地方执行一个任务。返回编码结果，以及之后画面不变时还要不要继续交画面（补清晰、恢复）。
+pub fn encode_job(
+    encoder: &mut dyn VideoEncoder,
+    job: &FrameJob,
+    screen: &Screen,
+    changed: bool,
+) -> Result<(Option<EncodedFrame>, bool), Error> {
+    for id in &job.lost {
+        encoder.on_lost(*id);
+    }
+    if let Some((floor, mask)) = job.feedback {
+        encoder.on_feedback(floor, mask);
+    }
+    let encoded = encoder.encode(job.frame_id, screen, changed, job.budget)?;
+    Ok((encoded, encoder.wants_refine()))
+}
+
 /// 画面发送端。
+///
+/// 两种用法：
+/// - 编码器交给它（[`MediaSender::new`]），每帧调用 [`MediaSender::on_frame`]，编码就在调用的地方做（仿真用这种）；
+/// - 编码器放在别的线程（[`MediaSender::detached`]），每帧先 [`MediaSender::start_frame`] 得到任务，
+///   编码器线程用 [`encode_job`] 执行，结果交回 [`MediaSender::finish_frame`]。编码期间会话循环照常处理输入。
 pub struct MediaSender {
     cfg: SenderConfig,
-    encoder: Box<dyn VideoEncoder>,
+    /// 编码器在这里时为 `Some`；放在别的线程时为 `None`，对它的通知攒在 `notes` 里随下一个任务带过去。
+    encoder: Option<Box<dyn VideoEncoder>>,
+    codec: Codec,
+    notes: (Vec<u32>, Option<(u32, u32)>),
+    /// 编码器上次报告的“还要不要继续交画面”（编码器在别的线程时用）。
+    refine: bool,
     rate: RateController,
     /// 已发出、还没有定论的帧：(帧号, 发出时间)。
     unacked: VecDeque<(u32, Time)>,
@@ -148,7 +189,7 @@ pub struct MediaSender {
 impl std::fmt::Debug for MediaSender {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MediaSender")
-            .field("codec", &self.encoder.codec())
+            .field("codec", &self.codec)
             .field("rate_bps", &self.rate.rate_bps())
             .field("stats", &self.stats)
             .finish_non_exhaustive()
@@ -159,10 +200,23 @@ impl MediaSender {
     /// 创建。
     #[must_use]
     pub fn new(cfg: SenderConfig, encoder: Box<dyn VideoEncoder>) -> Self {
+        let codec = encoder.codec();
+        Self {
+            encoder: Some(encoder),
+            ..Self::detached(cfg, codec)
+        }
+    }
+
+    /// 创建，编码器放在别的地方（见类型说明）。
+    #[must_use]
+    pub fn detached(cfg: SenderConfig, codec: Codec) -> Self {
         Self {
             rate: RateController::new(cfg.profile, cfg.start_bps, cfg.min_bps, cfg.max_bps),
             cfg,
-            encoder,
+            encoder: None,
+            codec,
+            notes: (Vec::new(), None),
+            refine: false,
             unacked: VecDeque::new(),
             last_frame: 0,
             last_key: 0,
@@ -175,8 +229,8 @@ impl MediaSender {
 
     /// 编码格式。
     #[must_use]
-    pub fn codec(&self) -> Codec {
-        self.encoder.codec()
+    pub const fn codec(&self) -> Codec {
+        self.codec
     }
 
     /// 当前码率。
@@ -194,7 +248,11 @@ impl MediaSender {
     /// 画面没变时还要不要按时交来（编码器在补清晰或要恢复）。
     #[must_use]
     pub fn wants_frame(&self) -> bool {
-        self.encoder.wants_refine()
+        let encoder = self
+            .encoder
+            .as_ref()
+            .map_or(self.refine, |e| e.wants_refine());
+        encoder || !self.notes.0.is_empty()
     }
 
     /// 网络画像。
@@ -211,7 +269,10 @@ impl MediaSender {
     fn lost(&mut self, frame_id: u32) {
         // 最近一个关键帧之前的帧丢了没关系：接收端从那个关键帧开始就能解。
         if frame_id >= self.last_key {
-            self.encoder.on_lost(frame_id);
+            match self.encoder.as_mut() {
+                Some(encoder) => encoder.on_lost(frame_id),
+                None => self.notes.0.push(frame_id),
+            }
             self.stats.lost = self.stats.lost.saturating_add(1);
         }
     }
@@ -225,6 +286,18 @@ impl MediaSender {
         changed: bool,
         rtt_us: u64,
     ) -> Result<Vec<Outgoing>, Error> {
+        let job = self.start_frame(now, rtt_us);
+        let mut encoder = self.encoder.take().ok_or(Error::InvalidArgument(
+            "编码器不在这里：用 start_frame / finish_frame",
+        ))?;
+        let result = encode_job(encoder.as_mut(), &job, screen, changed);
+        self.encoder = Some(encoder);
+        let (encoded, refine) = result?;
+        self.finish_frame(now, &job, encoded, refine)
+    }
+
+    /// 开始一帧：判定超时丢失，分配帧号和字节预算，带上要交给编码器的通知。
+    pub fn start_frame(&mut self, now: Time, rtt_us: u64) -> FrameJob {
         self.rtt_us = rtt_us;
         // 过了截止时间的帧不再重传。
         while self
@@ -249,13 +322,31 @@ impl MediaSender {
             self.unacked.pop_front();
             self.lost(id);
         }
-        let frame_id = self.last_frame.wrapping_add(1).max(1);
-        let budget = self.rate.frame_budget(self.cfg.fps);
-        let Some(encoded) = self.encoder.encode(frame_id, screen, changed, budget)? else {
+        let (lost, feedback) = std::mem::take(&mut self.notes);
+        FrameJob {
+            frame_id: self.last_frame.wrapping_add(1).max(1),
+            budget: self.rate.frame_budget(self.cfg.fps),
+            lost,
+            feedback,
+        }
+    }
+
+    /// 完成一帧：把编码结果切成分片、加校验分片，返回要发出的数据报。
+    /// `refine` 是编码器报告的“画面不变时还要不要继续交画面”。
+    pub fn finish_frame(
+        &mut self,
+        now: Time,
+        job: &FrameJob,
+        encoded: Option<EncodedFrame>,
+        refine: bool,
+    ) -> Result<Vec<Outgoing>, Error> {
+        self.refine = refine;
+        let Some(encoded) = encoded else {
             return Ok(Vec::new());
         };
+        let frame_id = job.frame_id;
         // 关键帧参考自己；其余参考上一帧（视频编码的增量帧依赖它）。
-        let ref_frame = if encoded.key || self.encoder.codec() == Codec::Tile {
+        let ref_frame = if encoded.key || self.codec == Codec::Tile {
             frame_id
         } else {
             self.last_frame
@@ -340,7 +431,10 @@ impl MediaSender {
     /// 接收端的反馈。
     pub fn on_feedback(&mut self, now: Time, feedback: &Feedback) {
         self.rate.on_feedback(now, feedback);
-        self.encoder.on_feedback(feedback.floor, feedback.delivered);
+        match self.encoder.as_mut() {
+            Some(encoder) => encoder.on_feedback(feedback.floor, feedback.delivered),
+            None => self.notes.1 = Some((feedback.floor, feedback.delivered)),
+        }
         while let Some((id, _)) = self.unacked.front().copied() {
             if id > feedback.floor {
                 break;
@@ -863,5 +957,51 @@ mod tests {
             .unwrap()
             .is_empty());
         assert!(tx.on_feedback_datagram(Time(400_200), &[1]).is_err());
+    }
+
+    #[test]
+    fn detached_encoder_gives_the_same_packets_and_gets_the_notes() {
+        let mut local = MediaSender::new(cfg(), Box::new(FakeEncoder::default()));
+        let mut remote = MediaSender::detached(cfg(), Codec::H264);
+        let mut encoder = FakeEncoder::default();
+        assert_eq!(remote.codec(), Codec::H264);
+        assert!(
+            remote
+                .on_frame(Time::ZERO, &Screen::new(8, 8, 1), true, 0)
+                .is_err(),
+            "编码器不在这里"
+        );
+        for (i, color) in [1u32, 2, 3].into_iter().enumerate() {
+            let t = Time(u64::try_from(i).unwrap() * 33_000);
+            let screen = Screen::new(16, 16, color);
+            let a = local.on_frame(t, &screen, true, 10_000).unwrap();
+            let job = remote.start_frame(t, 10_000);
+            let (encoded, refine) = encode_job(&mut encoder, &job, &screen, true).unwrap();
+            let b = remote.finish_frame(t, &job, encoded, refine).unwrap();
+            assert_eq!(a, b, "两种用法发出的数据报一样");
+        }
+        // 判定丢失、收到确认：攒着，随下一个任务交给编码器
+        let fb = Feedback {
+            floor: 3,
+            delivered: 0b110,
+            queue_delay_us: 0,
+            loss_permille: 0,
+            recv_bytes_per_s: 0,
+        };
+        remote.on_feedback(Time(100_000), &fb);
+        assert!(remote.wants_frame(), "有丢失要恢复");
+        let job = remote.start_frame(Time(110_000), 10_000);
+        assert_eq!(
+            (job.lost.clone(), job.feedback),
+            (vec![3], Some((3, 0b110)))
+        );
+        let (encoded, refine) =
+            encode_job(&mut encoder, &job, &Screen::new(16, 16, 3), false).unwrap();
+        assert!(encoded.unwrap().key, "编码器收到了丢失通知，出关键帧");
+        assert!(remote
+            .finish_frame(Time(110_000), &job, None, refine)
+            .unwrap()
+            .is_empty());
+        assert!(!remote.wants_frame());
     }
 }

@@ -159,8 +159,12 @@ async fn relay_path_carries_the_session_and_is_metered() {
     let usage = relay.usage(&session).unwrap();
     assert!(usage.bytes > 3000, "{usage:?}");
     assert!(usage.packets > 4, "{usage:?}");
+    // 两次读取之间中继可能又转发了保活包、QUIC 确认：总量只会更多，不会更少。
     let (total, sessions, _) = relay.totals();
-    assert_eq!(total, usage);
+    assert!(
+        total.bytes >= usage.bytes && total.packets >= usage.packets,
+        "{total:?} {usage:?}"
+    );
     assert_eq!(sessions, 1);
     assert!(
         relay.take_records().is_empty(),

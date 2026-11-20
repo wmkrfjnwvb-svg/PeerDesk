@@ -9,12 +9,12 @@ use peerdesk_core::auth::{Auth, Limiter};
 use peerdesk_core::crypto::Suite;
 use peerdesk_core::file::FileMsg;
 use peerdesk_core::input::{InputEvent, InputReceiver, KeyState};
-use peerdesk_core::media::{MediaSender, SenderConfig};
+use peerdesk_core::media::{encode_job, FrameJob, MediaSender, SenderConfig};
 use peerdesk_core::proto::{Caps, Channel, Control, RejectReason};
 use peerdesk_core::screen::Screen;
 use peerdesk_core::session::{Session, SessionConfig, State};
 use peerdesk_core::trace::{Stage, TraceId, Tracer};
-use peerdesk_core::video::{TileEncoder, VideoEncoder};
+use peerdesk_core::video::{EncodedFrame, TileEncoder, VideoEncoder};
 use peerdesk_media::H264Encoder;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -158,6 +158,35 @@ pub(crate) fn control_reader(mut recv: quinn::RecvStream) -> mpsc::Receiver<Cont
     rx
 }
 
+/// 编码线程的任务：一帧任务、画面、画面是否变了。
+type EncodeJob = (FrameJob, Screen, bool);
+/// 编码线程交回的结果。
+type EncodeDone = (
+    FrameJob,
+    Result<(Option<EncodedFrame>, bool), peerdesk_core::Error>,
+);
+
+/// 启动编码线程。编码要好几毫秒到几十毫秒，放在会话循环里会让输入和反馈排队等它。
+/// 任务通道关闭（会话结束）时线程退出。
+fn spawn_encoder(
+    mut encoder: Box<dyn VideoEncoder>,
+) -> (
+    std::sync::mpsc::Sender<EncodeJob>,
+    mpsc::UnboundedReceiver<EncodeDone>,
+) {
+    let (jobs, job_rx) = std::sync::mpsc::channel::<EncodeJob>();
+    let (done_tx, done_rx) = mpsc::unbounded_channel();
+    std::thread::spawn(move || {
+        while let Ok((job, screen, changed)) = job_rx.recv() {
+            let result = encode_job(encoder.as_mut(), &job, &screen, changed);
+            if done_tx.send((job, result)).is_err() {
+                break;
+            }
+        }
+    });
+    (jobs, done_rx)
+}
+
 /// 在一条已建立的连接上运行被控端会话，直到任一方结束。
 #[allow(clippy::too_many_lines)]
 pub async fn serve(
@@ -253,7 +282,9 @@ pub async fn serve(
     } else {
         Box::new(TileEncoder::new())
     };
-    let mut media = MediaSender::new(
+    let codec = encoder.codec();
+    let (jobs, encoded_rx) = spawn_encoder(encoder);
+    let mut media = MediaSender::detached(
         SenderConfig {
             fps: opts.fps,
             start_bps: opts.start_bps,
@@ -263,11 +294,15 @@ pub async fn serve(
             deadline_us: FRAME_DEADLINE_US,
             max_payload: link.max_payload(),
         },
-        encoder,
+        codec,
     );
+    let mut encoded_rx = encoded_rx;
     // 判断画面变没变：来源会报告变化计数时用它；否则和上一幅比较。
     let mut last_seq: Option<u64> = None;
     let mut last_screen: Option<Screen> = None;
+    // 编码线程正在编一帧时不再派新的；这期间画面变了先记下，编完再编最新的那一幅（不排队）。
+    let mut encoding = false;
+    let mut pending_change = false;
 
     let end = loop {
         tokio::select! {
@@ -347,10 +382,39 @@ pub async fn serve(
                     | Control::AuthProof { .. },
                 ) => {}
             },
+            // 编码线程交回一帧：切片发出。
+            done = encoded_rx.recv() => {
+                encoding = false;
+                let (job, result) = match done {
+                    Some(done) => done,
+                    None => break "编码线程结束".to_owned(),
+                };
+                let out = match result.and_then(|(encoded, refine)| media.finish_frame(link.now(), &job, encoded, refine)) {
+                    Ok(out) => out,
+                    Err(e) => break e.to_string(),
+                };
+                if out.is_empty() {
+                    continue;
+                }
+                let sent = out
+                    .iter()
+                    .try_for_each(|o| link.send_flags(Channel::Video, o.flags, &o.body));
+                if let Err(e) = sent { break e.to_string(); }
+                tracer.record(link.now(), trace, Stage::FrameSent, u64::from(media.stats().frames));
+            }
             _ = ticker.tick() => {
                 // 先取变化计数再取画面：中间变了的话，下一帧会再编一次，不会漏。
                 let seq = source.change_seq();
                 let Some(screen) = source.capture() else {
+                    // 画面来源结束：正在编的那一帧编完发出去再结束。
+                    if encoding {
+                        if let Some((job, Ok((encoded, refine)))) = encoded_rx.recv().await {
+                            let out = media.finish_frame(link.now(), &job, encoded, refine).unwrap_or_default();
+                            for o in &out {
+                                let _ = link.send_flags(Channel::Video, o.flags, &o.body);
+                            }
+                        }
+                    }
                     break "画面来源结束".to_owned();
                 };
                 let changed = match seq {
@@ -363,22 +427,16 @@ pub async fn serve(
                         changed
                     }
                 };
-                if !changed && !media.wants_frame() {
+                pending_change |= changed;
+                if encoding || (!pending_change && !media.wants_frame()) {
                     continue;
                 }
                 let rtt = u64::try_from(link.rtt().as_micros()).unwrap_or(u64::MAX);
-                let out = match media.on_frame(link.now(), screen, changed, rtt) {
-                    Ok(out) => out,
-                    Err(e) => break e.to_string(),
-                };
-                if out.is_empty() {
-                    continue;
+                let job = media.start_frame(link.now(), rtt);
+                if jobs.send((job, screen.clone(), std::mem::take(&mut pending_change))).is_err() {
+                    break "编码线程结束".to_owned();
                 }
-                let sent = out
-                    .iter()
-                    .try_for_each(|o| link.send_flags(Channel::Video, o.flags, &o.body));
-                if let Err(e) = sent { break e.to_string(); }
-                tracer.record(link.now(), trace, Stage::FrameSent, u64::from(media.stats().frames));
+                encoding = true;
             }
         }
     };

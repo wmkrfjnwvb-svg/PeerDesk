@@ -175,7 +175,8 @@ async fn full_session_video_input_and_files() {
     // 这里只验证链路：内容对上了就行。CPU 很忙时（调试构建、并行测试）反馈会迟到，
     // 码率会被压低、画质跟着降，所以门槛放宽；画质由确定性的端到端测试（crates/e2e）把关。
     assert!(psnr > 20.0, "观看端画面与被控端对不上：{psnr:.1} dB");
-    assert!(host_report.frames_sent >= 20, "{}", host_report.frames_sent);
+    // 桌面变了 20 次；编码器忙时期间的变化合并成最新的一帧（不排队），所以帧数可能少于 20。
+    assert!(host_report.frames_sent >= 5, "{}", host_report.frames_sent);
     // 桌面静止后不再发帧：帧数远少于 1.5 秒 × 100 帧每秒
     // （机器很慢时个别帧会被判定超时而重发，所以留一些余量。）
     assert!(host_report.frames_sent < 60, "{}", host_report.frames_sent);
@@ -300,13 +301,15 @@ async fn host_ending_first_is_reported_to_controller() {
     .unwrap();
     let host_report = host_task.await.unwrap().unwrap();
     assert_eq!(host_report.end, "画面来源结束");
-    assert_eq!(host_report.frames_sent, 5);
-    // 被控端发完最后一帧就结束会话，还在路上的帧可能来不及送达。
+    // 编码线程忙时，期间的画面变化合并成最新的一帧（不排队），所以最多 5 帧。
     assert!(
-        (1..=5).contains(&report.frames_delivered),
+        (1..=5).contains(&host_report.frames_sent),
         "{}",
-        report.frames_delivered
+        host_report.frames_sent
     );
+    // 被控端发完最后一帧就结束会话：结束消息走可靠流，可能比还在路上的视频数据报先到，
+    // 所以送达几帧不确定；这个测试要的是控制端知道被控端结束了。
+    assert!(report.frames_delivered <= u64::from(host_report.frames_sent));
     assert!(report.files.is_empty());
 }
 
