@@ -14,7 +14,9 @@ use openh264::encoder::{
     BitRate, Complexity, Encoder, EncoderConfig, FrameRate, FrameType, IntraFramePeriod, Level,
     QpRange, RateControlMode, UsageType,
 };
-use openh264::formats::{ArgbSliceU32, YUVBuffer, YUVSource};
+use openh264::formats::{YUVSlices, YUVSource};
+
+mod color;
 use openh264::OpenH264API;
 use peerdesk_core::error::Error;
 use peerdesk_core::screen::Screen;
@@ -67,6 +69,8 @@ pub struct H264Encoder {
     refine_left: u8,
     /// 画面连续没变的帧数：够了 [`Self::refine_after`] 才开始补清晰。
     still: u32,
+    /// 转换好的 Y、U、V 平面，每帧复用。
+    planes: (Vec<u8>, Vec<u8>, Vec<u8>),
 }
 
 impl std::fmt::Debug for H264Encoder {
@@ -98,6 +102,7 @@ impl H264Encoder {
             force_key: false,
             refine_left: 0,
             still: 0,
+            planes: (Vec::new(), Vec::new(), Vec::new()),
         }
     }
 
@@ -208,7 +213,18 @@ impl VideoEncoder for H264Encoder {
             enc.force_intra_frame();
         }
         let (w, h, pixels) = even_pixels(screen);
-        let yuv = YUVBuffer::from_rgb_source(ArgbSliceU32::new(&pixels, (w, h)));
+        color::rgb_to_i420(
+            &pixels,
+            w,
+            &mut self.planes.0,
+            &mut self.planes.1,
+            &mut self.planes.2,
+        );
+        let yuv = YUVSlices::new(
+            (&self.planes.0, &self.planes.1, &self.planes.2),
+            (w, h),
+            (w, w / 2, w / 2),
+        );
         let stream = enc.encode(&yuv).map_err(codec_error("H.264 编码失败"))?;
         let key = matches!(stream.frame_type(), FrameType::IDR | FrameType::I);
         let data = stream.to_vec();
@@ -295,10 +311,7 @@ impl VideoDecoder for H264Decoder {
                 .rgb
                 .get(y * dw * 3..(y * dw + w) * 3)
                 .unwrap_or_default();
-            pixels.extend(
-                row.chunks_exact(3)
-                    .map(|p| p.iter().fold(0u32, |acc, c| acc << 8 | u32::from(*c))),
-            );
+            color::pack_rgb(row, &mut pixels);
         }
         self.screen = Some(Screen::from_pixels(header.width, header.height, pixels)?);
         Ok(self.screen.as_ref())

@@ -49,6 +49,10 @@ cast_possible_wrap = "deny"
 [profile.dev.package."*"]
 opt-level = 2
 
+# 媒体模块是纯计算（颜色转换、像素打包），不优化时 720p 一帧要几十毫秒，会话测试会被它拖垮。
+[profile.dev.package.peerdesk-media]
+opt-level = 2
+
 # 体积优先的发布配置。
 [profile.release]
 opt-level = "z"
