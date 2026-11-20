@@ -26,6 +26,25 @@ impl Screen {
         }
     }
 
+    /// 用现成的像素创建。像素数必须等于宽乘高；每个像素只取低 24 位。
+    pub fn from_pixels(
+        width: u16,
+        height: u16,
+        mut pixels: Vec<u32>,
+    ) -> Result<Self, crate::Error> {
+        if pixels.len() != usize::from(width) * usize::from(height) {
+            return Err(crate::Error::Inconsistent("像素数与画面尺寸不符"));
+        }
+        for p in &mut pixels {
+            *p &= 0x00ff_ffff;
+        }
+        Ok(Self {
+            width,
+            height,
+            pixels,
+        })
+    }
+
     /// 宽度（像素）。
     #[must_use]
     pub const fn width(&self) -> u16 {

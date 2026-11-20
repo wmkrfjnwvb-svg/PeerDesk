@@ -1,0 +1,45 @@
+[package]
+name = "peerdesk-media"
+description = "PeerDesk 视频编解码：H.264（OpenH264），以后加硬件编码和 AV1"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+peerdesk-core.workspace = true
+openh264 = { version = "0.9.10", default-features = false }
+openh264-sys2 = { version = "0.9.10", default-features = false }
+
+[features]
+# 从源码编译 OpenH264（开发、测试、CI）。发布版改为运行时加载 Cisco 官方的二进制（以后加 `libloading`）。
+default = ["source"]
+source = ["openh264/source", "openh264-sys2/source"]
+
+# 与工作区相同的检查；只有改码率要调 OpenH264 的底层接口，所以 unsafe 从 forbid 放宽为 deny，
+# 只在那一个函数里放开。
+[lints.rust]
+unsafe_code = "deny"
+unreachable_patterns = "deny"
+unused_must_use = "deny"
+unused_results = "allow"
+missing_debug_implementations = "deny"
+trivial_casts = "deny"
+unused_qualifications = "deny"
+
+[lints.clippy]
+wildcard_enum_match_arm = "deny"
+match_wildcard_for_single_variants = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+cast_possible_truncation = "deny"
+cast_sign_loss = "deny"
+cast_possible_wrap = "deny"

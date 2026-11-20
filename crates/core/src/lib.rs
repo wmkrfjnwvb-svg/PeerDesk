@@ -39,6 +39,7 @@ pub mod sim;
 pub mod time;
 pub mod trace;
 pub mod transport;
+pub mod video;
 pub mod wire;
 
 pub use error::Error;
