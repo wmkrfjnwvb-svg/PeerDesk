@@ -14,7 +14,7 @@ use peerdesk_core::input::InputEvent;
 use peerdesk_core::proto::Caps;
 use peerdesk_core::session::SessionConfig;
 use peerdesk_net::controller::{self, ControllerOptions, Upload};
-use peerdesk_net::demo::{to_bmp, CountSink, DemoDesktop};
+use peerdesk_net::demo::{to_bmp, CountSink};
 use peerdesk_net::fs_store::scan;
 use peerdesk_net::host::{self, HostOptions, InputSink, Permissions};
 use peerdesk_net::identity::{parse_hex, to_hex};
@@ -22,7 +22,9 @@ use peerdesk_net::rendezvous::{
     answer, dial, register, Incoming, Path as PathKind, PathPolicy, Registration, Server,
 };
 use peerdesk_net::{bench, Fingerprint, Identity, NetError, Node};
+use peerdesk_platform::CaptureOptions;
 
+use crate::source::{Opener, SourceKind, Sources};
 use crate::{parse_number, usage_error, EXIT_FAILED, EXIT_OK};
 
 /// 默认的数据目录：优先用系统的每用户配置目录。
@@ -112,6 +114,8 @@ struct HostArgs {
     trusted: Vec<Fingerprint>,
     open: bool,
     permissions: Permissions,
+    source: SourceKind,
+    display: usize,
 }
 
 /// 密码从环境变量读，避免出现在进程列表和命令历史里；`--password` 仅为方便测试。
@@ -133,6 +137,8 @@ fn parse_host(args: &[String]) -> Result<HostArgs, String> {
         trusted: Vec::new(),
         open: false,
         permissions: Permissions::default(),
+        source: SourceKind::Auto,
+        display: 0,
     };
     let (mut server, mut server_pin) = (None, None);
     let mut it = args.iter();
@@ -154,6 +160,8 @@ fn parse_host(args: &[String]) -> Result<HostArgs, String> {
             "--open" => parsed.open = true,
             "--no-input" => parsed.permissions.input = false,
             "--no-files" => parsed.permissions.files = false,
+            "--source" => parsed.source = SourceKind::parse(it.next())?,
+            "--display" => parsed.display = parse_number(flag, it.next())?,
             other => return Err(format!("未知选项：{other}")),
         }
     }
@@ -234,6 +242,13 @@ async fn host_async(args: HostArgs, out: &mut dyn Write) -> Result<u8, NetError>
         tokio::spawn(stay_registered(Arc::clone(&node), server, registration));
     }
     let limiter = Arc::new(Mutex::new(Limiter::default()));
+    let capture = CaptureOptions {
+        display: args.display,
+        max_fps: args.fps,
+    };
+    let sources =
+        Sources::choose(args.source, capture, Opener::SYSTEM, out).map_err(NetError::Io)?;
+    let _ = writeln!(out, "画面来源：{}", sources.describe());
     let _ = out.flush();
 
     while let Some(incoming) = node.accept().await {
@@ -252,6 +267,7 @@ async fn host_async(args: HostArgs, out: &mut dyn Write) -> Result<u8, NetError>
         );
         let _ = out.flush();
         let inputs = Arc::new(AtomicU64::new(0));
+        let (source, sink) = sources.open(Box::new(CountInput(Arc::clone(&inputs))), out);
         let result = host::serve(
             link,
             HostOptions {
@@ -264,8 +280,8 @@ async fn host_async(args: HostArgs, out: &mut dyn Write) -> Result<u8, NetError>
                     recv_root.clone(),
                 )
             },
-            Box::new(DemoDesktop::new(1280, 720, 1)),
-            Box::new(CountInput(Arc::clone(&inputs))),
+            source,
+            sink,
         )
         .await;
         match result {
@@ -637,6 +653,8 @@ mod tests {
             "100",
             "--once",
             "--open",
+            "--source",
+            "demo",
         ]);
         let host_thread = std::thread::spawn(move || crate::run(&host_args, &mut writer));
         let addr = host_out.wait_for("监听");
@@ -707,6 +725,8 @@ mod tests {
             host_dir.join("in").to_str().unwrap(),
             "--once",
             "--open",
+            "--source",
+            "demo",
         ]);
         let host_thread = std::thread::spawn(move || crate::run(&host_args, &mut writer));
         let addr = host_out.wait_for("监听");
@@ -758,6 +778,8 @@ mod tests {
             "--data-dir",
             dir.to_str().unwrap(),
             "--once",
+            "--source",
+            "demo",
         ]);
         args.extend(strings(extra));
         let thread = std::thread::spawn(move || crate::run(&args, &mut writer));
@@ -903,6 +925,10 @@ mod tests {
             vec!["host", "--recv-dir"],
             vec!["host", "--fps", "0"],
             vec!["host", "--fps", "999"],
+            vec!["host", "--source"],
+            vec!["host", "--source", "camera"],
+            vec!["host", "--display"],
+            vec!["host", "--display", "x"],
             vec!["connect"],
             vec!["connect", "nope"],
             vec!["connect", "127.0.0.1:1", "--pin"],
@@ -1199,6 +1225,31 @@ mod tests {
         let (code, text) = run(&["host", "--listen", &addr, "--data-dir", d, "--open"]);
         assert_eq!(code, EXIT_FAILED);
         assert!(text.contains("绑定"), "{text}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 指定了 `--source screen` 而屏幕打不开：报错退出；没有指定时改用演示桌面并提示。
+    #[test]
+    fn screen_source_falls_back_to_demo_only_when_not_requested() {
+        let dir = temp_dir("source");
+        let d = dir.to_str().unwrap();
+        let base = ["host", "--listen", "127.0.0.1:0", "--data-dir", d, "--open"];
+        let mut explicit = base.to_vec();
+        explicit.extend(["--source", "screen", "--display", "999"]);
+        let (code, text) = run(&explicit);
+        assert_eq!(code, EXIT_FAILED);
+        assert!(text.contains("无法采集屏幕"), "{text}");
+
+        // 没有指定来源：被控端照常启动，提供演示桌面（没人连接，线程留在后台等待，测试结束时随进程退出）
+        let out = Shared::default();
+        let mut writer = out.clone();
+        let mut args = strings(&base);
+        args.extend(strings(&["--display", "999", "--once"]));
+        let host = std::thread::spawn(move || crate::run(&args, &mut writer));
+        let text = out.wait_for("画面来源：");
+        assert_eq!(text, "演示桌面");
+        assert!(out.text().contains("警告：无法采集屏幕"));
+        drop(host);
         let _ = std::fs::remove_dir_all(dir);
     }
 

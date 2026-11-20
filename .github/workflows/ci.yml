@@ -64,6 +64,49 @@ jobs:
             target/release/peerdesk-server.exe
           if-no-files-found: ignore
 
+  # 平台层实机测试：在三个系统的桌面上真的采集画面、注入键鼠（crates/platform/tests/live.rs），
+  # 再用发布版跑一次 screen-check 量采集耗时、保存画面。
+  # Linux 用 Xvfb；Windows 用 CI 机器的交互桌面；macOS 的 CI 机器可能没有“屏幕录制”权限，
+  # 这时测试打印说明后跳过，screen-check 报告缺少权限但不算失败（能不能采集本身就是要知道的信息）。
+  platform-live:
+    name: platform live (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: Start a virtual X11 display
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq xvfb xterm
+          Xvfb :99 -screen 0 1920x1080x24 &
+          echo "DISPLAY=:99" >> "$GITHUB_ENV"
+          sleep 2
+      - name: Live tests
+        run: cargo test -p peerdesk-platform --test live -- --ignored --test-threads 1 --nocapture
+      - name: screen-check (release build)
+        shell: bash
+        run: |
+          cargo build --release -p peerdesk
+          set +e
+          ./target/release/peerdesk screen-check --out screen.bmp | tee check.txt
+          code=${PIPESTATUS[0]}
+          if [ "$code" -ne 0 ] && [ "$RUNNER_OS" = "macOS" ] && grep -q "权限" check.txt; then
+            echo "::notice title=macOS 没有屏幕录制权限::这台 CI 机器没有授予屏幕录制权限，无法采集画面（不算失败）"
+            exit 0
+          fi
+          exit "$code"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: screen-check-${{ matrix.os }}
+          path: screen.bmp
+          if-no-files-found: ignore
+
   # 探测各系统的 CI 机器能不能截屏：决定屏幕采集的代码能否在 CI 里测。
   # 这个任务失败不算整体失败。
   screen-probe:

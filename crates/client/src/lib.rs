@@ -5,6 +5,8 @@
 use std::io::Write;
 
 mod remote;
+mod screen_check;
+mod source;
 
 use peerdesk_core::config::ClientConfig;
 use peerdesk_core::crypto::{Policy, Suite};
@@ -34,6 +36,7 @@ const USAGE: &str = "\
   connect --server <地址> --device <指纹> [选项]
                           通过服务器找到被控端：先试直连（打洞），不通再走中继
   bench-transport         对比裸 UDP 和 QUIC 数据报在本机回环上的延迟
+  screen-check [选项]     采集一帧本机屏幕，报告尺寸和耗时
   help                    显示本帮助
 
 host 的选项：
@@ -43,6 +46,9 @@ host 的选项：
   --data-dir <目录>       保存设备身份的目录
   --recv-dir <目录>       收到的文件放在哪里（默认 数据目录/received）
   --fps <N>               帧率（默认 60）
+  --source <来源>         screen：采集本机屏幕并接受键鼠控制；demo：合成的演示桌面，不碰本机键鼠。
+                          默认先试 screen，打不开时改用 demo 并给出警告
+  --display <N>           采集第几个显示器（默认 0，主显示器）
   --once                  服务完一次会话后退出
   --trust <指纹>          这台设备不需要密码就能控制（可重复）
   --open                  不要密码，任何人都能连（只应在受信任的内网使用）
@@ -65,8 +71,12 @@ connect 的选项：
   被控端需要密码时，通过环境变量 PEERDESK_PASSWORD 提供。
 
 加密套件由配置决定；host 和 connect 目前使用推荐预设。
-屏幕采集和窗口显示尚未接入：被控端现在提供的是一个合成的演示桌面（打字、拖窗口、滚动、视频），
-走的是真实的编码、传输和解码。
+被控端默认采集本机屏幕（Windows、macOS、Linux X11；Wayland 暂不支持），也可以用 --source demo
+提供一个合成的演示桌面（打字、拖窗口、滚动、视频），走的是同样的编码、传输和解码。
+
+screen-check 的选项：
+  --out <文件.bmp>        把采集到的画面存成图片
+  --display <N>           采集第几个显示器（默认 0）
 
 sim 的选项：
   --seed <N>              随机种子（默认 1），同一种子结果完全相同
@@ -260,6 +270,7 @@ pub fn run(args: &[String], out: &mut dyn Write) -> u8 {
         "host" => return remote::host(rest, out),
         "connect" => return remote::connect(rest, out),
         "bench-transport" => return remote::bench(rest, out),
+        "screen-check" => return screen_check::screen_check(rest, out),
         "check-config" => cmd_check_config(rest, out),
         other => Ok(usage_error(out, &format!("未知命令：{other}"))),
     };

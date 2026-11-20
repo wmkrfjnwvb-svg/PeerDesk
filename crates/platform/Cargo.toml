@@ -1,0 +1,90 @@
+[package]
+name = "peerdesk-platform"
+description = "PeerDesk 平台层：真实的屏幕采集与键鼠注入（Windows、macOS、Linux X11）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+peerdesk-core.workspace = true
+peerdesk-net.workspace = true
+
+# Linux：X11（MIT-SHM 采集、DAMAGE 变化检测、XTEST 注入）。x11rb 是纯 Rust 的 X11 协议实现，
+# 不依赖 libX11/libxcb；libc 只用于共享内存（memfd + mmap）和等待连接可读（poll）。
+[target.'cfg(target_os = "linux")'.dependencies]
+x11rb = { version = "0.13", features = ["shm", "damage", "xfixes", "randr", "xtest"] }
+libc = "0.2"
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# 实机测试（tests/live.rs）在 X 服务器上画一个已知颜色的窗口
+x11rb = "0.13"
+
+# Windows：DXGI 桌面复制采集（还没有画面时用 GDI），SendInput 注入。
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Direct3D",
+  "Win32_Graphics_Direct3D11",
+  "Win32_Graphics_Dxgi",
+  "Win32_Graphics_Dxgi_Common",
+  "Win32_Graphics_Gdi",
+  "Win32_UI_HiDpi",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_WindowsAndMessaging",
+] }
+
+# macOS：ScreenCaptureKit 采集，CGEvent 注入。框架绑定的默认 feature 会编译整个框架，只打开用到的部分。
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+block2 = "0.6"
+dispatch2 = "0.3"
+objc2-foundation = { version = "0.3", default-features = false, features = [
+  "std", "NSArray", "NSDictionary", "NSError", "NSObject", "NSString", "NSValue",
+] }
+objc2-core-foundation = { version = "0.3", default-features = false, features = [
+  "std", "CFArray", "CFBase", "CFCGTypes", "CFDictionary", "CFNumber", "CFString",
+] }
+objc2-core-graphics = { version = "0.3", default-features = false, features = [
+  "std", "CGDirectDisplay", "CGDisplayConfiguration", "CGError", "CGEvent", "CGEventSource",
+  "CGEventTypes", "CGGeometry", "CGRemoteOperation", "CGWindow", "libc",
+] }
+objc2-core-media = { version = "0.3", default-features = false, features = [
+  "std", "CMBase", "CMSampleBuffer", "CMTime", "objc2-core-video",
+] }
+objc2-core-video = { version = "0.3", default-features = false, features = [
+  "std", "CVBase", "CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVReturn",
+] }
+objc2-screen-capture-kit = { version = "0.3", default-features = false, features = [
+  "std", "SCShareableContent", "SCStream", "block2", "dispatch2", "objc2-core-foundation",
+  "objc2-core-graphics", "objc2-core-media",
+] }
+
+# 工作区的检查规则，只有 unsafe_code 从 forbid 放宽到 deny：调用系统接口离不开 unsafe，
+# 只在 x11.rs、windows.rs、macos.rs 三个系统胶水模块里用 #![allow(unsafe_code)] 打开。
+# Cargo 不允许在 `workspace = true` 的基础上单独改一项，所以这里完整抄了一份，改动时两边同步。
+[lints.rust]
+unsafe_code = "deny"
+unreachable_patterns = "deny"
+unused_must_use = "deny"
+unused_results = "allow"
+missing_debug_implementations = "deny"
+trivial_casts = "deny"
+unused_qualifications = "deny"
+
+[lints.clippy]
+wildcard_enum_match_arm = "deny"
+match_wildcard_for_single_variants = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+cast_possible_truncation = "deny"
+cast_sign_loss = "deny"
+cast_possible_wrap = "deny"

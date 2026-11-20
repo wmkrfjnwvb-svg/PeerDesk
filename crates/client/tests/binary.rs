@@ -77,7 +77,15 @@ fn session_through_server(tag: &str, extra: &[&str]) -> (String, String) {
     );
 
     let mut host = Command::new(BIN)
-        .args(["host", "--listen", "127.0.0.1:0", "--open", "--once"])
+        .args([
+            "host",
+            "--listen",
+            "127.0.0.1:0",
+            "--open",
+            "--once",
+            "--source",
+            "demo",
+        ])
         .args(["--server", &addr, "--server-pin", &server_pin])
         .arg("--data-dir")
         .arg(&host_dir)
