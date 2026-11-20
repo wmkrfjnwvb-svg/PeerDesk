@@ -35,7 +35,16 @@ const FILE_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// 画面来源。屏幕采集实现这个接口；测试和演示用合成桌面。
 pub trait ScreenSource: Send {
     /// 取当前画面。返回 `None` 表示没有更多画面，会话结束。
+    ///
+    /// 真实采集应当在自己的线程里进行，这里只交出最新的一幅，不能阻塞：
+    /// 会话循环同时在处理输入，阻塞会让操作变卡。
     fn capture(&mut self) -> Option<&Screen>;
+
+    /// 画面内容的变化计数：内容每变一次加一。没变时会话直接跳过编码，省下整屏比较的 CPU。
+    /// 返回 `None` 表示来源不知道（合成画面、测试），会话每次都自己比较。
+    fn change_seq(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// 起始码率：没有历史数据时从这里起步。
