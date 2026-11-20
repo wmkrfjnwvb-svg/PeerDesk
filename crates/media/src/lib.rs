@@ -479,4 +479,32 @@ mod tests {
         }
         assert!(n < u32::from(REFINE_FRAMES), "补了 {n} 帧");
     }
+
+    /// 720p 连续编码几帧：不能卡住，也不能 panic。在单独的线程里跑，10 秒没结束就判失败，
+    /// 这样卡死和崩溃都能在 CI 上明确地报出来，而不是让会话测试莫名超时。
+    #[test]
+    fn hd_frames_encode_without_hanging() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut enc = H264Encoder::new(60);
+            let mut dec = H264Decoder::new().unwrap();
+            let start = std::time::Instant::now();
+            let mut sizes = Vec::new();
+            for id in 1..=6u32 {
+                let mut screen = picture(1280, 720);
+                screen.fill(0, 0, 40 * u16::try_from(id).unwrap(), 40, 0x00ff_0000);
+                let f = enc.encode(id, &screen, true, 200_000).unwrap().unwrap();
+                decode(&mut dec, &f).unwrap();
+                sizes.push(f.payload.len());
+            }
+            tx.send((start.elapsed(), sizes)).unwrap();
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok((took, sizes)) => assert!(sizes.iter().all(|s| *s > 0), "{took:?} {sizes:?}"),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("720p 编码 10 秒没有结束：卡住了")
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => panic!("编码线程 panic 了"),
+        }
+    }
 }
