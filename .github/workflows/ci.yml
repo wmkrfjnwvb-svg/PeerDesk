@@ -1,7 +1,8 @@
 name: CI
 # 省着用：每次推送只在 Linux 上跑 lint、覆盖率门槛（含全部测试）和端到端测试。
 # Windows / macOS 的测试、平台实机测试、界面截图、安装包按需触发：
-# - 提交信息里写 [full]：全部平台的测试；写 [pkg]：打安装包（两个可以一起写）；
+# - 提交信息里写 [mac] 或 [win]：只跑那个平台的测试和实机测试；[full]：全部平台加界面截图；
+#   [pkg]：打安装包。可以组合，例如 [mac][pkg]。先在一个平台上验证，过了再跑其他平台；
 # - 在 Actions 页面手动运行（Run workflow），选择范围：full / macos-tests / windows-tests / packages。
 on:
   push:
@@ -47,11 +48,11 @@ jobs:
   # Windows / macOS 跑全部测试和发布构建的冒烟测试（Linux 的测试已经在覆盖率任务里跑过）。按需触发。
   platforms:
     name: test + release (${{ matrix.os }})
-    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.scope != 'packages') || contains(github.event.head_commit.message, '[full]') }}
+    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.scope != 'packages') || contains(github.event.head_commit.message, '[full]') || contains(github.event.head_commit.message, '[mac]') || contains(github.event.head_commit.message, '[win]') }}
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ fromJSON(inputs.scope == 'macos-tests' && '["macos-latest"]' || inputs.scope == 'windows-tests' && '["windows-latest"]' || '["windows-latest","macos-latest"]') }}
+        os: ${{ fromJSON(inputs.scope == 'macos-tests' && '["macos-latest"]' || inputs.scope == 'windows-tests' && '["windows-latest"]' || (!contains(github.event.head_commit.message, '[full]') && contains(github.event.head_commit.message, '[mac]') && !contains(github.event.head_commit.message, '[win]')) && '["macos-latest"]' || (!contains(github.event.head_commit.message, '[full]') && contains(github.event.head_commit.message, '[win]') && !contains(github.event.head_commit.message, '[mac]')) && '["windows-latest"]' || '["windows-latest","macos-latest"]') }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -113,11 +114,11 @@ jobs:
   # 这时测试打印说明后跳过，screen-check 报告缺少权限但不算失败（能不能采集本身就是要知道的信息）。
   platform-live:
     name: platform live (${{ matrix.os }})
-    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.scope == 'full') || contains(github.event.head_commit.message, '[full]') }}
+    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.scope != 'packages') || contains(github.event.head_commit.message, '[full]') || contains(github.event.head_commit.message, '[mac]') || contains(github.event.head_commit.message, '[win]') }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: ${{ fromJSON(inputs.scope == 'macos-tests' && '["macos-latest"]' || inputs.scope == 'windows-tests' && '["windows-latest"]' || (!contains(github.event.head_commit.message, '[full]') && contains(github.event.head_commit.message, '[mac]') && !contains(github.event.head_commit.message, '[win]')) && '["macos-latest"]' || (!contains(github.event.head_commit.message, '[full]') && contains(github.event.head_commit.message, '[win]') && !contains(github.event.head_commit.message, '[mac]')) && '["windows-latest"]' || '["ubuntu-latest","windows-latest","macos-latest"]') }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
