@@ -178,11 +178,11 @@ impl VideoEncoder for TileEncoder {
         // 尺寸变了（或第一帧）：换一个新的编码器，从整屏开始。
         let fresh = self.inner.as_ref().is_none_or(|(w, h, _)| (*w, *h) != size);
         if fresh {
-            self.inner = Some((size.0, size.1, codec::Encoder::new(size.0, size.1)));
+            self.inner = None;
         }
-        let Some((_, _, enc)) = self.inner.as_mut() else {
-            return Ok(None);
-        };
+        let (_, _, enc) = self
+            .inner
+            .get_or_insert_with(|| (size.0, size.1, codec::Encoder::new(size.0, size.1)));
         let header = FrameHeader {
             codec: Codec::Tile,
             key: fresh,
@@ -236,11 +236,11 @@ impl VideoDecoder for TileDecoder {
             (d.screen().width(), d.screen().height()) == (header.width, header.height)
         });
         if !size_ok {
-            self.inner = Some(codec::Decoder::new(header.width, header.height));
+            self.inner = None;
         }
-        let Some(dec) = self.inner.as_mut() else {
-            return Ok(None);
-        };
+        let dec = self
+            .inner
+            .get_or_insert_with(|| codec::Decoder::new(header.width, header.height));
         dec.apply(data)?;
         Ok(Some(dec.screen()))
     }

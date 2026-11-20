@@ -126,7 +126,7 @@ impl H264Encoder {
     }
 
     /// 按每帧预算设码率。变化不到一成时不动，避免频繁调整。
-    fn set_budget(&mut self, budget: usize) {
+    fn set_budget(&mut self, enc: &mut Encoder, budget: usize) {
         let bps = u64::try_from(budget)
             .unwrap_or(u64::MAX)
             .saturating_mul(8)
@@ -136,10 +136,8 @@ impl H264Encoder {
         if !changed {
             return;
         }
-        if let Some((_, _, enc)) = self.inner.as_mut() {
-            if set_bitrate(enc, bps) {
-                self.bps = bps;
-            }
+        if set_bitrate(enc, bps) {
+            self.bps = bps;
         }
     }
 }
@@ -179,15 +177,17 @@ impl VideoEncoder for H264Encoder {
         if !fresh && !changed && !self.force_key && self.refine_left == 0 {
             return Ok(None);
         }
-        if fresh {
-            self.inner = Some((size.0, size.1, self.open()?));
-            // 新编码器按上限打开：第一帧编完才能调码率。
-            self.bps = 0;
-        } else {
-            self.set_budget(budget);
-        }
-        let Some((_, _, enc)) = self.inner.as_mut() else {
-            return Ok(None);
+        // 编码器先拿出来用，编完放回去；编码出错时丢掉，下一帧重新打开（从关键帧开始）。
+        let mut enc = match self.inner.take() {
+            Some((_, _, mut enc)) if !fresh => {
+                self.set_budget(&mut enc, budget);
+                enc
+            }
+            Some(_) | None => {
+                // 新编码器按上限打开：第一帧编完才能调码率。
+                self.bps = 0;
+                self.open()?
+            }
         };
         if self.force_key && !fresh {
             enc.force_intra_frame();
@@ -199,8 +199,9 @@ impl VideoEncoder for H264Encoder {
         let data = stream.to_vec();
         self.force_key = false;
         if fresh {
-            self.set_budget(budget);
+            self.set_budget(&mut enc, budget);
         }
+        self.inner = Some((size.0, size.1, enc));
         // 画面在变：之后要补清晰；没变：这是补清晰的一帧。
         self.refine_left = if changed || fresh || key {
             REFINE_FRAMES
@@ -209,9 +210,6 @@ impl VideoEncoder for H264Encoder {
         } else {
             self.refine_left.saturating_sub(1)
         };
-        if data.is_empty() {
-            return Ok(None);
-        }
         let header = FrameHeader {
             codec: Codec::H264,
             key,
@@ -420,8 +418,9 @@ mod tests {
             width: 64,
             height: 48,
         };
-        // 不是 H.264：解码器不出画面或报错，都不能崩
+        // 不是 H.264、空的：解码器不出画面或报错，都不能崩
         let _ = dec.decode(&header, &[0, 0, 0, 1, 0xff, 0xff, 0xff]);
+        assert!(dec.decode(&header, &[]).is_ok_and(|s| s.is_none()));
         // 帧头说的尺寸比码流大
         let mut enc = H264Encoder::new(30);
         let f = enc
@@ -435,17 +434,25 @@ mod tests {
     #[test]
     fn budget_changes_reach_the_encoder() {
         let mut enc = H264Encoder::with_max_bps(30, 1_000_000);
-        enc.set_budget(1000);
-        assert_eq!(enc.bps, 0, "还没有编码器：不记");
         let _ = enc.encode(1, &picture(64, 64), true, 1000).unwrap();
         assert_eq!(enc.bps, 240_000, "第一帧编完按预算调下来");
-        enc.set_budget(1050); // 变化不到一成：不动
+        let (w, h, mut inner) = enc.inner.take().unwrap();
+        enc.set_budget(&mut inner, 1050); // 变化不到一成：不动
         assert_eq!(enc.bps, 240_000);
-        enc.set_budget(3000); // 往上调也要生效
+        enc.set_budget(&mut inner, 3000); // 往上调也要生效
         assert_eq!(enc.bps, 720_000);
-        enc.set_budget(usize::MAX); // 不超过上限
+        enc.set_budget(&mut inner, usize::MAX); // 不超过上限
         assert_eq!(enc.bps, 1_000_000);
-        enc.set_budget(0);
+        enc.set_budget(&mut inner, 0);
         assert_eq!(enc.bps, MIN_BPS);
+        enc.inner = Some((w, h, inner));
+        // 简单画面静止后补清晰的帧很小：提前停
+        let plain = Screen::new(64, 64, 0x0012_3456);
+        let _ = enc.encode(2, &plain, true, 10_000).unwrap();
+        let mut n = 0;
+        while enc.encode(3 + n, &plain, false, 10_000).unwrap().is_some() {
+            n += 1;
+        }
+        assert!(n < u32::from(REFINE_FRAMES), "补了 {n} 帧");
     }
 }

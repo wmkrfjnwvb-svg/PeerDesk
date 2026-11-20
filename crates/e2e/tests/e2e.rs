@@ -1,0 +1,171 @@
+//! 端到端场景。每个场景把截图、JSON 和表格写进 `target/e2e/`，CI 把这个目录作为构建产物上传，
+//! 并把表格贴到运行摘要里。
+//!
+//! 用 release 跑：`cargo test --release -p peerdesk-e2e -- --nocapture`。
+
+#![allow(clippy::unwrap_used, clippy::print_stdout, clippy::indexing_slicing)]
+
+use std::path::PathBuf;
+
+use peerdesk_core::adaptive::Profile;
+use peerdesk_core::sim::Link;
+use peerdesk_e2e::report::{markdown, save, TABLE_HEADER};
+use peerdesk_e2e::{run, Action, CodecKind, Outcome, Phase, Scenario};
+
+fn out_dir() -> PathBuf {
+    std::env::var_os("PEERDESK_E2E_OUT").map_or_else(
+        || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/e2e"),
+        PathBuf::from,
+    )
+}
+
+fn phase(action: Action, frames: u32) -> Phase {
+    Phase { action, frames }
+}
+
+/// 一段典型的办公操作，每段操作后停一秒。
+fn office() -> Vec<Phase> {
+    vec![
+        phase(Action::Idle, 30),
+        phase(Action::Typing, 90),
+        phase(Action::Idle, 30),
+        phase(Action::Scrolling, 60),
+        phase(Action::Idle, 30),
+        phase(Action::Dragging, 60),
+        phase(Action::Idle, 30),
+        phase(Action::Switching, 15),
+        phase(Action::Idle, 30),
+        phase(Action::Video, 90),
+        phase(Action::Idle, 30),
+    ]
+}
+
+/// 体验门槛：现在只报告、不让测试失败，写进 `target/e2e/gates.md`。
+/// 传输算法 v1 完成后改成硬门槛。
+fn soft_gate(o: &Outcome, what: &str, ok: bool, detail: &str) {
+    use std::io::Write as _;
+    let line = format!(
+        "| {} | {} | {what} | {} | {detail} |\n",
+        o.name,
+        o.codec.name(),
+        if ok { "达标" } else { "**未达标**" }
+    );
+    print!("{line}");
+    std::fs::create_dir_all(out_dir()).unwrap();
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(out_dir().join("gates.md"))
+        .unwrap();
+    f.write_all(line.as_bytes()).unwrap();
+}
+
+/// 所有场景共同的门槛。
+fn gates(o: &Outcome) {
+    // 硬门槛：任何时候都不能把解不了的帧交给解码器（花屏）。
+    assert_eq!(o.bad, 0, "{} {}: 有帧解码失败", o.name, o.codec.name());
+    soft_gate(
+        o,
+        "没有超过 1 秒的冻结",
+        o.max_wait_ms < 1000.0,
+        &format!("最长等待 {:.0} ms", o.max_wait_ms),
+    );
+    let idle: Vec<_> = o
+        .phases
+        .iter()
+        .filter(|p| p.action == Action::Idle)
+        .skip(1)
+        .collect();
+    let slow = idle
+        .iter()
+        .filter(|p| p.sharp_ms.is_none_or(|t| t > 500.0))
+        .count();
+    soft_gate(
+        o,
+        "停下后 0.5 秒内清晰",
+        slow == 0,
+        &format!("{slow}/{} 次没做到", idle.len()),
+    );
+}
+
+fn finish(o: &Outcome) {
+    save(&out_dir(), o).unwrap();
+    gates(o);
+    println!("\n{TABLE_HEADER}{}", markdown(o));
+    println!(
+        "keyframes {}, recoveries {}, skipped {}, bad {}, net lost {}, queue dropped {}",
+        o.keyframes, o.recoveries, o.skipped, o.bad, o.net.lost, o.net.queue_dropped
+    );
+}
+
+/// 局域网上的办公操作：两种编码器对比。
+#[test]
+fn office_on_lan() {
+    for codec in [CodecKind::H264, CodecKind::Tile] {
+        let o = run(&Scenario {
+            codec,
+            ..Scenario::new("office-lan", office())
+        })
+        .unwrap();
+        finish(&o);
+    }
+}
+
+/// 带宽阶梯：20 → 3 → 20 Mbps（ToDesk 切清晰度时卡几秒的场景）。
+#[test]
+fn bandwidth_steps() {
+    let at = |mbps: u64| Link {
+        rate_bps: Some(mbps * 1_000_000),
+        ..Link::lan()
+    };
+    let s = Scenario {
+        network: vec![(0, at(20)), (4_000_000, at(3)), (8_000_000, at(20))],
+        ..Scenario::new(
+            "bandwidth-steps",
+            vec![
+                phase(Action::Scrolling, 120),
+                phase(Action::Scrolling, 120),
+                phase(Action::Scrolling, 120),
+                phase(Action::Idle, 30),
+            ],
+        )
+    };
+    let o = run(&s).unwrap();
+    finish(&o);
+}
+
+/// 突然掉 90% 的带宽，持续 2 秒，再恢复。
+#[test]
+fn sudden_drop() {
+    let full = Link {
+        rate_bps: Some(20_000_000),
+        ..Link::wifi()
+    };
+    let low = Link {
+        rate_bps: Some(2_000_000),
+        ..full
+    };
+    let s = Scenario {
+        network: vec![(0, full), (3_000_000, low), (5_000_000, full)],
+        profile: Profile::WIRELESS,
+        ..Scenario::new(
+            "sudden-drop",
+            vec![phase(Action::Dragging, 240), phase(Action::Idle, 45)],
+        )
+    };
+    let o = run(&s).unwrap();
+    finish(&o);
+}
+
+/// 蜂窝网络上的办公操作。
+#[test]
+fn office_on_cellular() {
+    let o = run(&Scenario {
+        network: vec![(0, Link::cellular())],
+        profile: Profile::CELLULAR,
+        start_bps: 2_000_000,
+        ..Scenario::new("office-cellular", office())
+    })
+    .unwrap();
+    finish(&o);
+}

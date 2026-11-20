@@ -27,6 +27,7 @@ pub mod desktop_sim;
 pub mod error;
 pub mod file;
 pub mod input;
+pub mod media;
 pub mod probe;
 pub mod proto;
 pub mod region;

@@ -64,6 +64,45 @@ jobs:
             target/release/peerdesk-server.exe
           if-no-files-found: ignore
 
+  # 端到端测试：真实编码器 + 仿真网络 + 接近真实的桌面画面。每次都跑，
+  # 截图和指标作为构建产物上传，表格贴到运行摘要里。
+  e2e:
+    name: e2e (simulated network, real codec)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: Run scenarios
+        run: cargo test --release -p peerdesk-e2e -- --nocapture --test-threads 2
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## 端到端测试"
+            echo
+            echo "### 门槛"
+            echo
+            echo "| 场景 | 编码 | 门槛 | 结果 | 说明 |"
+            echo "|---|---|---|---|---|"
+            cat target/e2e/gates.md 2>/dev/null || true
+            echo
+            echo "### 各阶段指标"
+            echo
+            first=1
+            for f in target/e2e/*/result.md; do
+              if [ $first = 1 ]; then cat "$f"; first=0; else tail -n +3 "$f"; fi
+            done
+            echo
+            echo "截图在构建产物 e2e-<提交>：每个场景一个目录，左边源画面、中间控制端看到的画面、右边差异（放大 8 倍）。"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-${{ github.sha }}
+          path: target/e2e
+          retention-days: 14
+
   # 探测各系统的 CI 机器能不能截屏：决定屏幕采集的代码能否在 CI 里测。
   # 这个任务失败不算整体失败。
   screen-probe:

@@ -289,6 +289,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn from_pixels_checks_the_size_and_masks_alpha() {
+        assert!(Screen::from_pixels(2, 2, vec![0; 3]).is_err());
+        let s = Screen::from_pixels(1, 1, vec![0xff12_3456]).unwrap();
+        assert_eq!(s.pixels(), &[0x0012_3456]);
+    }
+
+    #[test]
     fn screen_basics_and_clipping() {
         let mut s = Screen::new(10, 4, 0xff00_0000 | 0x11_22_33);
         assert_eq!((s.width(), s.height()), (10, 4));

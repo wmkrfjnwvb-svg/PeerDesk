@@ -1,0 +1,16 @@
+[package]
+name = "peerdesk-e2e"
+description = "PeerDesk 端到端测试平台：真实编码器 + 仿真网络 + 接近真实的桌面画面，输出指标和截图"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+peerdesk-core.workspace = true
+peerdesk-media.workspace = true
+png = "0.18.1"
+
+[lints]
+workspace = true
