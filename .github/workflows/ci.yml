@@ -79,6 +79,19 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
+  # 每次推送都打一个能下载、安装、在自己机器之间试用的测试包。
+  package:
+    name: package (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: windows-x64
+            script: scripts/package-windows.sh
+          - os: macos-latest
+            name: macos-universal
+            script: scripts/package-macos.sh
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -140,6 +153,68 @@ jobs:
           name: screen-check-${{ matrix.os }}
           path: screen.bmp
           if-no-files-found: ignore
+        with:
+          key: package
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Build console
+        shell: bash
+        run: npm ci --no-audit --no-fund && npm run build
+        working-directory: web
+      - name: Package
+        shell: bash
+        run: |
+          short=$(git rev-parse --short=7 HEAD)
+          echo "ARTIFACT=peerdesk-$short-${{ matrix.name }}" >> "$GITHUB_ENV"
+          ${{ matrix.script }} dist "peerdesk-$short-${{ matrix.name }}"
+      - name: Binary sizes
+        shell: bash
+        run: ls -l target/release/peerdesk* target/universal/* 2>/dev/null || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  # 在虚拟显示器上打开图形界面（自测模式：开启被控并连接本机），截一张图。
+  gui-screenshot:
+    name: gui screenshot (linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xvfb imagemagick libgl1-mesa-dri libegl1 libxkbcommon-x11-0 fonts-noto-cjk
+      - run: cargo build --release -p peerdesk
+      - name: Run the GUI and take screenshots
+        run: |
+          Xvfb :99 -screen 0 1920x1080x24 &
+          sleep 2
+          export DISPLAY=:99 PEERDESK_DATA_DIR=$PWD/gui-data
+          # 主窗口（只开启被控）两种语言各一张，观看窗口（连接本机）一张。
+          shot() {
+            PEERDESK_LANG=$1 PEERDESK_GUI_SELFTEST=$2 ./target/release/peerdesk > gui-$3.log 2>&1 &
+            pid=$!
+            sleep 10
+            import -window root gui-$3.png
+            kill $pid || true
+            wait $pid || true
+            cat gui-$3.log
+          }
+          shot zh host main-zh
+          shot en host main-en
+          shot zh connect viewer-zh
+          ls -l gui-*.png
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: peerdesk-gui-screenshots
+          path: gui-*.png
+          retention-days: 14
 
   # 探测各系统的 CI 机器能不能截屏：决定屏幕采集的代码能否在 CI 里测。
   # 这个任务失败不算整体失败。

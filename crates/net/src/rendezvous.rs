@@ -203,7 +203,9 @@ pub async fn answer(node: &Node, incoming: &Incoming) -> Result<Option<Shim>, Ne
         Some(grant) => {
             let mut endpoint = node.local_addr()?;
             if endpoint.ip().is_unspecified() {
-                endpoint.set_ip(local_ip(endpoint.is_ipv6(), true));
+                // 转发器和中继是同一地址族。双栈的 IPv6 端点也收 IPv4，所以中继是 IPv4 时
+                // 用 IPv4 回环地址把包交给它。
+                endpoint.set_ip(local_ip(endpoint.is_ipv6() && grant.addr.is_ipv6(), true));
             }
             Some(Shim::start(grant, Some(endpoint)).await?)
         }

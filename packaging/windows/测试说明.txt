@@ -1,0 +1,69 @@
+PeerDesk 测试版（Windows）
+==========================
+
+这是测试用的构建，用来在你自己的两台机器之间试远程控制。
+注意：被控端现在显示的是一个合成的“演示桌面”，还不是真实屏幕；
+控制端发出的键盘鼠标会到达被控端并显示在“收到的输入”一栏，但还不会真正操作系统。
+真实的屏幕采集和输入注入接入后，同一个界面会直接显示真实桌面。
+
+文件
+  peerdesk.exe          客户端。双击打开图形界面；带参数运行是命令行（peerdesk help）。
+  peerdesk-server.exe   服务端（信令和中继），只在两台机器不在同一局域网时需要。
+
+使用（同一局域网）
+  1. 两台机器都运行 peerdesk.exe。第一次运行时 Windows 防火墙会询问，请允许“专用网络”。
+     如果出现“Windows 已保护你的电脑”（SmartScreen），点“更多信息” -> “仍要运行”。
+  2. 被控机：在“本机”里勾选“允许远程控制”。记下“本机地址”中的一个地址和“密码”。
+  3. 控制机：在“连接”里填写这个地址和密码（可选：粘贴被控机的设备指纹，用来核对身份），
+     点“连接”。会打开一个新窗口显示对方画面。
+  4. 在画面窗口里按 F12 显示/隐藏统计（帧率、码率、往返延迟、路径、分辨率）。
+     点“断开”或关闭窗口结束会话。被控机也可以点“断开”踢掉控制端。
+  只有一台机器时：勾选“允许远程控制”后点“连接本机（自测）”。
+
+通过服务器连接（不在同一网络）
+  在有公网地址的机器上运行 peerdesk-server.exe <配置文件>（配置见项目 config 目录），
+  被控机在“通过服务器让别人找到本机”里填服务器地址后再打开“允许远程控制”；
+  控制机在“通过服务器连接”里填服务器地址和被控机的设备指纹。
+
+命令行
+  peerdesk.exe 是图形界面程序，在 cmd 里运行命令时提示符会先回来、输出随后打印。
+  需要等它结束时用：start /wait peerdesk.exe version ，或在 PowerShell 里：peerdesk.exe version | Out-Host
+
+数据目录：%APPDATA%\PeerDesk（设备身份、最近连接、收到的文件）。
+
+------------------------------------------------------------------------
+
+PeerDesk test build (Windows)
+=============================
+
+A test build for trying remote control between your own machines.
+Note: the host currently streams a synthetic "demo desktop", not the real screen.
+Keyboard and mouse input from the controller reaches the host and is shown under
+"Input received", but is not injected into the OS yet. Once real screen capture and
+input injection land, the same UI shows the real desktop.
+
+Files
+  peerdesk.exe          The client. Double-click for the GUI; with arguments it is the CLI (peerdesk help).
+  peerdesk-server.exe   Signaling and relay server; only needed when the machines are not on one LAN.
+
+Usage (same LAN)
+  1. Run peerdesk.exe on both machines. Allow it on "Private networks" when the firewall asks.
+     If SmartScreen says "Windows protected your PC", click "More info" -> "Run anyway".
+  2. On the host: tick "Allow remote control". Note one of the addresses and the password.
+  3. On the controller: enter that address and the password (optionally paste the host's
+     fingerprint to verify its identity) and click "Connect". A new window shows the remote screen.
+  4. In the remote window press F12 to toggle stats (fps, bitrate, rtt, path, resolution).
+     Click "Disconnect" or close the window to end. The host can also click "Disconnect".
+  With one machine: tick "Allow remote control", then click "Connect to this device (self-test)".
+
+Through a server (different networks)
+  Run peerdesk-server.exe <config> on a machine with a public address (see the config folder
+  of the project). On the host fill in "Register on a signaling server" before turning on
+  "Allow remote control"; on the controller use "Connect via signaling server" with the
+  server address and the host's fingerprint.
+
+Command line
+  peerdesk.exe is a GUI program: in cmd the prompt returns before the output is printed.
+  To wait for it use: start /wait peerdesk.exe version , or in PowerShell: peerdesk.exe version | Out-Host
+
+Data folder: %APPDATA%\PeerDesk (device identity, recent hosts, received files).

@@ -10,7 +10,17 @@ rust-version.workspace = true
 peerdesk-core.workspace = true
 peerdesk-net.workspace = true
 peerdesk-platform.workspace = true
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+# 测试控制台的图形界面。只开 glow 后端和必要的功能，控制体积。
+eframe = { version = "0.32", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
+sys-locale = "0.3"
+if-addrs = "0.15"
+getrandom = "0.2"
+num-traits = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# 图形界面的 exe 没有控制台；命令行子命令运行时挂到启动它的终端上（AttachConsole 的安全封装）。
+win32console = "0.1"
 
 [dev-dependencies]
 peerdesk-server = { path = "../server" }

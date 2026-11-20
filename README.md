@@ -55,6 +55,12 @@ scripts         检查与发布脚本
 ./scripts/build-release.sh    # 构建管理页面和两个发布二进制
 ```
 
+**图形界面（测试控制台）**：不带参数运行 `peerdesk`（或双击）打开。“本机”面板开启被控并显示地址、
+指纹和每次启动随机生成的密码；“连接”面板填地址和密码，每个连接打开一个画面窗口（F12 显示统计）。
+CI 每次推送都会产出可下载的测试包：`peerdesk-<提交>-windows-x64`（ZIP，及 Inno Setup 安装程序）和
+`peerdesk-<提交>-macos-universal`（DMG），包里的 `测试说明.txt` 说明了安装和首次运行的步骤。
+合并平台层时，真实的屏幕采集和输入注入接在 `crates/client/src/local.rs`。
+
 两台机器之间试连（画面目前是合成的演示桌面，`--snapshot` 可以把看到的画面存成图片）：
 
 ```bash

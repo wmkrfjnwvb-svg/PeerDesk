@@ -21,7 +21,7 @@ fn version_and_exit_codes() {
         .unwrap()
         .starts_with("peerdesk "));
 
-    let out = Command::new(BIN).output().unwrap();
+    let out = Command::new(BIN).arg("frobnicate").output().unwrap();
     assert_eq!(out.status.code(), Some(2));
 
     let out = Command::new(BIN)
@@ -30,6 +30,20 @@ fn version_and_exit_codes() {
         .unwrap();
     assert!(out.status.success());
     assert!(String::from_utf8(out.stdout).unwrap().contains("送达 10"));
+}
+
+/// 不带参数时打开图形界面；没有显示器时报错退出，而不是卡住。
+#[cfg(target_os = "linux")]
+#[test]
+fn gui_without_a_display_fails_cleanly() {
+    let out = Command::new(BIN)
+        .env_remove("DISPLAY")
+        .env_remove("WAYLAND_DISPLAY")
+        .env("PEERDESK_DATA_DIR", temp_dir("gui"))
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("GUI"));
 }
 
 fn temp_dir(tag: &str) -> PathBuf {

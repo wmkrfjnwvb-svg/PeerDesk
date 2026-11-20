@@ -28,7 +28,7 @@ use crate::source::{Opener, SourceKind, Sources};
 use crate::{parse_number, usage_error, EXIT_FAILED, EXIT_OK};
 
 /// 默认的数据目录：优先用系统的每用户配置目录。
-fn default_data_dir() -> PathBuf {
+pub(crate) fn default_data_dir() -> PathBuf {
     let from_env = |name: &str| {
         std::env::var_os(name)
             .filter(|v| !v.is_empty())
@@ -41,7 +41,7 @@ fn default_data_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".peerdesk"))
 }
 
-fn runtime() -> Result<tokio::runtime::Runtime, NetError> {
+pub(crate) fn runtime() -> Result<tokio::runtime::Runtime, NetError> {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -55,7 +55,7 @@ fn finish(out: &mut dyn Write, result: Result<u8, NetError>) -> u8 {
     })
 }
 
-fn session(identity: &Identity, policy: &Policy, auth: Auth) -> SessionConfig {
+pub(crate) fn session(identity: &Identity, policy: &Policy, auth: Auth) -> SessionConfig {
     SessionConfig {
         device_id: identity.device_id(),
         region: String::new(),
@@ -201,7 +201,7 @@ async fn next_request(registration: &mut Option<Registration>) -> Option<Incomin
 
 /// 保持在服务器上的登记：对每个连接请求打洞并接上中继；断开后定期重新登记，直到成功。
 /// 中继转发器留在这里，直到被更新的请求挤掉。
-async fn stay_registered(node: Arc<Node>, server: Server, registration: Registration) {
+pub(crate) async fn stay_registered(node: Arc<Node>, server: Server, registration: Registration) {
     let mut registration = Some(registration);
     let mut shims = VecDeque::new();
     loop {
