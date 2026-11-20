@@ -224,28 +224,23 @@ pub fn start_host(config: HostConfig, password: &str, repaint: Repaint) -> HostH
     }
 }
 
-/// 绑定监听端口：先试 IPv6（多数系统上同时接受 IPv4），再在同一端口上试 IPv4。
-/// IPv6 不可用、或者 IPv4 已经由 IPv6 套接字一并接收时，只用其中一个。
+/// 绑定监听端口：IPv4 必须成功；同一端口上再试一个 IPv6 端点。
+/// Linux 和 macOS 的 IPv6 套接字默认也收 IPv4，和 IPv4 端点冲突而绑定失败，这时只用 IPv4；
+/// Windows 上两者互不影响，IPv6 地址也能连。
 fn bind_nodes(
     port: u16,
     identity: &Identity,
     policy: &Policy,
 ) -> Result<(Vec<Arc<Node>>, bool), NetError> {
-    let v6 = Node::bind((Ipv6Addr::UNSPECIFIED, port).into(), identity, policy);
-    let port = match &v6 {
-        Ok(node) => node.local_addr()?.port(),
-        Err(_) => port,
-    };
-    let v4 = Node::bind((Ipv4Addr::UNSPECIFIED, port).into(), identity, policy);
-    let has_v6 = v6.is_ok();
-    let nodes: Vec<Arc<Node>> = match (v6, v4) {
-        (Err(_), Err(e)) => return Err(e),
-        (v6, v4) => [v6.ok(), v4.ok()]
-            .into_iter()
-            .flatten()
-            .map(Arc::new)
-            .collect(),
-    };
+    let v4 = Arc::new(Node::bind(
+        (Ipv4Addr::UNSPECIFIED, port).into(),
+        identity,
+        policy,
+    )?);
+    let port = v4.local_addr()?.port();
+    let v6 = Node::bind((Ipv6Addr::UNSPECIFIED, port).into(), identity, policy).ok();
+    let has_v6 = v6.is_some();
+    let nodes = std::iter::once(v4).chain(v6.map(Arc::new)).collect();
     Ok((nodes, has_v6))
 }
 
