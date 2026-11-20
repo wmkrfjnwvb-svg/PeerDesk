@@ -21,8 +21,9 @@ for candidate in "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" "/c/Program File
   if [ -z "$iscc" ] && [ -f "$candidate" ]; then iscc=$candidate; fi
 done
 if [ -n "$iscc" ]; then
-  "$iscc" -Q "/DAppVersion=$version" "/DSourceDir=$(cygpath -w "$PWD/$stage")" \
-    "/DOutputDir=$(cygpath -w "$out")" "/DOutputName=$name-setup" packaging/windows/peerdesk.iss
+  # Git Bash 会把以 / 开头的参数当成路径改写，对 iscc 的 /D 参数要关掉。
+  MSYS2_ARG_CONV_EXCL='*' "$iscc" -Q "/DAppVersion=$version" "/DSourceDir=$(cygpath -w "$PWD/$stage")" \
+    "/DOutputDir=$(cygpath -w "$out")" "/DOutputName=$name-setup" "$(cygpath -w "$PWD/packaging/windows/peerdesk.iss")"
 else
   echo "没有找到 Inno Setup（iscc），跳过安装程序。"
 fi
