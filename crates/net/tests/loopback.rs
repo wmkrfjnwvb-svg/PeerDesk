@@ -585,3 +585,60 @@ fn luma_psnr(a: &peerdesk_core::screen::Screen, b: &peerdesk_core::screen::Scree
     let mse = sum / a.pixels().len() as f64;
     10.0 * (255.0 * 255.0 / mse.max(1e-9)).log10()
 }
+
+/// 会报告变化计数的画面来源：被控端靠计数判断画面变没变，不再整屏比较。
+struct Counted {
+    inner: DemoDesktop,
+    seq: u64,
+}
+
+impl host::ScreenSource for Counted {
+    fn capture(&mut self) -> Option<&peerdesk_core::screen::Screen> {
+        self.seq += 1;
+        self.inner.capture()
+    }
+
+    fn change_seq(&self) -> Option<u64> {
+        // 每两次取画面才算变一次：没变的那一次不应该编码
+        Some(self.seq / 2)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sources_with_a_change_counter_are_encoded_only_when_it_moves() {
+    let policy = Policy::recommended();
+    let p = pair(&policy, &policy);
+    let (host_link, ctrl_link) = links(&p).await;
+    let host_task = tokio::spawn(host::serve(
+        host_link,
+        HostOptions::new(session(&p.host_id, &policy), 100, temp_dir("seq")),
+        Box::new(Counted {
+            inner: DemoDesktop::new(320, 240, 1).with_limit(12),
+            seq: 0,
+        }),
+        Box::new(Recorder::default()),
+    ));
+    let (_tx, rx) = mpsc::channel(1);
+    let report = controller::run(
+        ctrl_link,
+        ControllerOptions {
+            session: session(&p.ctrl_id, &policy),
+            deadline_us: 100_000,
+            duration: None,
+        },
+        Box::new(CountSink::new()),
+        rx,
+        None,
+    )
+    .await
+    .unwrap();
+    let host_report = host_task.await.unwrap().unwrap();
+    assert_eq!(host_report.end, "画面来源结束");
+    // 12 次取画面里计数只动了 6 次左右：没动的那几次不编码
+    assert!(
+        (1..=7).contains(&host_report.frames_sent),
+        "{}",
+        host_report.frames_sent
+    );
+    assert!(report.frames_delivered <= u64::from(host_report.frames_sent));
+}

@@ -7,7 +7,7 @@ use std::time::Duration;
 use peerdesk_core::crypto::Suite;
 use peerdesk_core::file::FileMeta;
 use peerdesk_core::input::{InputEvent, InputSender};
-use peerdesk_core::media::MediaReceiver;
+use peerdesk_core::media::{DecodeJob, DecodeWorker, MediaReceiver};
 use peerdesk_core::proto::{Caps, Channel, Control, RejectReason};
 use peerdesk_core::screen::Screen;
 use peerdesk_core::session::{Session, SessionConfig, State};
@@ -92,6 +92,30 @@ pub struct ControllerReport {
     pub trace: String,
 }
 
+/// 解码线程交回的结果：帧号和解出的画面。
+type Decoded = (u32, Result<Option<Screen>, peerdesk_core::Error>);
+
+/// 启动解码线程。解码一帧要好几毫秒到几十毫秒，放在会话循环里会让本地的键鼠输入排队等它。
+/// 任务通道关闭（会话结束）时线程退出。
+fn spawn_decoder(
+    decoder: Box<dyn VideoDecoder>,
+) -> (
+    std::sync::mpsc::Sender<DecodeJob>,
+    mpsc::UnboundedReceiver<Decoded>,
+) {
+    let (jobs, job_rx) = std::sync::mpsc::channel::<DecodeJob>();
+    let (done_tx, done_rx) = mpsc::unbounded_channel();
+    std::thread::spawn(move || {
+        let mut worker = DecodeWorker::new(decoder);
+        while let Ok(job) = job_rx.recv() {
+            if done_tx.send((job.frame_id, worker.decode(&job))).is_err() {
+                break;
+            }
+        }
+    });
+    (jobs, done_rx)
+}
+
 /// 在一条已建立的连接上运行控制端会话。
 #[allow(clippy::too_many_lines)]
 pub async fn run(
@@ -169,7 +193,9 @@ pub async fn run(
     } else {
         Box::new(TileDecoder::new())
     };
-    let mut media = MediaReceiver::new(link.now(), opts.deadline_us, decoder);
+    let mut media = MediaReceiver::detached(link.now(), opts.deadline_us);
+    let (decode_jobs, mut decoded_rx) = spawn_decoder(decoder);
+    let mut last_screen: Option<Screen> = None;
     // 反馈只在有新情况时发；什么都没发生时每秒一次，证明自己还在。
     let mut video_since_feedback = 0u32;
     let mut reported_floor = 0u32;
@@ -181,6 +207,18 @@ pub async fn run(
         }
         tokio::select! {
             () = &mut time_limit, if !time_up => time_up = true,
+            // 解码线程交回一帧：显示。
+            done = decoded_rx.recv() => match done {
+                Some((frame_id, Ok(Some(screen)))) => {
+                    media.decode_succeeded();
+                    tracer.record(link.now(), trace, Stage::FrameDelivered, u64::from(frame_id));
+                    sink.present(&screen);
+                    last_screen = Some(screen);
+                }
+                Some((_, Ok(None))) => {}
+                Some((_, Err(_))) => media.decode_failed(),
+                None => break "解码线程结束".to_owned(),
+            },
             result = async {
                 match upload_task.as_mut() {
                     Some(task) => task.await,
@@ -195,10 +233,9 @@ pub async fn run(
                     Channel::Video => {
                         let now = link.now();
                         video_since_feedback = video_since_feedback.saturating_add(1);
-                        match media.on_datagram(now, header.send_time, header.seq, header.flags, &payload) {
-                            Ok(Some(shown)) => {
-                                tracer.record(now, trace, Stage::FrameDelivered, u64::from(shown.frame_id));
-                                sink.present(shown.screen);
+                        match media.on_datagram_deferred(now, header.send_time, header.seq, header.flags, &payload) {
+                            Ok(Some(job)) => {
+                                if decode_jobs.send(job).is_err() { break "解码线程结束".to_owned(); }
                             }
                             Ok(None) => {}
                             Err(_) => bad_datagrams = bad_datagrams.saturating_add(1),
@@ -285,7 +322,7 @@ pub async fn run(
         video_bytes: media.stats().video_bytes,
         bad_frames: u64::from(media.stats().bad),
         recovered: stats.recovered,
-        screen: media.screen().cloned(),
+        screen: last_screen,
         bad_datagrams,
         input_sent,
         input_unacked: sender.pending(),

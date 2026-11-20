@@ -427,7 +427,9 @@ mod tests {
         assert!(key.key);
         // 新解码器只从关键帧开始也能解
         let mut fresh = H264Decoder::new().unwrap();
+        assert!(fresh.screen().is_none());
         assert!(psnr(&decode(&mut fresh, &key).unwrap(), &screen) > 30.0);
+        assert!(fresh.screen().is_some());
     }
 
     #[test]

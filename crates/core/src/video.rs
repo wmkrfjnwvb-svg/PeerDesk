@@ -296,8 +296,10 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(first.key);
+        assert!(dec.screen().is_none());
         let (h, data) = FrameHeader::parse(&first.payload).unwrap();
         assert_eq!(dec.decode(&h, data).unwrap().unwrap(), &screen);
+        assert_eq!(dec.screen(), Some(&screen));
         // 没变：不用发
         assert!(enc
             .encode(2, &screen, false, usize::MAX / 2)

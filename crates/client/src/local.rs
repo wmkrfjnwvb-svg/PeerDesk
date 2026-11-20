@@ -14,33 +14,33 @@ use peerdesk_platform::{CaptureOptions, PlatformError};
 /// 演示桌面的尺寸。
 const DEMO_SIZE: (u16, u16) = (1280, 720);
 
-#[cfg(not(test))]
-fn system_screen() -> Result<Box<dyn ScreenSource>, PlatformError> {
-    peerdesk_platform::open_screen(CaptureOptions::default())
-}
+type OpenScreen = fn(CaptureOptions) -> Result<Box<dyn ScreenSource>, PlatformError>;
+type OpenInput = fn() -> Result<Box<dyn InputSink>, PlatformError>;
 
-#[cfg(test)]
-fn system_screen() -> Result<Box<dyn ScreenSource>, PlatformError> {
+/// 系统的屏幕采集和键鼠注入。测试构建里换成“打不开”：单元测试不能去动开发者电脑的键鼠。
+const SYSTEM: (OpenScreen, OpenInput) = if cfg!(test) {
+    (no_screen, no_input)
+} else {
+    (
+        peerdesk_platform::open_screen,
+        peerdesk_platform::open_input,
+    )
+};
+
+fn no_screen(opts: CaptureOptions) -> Result<Box<dyn ScreenSource>, PlatformError> {
     Err(PlatformError::InvalidOptions(format!(
-        "测试里不打开屏幕：{:?}",
-        CaptureOptions::default()
+        "测试里不打开屏幕：{opts:?}"
     )))
 }
 
-#[cfg(not(test))]
-fn system_input() -> Result<Box<dyn InputSink>, PlatformError> {
-    peerdesk_platform::open_input()
-}
-
-#[cfg(test)]
-fn system_input() -> Result<Box<dyn InputSink>, PlatformError> {
+fn no_input() -> Result<Box<dyn InputSink>, PlatformError> {
     Err(PlatformError::InvalidOptions("测试里不注入键鼠".into()))
 }
 
 /// 本机屏幕的画面来源：真实屏幕，打不开时用演示桌面。
 #[must_use]
 pub fn local_screen(seed: u64) -> Box<dyn ScreenSource> {
-    screen_or_demo(system_screen(), seed)
+    screen_or_demo((SYSTEM.0)(CaptureOptions::default()), seed)
 }
 
 fn screen_or_demo(
@@ -54,7 +54,7 @@ fn screen_or_demo(
 /// 系统注入打不开时只记录。
 #[must_use]
 pub fn local_input(tap: Arc<Tap>) -> Box<dyn InputSink> {
-    Box::new(TapSink(tap, system_input().ok()))
+    Box::new(TapSink(tap, (SYSTEM.1)().ok()))
 }
 
 /// 记录收到的输入：数量和最后一个事件。被控端界面用它确认输入确实到了。
