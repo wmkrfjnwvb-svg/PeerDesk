@@ -40,9 +40,9 @@ fn office() -> Vec<Phase> {
     ]
 }
 
-/// 体验门槛：现在只报告、不让测试失败，写进 `target/e2e/gates.md`。
-/// 传输算法 v1 完成后改成硬门槛。
-fn soft_gate(o: &Outcome, what: &str, ok: bool, detail: &str) {
+/// 体验门槛：写进 `target/e2e/gates.md`（CI 贴到运行摘要里），不达标时测试失败。
+/// 仿真是确定性的，同一份代码每次结果相同，所以可以当硬门槛。
+fn gate(o: &Outcome, what: &str, ok: bool, detail: &str) {
     use std::io::Write as _;
     let line = format!(
         "| {} | {} | {what} | {} | {detail} |\n",
@@ -58,13 +58,19 @@ fn soft_gate(o: &Outcome, what: &str, ok: bool, detail: &str) {
         .open(out_dir().join("gates.md"))
         .unwrap();
     f.write_all(line.as_bytes()).unwrap();
+    assert!(
+        ok,
+        "{} {}: {what} 未达标（{detail}）",
+        o.name,
+        o.codec.name()
+    );
 }
 
 /// 所有场景共同的门槛。
 fn gates(o: &Outcome) {
     // 硬门槛：任何时候都不能把解不了的帧交给解码器（花屏）。
     assert_eq!(o.bad, 0, "{} {}: 有帧解码失败", o.name, o.codec.name());
-    soft_gate(
+    gate(
         o,
         "没有超过 1 秒的冻结",
         o.max_wait_ms < 1000.0,
@@ -80,7 +86,7 @@ fn gates(o: &Outcome) {
         .iter()
         .filter(|p| p.sharp_ms.is_none_or(|t| t > 500.0))
         .count();
-    soft_gate(
+    gate(
         o,
         "停下后 0.5 秒内清晰",
         slow == 0,

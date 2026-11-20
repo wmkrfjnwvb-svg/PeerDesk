@@ -208,6 +208,8 @@ pub struct RealisticDesktop {
     wallpaper: Canvas,
     windows: Vec<Window>,
     video: (u32, u32, u32, u32),
+    /// 视频区域当前这一帧：只在播放视频时更新，否则保持不变（像暂停的视频）。
+    video_frame: Canvas,
     frame: u32,
     typed: u32,
     drag_dir: i32,
@@ -309,12 +311,14 @@ impl RealisticDesktop {
             wallpaper,
             windows,
             video: player,
+            video_frame: Canvas::new(player.2, player.3, 0),
             frame: 0,
             typed: 0,
             drag_dir: 1,
             rng,
             screen: Screen::new(width, height, 0),
         };
+        desk.render_video();
         desk.compose()?;
         Ok(desk)
     }
@@ -337,6 +341,17 @@ impl RealisticDesktop {
         r << 16 | g << 8 | b
     }
 
+    /// 生成视频区域的下一帧。
+    fn render_video(&mut self) {
+        let (_, _, vw, vh) = self.video;
+        for y in 0..vh {
+            for x in 0..vw {
+                let p = self.video_pixel(x, y);
+                self.video_frame.set(x, y, p);
+            }
+        }
+    }
+
     fn compose(&mut self) -> Result<(), Error> {
         let mut out = Vec::with_capacity(usize::try_from(self.w * self.h).unwrap_or(0));
         let (vx, vy, vw, vh) = self.video;
@@ -357,7 +372,7 @@ impl RealisticDesktop {
                             && (vx..vx + vw).contains(&x)
                             && (vy..vy + vh).contains(&y) =>
                     {
-                        self.video_pixel(x - vx, y - vy)
+                        self.video_frame.get(x - vx, y - vy)
                     }
                     Some((_, c)) => c,
                     None => self.wallpaper.get(x, y),
@@ -423,7 +438,10 @@ impl RealisticDesktop {
                     Some(_) | None => false,
                 }
             }
-            Action::Video => true,
+            Action::Video => {
+                self.render_video();
+                true
+            }
         };
         if changed {
             self.compose()?;

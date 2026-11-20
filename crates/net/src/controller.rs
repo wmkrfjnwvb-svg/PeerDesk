@@ -231,13 +231,13 @@ pub async fn run(
                 for frame_id in expired {
                     tracer.record(now, trace, Stage::FrameExpired, u64::from(frame_id));
                 }
-                let news = video_since_feedback > 0 || floor != reported_floor;
+                let news = video_since_feedback > 0 || floor != reported_floor || media.wants_nack(now);
                 if news || now.since(last_feedback) >= IDLE_FEEDBACK_US {
                     video_since_feedback = 0;
                     reported_floor = floor;
                     last_feedback = now;
-                    let feedback = media.feedback(now);
-                    if let Err(e) = link.send(Channel::Control, &feedback.encode()) { break e.to_string(); }
+                    let feedback = media.feedback_datagram(now);
+                    if let Err(e) = link.send(Channel::Control, &feedback) { break e.to_string(); }
                 }
                 if sender.pending() > 0 {
                     let failed = sender.packet()?.and_then(|p| link.send(Channel::Input, &p).err());

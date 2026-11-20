@@ -7,7 +7,7 @@
 //! - 接收端：重组分片，只把解得了的帧交给解码器（缺了参考帧就等关键帧，不显示花屏），
 //!   生成反馈。
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 use crate::adaptive::{DelayTracker, DeliveryLog, Feedback, Profile, RateController};
 use crate::error::Error;
@@ -20,6 +20,53 @@ use crate::wire::{Reader, Writer};
 
 pub use crate::desktop_sim::FLAG_PARITY;
 use crate::proto::{HEADER_LEN, VIDEO_HEADER_LEN};
+
+/// 一条反馈最多带多少个重传请求。
+pub const MAX_NACKS: usize = 48;
+/// 分片缺了多久才请求重传（微秒）：短于这个时间可能只是乱序。
+const NACK_AFTER_US: u64 = 10_000;
+
+/// 反馈数据报：[`Feedback`] 后面跟着重传请求（个数 + 每个的帧号和分片序号）。
+#[must_use]
+pub fn encode_feedback(feedback: &Feedback, nacks: &[(u32, u16)]) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.bytes(&feedback.encode());
+    let nacks = nacks.get(..MAX_NACKS.min(nacks.len())).unwrap_or_default();
+    if !nacks.is_empty() {
+        w.u8(u8::try_from(nacks.len()).unwrap_or(u8::MAX));
+        for (frame, frag) in nacks {
+            w.u32(*frame).u16(*frag);
+        }
+    }
+    w.into_vec()
+}
+
+/// 解析反馈数据报。
+pub fn decode_feedback(buf: &[u8]) -> Result<(Feedback, Vec<(u32, u16)>), Error> {
+    let (head, rest) = buf
+        .split_at_checked(Feedback::LEN)
+        .ok_or(Error::Truncated {
+            need: Feedback::LEN,
+            have: buf.len(),
+        })?;
+    let feedback = Feedback::decode(head)?;
+    if rest.is_empty() {
+        return Ok((feedback, Vec::new()));
+    }
+    let mut r = Reader::new(rest);
+    let count = usize::from(r.u8()?);
+    if count == 0 || count > MAX_NACKS {
+        return Err(Error::TooManyItems {
+            len: count,
+            max: MAX_NACKS,
+        });
+    }
+    let nacks = (0..count)
+        .map(|_| Ok((r.u32()?, r.u16()?)))
+        .collect::<Result<Vec<_>, Error>>()?;
+    r.finish()?;
+    Ok((feedback, nacks))
+}
 
 /// 发送端的参数。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,7 +95,8 @@ impl Default for SenderConfig {
             min_bps: 100_000,
             max_bps: 30_000_000,
             profile: Profile::STABLE,
-            deadline_us: 100_000,
+            // 要留够时间给丢失的分片重传一次（大约一个往返）。
+            deadline_us: 250_000,
             max_payload: MAX_DATAGRAM - HEADER_LEN,
         }
     }
@@ -76,6 +124,8 @@ pub struct SenderStats {
     pub wire_bytes: u64,
     /// 判定丢失、让编码器恢复的帧数。
     pub lost: u32,
+    /// 按接收端的请求重传的分片数。
+    pub retransmitted: u32,
 }
 
 /// 画面发送端。
@@ -88,6 +138,11 @@ pub struct MediaSender {
     last_frame: u32,
     last_key: u32,
     stats: SenderStats,
+    /// 最近发出的帧的数据分片，留着重传：(帧号, 发出时间, 数据分片)。
+    recent: VecDeque<(u32, Time, Vec<Outgoing>)>,
+    /// 每个分片上次重传的时间：一个往返之内不重复重传。
+    resent: BTreeMap<(u32, u16), Time>,
+    rtt_us: u64,
 }
 
 impl std::fmt::Debug for MediaSender {
@@ -112,6 +167,9 @@ impl MediaSender {
             last_frame: 0,
             last_key: 0,
             stats: SenderStats::default(),
+            recent: VecDeque::new(),
+            resent: BTreeMap::new(),
+            rtt_us: 0,
         }
     }
 
@@ -167,6 +225,17 @@ impl MediaSender {
         changed: bool,
         rtt_us: u64,
     ) -> Result<Vec<Outgoing>, Error> {
+        self.rtt_us = rtt_us;
+        // 过了截止时间的帧不再重传。
+        while self
+            .recent
+            .front()
+            .is_some_and(|(_, at, _)| now.since(*at) > self.cfg.deadline_us)
+        {
+            if let Some((id, _, _)) = self.recent.pop_front() {
+                self.resent.retain(|(frame, _), _| *frame != id);
+            }
+        }
         // 迟迟等不到反馈的帧按丢失处理。
         let ack_timeout = self
             .cfg
@@ -197,6 +266,7 @@ impl MediaSender {
             .saturating_sub(VIDEO_HEADER_LEN)
             .saturating_sub(PARITY_PREFIX);
         let mut packets = fragment(frame_id, ref_frame, &encoded.payload, max)?;
+        let data_count = packets.len();
         let parity = parity_for(&packets, self.rate.profile().fec_permille);
         packets.extend(parity);
         let out: Vec<Outgoing> = packets
@@ -211,6 +281,11 @@ impl MediaSender {
                 }
             })
             .collect();
+        self.recent.push_back((
+            frame_id,
+            now,
+            out.get(..data_count).unwrap_or_default().to_vec(),
+        ));
         self.last_frame = frame_id;
         if encoded.key {
             self.last_key = frame_id;
@@ -222,6 +297,38 @@ impl MediaSender {
             .stats
             .video_bytes
             .saturating_add(u64::try_from(encoded.payload.len()).unwrap_or(u64::MAX));
+        let wire: usize = out.iter().map(|o| o.body.len()).sum();
+        self.stats.wire_bytes = self
+            .stats
+            .wire_bytes
+            .saturating_add(u64::try_from(wire).unwrap_or(u64::MAX));
+        Ok(out)
+    }
+
+    /// 收到一个反馈数据报。返回要重传的分片。
+    pub fn on_feedback_datagram(&mut self, now: Time, buf: &[u8]) -> Result<Vec<Outgoing>, Error> {
+        let (feedback, nacks) = decode_feedback(buf)?;
+        self.on_feedback(now, &feedback);
+        let mut out = Vec::new();
+        for (frame, frag) in nacks {
+            let again = self
+                .resent
+                .get(&(frame, frag))
+                .is_none_or(|at| now.since(*at) >= self.rtt_us.max(1));
+            let packet = self
+                .recent
+                .iter()
+                .find(|(id, _, _)| *id == frame)
+                .and_then(|(_, _, packets)| packets.get(usize::from(frag)));
+            if let Some(packet) = packet.filter(|_| again) {
+                out.push(packet.clone());
+                self.resent.insert((frame, frag), now);
+            }
+        }
+        self.stats.retransmitted = self
+            .stats
+            .retransmitted
+            .saturating_add(u32::try_from(out.len()).unwrap_or(u32::MAX));
         let wire: usize = out.iter().map(|o| o.body.len()).sum();
         self.stats.wire_bytes = self
             .stats
@@ -397,6 +504,19 @@ impl MediaReceiver {
             self.log.advance(floor);
         }
         (self.log.snapshot().0, expired)
+    }
+
+    /// 有没有缺了一阵子的分片要请求重传。
+    #[must_use]
+    pub fn wants_nack(&self, now: Time) -> bool {
+        !self.reassembler.missing(now, NACK_AFTER_US, 1).is_empty()
+    }
+
+    /// 生成一个反馈数据报：反馈加上缺失分片的重传请求。
+    pub fn feedback_datagram(&mut self, now: Time) -> Vec<u8> {
+        let feedback = self.feedback(now);
+        let nacks = self.reassembler.missing(now, NACK_AFTER_US, MAX_NACKS);
+        encode_feedback(&feedback, &nacks)
     }
 
     /// 生成一条反馈，同时让超时的帧作废。
@@ -677,5 +797,71 @@ mod tests {
             .unwrap();
         assert!(deliver(&mut rx, Time(4), &k, |_| false).is_empty());
         assert_eq!(rx.stats().bad, 1);
+    }
+
+    #[test]
+    fn feedback_datagram_round_trip_and_rejects_garbage() {
+        let fb = Feedback {
+            floor: 7,
+            delivered: 3,
+            queue_delay_us: 1,
+            loss_permille: 2,
+            recv_bytes_per_s: 9,
+        };
+        assert_eq!(
+            decode_feedback(&encode_feedback(&fb, &[])).unwrap(),
+            (fb, vec![])
+        );
+        let nacks: Vec<(u32, u16)> = (0..60).map(|i| (5, i)).collect();
+        let (back, got) = decode_feedback(&encode_feedback(&fb, &nacks)).unwrap();
+        assert_eq!((back, got.len()), (fb, MAX_NACKS), "最多带 {MAX_NACKS} 个");
+        assert!(decode_feedback(&[0; 5]).is_err(), "截断");
+        let mut zero = fb.encode();
+        zero.push(0);
+        assert!(decode_feedback(&zero).is_err(), "个数为 0");
+        let mut short = fb.encode();
+        short.extend([2, 0, 0, 0, 1, 0, 1]);
+        assert!(decode_feedback(&short).is_err(), "说有 2 个，只有 1 个");
+    }
+
+    #[test]
+    fn lost_fragments_are_retransmitted_once_per_rtt() {
+        let mut tx = MediaSender::new(cfg(), Box::new(FakeEncoder::default()));
+        let mut rx = MediaReceiver::new(Time::ZERO, 250_000, Box::new(FakeDecoder::default()));
+        tx.set_profile(Profile {
+            fec_permille: 0,
+            ..Profile::STABLE
+        });
+        let out = tx
+            .on_frame(Time::ZERO, &Screen::new(16, 16, 3), true, 40_000)
+            .unwrap();
+        assert!(out.len() > 3, "关键帧跨好几个分片");
+        // 丢第 2 片：收不齐
+        assert!(deliver(&mut rx, Time::ZERO, &out, |i| i == 1).is_empty());
+        assert!(!rx.wants_nack(Time(1_000)), "刚缺：可能只是乱序");
+        assert!(rx.wants_nack(Time(20_000)));
+        let fb = rx.feedback_datagram(Time(20_000));
+        let again = tx.on_feedback_datagram(Time(20_100), &fb).unwrap();
+        assert_eq!(again, vec![out[1].clone()], "只重传缺的那一片");
+        // 一个往返之内再要：不重复发
+        assert!(tx
+            .on_feedback_datagram(Time(30_000), &fb)
+            .unwrap()
+            .is_empty());
+        assert_eq!(tx.stats().retransmitted, 1);
+        // 重传到了：整帧收齐、显示
+        let shown = deliver(&mut rx, Time(60_000), &again, |_| false);
+        assert_eq!(shown, vec![(1, 3)]);
+        // 过了一个往返还缺（假设重传也丢了）：可以再发
+        assert_eq!(tx.on_feedback_datagram(Time(70_000), &fb).unwrap().len(), 1);
+        // 过了截止时间：不再保留，不重传
+        let _ = tx
+            .on_frame(Time(400_000), &Screen::new(16, 16, 4), true, 40_000)
+            .unwrap();
+        assert!(tx
+            .on_feedback_datagram(Time(400_100), &fb)
+            .unwrap()
+            .is_empty());
+        assert!(tx.on_feedback_datagram(Time(400_200), &[1]).is_err());
     }
 }

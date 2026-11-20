@@ -183,7 +183,7 @@ async fn full_session_video_input_and_files() {
     assert!(report.frames_delivered <= u64::from(host_report.frames_sent));
     assert!(report.frames_delivered >= 10, "{}", report.frames_delivered);
     assert_eq!(sink.count(), report.frames_delivered);
-    assert_eq!(report.video_bytes, host_report.video_bytes);
+    assert!(report.video_bytes <= host_report.video_bytes && report.video_bytes > 0);
     assert_eq!(report.bad_frames, 0);
     assert_eq!(host_report.profile, "stable");
     assert!(host_report.final_rate_bps >= 100_000);

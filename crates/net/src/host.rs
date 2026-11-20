@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use peerdesk_core::adaptive::{Feedback, Profile};
+use peerdesk_core::adaptive::Profile;
 use peerdesk_core::auth::{Auth, Limiter};
 use peerdesk_core::crypto::Suite;
 use peerdesk_core::file::FileMsg;
@@ -295,8 +295,13 @@ pub async fn serve(
                         Err(_) => bad_datagrams = bad_datagrams.saturating_add(1),
                     },
                     // 控制通道的数据报是观看端的反馈：哪些帧到了、链路有没有积压。
-                    Channel::Control => match Feedback::decode(&payload) {
-                        Ok(feedback) => media.on_feedback(link.now(), &feedback),
+                    Channel::Control => match media.on_feedback_datagram(link.now(), &payload) {
+                        Ok(again) => {
+                            let sent = again
+                                .iter()
+                                .try_for_each(|o| link.send_flags(Channel::Video, o.flags, &o.body));
+                            if let Err(e) = sent { break e.to_string(); }
+                        }
                         Err(_) => bad_datagrams = bad_datagrams.saturating_add(1),
                     },
                     Channel::Cursor | Channel::Video | Channel::Clipboard | Channel::File => {

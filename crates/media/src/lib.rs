@@ -5,7 +5,8 @@
 //!
 //! 编码器听传输层的指挥：
 //! - 每帧的字节预算换算成目标码率，码率变化超过一成才通知编码器（避免频繁调整）。
-//! - 画面不变就不编；画面停下后把最后一帧再编几次，只补残差，几帧之内补清晰（[`REFINE_FRAMES`]）。
+//! - 画面不变就不编；画面停下约 200 ms 后把最后一帧再编几次，只补残差，几帧之内补清晰
+//!   （[`REFINE_FRAMES`]）。画面一直在变（打字、拖动）时不补：补了也马上被新内容盖掉，白费流量。
 //! - 丢了帧：下一帧编关键帧。以后改为从长期参考帧恢复。
 
 use openh264::decoder::Decoder;
@@ -64,6 +65,8 @@ pub struct H264Encoder {
     bps: u64,
     force_key: bool,
     refine_left: u8,
+    /// 画面连续没变的帧数：够了 [`Self::refine_after`] 才开始补清晰。
+    still: u32,
 }
 
 impl std::fmt::Debug for H264Encoder {
@@ -94,6 +97,7 @@ impl H264Encoder {
             bps: 0,
             force_key: false,
             refine_left: 0,
+            still: 0,
         }
     }
 
@@ -101,6 +105,11 @@ impl H264Encoder {
     ///
     /// openh264 的封装把每层的最大码率设成初始码率，之后码率只能往下调；所以按上限打开，
     /// 第一帧编完再按预算调下来（编第一帧之前 OpenH264 不接受调码率）。
+    /// 画面停下多少帧之后开始补清晰（约 200 ms）。
+    const fn refine_after(&self) -> u32 {
+        self.fps / 5
+    }
+
     fn open(&self) -> Result<Encoder, Error> {
         let bps = u32::try_from(self.max_bps).unwrap_or(u32::MAX);
         let fps = u16::try_from(self.fps).unwrap_or(u16::MAX);
@@ -174,8 +183,14 @@ impl VideoEncoder for H264Encoder {
     ) -> Result<Option<EncodedFrame>, Error> {
         let size = (screen.width(), screen.height());
         let fresh = self.inner.as_ref().is_none_or(|(w, h, _)| (*w, *h) != size);
-        if !fresh && !changed && !self.force_key && self.refine_left == 0 {
-            return Ok(None);
+        if !fresh && !changed && !self.force_key {
+            // 画面停下了：先等一会儿，确认真的停了再补清晰。
+            self.still = self.still.saturating_add(1);
+            if self.refine_left == 0 || self.still < self.refine_after() {
+                return Ok(None);
+            }
+        } else {
+            self.still = 0;
         }
         // 编码器先拿出来用，编完放回去；编码出错时丢掉，下一帧重新打开（从关键帧开始）。
         let mut enc = match self.inner.take() {
@@ -364,16 +379,19 @@ mod tests {
         let blurry = psnr(&shown, &screen);
         // 画面不再变，预算放宽：补清晰，几帧之后停发
         let mut frames = 0;
-        for id in 2..40 {
+        let mut waited = 0;
+        for id in 2..60 {
             match enc.encode(id, &screen, false, 50_000).unwrap() {
                 Some(f) => {
                     assert!(!f.key);
                     shown = decode(&mut dec, &f).unwrap_or(shown);
                     frames += 1;
                 }
+                None if frames == 0 => waited += 1,
                 None => break,
             }
         }
+        assert_eq!(waited, 30 / 5 - 1, "停下约 200 ms 才开始补");
         assert!(
             frames <= usize::from(REFINE_FRAMES),
             "补清晰最多 {REFINE_FRAMES} 帧，实际 {frames}"
@@ -454,8 +472,10 @@ mod tests {
         let plain = Screen::new(64, 64, 0x0012_3456);
         let _ = enc.encode(2, &plain, true, 10_000).unwrap();
         let mut n = 0;
-        while enc.encode(3 + n, &plain, false, 10_000).unwrap().is_some() {
-            n += 1;
+        for id in 3..60 {
+            if enc.encode(id, &plain, false, 10_000).unwrap().is_some() {
+                n += 1;
+            }
         }
         assert!(n < u32::from(REFINE_FRAMES), "补了 {n} 帧");
     }

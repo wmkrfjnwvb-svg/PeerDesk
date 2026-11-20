@@ -337,7 +337,7 @@ pub fn run(s: &Scenario) -> Result<Outcome, Error> {
                 net.advance_to(when);
                 now = when;
                 if next_feedback <= now {
-                    let fb = rx.feedback(now);
+                    let fb = rx.feedback_datagram(now);
                     let header = Header {
                         channel: Channel::Control,
                         flags: 0,
@@ -346,7 +346,7 @@ pub fn run(s: &Scenario) -> Result<Outcome, Error> {
                         send_time: now,
                     };
                     fb_seq = fb_seq.wrapping_add(1);
-                    let datagram = encode_datagram(&header, &fb.encode())?;
+                    let datagram = encode_datagram(&header, &fb)?;
                     net.send(VIEWER, HOST, datagram.len(), datagram);
                     next_feedback = now.plus(FEEDBACK_US);
                 }
@@ -356,8 +356,21 @@ pub fn run(s: &Scenario) -> Result<Outcome, Error> {
                         continue;
                     };
                     if d.to == HOST {
-                        if let Ok(fb) = peerdesk_core::adaptive::Feedback::decode(body) {
-                            tx.on_feedback(now, &fb);
+                        // 反馈；顺便按请求重传丢了的分片。
+                        for o in tx.on_feedback_datagram(now, body).unwrap_or_default() {
+                            let header = Header {
+                                channel: Channel::Video,
+                                flags: o.flags,
+                                conn_id: 0,
+                                seq,
+                                send_time: now,
+                            };
+                            seq = seq.wrapping_add(1);
+                            let datagram = encode_datagram(&header, &o.body)?;
+                            acc.bytes = acc
+                                .bytes
+                                .saturating_add(u64::try_from(datagram.len()).unwrap_or(u64::MAX));
+                            net.send(HOST, VIEWER, datagram.len(), datagram);
                         }
                         continue;
                     }
