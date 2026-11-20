@@ -69,30 +69,6 @@ jobs:
   e2e:
     name: e2e (simulated network, real codec)
     runs-on: ubuntu-latest
-  # 平台层实机测试：在三个系统的桌面上真的采集画面、注入键鼠（crates/platform/tests/live.rs），
-  # 再用发布版跑一次 screen-check 量采集耗时、保存画面。
-  # Linux 用 Xvfb；Windows 用 CI 机器的交互桌面；macOS 的 CI 机器可能没有“屏幕录制”权限，
-  # 这时测试打印说明后跳过，screen-check 报告缺少权限但不算失败（能不能采集本身就是要知道的信息）。
-  platform-live:
-    name: platform live (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-  # 每次推送都打一个能下载、安装、在自己机器之间试用的测试包。
-  package:
-    name: package (${{ matrix.name }})
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: windows-latest
-            name: windows-x64
-            script: scripts/package-windows.sh
-          - os: macos-latest
-            name: macos-universal
-            script: scripts/package-macos.sh
-    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - run: rustup show
@@ -126,6 +102,22 @@ jobs:
           name: e2e-${{ github.sha }}
           path: target/e2e
           retention-days: 14
+
+  # 平台层实机测试：在三个系统的桌面上真的采集画面、注入键鼠（crates/platform/tests/live.rs），
+  # 再用发布版跑一次 screen-check 量采集耗时、保存画面。
+  # Linux 用 Xvfb；Windows 用 CI 机器的交互桌面；macOS 的 CI 机器可能没有“屏幕录制”权限，
+  # 这时测试打印说明后跳过，screen-check 报告缺少权限但不算失败（能不能采集本身就是要知道的信息）。
+  platform-live:
+    name: platform live (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
       - name: Start a virtual X11 display
         if: runner.os == 'Linux'
         run: |
@@ -153,6 +145,25 @@ jobs:
           name: screen-check-${{ matrix.os }}
           path: screen.bmp
           if-no-files-found: ignore
+
+  # 每次推送都打一个能下载、安装、在自己机器之间试用的测试包。
+  package:
+    name: package (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: windows-x64
+            script: scripts/package-windows.sh
+          - os: macos-latest
+            name: macos-universal
+            script: scripts/package-macos.sh
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
         with:
           key: package
       - uses: actions/setup-node@v4
