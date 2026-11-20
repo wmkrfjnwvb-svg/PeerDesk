@@ -44,6 +44,11 @@ cast_possible_truncation = "deny"
 cast_sign_loss = "deny"
 cast_possible_wrap = "deny"
 
+# 开发和测试构建里，依赖库（OpenH264、图形界面等）也开优化：不优化的软件编码器编一帧要好几秒，
+# 会让会话测试超时。只影响依赖，我们自己的代码仍按调试方式编译（覆盖率只统计我们的代码）。
+[profile.dev.package."*"]
+opt-level = 2
+
 # 体积优先的发布配置。
 [profile.release]
 opt-level = "z"
