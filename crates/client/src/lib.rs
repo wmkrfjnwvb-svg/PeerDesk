@@ -1,9 +1,12 @@
 //! PeerDesk 客户端的命令行逻辑。
 //!
-//! 现阶段提供探测、仿真和配置检查；远程画面窗口在 M1 用 Tauri 接入，复用同一个核心库。
+//! 现阶段提供探测、仿真和配置检查，以及一个测试用的图形界面（不带参数运行时打开）；
+//! 正式的产品界面在 M1 用 Tauri 接入，复用同一个核心库。
 
 use std::io::Write;
 
+pub mod gui;
+mod local;
 mod remote;
 
 use peerdesk_core::config::ClientConfig;
@@ -23,6 +26,7 @@ pub const EXIT_USAGE: u8 = 2;
 
 const USAGE: &str = "\
 用法：peerdesk <命令> [参数]
+      peerdesk                不带参数：打开图形界面（测试控制台）
 
 命令：
   version                 显示版本
