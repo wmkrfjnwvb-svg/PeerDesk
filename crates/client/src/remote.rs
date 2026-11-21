@@ -1347,7 +1347,10 @@ mod tests {
             Ok(Lookup::Code(123_456_789))
         ));
         let fp = "ab".repeat(32);
-        assert!(matches!(parse_device("--device", Some(&fp)), Ok(Lookup::Device(_))));
+        assert!(matches!(
+            parse_device("--device", Some(&fp)),
+            Ok(Lookup::Device(_))
+        ));
         assert!(parse_device("--device", None).is_err());
         assert!(parse_device("--device", Some(&"zz".to_owned())).is_err());
     }
