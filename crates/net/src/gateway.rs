@@ -284,22 +284,31 @@ fn probe_targets(gw: IpAddr, port: u16) -> Vec<SocketAddr> {
     match gw {
         IpAddr::V4(_) => vec![SocketAddr::new(gw, port)],
         IpAddr::V6(v6) => {
-            if is_link_local_v6(v6) {
-                let scopes = link_local_scopes(
+            let scopes = if is_link_local_v6(v6) {
+                link_local_scopes(
                     if_addrs::get_if_addrs()
                         .unwrap_or_default()
                         .iter()
                         .map(|i| (i.index, i.ip())),
-                );
-                scopes
-                    .into_iter()
-                    .map(|scope| SocketAddr::V6(SocketAddrV6::new(v6, port, 0, scope)))
-                    .collect()
+                )
             } else {
-                vec![SocketAddr::new(gw, port)]
-            }
+                Vec::new()
+            };
+            scoped_targets(v6, port, &scopes)
         }
     }
+}
+
+/// 把 IPv6 网关和接口编号拼成目标地址：没有接口编号（非链路本地地址）就只有一个不带编号的目标，
+/// 链路本地地址每个接口编号一个目标。
+fn scoped_targets(gw: Ipv6Addr, port: u16, scopes: &[u32]) -> Vec<SocketAddr> {
+    if scopes.is_empty() {
+        return vec![SocketAddr::V6(SocketAddrV6::new(gw, port, 0, 0))];
+    }
+    scopes
+        .iter()
+        .map(|&scope| SocketAddr::V6(SocketAddrV6::new(gw, port, 0, scope)))
+        .collect()
 }
 
 /// 是否 IPv6 链路本地地址 `fe80::/10`。
@@ -330,17 +339,19 @@ async fn probe_once(target: SocketAddr, timeout: Duration) -> Option<Duration> {
     let socket = UdpSocket::bind(bind).await.ok()?;
     socket.connect(target).await.ok()?;
     let start = Instant::now();
-    if let Err(e) = socket.send(&[0u8]).await {
-        // 回环等场景下，ICMP 错误可能在发送时就报出来。
-        return is_unreachable(&e).then(|| start.elapsed());
-    }
     let mut buf = [0u8; 16];
-    match tokio::time::timeout(timeout, socket.recv(&mut buf)).await {
-        Ok(Err(e)) if is_unreachable(&e) => Some(start.elapsed()),
-        // 对端居然回了数据：也是一次有效的往返。
-        Ok(Ok(_)) => Some(start.elapsed()),
-        // 其他错误、超时：这次没测到。
-        Ok(Err(_)) | Err(_) => None,
+    // 发送失败（回环等场景下 ICMP 错误可能在发送时就报出来）和接收失败按同一种方式判断；超时记为 TimedOut。
+    let result: std::io::Result<usize> = async {
+        socket.send(&[0u8]).await?;
+        tokio::time::timeout(timeout, socket.recv(&mut buf))
+            .await
+            .unwrap_or_else(|_| Err(std::io::ErrorKind::TimedOut.into()))
+    }
+    .await;
+    // 对端居然回了数据也是一次有效的往返；其他错误（含超时）这次没测到。
+    match result {
+        Ok(_) => Some(start.elapsed()),
+        Err(e) => is_unreachable(&e).then(|| start.elapsed()),
     }
 }
 
@@ -611,14 +622,21 @@ Persistent Routes:
             v6,
             vec!["[2001:db8::1]:33434".parse::<SocketAddr>().unwrap()]
         );
-        // 链路本地：每个目标都带接口编号（沙箱里可能没有，只检查带的都是链路本地地址 + 正确端口）。
+        // 链路本地：目标数由本机接口决定（沙箱里可能为 0 个以上任意数量），每个都是同一网关、同一端口。
         for t in probe_targets("fe80::1".parse().unwrap(), 33440) {
-            let SocketAddr::V6(t) = t else {
-                panic!("应为 IPv6 目标");
-            };
             assert_eq!(t.port(), 33440);
-            assert_ne!(t.scope_id(), 0);
+            assert_eq!(t.ip(), "fe80::1".parse::<IpAddr>().unwrap());
         }
+    }
+
+    #[test]
+    fn scoped_targets_per_interface() {
+        let gw: Ipv6Addr = "fe80::1".parse().unwrap();
+        let none = scoped_targets(gw, 33434, &[]);
+        assert_eq!(none, vec!["[fe80::1]:33434".parse::<SocketAddr>().unwrap()]);
+        let two = scoped_targets(gw, 33434, &[2, 7]);
+        let shown: Vec<String> = two.iter().map(ToString::to_string).collect();
+        assert_eq!(shown, vec!["[fe80::1%2]:33434", "[fe80::1%7]:33434"]);
     }
 
     #[tokio::test]
@@ -665,9 +683,8 @@ Persistent Routes:
         let target = echo.local_addr().unwrap();
         tokio::spawn(async move {
             let mut buf = [0u8; 16];
-            if let Ok((_, from)) = echo.recv_from(&mut buf).await {
-                let _ = echo.send_to(b"x", from).await;
-            }
+            let (_, from) = echo.recv_from(&mut buf).await.unwrap();
+            echo.send_to(b"x", from).await.unwrap();
         });
         assert!(probe_once(target, Duration::from_secs(1)).await.is_some());
     }
