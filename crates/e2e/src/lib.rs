@@ -334,6 +334,8 @@ pub fn run(s: &Scenario) -> Result<Outcome, Error> {
     // 源画面变了、控制端还没看到新画面：从哪个时刻开始等的。
     let mut waiting_since: Option<Time> = None;
     let mut first = true;
+    // 画面变了但还没编（在途数据满了）。
+    let mut pending = false;
     let mut overall_freezes = 0u32;
 
     let mut now = Time::ZERO;
@@ -362,10 +364,12 @@ pub fn run(s: &Scenario) -> Result<Outcome, Error> {
             if changed && waiting_since.is_none() {
                 waiting_since = Some(now);
             }
-            if changed || tx.wants_frame() {
+            pending |= changed;
+            // 在途数据超过上限：这一帧不编，变化攒着，等确认之后编最新的画面。
+            if (pending || tx.wants_frame()) && !tx.in_flight_full(now) {
                 let rtt = link.delay_us.saturating_mul(2).saturating_add(1_000);
                 let before = tx.stats().frames;
-                let out = tx.on_frame(now, desk.screen(), changed, rtt)?;
+                let out = tx.on_frame(now, desk.screen(), std::mem::take(&mut pending), rtt)?;
                 if tx.stats().frames != before {
                     captured.push(now);
                 }

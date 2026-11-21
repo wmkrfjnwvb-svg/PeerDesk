@@ -430,7 +430,8 @@ pub async fn serve(
                     }
                 };
                 pending_change |= changed;
-                if encoding || (!pending_change && !media.wants_frame()) {
+                // 在途数据超过上限：这一帧不编，变化攒着，等确认之后编最新的画面。
+                if encoding || media.in_flight_full(link.now()) || (!pending_change && !media.wants_frame()) {
                     continue;
                 }
                 let rtt = u64::try_from(link.rtt().as_micros()).unwrap_or(u64::MAX);

@@ -22,6 +22,11 @@ use crate::wire::{Reader, Writer};
 pub use crate::desktop_sim::FLAG_PARITY;
 use crate::proto::{HEADER_LEN, VIDEO_HEADER_LEN};
 
+/// 在途上限在往返时间之外多留的时间（微秒）。
+const IN_FLIGHT_EXTRA_US: u64 = 50_000;
+/// 发出多久之内的帧算“在途”（往返时间之外，微秒）。
+const IN_FLIGHT_RECENT_US: u64 = 100_000;
+
 /// 一条反馈最多带多少个重传请求。
 pub const MAX_NACKS: usize = 48;
 /// 分片缺了多久才请求重传（微秒）：短于这个时间可能只是乱序。
@@ -256,6 +261,31 @@ impl MediaSender {
     #[must_use]
     pub const fn stats(&self) -> SenderStats {
         self.stats
+    }
+
+    /// 在途数据有没有超过上限。超过时不要编下一帧：画面的变化先攒着，等在途数据被确认之后
+    /// 编最新的那一幅（跳到最新，不排队）。上限约等于码率 ×（往返 + 50 ms），至少两帧的预算。
+    ///
+    /// 一次大面积变化（切窗口）编出来的帧往往是预算的十几倍，这是编码器决定的、免不了；
+    /// 要避免的是它之后的帧接着往里塞，在瓶颈处排出长队，让之后的每一帧都晚到。
+    ///
+    /// 只算最近一个往返加 100 ms 之内发出的帧：更早的要么已经到了（确认还在路上），要么正在靠
+    /// 重传补，再拦着新帧只会让画面停住（例如丢包网络上一个大帧要好几轮重传才收齐）。
+    #[must_use]
+    pub fn in_flight_full(&self, now: Time) -> bool {
+        let window_us = self.rtt_us.saturating_add(IN_FLIGHT_EXTRA_US);
+        let by_rate = self.rate.rate_bps().saturating_mul(window_us) / 8_000_000;
+        let floor = u64::try_from(self.frame_budget())
+            .unwrap_or(u64::MAX)
+            .saturating_mul(2);
+        let recent_us = self.rtt_us.saturating_add(IN_FLIGHT_RECENT_US);
+        let recent: u64 = self
+            .unacked
+            .iter()
+            .filter(|(_, at, _)| now.since(*at) < recent_us)
+            .map(|(_, _, bytes)| *bytes)
+            .sum();
+        recent > by_rate.max(floor)
     }
 
     /// 画面没变时还要不要按时交来（编码器在补清晰或要恢复）。
