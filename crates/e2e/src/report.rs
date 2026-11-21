@@ -115,7 +115,7 @@ pub fn json(o: &Outcome) -> String {
         })
         .collect();
     format!(
-        "{{\"name\":\"{}\",\"codec\":\"{}\",\"estimator\":\"{}\",\"keyframes\":{},\"recoveries\":{},\"skipped\":{},\"bad\":{},\"net_lost\":{},\"net_queue_dropped\":{},\"max_wait_ms\":{:.1},\"freezes\":{},\"phases\":[{}]}}",
+        "{{\"name\":\"{}\",\"codec\":\"{}\",\"estimator\":\"{}\",\"keyframes\":{},\"recoveries\":{},\"skipped\":{},\"bad\":{},\"net_lost\":{},\"net_queue_dropped\":{},\"max_wait_ms\":{:.1},\"first_picture_ms\":{},\"freezes\":{},\"phases\":[{}]}}",
         o.name,
         o.codec.name(),
         o.estimator,
@@ -126,6 +126,7 @@ pub fn json(o: &Outcome) -> String {
         o.net.lost,
         o.net.queue_dropped,
         o.max_wait_ms,
+        o.first_picture_ms.map_or_else(|| "null".to_owned(), |v| format!("{v:.1}")),
         o.freezes,
         phases.join(","),
     )

@@ -180,8 +180,10 @@ pub struct Outcome {
     pub bad: u32,
     /// 网络计数。
     pub net: NetStats,
-    /// 全程最长等待（毫秒）。
+    /// 全程最长等待（毫秒），从看到第一幅画面之后算。
     pub max_wait_ms: f64,
+    /// 会话开始到看到第一幅画面（毫秒）；一直没看到时为 `None`。
+    pub first_picture_ms: Option<f64>,
     /// 全程卡顿次数。
     pub freezes: u32,
     /// 带宽估计器的名字。
@@ -333,6 +335,8 @@ pub fn run(s: &Scenario) -> Result<Outcome, Error> {
     let mut features = Vec::new();
     // 源画面变了、控制端还没看到新画面：从哪个时刻开始等的。
     let mut waiting_since: Option<Time> = None;
+    // 会话开始到看到第一幅画面用了多久。
+    let mut first_picture: Option<u64> = None;
     let mut first = true;
     // 画面变了但还没编（在途数据满了）。
     let mut pending = false;
@@ -366,7 +370,7 @@ pub fn run(s: &Scenario) -> Result<Outcome, Error> {
             }
             pending |= changed;
             // 在途数据超过上限：这一帧不编，变化攒着，等确认之后编最新的画面。
-            if (pending || tx.wants_frame()) && !tx.in_flight_full(now) {
+            if (pending || tx.wants_frame()) && !tx.in_flight_full(now) && tx.due(now) {
                 let rtt = link.delay_us.saturating_mul(2).saturating_add(1_000);
                 let before = tx.stats().frames;
                 let out = tx.on_frame(now, desk.screen(), std::mem::take(&mut pending), rtt)?;
@@ -464,9 +468,14 @@ pub fn run(s: &Scenario) -> Result<Outcome, Error> {
                     acc.shown += 1;
                     if let Some(since) = waiting_since.take() {
                         let wait = now.since(since);
-                        acc.max_wait = acc.max_wait.max(wait);
-                        if wait > FREEZE_US {
-                            acc.freezes += 1;
+                        // 第一幅画面单独记（会话开始时的等待），不算卡顿。
+                        if first_picture.is_none() {
+                            first_picture = Some(wait);
+                        } else {
+                            acc.max_wait = acc.max_wait.max(wait);
+                            if wait > FREEZE_US {
+                                acc.freezes += 1;
+                            }
                         }
                     }
                     let screen = frame.screen.clone();
@@ -479,8 +488,8 @@ pub fn run(s: &Scenario) -> Result<Outcome, Error> {
             net.advance_to(tick_end);
             now = tick_end;
         }
-        // 阶段结束时还在等：等到现在的时间也算进去。
-        if let Some(since) = waiting_since {
+        // 阶段结束时还在等（第一幅画面已经出来之后）：等到现在的时间也算进去。
+        if let Some(since) = waiting_since.filter(|_| first_picture.is_some()) {
             let wait = now.since(since);
             acc.max_wait = acc.max_wait.max(wait);
             if wait > FREEZE_US && acc.max_wait == wait {
@@ -522,6 +531,7 @@ pub fn run(s: &Scenario) -> Result<Outcome, Error> {
         bad: rx_stats.bad,
         net: net.stats(),
         max_wait_ms: ms(overall_wait),
+        first_picture_ms: first_picture.map(ms),
         freezes: overall_freezes,
         estimator: tx.estimator(),
         features,

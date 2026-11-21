@@ -27,6 +27,7 @@ pub mod desktop_sim;
 pub mod error;
 pub mod estimator;
 pub mod file;
+pub mod governor;
 pub mod input;
 pub mod media;
 pub mod probe;

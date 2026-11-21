@@ -36,20 +36,17 @@ pub struct Extension {
     pub groups: u16,
     /// 这段时间里测到的最大包串速率（字节每秒），0 表示没有测到。
     pub train_bytes_per_s: u32,
-    /// 接收端处理积压（微秒）：收到数据报到交给解码之间排了多久。是本机 CPU 忙，不是网络。
-    pub processing_us: u32,
 }
 
 impl Extension {
     /// 编码后的长度。
-    pub const LEN: usize = 14;
+    pub const LEN: usize = 10;
 
     /// 编码。
     pub fn encode(&self, w: &mut Writer) {
         w.u32(u32::from_ne_bytes(self.trend_tenth_ms.to_ne_bytes()))
             .u16(self.groups)
-            .u32(self.train_bytes_per_s)
-            .u32(self.processing_us);
+            .u32(self.train_bytes_per_s);
     }
 
     /// 解码。
@@ -58,7 +55,6 @@ impl Extension {
             trend_tenth_ms: i32::from_ne_bytes(r.u32()?.to_ne_bytes()),
             groups: r.u16()?,
             train_bytes_per_s: r.u32()?,
-            processing_us: r.u32()?,
         })
     }
 }
@@ -85,7 +81,6 @@ pub struct ReceiverMetrics {
     /// 回归用的点：(到达时间毫秒, 平滑后的累加延迟微秒)。
     points: Vec<(i64, i64)>,
     max_train: u32,
-    processing_us: u32,
 }
 
 impl ReceiverMetrics {
@@ -99,7 +94,6 @@ impl ReceiverMetrics {
             smoothed: 0,
             points: Vec::new(),
             max_train: 0,
-            processing_us: 0,
         }
     }
 
@@ -139,13 +133,6 @@ impl ReceiverMetrics {
         });
     }
 
-    /// 记下接收端的处理积压（数据报到达到被处理之间的时间）。
-    pub const fn on_processing_delay(&mut self, us: u32) {
-        if us > self.processing_us {
-            self.processing_us = us;
-        }
-    }
-
     fn finish(&mut self, g: Group) {
         // 包串速率：首包到达之后的字节 ÷ 首尾到达间隔。
         let span = g.last_arrival.since(g.first_arrival);
@@ -173,7 +160,7 @@ impl ReceiverMetrics {
         self.previous = Some(g);
     }
 
-    /// 生成这段时间的扩展测量，并开始下一段（包串速率和处理积压清零，趋势线保留）。
+    /// 生成这段时间的扩展测量，并开始下一段（包串速率清零，趋势线保留）。
     pub fn report(&mut self) -> Extension {
         let slope_milli = slope_per_mille(&self.points);
         let n = i64::try_from(self.points.len()).unwrap_or(0);
@@ -188,10 +175,8 @@ impl ReceiverMetrics {
             }),
             groups: u16::try_from(self.points.len()).unwrap_or(u16::MAX),
             train_bytes_per_s: self.max_train,
-            processing_us: self.processing_us,
         };
         self.max_train = 0;
-        self.processing_us = 0;
         ext
     }
 }
@@ -516,7 +501,6 @@ mod tests {
             trend_tenth_ms: -1234,
             groups: 20,
             train_bytes_per_s: 9_000_000,
-            processing_us: 777,
         };
         let mut w = Writer::new();
         e.encode(&mut w);
@@ -585,11 +569,6 @@ mod tests {
             draining.on_packet(send.plus(10_000 + queue), send, f, 1000);
         }
         assert!(draining.report().trend_tenth_ms < 0);
-        // 处理积压取最大值，报告后清零
-        let mut m = ReceiverMetrics::new();
-        m.on_processing_delay(5);
-        m.on_processing_delay(3);
-        assert_eq!(m.report().processing_us, 5);
         assert_eq!(slope_per_mille(&[(1, 1), (1, 5)]), 0, "x 都相同");
     }
 

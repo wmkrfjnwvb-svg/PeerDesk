@@ -80,9 +80,16 @@ fn gate(o: &Outcome, what: &str, ok: bool, detail: &str) {
 fn gates(o: &Outcome) {
     // 硬门槛：任何时候都不能把解不了的帧交给解码器（花屏）。
     assert_eq!(o.bad, 0, "{} {}: 有帧解码失败", o.name, o.codec.name());
+    let first = o.first_picture_ms.unwrap_or(f64::INFINITY);
     gate(
         o,
-        "没有超过 1 秒的冻结",
+        "2 秒内看到第一幅画面",
+        first < 2000.0,
+        &format!("第一幅画面 {first:.0} ms"),
+    );
+    gate(
+        o,
+        "之后没有超过 1 秒的冻结",
         o.max_wait_ms < 1000.0,
         &format!("最长等待 {:.0} ms", o.max_wait_ms),
     );
@@ -231,5 +238,56 @@ fn random_loss_without_congestion() {
             "random-loss",
             vec![phase(Action::Dragging, 150), phase(Action::Idle, 30)],
         )
+    });
+}
+
+/// 窄带宽上播放视频：每帧都装不进预算。应当降帧率保住画面，而不是每帧都超预算、排长队卡住。
+#[test]
+fn video_on_a_narrow_link() {
+    compare(&Scenario {
+        network: vec![(
+            0,
+            Link {
+                rate_bps: Some(1_500_000),
+                delay_us: 15_000,
+                ..Link::lan()
+            },
+        )],
+        start_bps: 1_000_000,
+        ..Scenario::new(
+            "narrow-video",
+            vec![phase(Action::Video, 150), phase(Action::Idle, 30)],
+        )
+    });
+}
+
+/// 带宽随时间变化的蜂窝网络（合成的，不是录下来的真实轨迹）：每半秒在 2–12 Mbps 之间随机游走，
+/// 40 ms 延迟、抖动、1% 丢包，跑一整段办公操作。种子固定，结果可复现。
+#[test]
+fn office_on_a_varying_cellular_link() {
+    let mut seed = 7u64;
+    let mut mbps = 6i64;
+    let network: Vec<(u64, Link)> = (0..36u64)
+        .map(|i| {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let step = i64::try_from(seed >> 62).unwrap() - 1; // -1、0、1、2
+            mbps = (mbps + step * 2).clamp(2, 12);
+            let link = Link {
+                delay_us: 40_000,
+                jitter_us: 15_000,
+                loss_permille: 10,
+                rate_bps: Some(u64::try_from(mbps).unwrap() * 1_000_000),
+                ..Link::lan()
+            };
+            (i * 500_000, link)
+        })
+        .collect();
+    compare(&Scenario {
+        network,
+        profile: Profile::CELLULAR,
+        start_bps: 2_000_000,
+        ..Scenario::new("varying-cellular", office())
     });
 }

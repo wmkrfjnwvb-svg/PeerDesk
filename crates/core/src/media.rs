@@ -12,6 +12,7 @@ use std::collections::{BTreeMap, VecDeque};
 use crate::adaptive::{DelayTracker, DeliveryLog, Feedback, Profile};
 use crate::error::Error;
 use crate::estimator::{EstimatorKind, Extension, Observation, RateEstimator, ReceiverMetrics};
+use crate::governor::FpsGovernor;
 use crate::proto::{VideoHeader, MAX_DATAGRAM};
 use crate::screen::Screen;
 use crate::time::Time;
@@ -21,6 +22,12 @@ use crate::wire::{Reader, Writer};
 
 pub use crate::desktop_sim::FLAG_PARITY;
 use crate::proto::{HEADER_LEN, VIDEO_HEADER_LEN};
+
+/// 一轮重传最多补发多长时间的量（按当前码率，微秒）。
+const RESEND_WINDOW_US: u64 = 40_000;
+
+/// 一帧从发出到送达的目标时间（微秒）：排队延迟按它扣减每帧预算。
+const QUEUE_TARGET_US: u64 = 50_000;
 
 /// 在途上限在往返时间之外多留的时间（微秒）。
 const IN_FLIGHT_EXTRA_US: u64 = 50_000;
@@ -199,6 +206,9 @@ pub struct MediaSender {
     resent: BTreeMap<(u32, u16), Time>,
     rtt_us: u64,
     last_obs: Option<Observation>,
+    governor: FpsGovernor,
+    /// 下一次 [`Self::finish_frame`] 用的编码时间（微秒），由编码线程报告。
+    encode_us: u64,
 }
 
 impl std::fmt::Debug for MediaSender {
@@ -242,6 +252,8 @@ impl MediaSender {
             resent: BTreeMap::new(),
             rtt_us: 0,
             last_obs: None,
+            governor: FpsGovernor::new(cfg.fps),
+            encode_us: 0,
         }
     }
 
@@ -261,6 +273,23 @@ impl MediaSender {
     #[must_use]
     pub const fn stats(&self) -> SenderStats {
         self.stats
+    }
+
+    /// 当前帧率（CPU 跟不上或内容装不进预算时会低于设定值）。
+    #[must_use]
+    pub const fn fps(&self) -> u32 {
+        self.governor.fps()
+    }
+
+    /// 按当前帧率，到时间编下一帧了吗。
+    #[must_use]
+    pub fn due(&self, now: Time) -> bool {
+        self.governor.due(now)
+    }
+
+    /// 编码线程报告这一帧编了多久（微秒），在 [`Self::finish_frame`] 之前调用。
+    pub const fn set_encode_time(&mut self, us: u64) {
+        self.encode_us = us;
     }
 
     /// 在途数据有没有超过上限。超过时不要编下一帧：画面的变化先攒着，等在途数据被确认之后
@@ -285,7 +314,9 @@ impl MediaSender {
             .filter(|(_, at, _)| now.since(*at) < recent_us)
             .map(|(_, _, bytes)| *bytes)
             .sum();
-        recent > by_rate.max(floor)
+        // 最近的关键帧还没确认：之后的帧都依赖它，发了也解不了，先等它送到。
+        let key_pending = self.unacked.iter().any(|(id, _, _)| *id == self.last_key);
+        recent > by_rate.max(floor) || key_pending
     }
 
     /// 画面没变时还要不要按时交来（编码器在补清晰或要恢复）。
@@ -384,9 +415,12 @@ impl MediaSender {
         refine: bool,
     ) -> Result<Vec<Outgoing>, Error> {
         self.refine = refine;
+        let encode_us = std::mem::take(&mut self.encode_us);
         let Some(encoded) = encoded else {
             return Ok(Vec::new());
         };
+        self.governor
+            .on_frame(now, encode_us, encoded.payload.len(), job.budget);
         let frame_id = job.frame_id;
         // 关键帧参考自己；其余参考上一帧（视频编码的增量帧依赖它）。
         let ref_frame = if encoded.key || self.codec == Codec::Tile {
@@ -445,8 +479,21 @@ impl MediaSender {
     pub fn on_feedback_datagram(&mut self, now: Time, buf: &[u8]) -> Result<Vec<Outgoing>, Error> {
         let (feedback, ext, nacks) = decode_feedback(buf)?;
         self.observe(now, &feedback, ext);
+        // 接收端还在为这些帧要重传：它们在路上、在进展，不能按超时判丢（判丢就要重发关键帧）。
+        for (id, at, _) in &mut self.unacked {
+            if nacks.iter().any(|(frame, _)| frame == id) {
+                *at = now;
+            }
+        }
         let mut out = Vec::new();
+        // 一轮重传不超过约两个反馈间隔能送完的量：一次全部补发会再次挤爆瓶颈的缓冲区，
+        // 又丢一大半（窄带宽上大关键帧就是这样反复丢、半天收不齐）。没补到的下一轮还会再要。
+        let allowance = self.rate.rate_bps().saturating_mul(RESEND_WINDOW_US) / 8_000_000;
+        let mut resent_bytes = 0u64;
         for (frame, frag) in nacks {
+            if resent_bytes >= allowance.max(1) {
+                break;
+            }
             let again = self
                 .resent
                 .get(&(frame, frag))
@@ -457,6 +504,8 @@ impl MediaSender {
                 .find(|(id, _, _)| *id == frame)
                 .and_then(|(_, _, packets)| packets.get(usize::from(frag)));
             if let Some(packet) = packet.filter(|_| again) {
+                resent_bytes = resent_bytes
+                    .saturating_add(u64::try_from(packet.body.len()).unwrap_or(u64::MAX));
                 out.push(packet.clone());
                 self.resent.insert((frame, frag), now);
             }
@@ -492,11 +541,18 @@ impl MediaSender {
     }
 
     /// 每帧字节预算：码率摊到每帧，打一个折扣给重传和控制消息留余量。
+    ///
+    /// 排队延迟越接近目标（[`QUEUE_TARGET_US`]），预算越小：一帧要在目标时间内送到，已经排着的
+    /// 时间要扣掉。这样排队刚开始涨，下一帧就先变小，不用等码率调下来。最少保留四分之一。
     fn frame_budget(&self) -> usize {
-        let per_frame = self.rate.rate_bps() / 8 / u64::from(self.cfg.fps.max(1));
+        let per_frame = self.rate.rate_bps() / 8 / u64::from(self.governor.fps().max(1));
         let budget =
             per_frame.saturating_mul(u64::from(self.rate.profile().safety_permille)) / 1000;
-        usize::try_from(budget).unwrap_or(usize::MAX)
+        let queue = u64::from(self.last_obs.map_or(0, |o| o.feedback.queue_delay_us));
+        let left = QUEUE_TARGET_US
+            .saturating_sub(queue)
+            .max(QUEUE_TARGET_US / 4);
+        usize::try_from(budget.saturating_mul(left) / QUEUE_TARGET_US).unwrap_or(usize::MAX)
     }
 
     fn observe(&mut self, now: Time, feedback: &Feedback, ext: Extension) {
@@ -1115,7 +1171,6 @@ mod tests {
             trend_tenth_ms: -5,
             groups: 3,
             train_bytes_per_s: 1,
-            processing_us: 2,
         };
         assert_eq!(
             decode_feedback(&encode_feedback(&fb, &ext, &[])).unwrap(),
@@ -1277,5 +1332,28 @@ mod tests {
         tx.on_feedback(Time(5), &fb);
         let key = step(&mut tx, &mut rx, 6, 6);
         assert_eq!(worker.decode(&key[0]).unwrap().unwrap().pixels()[0], 6);
+    }
+
+    #[test]
+    fn budget_shrinks_as_the_queue_grows() {
+        let mut tx = MediaSender::new(cfg(), Box::new(FakeEncoder::default()));
+        let full = tx.frame_budget();
+        assert!(full > 0);
+        let fb = |q| Feedback {
+            floor: 0,
+            delivered: 0,
+            queue_delay_us: q,
+            loss_permille: 0,
+            recv_bytes_per_s: 0,
+        };
+        tx.on_feedback(Time(1), &fb(25_000));
+        let half = tx.frame_budget();
+        assert!(half < full && half > full / 3, "{full} {half}");
+        tx.on_feedback(Time(2), &fb(200_000));
+        assert!(
+            tx.frame_budget() >= tx.frame_budget().min(full / 4),
+            "最少保留四分之一"
+        );
+        assert!(tx.frame_budget() < half);
     }
 }

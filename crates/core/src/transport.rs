@@ -154,6 +154,8 @@ struct Parity {
 #[derive(Debug, Clone)]
 struct Partial {
     first_seen: Time,
+    /// 最近一次收到这一帧分片的时间。
+    last_seen: Time,
     ref_frame: u32,
     parts: Vec<Option<Vec<u8>>>,
     have: usize,
@@ -199,6 +201,9 @@ impl Partial {
         recovered
     }
 }
+
+/// 一帧从第一个分片算起最多等这么多个截止时间。
+const MAX_FRAME_LIFETIME_FACTOR: u64 = 8;
 
 /// 按截止时间重组视频帧。
 #[derive(Debug, Clone)]
@@ -313,11 +318,13 @@ impl Reassembler {
             .entry(header.frame_id)
             .or_insert_with(|| Partial {
                 first_seen: now,
+                last_seen: now,
                 ref_frame: header.ref_frame,
                 parts: vec![None; usize::from(data_count)],
                 have: 0,
                 parity: Vec::new(),
             });
+        partial.last_seen = now;
         if partial.parts.len() != usize::from(data_count) {
             return Err(Error::Inconsistent("同一帧的分片总数不一致"));
         }
@@ -382,13 +389,18 @@ impl Reassembler {
         }))
     }
 
-    /// 作废超过截止时间的帧，返回它们的帧号。
+    /// 作废没有进展的帧，返回它们的帧号。
+    ///
+    /// 按“多久没收到新分片”判断，而不是按“第一个分片到了多久”：窄带宽上一个关键帧可能要
+    /// 好几百毫秒才送完，只要分片还在陆续到，就不该作废它（作废了发送端只能再发一个同样大的
+    /// 关键帧，永远收不齐）。另有一个硬上限：截止时间的 8 倍。
     pub fn expire(&mut self, now: Time) -> Vec<u32> {
         let deadline = self.deadline_us;
+        let hard = deadline.saturating_mul(MAX_FRAME_LIFETIME_FACTOR);
         let late: Vec<u32> = self
             .pending
             .iter()
-            .filter(|(_, p)| now.since(p.first_seen) >= deadline)
+            .filter(|(_, p)| now.since(p.last_seen) >= deadline || now.since(p.first_seen) >= hard)
             .map(|(id, _)| *id)
             .collect();
         for id in &late {

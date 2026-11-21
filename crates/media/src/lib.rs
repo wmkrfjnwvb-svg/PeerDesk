@@ -23,7 +23,7 @@ use peerdesk_core::screen::Screen;
 use peerdesk_core::video::{Codec, EncodedFrame, FrameHeader, VideoDecoder, VideoEncoder};
 
 /// 画面停下后最多再编几帧来补清晰。
-pub const REFINE_FRAMES: u8 = 8;
+pub const REFINE_FRAMES: u8 = 12;
 /// 补清晰的一帧小于这么多字节，说明已经补不出什么了，提前停下。
 const REFINE_DONE_BYTES: usize = 64;
 /// 码率下限（比特每秒）：再低 OpenH264 的码率控制就不稳定了。
@@ -106,17 +106,19 @@ impl H264Encoder {
         }
     }
 
-    /// 打开编码器。
-    ///
-    /// openh264 的封装把每层的最大码率设成初始码率，之后码率只能往下调；所以按上限打开，
-    /// 第一帧编完再按预算调下来（编第一帧之前 OpenH264 不接受调码率）。
     /// 画面停下多少帧之后开始补清晰（约 200 ms）。
     const fn refine_after(&self) -> u32 {
         self.fps / 5
     }
 
-    fn open(&self) -> Result<Encoder, Error> {
-        let bps = u32::try_from(self.max_bps).unwrap_or(u32::MAX);
+    /// 按 `bps` 打开编码器。
+    ///
+    /// 第一帧（关键帧）的大小由打开时的码率决定：按上限打开的话，1.5 Mbps 的链路上第一帧有
+    /// 130 KB 左右，要 0.7 秒才送得完，超过一帧的截止时间，永远收不齐，画面一直是黑的。
+    /// 所以按当前预算打开；openh264 的封装把每层的最大码率设成初始码率，第一帧编完之后
+    /// （编第一帧之前 OpenH264 不接受改）再把上限放开，之后码率才能往上调。
+    fn open_at(&self, bps: u64) -> Result<Encoder, Error> {
+        let bps = u32::try_from(bps).unwrap_or(u32::MAX);
         let fps = u16::try_from(self.fps).unwrap_or(u16::MAX);
         let config = EncoderConfig::new()
             .usage_type(UsageType::ScreenContentRealTime)
@@ -139,13 +141,18 @@ impl H264Encoder {
             .map_err(codec_error("创建 H.264 编码器失败"))
     }
 
-    /// 按每帧预算设码率。变化不到一成时不动，避免频繁调整。
-    fn set_budget(&mut self, enc: &mut Encoder, budget: usize) {
-        let bps = u64::try_from(budget)
+    /// 每帧预算换算成码率。
+    fn budget_bps(&self, budget: usize) -> u64 {
+        u64::try_from(budget)
             .unwrap_or(u64::MAX)
             .saturating_mul(8)
             .saturating_mul(u64::from(self.fps))
-            .clamp(MIN_BPS, self.max_bps);
+            .clamp(MIN_BPS, self.max_bps)
+    }
+
+    /// 按每帧预算设码率。变化不到一成时不动，避免频繁调整。
+    fn set_budget(&mut self, enc: &mut Encoder, budget: usize) {
+        let bps = self.budget_bps(budget);
         let changed = bps.abs_diff(self.bps).saturating_mul(10) > self.bps;
         if !changed {
             return;
@@ -153,6 +160,28 @@ impl H264Encoder {
         if set_bitrate(enc, bps) {
             self.bps = bps;
         }
+    }
+}
+
+/// 放开码率上限（第一帧编完之后调用）：每层的上限和总的上限都设成 `bps`。
+#[allow(unsafe_code)]
+fn set_max_bitrate(enc: &mut Encoder, bps: u64) {
+    for layer in [
+        openh264_sys2::SPATIAL_LAYER_0,
+        openh264_sys2::SPATIAL_LAYER_ALL,
+    ] {
+        let mut info = openh264_sys2::SBitrateInfo {
+            iLayer: layer,
+            iBitrate: i32::try_from(bps).unwrap_or(i32::MAX),
+        };
+        // SAFETY: 编码器已经初始化并编过一帧；ENCODER_OPTION_MAX_BITRATE 的参数就是 SBitrateInfo，
+        // 指针指向本函数里的局部变量，调用期间有效。只改码率上限。
+        let _ = unsafe {
+            enc.raw_api().set_option(
+                openh264_sys2::ENCODER_OPTION_MAX_BITRATE,
+                std::ptr::addr_of_mut!(info).cast(),
+            )
+        };
     }
 }
 
@@ -204,9 +233,9 @@ impl VideoEncoder for H264Encoder {
                 enc
             }
             Some(_) | None => {
-                // 新编码器按上限打开：第一帧编完才能调码率。
-                self.bps = 0;
-                self.open()?
+                // 新编码器按当前预算打开（见 open_at）。
+                self.bps = self.budget_bps(budget);
+                self.open_at(self.bps)?
             }
         };
         if self.force_key && !fresh {
@@ -230,7 +259,8 @@ impl VideoEncoder for H264Encoder {
         let data = stream.to_vec();
         self.force_key = false;
         if fresh {
-            self.set_budget(&mut enc, budget);
+            // 第一帧编完：放开上限，之后码率才能往上调。
+            set_max_bitrate(&mut enc, self.max_bps);
         }
         self.inner = Some((size.0, size.1, enc));
         // 画面在变：之后要补清晰；没变：这是补清晰的一帧。
@@ -472,7 +502,7 @@ mod tests {
     fn budget_changes_reach_the_encoder() {
         let mut enc = H264Encoder::with_max_bps(30, 1_000_000);
         let _ = enc.encode(1, &picture(64, 64), true, 1000).unwrap();
-        assert_eq!(enc.bps, 240_000, "第一帧编完按预算调下来");
+        assert_eq!(enc.bps, 240_000, "按当前预算打开");
         let (w, h, mut inner) = enc.inner.take().unwrap();
         enc.set_budget(&mut inner, 1050); // 变化不到一成：不动
         assert_eq!(enc.bps, 240_000);

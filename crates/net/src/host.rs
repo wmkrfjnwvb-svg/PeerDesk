@@ -165,6 +165,7 @@ type EncodeJob = (FrameJob, Screen, bool);
 type EncodeDone = (
     FrameJob,
     Result<(Option<EncodedFrame>, bool), peerdesk_core::Error>,
+    u64,
 );
 
 /// 启动编码线程。编码要好几毫秒到几十毫秒，放在会话循环里会让输入和反馈排队等它。
@@ -179,8 +180,10 @@ fn spawn_encoder(
     let (done_tx, done_rx) = mpsc::unbounded_channel();
     std::thread::spawn(move || {
         while let Ok((job, screen, changed)) = job_rx.recv() {
+            let started = std::time::Instant::now();
             let result = encode_job(encoder.as_mut(), &job, &screen, changed);
-            if done_tx.send((job, result)).is_err() {
+            let took = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+            if done_tx.send((job, result, took)).is_err() {
                 break;
             }
         }
@@ -391,10 +394,11 @@ pub async fn serve(
             // 编码线程交回一帧：切片发出。
             done = encoded_rx.recv() => {
                 encoding = false;
-                let (job, result) = match done {
+                let (job, result, took) = match done {
                     Some(done) => done,
                     None => break "编码线程结束".to_owned(),
                 };
+                media.set_encode_time(took);
                 let out = match result.and_then(|(encoded, refine)| media.finish_frame(link.now(), &job, encoded, refine)) {
                     Ok(out) => out,
                     Err(e) => break e.to_string(),
@@ -414,7 +418,7 @@ pub async fn serve(
                 let Some(screen) = source.capture() else {
                     // 画面来源结束：正在编的那一帧编完发出去再结束。
                     let last = if encoding { encoded_rx.recv().await } else { None };
-                    let last = last.and_then(|(job, r)| r.ok().map(|(e, f)| (job, e, f)));
+                    let last = last.and_then(|(job, r, _)| r.ok().map(|(e, f)| (job, e, f)));
                     let out = last.map(|(job, e, f)| media.finish_frame(link.now(), &job, e, f).unwrap_or_default());
                     out.unwrap_or_default().iter().for_each(|o| drop(link.send_flags(Channel::Video, o.flags, &o.body)));
                     break "画面来源结束".to_owned();
@@ -431,7 +435,7 @@ pub async fn serve(
                 };
                 pending_change |= changed;
                 // 在途数据超过上限：这一帧不编，变化攒着，等确认之后编最新的画面。
-                if encoding || media.in_flight_full(link.now()) || (!pending_change && !media.wants_frame()) {
+                if encoding || media.in_flight_full(link.now()) || !media.due(link.now()) || (!pending_change && !media.wants_frame()) {
                     continue;
                 }
                 let rtt = u64::try_from(link.rtt().as_micros()).unwrap_or(u64::MAX);
