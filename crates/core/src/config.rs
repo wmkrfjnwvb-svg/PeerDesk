@@ -466,6 +466,19 @@ preset = "fips"
         assert!(server_err(&SERVER.replace("fips", "nope")).contains("nope"));
         let short = format!("cluster_secret = \"short\"\n{SERVER}");
         assert!(server_err(&short).contains("cluster_secret"));
+        // 计费、管理、记账相关的配置检查
+        for (line, key) in [
+            ("signal_advertise = \"x\"", "signal_advertise"),
+            ("billing_secret = \"short\"", "billing_secret"),
+            ("admin_token = \"short\"", "admin_token"),
+            ("bill_every_ms = 0", "bill_every_ms"),
+            ("free_window_secs = 0", "free_window_secs"),
+        ] {
+            assert!(
+                server_err(&format!("{line}\n{SERVER}")).contains(key),
+                "{line}"
+            );
+        }
         let ok = format!("cluster_secret = \"0123456789abcdef\"\n{SERVER}");
         assert_eq!(
             ServerConfig::from_toml(&ok)

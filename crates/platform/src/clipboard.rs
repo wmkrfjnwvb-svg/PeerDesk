@@ -29,8 +29,12 @@ pub fn rgba_to_png(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, Stri
     Ok(out)
 }
 
-/// PNG 解码成 RGBA 像素：（宽，高，像素）。
+/// PNG 解码成 RGBA 像素：（宽，高，像素）。超过 [`MAX_PIXELS`] 的拒绝。
 pub fn png_to_rgba(data: &[u8]) -> Result<(u32, u32, Vec<u8>), String> {
+    png_to_rgba_within(data, MAX_PIXELS)
+}
+
+fn png_to_rgba_within(data: &[u8], max_pixels: u64) -> Result<(u32, u32, Vec<u8>), String> {
     let mut decoder = png::Decoder::new(std::io::Cursor::new(data));
     // 调色板、灰度、16 位都展开成 8 位
     decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
@@ -39,7 +43,7 @@ pub fn png_to_rgba(data: &[u8]) -> Result<(u32, u32, Vec<u8>), String> {
         let info = reader.info();
         (info.width, info.height)
     };
-    if u64::from(width).saturating_mul(u64::from(height)) > MAX_PIXELS {
+    if u64::from(width).saturating_mul(u64::from(height)) > max_pixels {
         return Err(format!("图片太大：{width}×{height}"));
     }
     let size = reader
@@ -122,6 +126,11 @@ mod tests {
     #[test]
     fn bad_and_huge_images_are_rejected() {
         assert!(png_to_rgba(b"not a png").is_err());
+        // 像素数超过上限：只读头就拒绝
+        let two = encode(2, 1, png::ColorType::Grayscale, &[0, 0]);
+        assert!(png_to_rgba_within(&two, 1)
+            .unwrap_err()
+            .contains("图片太大"));
         // 声称 10 万 × 10 万像素：只读头就拒绝
         let mut huge = encode(1, 1, png::ColorType::Grayscale, &[0]);
         // IHDR 里的宽高在第 16..24 字节；改了以后 CRC 不对，解码器同样拒绝

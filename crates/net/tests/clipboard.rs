@@ -46,8 +46,12 @@ async fn arrives(clip: &MemClipboard, want: &Clip) -> Duration {
 }
 
 /// 跑一次会话：`script` 在会话期间操作两端的剪贴板。
-async fn session_with<F, Fut>(host_caps: Caps, host_allows: bool, script: F)
-where
+async fn session_with<F, Fut>(
+    host_caps: Caps,
+    host_allows: bool,
+    host_has_clipboard: bool,
+    script: F,
+) where
     F: FnOnce(Arc<MemClipboard>, Arc<MemClipboard>) -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
@@ -66,7 +70,7 @@ where
         Arc::new(MemClipboard::default()),
     );
     let mut opts = HostOptions::new(session(&host_id, host_caps), 30, std::env::temp_dir());
-    opts.clipboard = Some(ClipboardHandle(host_clip.clone()));
+    opts.clipboard = host_has_clipboard.then(|| ClipboardHandle(host_clip.clone()));
     opts.permissions.clipboard = host_allows;
     let host_task = tokio::spawn(host::serve(
         host_link,
@@ -98,7 +102,7 @@ where
 
 #[tokio::test(flavor = "multi_thread")]
 async fn text_and_images_sync_both_ways() {
-    session_with(Caps::CLIPBOARD, true, |host, ctrl| async move {
+    session_with(Caps::CLIPBOARD, true, true, |host, ctrl| async move {
         // 控制端 → 被控端：文本。门槛：300 ms 内可以粘贴
         let text = Clip::text("从控制端复制的文字 copied text");
         ctrl.copy(text.clone());
@@ -151,8 +155,13 @@ async fn text_and_images_sync_both_ways() {
 async fn old_peer_or_disabled_permission_means_no_sync() {
     // 被控端是不支持剪贴板的老版本（能力位里没有剪贴板），或者被控端关掉了剪贴板权限：
     // 会话照常进行，剪贴板不同步。
-    for (caps, allows) in [(Caps(0), true), (Caps::CLIPBOARD, false)] {
-        session_with(caps, allows, |host, ctrl| async move {
+    // 第三种：双方都声明了能力，但被控端打不开系统剪贴板：拒绝剪贴板流，会话照常。
+    for (caps, allows, has) in [
+        (Caps(0), true, true),
+        (Caps::CLIPBOARD, false, true),
+        (Caps::CLIPBOARD, true, false),
+    ] {
+        session_with(caps, allows, has, |host, ctrl| async move {
             ctrl.copy(Clip::text("secret"));
             tokio::time::sleep(Duration::from_millis(500)).await;
             assert_eq!(host.get(), None);
