@@ -16,6 +16,7 @@ use peerdesk_core::crypto::Policy;
 use peerdesk_core::input::InputEvent;
 use peerdesk_core::screen::Screen;
 use peerdesk_core::signal::format_code;
+use peerdesk_net::clipsync::{ClipNote, ClipboardHandle};
 use peerdesk_net::controller::{self, ControllerOptions, ScreenSink};
 use peerdesk_net::host::{self, HostOptions, ScreenSource, FRAME_DEADLINE_US};
 use peerdesk_net::identity::to_hex;
@@ -391,6 +392,7 @@ async fn host_main(
             .clone();
         let opts = HostOptions {
             limiter: Arc::clone(&limiter),
+            clipboard: system_clipboard(Box::new(|_| {})),
             ..HostOptions::new(
                 session(&identity, &policy, Auth::Password(password)),
                 config.fps,
@@ -538,6 +540,26 @@ pub enum ViewEvent {
     },
     /// 服务器的通知（例如免费额度用完），会话随之结束。
     Notice(String),
+    /// 剪贴板事件（内容太大没有同步等），界面短暂提示，会话继续。
+    Clipboard(ClipNote),
+}
+
+/// 打开本机系统剪贴板。测试构建里没有（测试不碰开发者电脑的剪贴板）。
+#[cfg(not(test))]
+fn system_clipboard(on_note: peerdesk_platform::OnNote) -> Option<ClipboardHandle> {
+    match peerdesk_platform::SystemClip::open(on_note) {
+        Ok(clip) => Some(ClipboardHandle(Arc::new(clip))),
+        Err(e) => {
+            peerdesk_net::note!(warn, "剪贴板不可用，不同步：{e}");
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unnecessary_wraps, clippy::needless_pass_by_value)]
+fn system_clipboard(_on_note: Box<dyn Fn(ClipNote) + Send + Sync>) -> Option<ClipboardHandle> {
+    None
 }
 
 /// 网络断开后最多自动重连几次。
@@ -865,7 +887,10 @@ async fn one_session(
             session: session(identity, policy, auth.clone()),
             deadline_us: FRAME_DEADLINE_US,
             duration: None,
-            clipboard: None,
+            clipboard: {
+                let ev = ev.clone();
+                system_clipboard(Box::new(move |note| ev.send(ViewEvent::Clipboard(note))))
+            },
         },
         Box::new(sink),
         input,

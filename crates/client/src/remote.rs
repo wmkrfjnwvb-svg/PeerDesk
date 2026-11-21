@@ -63,7 +63,8 @@ pub(crate) fn session(identity: &Identity, policy: &Policy, auth: Auth) -> Sessi
     SessionConfig {
         device_id: identity.device_id(),
         region: String::new(),
-        caps: Caps::H264,
+        // 剪贴板能力：双方都支持、两端都有剪贴板时才真正同步（命令行不同步剪贴板）。
+        caps: Caps::H264.with(Caps::CLIPBOARD),
         policy: policy.clone(),
         auth,
         // 由网络层替换成真实连接的通道绑定。

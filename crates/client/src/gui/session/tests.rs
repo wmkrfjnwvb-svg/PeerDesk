@@ -97,7 +97,10 @@ use peerdesk_net::Fingerprint;
 fn ended(v: &ViewHandle, seen: &mut Log<ViewEvent>) -> Result<Summary, NetError> {
     match wait_for(|| v.poll(), seen, |e| matches!(e, ViewEvent::Ended(_))) {
         ViewEvent::Ended(r) => r,
-        ViewEvent::Connected { .. } | ViewEvent::Reconnecting { .. } | ViewEvent::Notice(_) => {
+        ViewEvent::Connected { .. }
+        | ViewEvent::Reconnecting { .. }
+        | ViewEvent::Notice(_)
+        | ViewEvent::Clipboard(_) => {
             panic!("不是 Ended")
         }
     }
@@ -567,7 +570,9 @@ fn server_crash_shows_reconnecting_then_gives_up() {
                 attempts.push(attempt);
             }
             ViewEvent::Ended(r) => break r,
-            other @ (ViewEvent::Connected { .. } | ViewEvent::Notice(_)) => panic!("{other:?}"),
+            other @ (ViewEvent::Connected { .. }
+            | ViewEvent::Notice(_)
+            | ViewEvent::Clipboard(_)) => panic!("{other:?}"),
         }
     };
     assert_eq!(

@@ -207,6 +207,22 @@ pub enum ViewPhase {
     },
 }
 
+/// 剪贴板事件要给用户看的话；不需要提示的返回 `None`。
+#[must_use]
+pub fn clip_message(note: &peerdesk_net::clipsync::ClipNote, s: &Strings) -> Option<String> {
+    use peerdesk_net::clipsync::ClipNote;
+    let mb = |size: u64| format!("{:.1}", size as f64 / 1_048_576.0);
+    match note {
+        ClipNote::LocalTooLarge { size, .. } => {
+            Some(s.clip_local_too_large.replace("{mb}", &mb(*size)))
+        }
+        ClipNote::RemoteTooLarge { size, .. } => {
+            Some(s.clip_remote_too_large.replace("{mb}", &mb(*size)))
+        }
+        ClipNote::Received { .. } => None,
+    }
+}
+
 impl ViewPhase {
     /// 当前路径。
     #[must_use]
@@ -259,6 +275,7 @@ impl ViewPhase {
                 attempt: *attempt,
                 why: why.clone(),
             },
+            ViewEvent::Clipboard(_) => self.clone(),
             ViewEvent::Notice(text) => ViewPhase::Ended {
                 status: Status::error(text.clone()),
                 summary: None,
@@ -305,6 +322,31 @@ pub const fn route_name(route: Option<Route>, s: &Strings) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clipboard_notes() {
+        use peerdesk_core::clipboard::ClipKind;
+        use peerdesk_net::clipsync::ClipNote;
+        let s = &crate::gui::i18n::ZH;
+        let big = ClipNote::LocalTooLarge {
+            kind: ClipKind::Png,
+            size: 20 * 1_048_576,
+        };
+        assert!(clip_message(&big, s).unwrap().contains("20.0 MB"));
+        let remote = ClipNote::RemoteTooLarge {
+            kind: ClipKind::Text,
+            size: 5 * 1_048_576,
+        };
+        assert!(clip_message(&remote, s).unwrap().contains("对方"));
+        let ok = ClipNote::Received {
+            kind: ClipKind::Text,
+            size: 1,
+        };
+        assert_eq!(clip_message(&ok, s), None);
+        // 剪贴板事件不改变会话状态
+        let phase = ViewPhase::Connecting;
+        assert_eq!(phase.apply(&ViewEvent::Clipboard(ok), s), phase);
+    }
     use crate::gui::i18n::EN;
     use peerdesk_net::NetError;
 

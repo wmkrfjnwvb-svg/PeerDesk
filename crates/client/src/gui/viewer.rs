@@ -1,7 +1,7 @@
 //! 观看窗口（eframe 接线）：每个连接一个系统窗口。只画画面和工具栏、转发输入，
 //! 逻辑在 `coords`、`input`、`state`、`stats`、`session` 里。
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use eframe::egui::{
     self, pos2, vec2, Align2, Color32, FontId, Frame, Rect, TextureHandle, TextureOptions,
@@ -39,6 +39,8 @@ pub struct Viewer {
     started: Instant,
     /// 通知弹框里展开了升级说明。
     show_upgrade: bool,
+    /// 剪贴板提示和它出现的时刻（显示几秒后消失）。
+    clip_toast: Option<(String, Instant)>,
 }
 
 impl Viewer {
@@ -57,6 +59,7 @@ impl Viewer {
             frames_seen: 0,
             started: Instant::now(),
             show_upgrade: false,
+            clip_toast: None,
         }
     }
 
@@ -83,6 +86,11 @@ impl Viewer {
             connected: false,
         };
         for event in self.handle.poll() {
+            if let super::session::ViewEvent::Clipboard(note) = &event {
+                if let Some(text) = super::state::clip_message(note, s) {
+                    self.clip_toast = Some((text, Instant::now()));
+                }
+            }
             self.phase = self.phase.apply(&event, s);
             outcome.connected |= matches!(self.phase, ViewPhase::Connected { .. });
         }
@@ -115,6 +123,15 @@ impl Viewer {
                     outcome.open = false;
                 }
                 let _ = ui.toggle_value(&mut self.overlay, s.stats);
+                // 剪贴板提示显示 6 秒
+                if let Some((text, at)) = &self.clip_toast {
+                    if at.elapsed() < Duration::from_secs(6) {
+                        ui.colored_label(Color32::from_rgb(230, 160, 40), text);
+                        ctx.request_repaint_after(Duration::from_millis(500));
+                    } else {
+                        self.clip_toast = None;
+                    }
+                }
                 match &self.phase {
                     ViewPhase::Connecting => ui.label(s.connecting),
                     ViewPhase::Reconnecting { .. } => {
@@ -207,13 +224,7 @@ impl Viewer {
         outcome
     }
 
-    fn paint_stats(
-        &mut self,
-        painter: &egui::Painter,
-        avail: Rect,
-        now: std::time::Duration,
-        s: &Strings,
-    ) {
+    fn paint_stats(&mut self, painter: &egui::Painter, avail: Rect, now: Duration, s: &Strings) {
         let (rtt, rate) = match &self.phase {
             ViewPhase::Ended {
                 summary: Some(summary),
