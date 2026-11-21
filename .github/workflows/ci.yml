@@ -2,7 +2,8 @@ name: CI
 # 省着用：每次推送只在 Linux 上跑 lint、覆盖率门槛（含全部测试）和端到端测试。
 # Windows / macOS 的测试、平台实机测试、界面截图、安装包按需触发：
 # - 提交信息里写 [mac] 或 [win]：只跑那个平台的测试和实机测试；[full]：全部平台加界面截图；
-#   [pkg]：打安装包。可以组合，例如 [mac][pkg]。先在一个平台上验证，过了再跑其他平台；
+#   [pkg]：打安装包（同时验证 Docker 镜像能构建）；[load]：服务端并发压力测试（Linux）。
+#   可以组合，例如 [mac][pkg]。先在一个平台上验证，过了再跑其他平台；
 # - 在 Actions 页面手动运行（Run workflow），选择范围：full / macos-tests / windows-tests / packages。
 on:
   push:
@@ -254,6 +255,49 @@ jobs:
           name: peerdesk-${{ github.sha }}-linux-server
           path: dist/*
           if-no-files-found: error
+          retention-days: 7
+
+  # Docker 镜像：只验证能构建（不推送）。和打包一样只在 [pkg] 时跑。
+  docker-build:
+    name: docker build (server)
+    if: ${{ contains(github.event.head_commit.message, '[pkg]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -f deploy/docker/Dockerfile -t peerdesk-server:ci .
+      # 能启动并读到配置：镜像里的默认配置只开信令，--exit-after-ms 让它自己退出。
+      - name: Smoke run
+        run: docker run --rm peerdesk-server:ci /etc/peerdesk/server.toml --exit-after-ms 1500
+
+  # 服务端并发压力测试（登记、同时连接、中继吞吐）：三个真实节点跑在本进程里。
+  # 只在提交信息带 [load] 时跑；摘要写进 Actions 页面，只在失败时上传文件。
+  load:
+    name: load (server concurrency)
+    if: ${{ contains(github.event.head_commit.message, '[load]') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: load
+      - name: Load test
+        run: cargo test --release -p peerdesk-server --test load -- --ignored --nocapture
+        env:
+          PEERDESK_LOAD_DEVICES: 200
+          PEERDESK_LOAD_SESSIONS: 50
+          PEERDESK_LOAD_SECONDS: 10
+      - name: Summary
+        if: always()
+        run: |
+          if [ -f target/load/summary.md ]; then cat target/load/summary.md >> "$GITHUB_STEP_SUMMARY"; fi
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: peerdesk-${{ github.sha }}-load-summary
+          path: target/load/summary.md
+          if-no-files-found: ignore
           retention-days: 7
 
   # 在虚拟显示器上打开图形界面（自测模式：开启被控并连接本机），截一张图。

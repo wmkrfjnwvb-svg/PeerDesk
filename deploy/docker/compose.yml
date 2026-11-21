@@ -1,0 +1,74 @@
+# 三节点示例集群：node1 付费，node2 / node3 免费，都在同一台机器的一个 bridge 网络里。
+# 用法见 README.md：先运行 ./init.sh 生成密钥和配置，再 docker compose up -d --build。
+name: peerdesk
+
+x-node: &node
+  image: ${PEERDESK_IMAGE:-peerdesk-server:local}
+  build:
+    context: ../..
+    dockerfile: deploy/docker/Dockerfile
+  restart: unless-stopped
+  # 容器里是 nonroot 用户；根文件系统只读，只有数据卷可写。
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  ulimits:
+    nofile: 65536
+
+services:
+  node1:
+    <<: *node
+    container_name: peerdesk-node1
+    hostname: node1
+    networks:
+      peerdesk:
+        ipv4_address: 172.28.0.11
+    ports:
+      - "4433:4433/udp" # 信令
+      - "3478:3478/udp" # 中继
+      - "127.0.0.1:8081:8080/tcp" # 管理页面（只在本机）
+    volumes:
+      - ./run/node1.toml:/etc/peerdesk/server.toml:ro
+      - node1-data:/var/lib/peerdesk
+
+  node2:
+    <<: *node
+    container_name: peerdesk-node2
+    hostname: node2
+    networks:
+      peerdesk:
+        ipv4_address: 172.28.0.12
+    ports:
+      - "4434:4433/udp"
+      - "3479:3478/udp"
+      - "127.0.0.1:8082:8080/tcp"
+    volumes:
+      - ./run/node2.toml:/etc/peerdesk/server.toml:ro
+      - node2-data:/var/lib/peerdesk
+
+  node3:
+    <<: *node
+    container_name: peerdesk-node3
+    hostname: node3
+    networks:
+      peerdesk:
+        ipv4_address: 172.28.0.13
+    ports:
+      - "4435:4433/udp"
+      - "3480:3478/udp"
+      - "127.0.0.1:8083:8080/tcp"
+    volumes:
+      - ./run/node3.toml:/etc/peerdesk/server.toml:ro
+      - node3-data:/var/lib/peerdesk
+
+networks:
+  peerdesk:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:

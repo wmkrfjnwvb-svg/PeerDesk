@@ -1,0 +1,40 @@
+# 示例集群的节点 1（付费）。${...} 由 init.sh 填写后生成 run/node1.toml，容器里挂载的是生成的文件。
+# 不要直接把这个文件挂进容器：里面的 ${...} 不会被替换。
+node_id = 1
+region = "demo"
+# 付费集群（paid）：会员（带令牌）的中继优先走这里；免费集群（free）：没有令牌的用户走这里。
+role = "paid"
+
+# 管理页面和接口。容器里监听所有地址，compose 只把它映射到宿主机的 127.0.0.1。
+http_listen = "0.0.0.0:8080"
+
+# 集群心跳（UDP）。节点之间用 compose 网络里的固定地址互相联系，不需要对外开放。
+cluster_listen = "0.0.0.0:7946"
+advertise = "172.28.0.11:7946"
+peers = ["172.28.0.12:7946", "172.28.0.13:7946"]
+
+# 三个密钥所有节点必须相同，都由 init.sh 随机生成，保存在 .env 里。
+cluster_secret = "${PEERDESK_CLUSTER_SECRET}"
+billing_secret = "${PEERDESK_BILLING_SECRET}"
+admin_token = "${PEERDESK_ADMIN_TOKEN}"
+
+# 信令和中继：容器里的端口固定，宿主机上的映射端口见 compose.yml。
+signal_listen = "0.0.0.0:4433"
+signal_advertise = "${PEERDESK_PUBLIC_IP}:4433"
+relay_listen = "0.0.0.0:3478"
+relay_advertise = "${PEERDESK_PUBLIC_IP}:3478"
+data_dir = "/var/lib/peerdesk"
+
+# 中继流量单价（分/GB），只用于管理中心显示费用。
+relay_price_cents_per_gb = 80
+# 免费通道额度：每台设备每个窗口（默认 600 秒）200 MB，每个公网 IP 600 MB；0 表示不限。
+free_window_secs = 600
+free_device_mb = 200
+free_ip_mb = 600
+# 付费节点负载超过 90% 时，会员改走免费节点。
+paid_load_limit_permille = 900
+# 本节点中继的带宽（Mbps），用来算负载；0 表示按会话数算。
+relay_capacity_mbps = 0
+
+[crypto]
+preset = "recommended"
