@@ -2037,8 +2037,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(got.port(), 6000);
-        // Windows 允许 UDP 套接字 connect 到广播地址，下面的失败只在 Linux/macOS 上出现。
-        #[cfg(not(windows))]
+        // Windows、macOS 允许 UDP 套接字 connect 到广播地址，下面的失败只在 Linux 上出现。
+        #[cfg(target_os = "linux")]
         {
             let bad: IpAddr = "255.255.255.255".parse().unwrap();
             let err = lan_addr("0.0.0.0:6000".parse().unwrap(), None, bad)
@@ -2266,8 +2266,8 @@ mod tests {
         }
     }
 
-    // Windows 允许 UDP 套接字 connect 到广播地址，这个失败只在 Linux/macOS 上出现。
-    #[cfg(not(windows))]
+    // Windows、macOS 允许 UDP 套接字 connect 到广播地址，这个失败只在 Linux 上出现。
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn connect_failure_is_reported() {
         // 没开广播权限的 UDP socket 连广播地址：系统直接拒绝（EACCES），不是"端口不可达"。
