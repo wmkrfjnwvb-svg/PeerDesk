@@ -244,6 +244,28 @@ impl Caps {
     /// 声音。
     pub const AUDIO: Caps = Caps(1 << 17);
 
+    // 第 24–26 位不是能力，是被控端在 Accept 里告诉控制端自己的系统（见 [`PeerOs`]），
+    // 控制端据此把快捷键里的 Ctrl 换成 Cmd 等。老版本只看能力位，会忽略这几位。
+    const OS_SHIFT: u32 = 24;
+    const OS_MASK: u32 = 0b111 << Self::OS_SHIFT;
+
+    /// 带上本机系统（被控端发 Accept 时用）。
+    #[must_use]
+    pub const fn with_os(self, os: PeerOs) -> Caps {
+        Caps((self.0 & !Self::OS_MASK) | ((os as u32) << Self::OS_SHIFT))
+    }
+
+    /// 对端的系统；老版本不发时为 [`PeerOs::Unknown`]。
+    #[must_use]
+    pub const fn os(self) -> PeerOs {
+        match (self.0 & Self::OS_MASK) >> Self::OS_SHIFT {
+            1 => PeerOs::Windows,
+            2 => PeerOs::Mac,
+            3 => PeerOs::Linux,
+            _ => PeerOs::Unknown,
+        }
+    }
+
     /// 本版本支持的全部能力。
     pub const ALL: Caps = Caps(Self::H264.0 | Self::CLIPBOARD.0 | Self::AUDIO.0);
 
@@ -263,6 +285,35 @@ impl Caps {
     #[must_use]
     pub const fn has(self, other: Caps) -> bool {
         self.0 & other.0 == other.0
+    }
+}
+
+/// 被控端的操作系统。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerOs {
+    /// 不知道（老版本）。
+    Unknown = 0,
+    /// Windows。
+    Windows = 1,
+    /// macOS。
+    Mac = 2,
+    /// Linux。
+    Linux = 3,
+}
+
+impl PeerOs {
+    /// 本机的系统。
+    #[must_use]
+    pub const fn current() -> Self {
+        if cfg!(windows) {
+            Self::Windows
+        } else if cfg!(target_os = "macos") {
+            Self::Mac
+        } else if cfg!(target_os = "linux") {
+            Self::Linux
+        } else {
+            Self::Unknown
+        }
     }
 }
 

@@ -5,6 +5,7 @@
 //! 键位映射、坐标换算、输入翻译、状态机、密码、最近连接、语言和字体选择、后台会话。
 
 mod app;
+pub mod assistant;
 pub mod coords;
 pub mod fonts;
 pub mod form;

@@ -78,6 +78,8 @@ async fn session_with<F, Fut>(
         Box::new(DemoDesktop::new(320, 180, 1)),
         Box::new(NoInput),
     ));
+    let os_report = Arc::new(std::sync::Mutex::new(None));
+    let seen_os = Arc::clone(&os_report);
     let (tx, rx) = mpsc::channel(4);
     let ctrl = tokio::spawn(controller::run(
         ctrl_link,
@@ -86,6 +88,9 @@ async fn session_with<F, Fut>(
             deadline_us: 200_000,
             duration: None,
             clipboard: Some(ClipboardHandle(ctrl_clip.clone())),
+            on_established: Some(controller::EstablishedHook(Arc::new(move |caps: Caps| {
+                *seen_os.lock().unwrap() = Some(caps.os());
+            }))),
         },
         Box::new(CountSink::new()),
         rx,
@@ -93,6 +98,11 @@ async fn session_with<F, Fut>(
     ));
     // 等会话建立、剪贴板流打开
     tokio::time::sleep(Duration::from_millis(300)).await;
+    // 握手完成时控制端得知了被控端的系统（新版本被控端在 Accept 里带上）
+    assert_eq!(
+        *os_report.lock().unwrap(),
+        Some(peerdesk_core::proto::PeerOs::current())
+    );
     script(host_clip, ctrl_clip).await;
     drop(tx);
     ctrl.abort();

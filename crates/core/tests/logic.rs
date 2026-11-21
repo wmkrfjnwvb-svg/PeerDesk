@@ -3,7 +3,7 @@
 
 use peerdesk_core::auth::Auth;
 use peerdesk_core::crypto::{Policy, Suite};
-use peerdesk_core::proto::{Caps, Control, RejectReason, MIN_VERSION, VERSION};
+use peerdesk_core::proto::{Caps, Control, PeerOs, RejectReason, MIN_VERSION, VERSION};
 use peerdesk_core::session::{Role, Session, SessionConfig, State};
 use peerdesk_core::trace::{Stage, TraceId, Tracer};
 use peerdesk_core::{Error, Time};
@@ -73,7 +73,9 @@ fn happy_path() {
         ) => {
             assert_eq!(a, b);
             assert_ne!(*a, 0);
-            assert_eq!(ca, cb);
+            // 控制端还知道了被控端的系统（Accept 里带的，不是能力位）
+            assert_eq!(*ca, cb.with_os(PeerOs::current()));
+            assert_eq!(ca.os(), PeerOs::current());
             assert_eq!((*pa, *pb), (0, 10));
         }
         other => panic!("{other:?}"),

@@ -126,6 +126,7 @@ async fn attempt(
             deadline_us: 100_000,
             duration: Some(Duration::from_millis(200)),
             clipboard: None,
+            on_established: None,
         },
         Box::new(Null),
         rx,

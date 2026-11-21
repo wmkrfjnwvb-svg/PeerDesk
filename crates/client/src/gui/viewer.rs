@@ -3,6 +3,10 @@
 
 use std::time::{Duration, Instant};
 
+use peerdesk_core::proto::PeerOs;
+
+use super::assistant::{os_label, Shortcut};
+
 use eframe::egui::{
     self, pos2, vec2, Align2, Color32, FontId, Frame, Rect, TextureHandle, TextureOptions,
     ViewportBuilder, ViewportId,
@@ -41,6 +45,12 @@ pub struct Viewer {
     show_upgrade: bool,
     /// 剪贴板提示和它出现的时刻（显示几秒后消失）。
     clip_toast: Option<(String, Instant)>,
+    /// 被控端的系统（握手后得知），助手据此选快捷键。
+    peer_os: PeerOs,
+    /// 浮动助手是否展开。
+    assistant: bool,
+    /// 是否全屏。
+    fullscreen: bool,
 }
 
 impl Viewer {
@@ -60,6 +70,9 @@ impl Viewer {
             started: Instant::now(),
             show_upgrade: false,
             clip_toast: None,
+            peer_os: PeerOs::Unknown,
+            assistant: true,
+            fullscreen: false,
         }
     }
 
@@ -90,6 +103,9 @@ impl Viewer {
                 if let Some(text) = super::state::clip_message(note, s) {
                     self.clip_toast = Some((text, Instant::now()));
                 }
+            }
+            if let super::session::ViewEvent::PeerOs(os) = &event {
+                self.peer_os = *os;
             }
             self.phase = self.phase.apply(&event, s);
             outcome.connected |= matches!(self.phase, ViewPhase::Connected { .. });
@@ -123,6 +139,7 @@ impl Viewer {
                     outcome.open = false;
                 }
                 let _ = ui.toggle_value(&mut self.overlay, s.stats);
+                let _ = ui.toggle_value(&mut self.assistant, s.assistant);
                 // 剪贴板提示显示 6 秒
                 if let Some((text, at)) = &self.clip_toast {
                     if at.elapsed() < Duration::from_secs(6) {
@@ -153,6 +170,54 @@ impl Viewer {
         });
 
         let mut picture = None;
+        if self.assistant && matches!(self.phase, ViewPhase::Connected { .. }) {
+            let mut open = true;
+            egui::Window::new(s.assistant)
+                .open(&mut open)
+                .collapsible(true)
+                .resizable(false)
+                .default_pos([ctx.screen_rect().right() - 260.0, 48.0])
+                .show(ctx, |ui| {
+                    ui.label(format!("{}：{}", s.remote_os, os_label(self.peer_os, s)));
+                    ui.separator();
+                    egui::Grid::new("shortcuts").num_columns(2).show(ui, |ui| {
+                        for (i, sc) in Shortcut::ALL.into_iter().enumerate() {
+                            let events = sc.events(self.peer_os);
+                            let button = ui
+                                .add_enabled(!events.is_empty(), egui::Button::new(sc.label(s)))
+                                .on_disabled_hover_text(s.not_on_this_os);
+                            if button.clicked() {
+                                for event in events {
+                                    let _ = self.handle.send(event);
+                                }
+                            }
+                            if i % 2 == 1 {
+                                ui.end_row();
+                            }
+                        }
+                    });
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui
+                            .toggle_value(&mut self.fullscreen, s.fullscreen)
+                            .changed()
+                        {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(
+                                self.fullscreen,
+                            ));
+                        }
+                        let _ = ui.toggle_value(&mut self.overlay, s.stats);
+                        if ui.button(s.disconnect).clicked() {
+                            self.stop();
+                            outcome.open = false;
+                        }
+                    });
+                });
+            if !open {
+                self.assistant = false;
+            }
+        }
+
         egui::CentralPanel::default()
             .frame(Frame::NONE.fill(Color32::BLACK))
             .show(ctx, |ui| {

@@ -695,6 +695,7 @@ async fn connect_session(
             deadline_us: 100_000,
             duration: Some(Duration::from_secs(args.seconds)),
             clipboard: None,
+            on_established: None,
         },
         Box::new(sink.clone()),
         input_rx,

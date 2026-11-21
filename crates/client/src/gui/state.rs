@@ -275,7 +275,7 @@ impl ViewPhase {
                 attempt: *attempt,
                 why: why.clone(),
             },
-            ViewEvent::Clipboard(_) => self.clone(),
+            ViewEvent::Clipboard(_) | ViewEvent::PeerOs(_) => self.clone(),
             ViewEvent::Notice(text) => ViewPhase::Ended {
                 status: Status::error(text.clone()),
                 summary: None,

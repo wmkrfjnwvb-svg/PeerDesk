@@ -181,6 +181,42 @@ pub struct Strings {
     pub clip_local_too_large: &'static str,
     /// 对方复制的内容太大没有同步（`{mb}` 换成大小）。
     pub clip_remote_too_large: &'static str,
+    /// 助手：助手。
+    pub assistant: &'static str,
+    /// 助手：开始菜单。
+    pub sc_start: &'static str,
+    /// 助手：切换程序。
+    pub sc_switch_app: &'static str,
+    /// 助手：关闭窗口。
+    pub sc_close_window: &'static str,
+    /// 助手：任务管理器。
+    pub sc_task_manager: &'static str,
+    /// 助手：锁屏。
+    pub sc_lock: &'static str,
+    /// 助手：显示桌面。
+    pub sc_show_desktop: &'static str,
+    /// 助手：截图。
+    pub sc_screenshot: &'static str,
+    /// 助手：复制。
+    pub sc_copy: &'static str,
+    /// 助手：粘贴。
+    pub sc_paste: &'static str,
+    /// 助手：全选。
+    pub sc_select_all: &'static str,
+    /// 助手：撤销。
+    pub sc_undo: &'static str,
+    /// 助手：未知（按 Windows 发送）。
+    pub os_unknown: &'static str,
+    /// 助手：对方系统。
+    pub remote_os: &'static str,
+    /// 助手：声音。
+    pub sound: &'static str,
+    /// 助手：剪贴板同步。
+    pub clipboard_sync: &'static str,
+    /// 助手：全屏。
+    pub fullscreen: &'static str,
+    /// 助手：对方系统没有这个操作。
+    pub not_on_this_os: &'static str,
     pub err_port_in_use: &'static str,
     pub err_timeout: &'static str,
     pub err_refused: &'static str,
@@ -269,6 +305,24 @@ pub const ZH: Strings = Strings {
     account_token: "会员令牌（可选）",
     clip_local_too_large: "复制的内容太大（{mb} MB），没有同步到对方；大文件请用文件传输",
     clip_remote_too_large: "对方复制的内容太大（{mb} MB），没有同步过来；大文件请用文件传输",
+    assistant: "助手",
+    sc_start: "开始菜单",
+    sc_switch_app: "切换程序",
+    sc_close_window: "关闭窗口",
+    sc_task_manager: "任务管理器",
+    sc_lock: "锁屏",
+    sc_show_desktop: "显示桌面",
+    sc_screenshot: "截图",
+    sc_copy: "复制",
+    sc_paste: "粘贴",
+    sc_select_all: "全选",
+    sc_undo: "撤销",
+    os_unknown: "未知（按 Windows 发送）",
+    remote_os: "对方系统",
+    sound: "声音",
+    clipboard_sync: "剪贴板同步",
+    fullscreen: "全屏",
+    not_on_this_os: "对方系统没有这个操作",
     err_port_in_use: "端口已被占用（也许另一个 PeerDesk 正在运行），换一个端口试试",
     err_timeout: "对方没有响应。请检查地址和端口、防火墙，以及对方是否打开了“允许远程控制”",
     err_refused: "连接失败",
@@ -358,6 +412,24 @@ pub const EN: Strings = Strings {
     account_token: "Member token (optional)",
     clip_local_too_large: "Copied content is too large ({mb} MB) to sync; use file transfer for large files",
     clip_remote_too_large: "Content copied on the remote ({mb} MB) is too large to sync; use file transfer for large files",
+    assistant: "Assistant",
+    sc_start: "Start menu",
+    sc_switch_app: "Switch app",
+    sc_close_window: "Close window",
+    sc_task_manager: "Task manager",
+    sc_lock: "Lock screen",
+    sc_show_desktop: "Show desktop",
+    sc_screenshot: "Screenshot",
+    sc_copy: "Copy",
+    sc_paste: "Paste",
+    sc_select_all: "Select all",
+    sc_undo: "Undo",
+    os_unknown: "unknown (sent as Windows)",
+    remote_os: "Remote system",
+    sound: "Sound",
+    clipboard_sync: "Clipboard sync",
+    fullscreen: "Full screen",
+    not_on_this_os: "Not available on the remote system",
     err_port_in_use:
         "The port is already in use (maybe another PeerDesk is running). Try another port",
     err_timeout: "No response. Check the address, the port, the firewall, and that \

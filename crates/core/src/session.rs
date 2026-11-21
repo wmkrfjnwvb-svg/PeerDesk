@@ -17,7 +17,7 @@
 
 use crate::auth::{Auth, Pake, Proofs, Side};
 use crate::crypto::{negotiate, Policy, Suite};
-use crate::proto::{Caps, Control, RejectReason, MIN_VERSION, VERSION};
+use crate::proto::{Caps, Control, PeerOs, RejectReason, MIN_VERSION, VERSION};
 use crate::trace::{Stage, TraceId, Tracer};
 use crate::{Error, Time};
 
@@ -268,7 +268,7 @@ impl Session {
         Control::Accept {
             suite: p.suite,
             session_id,
-            caps: p.caps,
+            caps: p.caps.with_os(PeerOs::current()),
         }
     }
 
@@ -299,7 +299,7 @@ impl Session {
                 return Ok(vec![Control::Accept {
                     suite,
                     session_id,
-                    caps: common,
+                    caps: common.with_os(PeerOs::current()),
                 }]);
             }
             State::AwaitAuth if self.pending.is_some_and(|p| p.device_id == device_id) => {
@@ -495,7 +495,8 @@ impl Session {
                     suite,
                     session_id,
                     peer: 0,
-                    caps: self.cfg.caps.common(caps),
+                    // 取交集时保留被控端带来的系统信息（不是能力位）。
+                    caps: self.cfg.caps.common(caps).with_os(caps.os()),
                 };
                 tracer.record(now, self.trace, Stage::Established, u64::from(suite.id()));
                 Ok(Vec::new())

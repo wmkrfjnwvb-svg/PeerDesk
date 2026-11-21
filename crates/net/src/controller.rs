@@ -56,6 +56,18 @@ pub struct ControllerOptions {
     pub duration: Option<Duration>,
     /// 本机剪贴板；`None` 表示不同步剪贴板。双方都协商出剪贴板能力时才同步。
     pub clipboard: Option<crate::clipsync::ClipboardHandle>,
+    /// 握手完成时调用，参数是被控端 Accept 里的能力（含被控端的系统，见 `Caps::os`）。
+    pub on_established: Option<EstablishedHook>,
+}
+
+/// 握手完成时的回调。
+#[derive(Clone)]
+pub struct EstablishedHook(pub Arc<dyn Fn(Caps) + Send + Sync>);
+
+impl std::fmt::Debug for EstablishedHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("EstablishedHook")
+    }
 }
 
 /// 统计日志的一个窗口：上一次写日志时的累计值，以及这一秒里的帧数和最长间隔。
@@ -193,6 +205,9 @@ pub async fn run(
         }
     };
     let mut ctrl_rx = control_reader(ctrl_recv);
+    if let Some(hook) = &opts.on_established {
+        (hook.0)(caps);
+    }
 
     // 剪贴板同步：由控制端打开专用的流。对方是不支持剪贴板的老版本时不开。
     let clip_task = match opts.clipboard.clone().filter(|_| caps.has(Caps::CLIPBOARD)) {

@@ -14,6 +14,7 @@ use eframe::egui::{Color32, ColorImage};
 use peerdesk_core::auth::{Auth, Limiter};
 use peerdesk_core::crypto::Policy;
 use peerdesk_core::input::InputEvent;
+use peerdesk_core::proto::{Caps, PeerOs};
 use peerdesk_core::screen::Screen;
 use peerdesk_core::signal::format_code;
 use peerdesk_net::clipsync::{ClipNote, ClipboardHandle};
@@ -542,6 +543,8 @@ pub enum ViewEvent {
     Notice(String),
     /// 剪贴板事件（内容太大没有同步等），界面短暂提示，会话继续。
     Clipboard(ClipNote),
+    /// 握手完成，得知被控端的系统（老版本为未知）。助手据此选 Ctrl 还是 Cmd。
+    PeerOs(PeerOs),
 }
 
 /// 打开本机系统剪贴板。测试构建里没有（测试不碰开发者电脑的剪贴板）。
@@ -884,6 +887,12 @@ async fn one_session(
             clipboard: {
                 let ev = ev.clone();
                 system_clipboard(Box::new(move |note| ev.send(ViewEvent::Clipboard(note))))
+            },
+            on_established: {
+                let ev = ev.clone();
+                Some(controller::EstablishedHook(Arc::new(move |caps: Caps| {
+                    ev.send(ViewEvent::PeerOs(caps.os()));
+                })))
             },
         },
         Box::new(sink),
