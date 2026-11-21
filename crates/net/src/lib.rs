@@ -33,11 +33,15 @@ pub mod demo;
 pub mod error;
 pub mod files;
 pub mod fs_store;
+pub mod gateway;
 #[cfg(feature = "media")]
 pub mod host;
 pub mod ice;
 pub mod identity;
+pub mod netcheck;
 pub mod node;
+#[cfg(feature = "portmap")]
+pub mod portmap;
 pub mod punch;
 pub mod rendezvous;
 pub mod service;

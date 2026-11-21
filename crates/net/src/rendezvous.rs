@@ -22,7 +22,7 @@ use crate::{Fingerprint, Link, NetError, Node};
 /// 被控端向控制端的候选地址发 ping 的时长（控制端探测加多端口打洞都在这之内）。
 const PINGING_TIME: Duration = Duration::from_millis(5000);
 /// 一端难打洞时，先让快路径试这么久再开始多端口打洞（和 `Limits::HARD` 的等待一致）。
-const HARD_HEAD_START: Duration = Duration::from_millis(600);
+const HARD_HEAD_START: Duration = Duration::from_millis(1000);
 /// 普通打洞时，等这么久控制端还没连上来，被控端就开始多端口打洞（和 `Limits::NORMAL` 的等待一致）。
 const PLAIN_FALLBACK: Duration = Duration::from_millis(1500);
 /// 多端口打洞（生日攻击）最多用这么久。
@@ -432,6 +432,8 @@ pub async fn dial(
         }
         SignalMsg::Register { .. }
         | SignalMsg::Probe { .. }
+        | SignalMsg::Check
+        | SignalMsg::Checked { .. }
         | SignalMsg::Registered { .. }
         | SignalMsg::Connect { .. }
         | SignalMsg::ConnectCode { .. }

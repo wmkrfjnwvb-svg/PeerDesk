@@ -116,6 +116,8 @@ pub struct Strings {
     pub saved: &'static str,
     /// 打开日志文件夹。
     pub open_logs: &'static str,
+    /// 网络体检。
+    pub network_check: &'static str,
     pub err_port_in_use: &'static str,
     pub err_timeout: &'static str,
     pub err_refused: &'static str,
@@ -196,6 +198,7 @@ pub const ZH: Strings = Strings {
     save: "保存",
     saved: "服务器设置已保存",
     open_logs: "打开日志文件夹",
+    network_check: "网络体检（NAT、路由器、服务器、IPv6、端口映射）",
     err_port_in_use: "端口已被占用（也许另一个 PeerDesk 正在运行），换一个端口试试",
     err_timeout: "对方没有响应。请检查地址和端口、防火墙，以及对方是否打开了“允许远程控制”",
     err_refused: "连接失败",
@@ -277,6 +280,7 @@ pub const EN: Strings = Strings {
     save: "Save",
     saved: "Server settings saved",
     open_logs: "Open log folder",
+    network_check: "Network check (NAT, router, server, IPv6, port mapping)",
     err_port_in_use:
         "The port is already in use (maybe another PeerDesk is running). Try another port",
     err_timeout: "No response. Check the address, the port, the firewall, and that \

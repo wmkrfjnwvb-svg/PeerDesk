@@ -11,6 +11,7 @@ use std::time::Duration;
 use peerdesk_core::auth::{Auth, Limiter};
 use peerdesk_core::crypto::Policy;
 use peerdesk_core::input::InputEvent;
+use peerdesk_core::paths::Candidate;
 use peerdesk_core::proto::Caps;
 use peerdesk_core::session::SessionConfig;
 use peerdesk_core::signal::{format_code, parse_code};
@@ -19,8 +20,10 @@ use peerdesk_net::demo::{to_bmp, CountSink};
 use peerdesk_net::fs_store::scan;
 use peerdesk_net::host::{self, HostOptions, InputSink, Permissions};
 use peerdesk_net::identity::{parse_hex, to_hex};
+use peerdesk_net::netcheck::prepare_host;
 use peerdesk_net::rendezvous::{
-    answer, dial, register, Incoming, Lookup, Path as PathKind, PathPolicy, Registration, Server,
+    answer, dial, register_with, Incoming, Lookup, Path as PathKind, PathPolicy, Registration,
+    Server,
 };
 use peerdesk_net::{bench, Fingerprint, Identity, NetError, Node};
 use peerdesk_platform::CaptureOptions;
@@ -202,7 +205,12 @@ async fn next_request(registration: &mut Option<Registration>) -> Option<Incomin
 
 /// 保持在服务器上的登记：对每个连接请求打洞并接上中继；断开后定期重新登记，直到成功。
 /// 中继转发器留在这里，直到被更新的请求挤掉。
-pub(crate) async fn stay_registered(node: Arc<Node>, server: Server, registration: Registration) {
+pub(crate) async fn stay_registered(
+    node: Arc<Node>,
+    server: Server,
+    registration: Registration,
+    extra: Vec<Candidate>,
+) {
     let mut registration = Some(registration);
     let mut shims = VecDeque::new();
     loop {
@@ -212,7 +220,7 @@ pub(crate) async fn stay_registered(node: Arc<Node>, server: Server, registratio
             let _ = shims.drain(..shims.len().saturating_sub(MAX_SHIMS));
         }
         tokio::time::sleep(REREGISTER_EVERY).await;
-        registration = register(&node, &server).await.ok();
+        registration = register_with(&node, &server, extra.clone()).await.ok();
     }
 }
 
@@ -241,14 +249,25 @@ async fn host_async(args: HostArgs, out: &mut dyn Write) -> Result<u8, NetError>
     }
     if let Some(server) = args.server {
         warn_unpinned_server(out, &server);
-        let registration = register(&node, &server).await?;
+        // 先体检、请路由器映射端口（映射出来的地址也报告给服务器）。
+        let (report, extra) = prepare_host(&node, Some(&server)).await;
+        for (item, value) in report.lines() {
+            let _ = writeln!(out, "{item:<12}{value}");
+            peerdesk_net::note!(info, "网络体检 {item}：{value}");
+        }
+        let registration = register_with(&node, &server, extra.clone()).await?;
         let _ = writeln!(
             out,
             "已在服务器 {} 登记，服务器看到的本机地址 {}",
             server.addr, registration.observed
         );
         let _ = writeln!(out, "设备码 {}", format_code(registration.code));
-        tokio::spawn(stay_registered(Arc::clone(&node), server, registration));
+        tokio::spawn(stay_registered(
+            Arc::clone(&node),
+            server,
+            registration,
+            extra,
+        ));
     }
     let limiter = Arc::new(Mutex::new(Limiter::default()));
     let capture = CaptureOptions {
@@ -649,6 +668,51 @@ pub fn connect(args: &[String], out: &mut dyn Write) -> u8 {
 }
 
 /// `peerdesk bench-transport`。
+/// `netcheck`：网络体检（NAT 类型、路由器和服务器延迟、IPv6）。不请求端口映射。
+pub fn netcheck(args: &[String], out: &mut dyn Write) -> u8 {
+    let mut it = args.iter();
+    let (mut server, mut pin) = (None, None);
+    while let Some(flag) = it.next() {
+        let parsed = match flag.as_str() {
+            "--server" => parse_number(flag, it.next()).map(|a| server = Some(a)),
+            "--server-pin" => parse_fingerprint(flag, it.next()).map(|p| pin = Some(p)),
+            other => Err(format!("未知选项：{other}")),
+        };
+        if let Err(e) = parsed {
+            return usage_error(out, &e);
+        }
+    }
+    let server = match server_of(server, pin) {
+        Ok(server) => server,
+        Err(e) => return usage_error(out, &e),
+    };
+    let result = runtime().and_then(|rt| {
+        rt.block_on(async {
+            let identity = Identity::generate()?;
+            let tries: [SocketAddr; 2] = [
+                (std::net::Ipv6Addr::UNSPECIFIED, 0).into(),
+                ([0, 0, 0, 0], 0).into(),
+            ];
+            let node = Node::bind_first(&tries, &identity, &Policy::recommended())?;
+            let report = peerdesk_net::netcheck::run(&node, server.as_ref()).await;
+            node.close();
+            Ok::<_, NetError>(report)
+        })
+    });
+    match result {
+        Ok(report) => {
+            for (item, value) in report.lines() {
+                let _ = writeln!(out, "{item:<12}{value}");
+            }
+            EXIT_OK
+        }
+        Err(e) => {
+            let _ = writeln!(out, "错误：{e}");
+            EXIT_FAILED
+        }
+    }
+}
+
 pub fn bench(args: &[String], out: &mut dyn Write) -> u8 {
     let packets = match args {
         [] => 1200usize,
@@ -687,6 +751,31 @@ pub fn bench(args: &[String], out: &mut dyn Write) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn netcheck_command() {
+        let run = |args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
+            let mut out = Vec::new();
+            let code = netcheck(&args, &mut out);
+            (code, String::from_utf8(out).unwrap())
+        };
+        let (code, text) = run(&[]);
+        assert_eq!(code, EXIT_OK, "{text}");
+        assert!(
+            text.contains("NAT 类型") && text.contains("本机 → 路由器"),
+            "{text}"
+        );
+        assert_eq!(run(&["--bogus"]).0, crate::EXIT_USAGE);
+        assert_eq!(run(&["--server", "nope"]).0, crate::EXIT_USAGE);
+        assert_eq!(
+            run(&["--server-pin", &"ab".repeat(32)]).0,
+            crate::EXIT_USAGE
+        );
+        let (code, text) = run(&["--server", "127.0.0.1:9"]);
+        assert_eq!(code, EXIT_OK, "{text}");
+        assert!(text.contains("连不上"), "{text}");
+    }
     use peerdesk_net::service::{RelayService, SignalService};
     use std::sync::Mutex;
 

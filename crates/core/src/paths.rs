@@ -38,8 +38,8 @@ impl Limits {
     /// 早点交给多端口打洞（整个连接仍在 5 秒内）。
     pub const HARD: Self = Self {
         settle_us: 200_000,
-        direct_wait_us: 600_000,
-        budget_us: 800_000,
+        direct_wait_us: 1_000_000,
+        budget_us: 1_200_000,
     };
 }
 
@@ -370,7 +370,7 @@ mod tests {
         assert!(matches!(decide(&one, 3, 340_000, n), Decision::Pick(_)));
         // 所有候选都回应了：不用等
         assert!(matches!(decide(&one, 1, 50_000, n), Decision::Pick(_)));
-        // 只有中继：等直连到 1.5 秒（难打洞时 0.6 秒）
+        // 只有中继：等直连到 1.5 秒（难打洞时 1 秒）
         let relay = [m(PathKind::Relay, 30, 30)];
         assert_eq!(decide(&relay, 3, 1_000_000, n), Decision::Wait);
         assert!(matches!(
@@ -378,7 +378,7 @@ mod tests {
             Decision::Pick(_)
         ));
         assert!(matches!(
-            decide(&relay, 3, 600_000, Limits::HARD),
+            decide(&relay, 3, 1_000_000, Limits::HARD),
             Decision::Pick(_)
         ));
         // 时限到了，有什么用什么

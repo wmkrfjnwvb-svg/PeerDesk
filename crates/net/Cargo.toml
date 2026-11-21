@@ -9,8 +9,10 @@ rust-version.workspace = true
 [features]
 # 画面编解码（会话的被控端和控制端）。服务端只做信令和中继，不需要它，也就不用编译 C++ 的 openh264，
 # 可以静态链接 musl 发布。
-default = ["media"]
+default = ["media", "portmap"]
 media = ["dep:peerdesk-media"]
+# 请家里的路由器为本机映射端口（UPnP、NAT-PMP、PCP）。
+portmap = ["dep:igd-next"]
 
 [dependencies]
 log = "0.4"
@@ -24,6 +26,8 @@ ring = "0.17"
 bytes = "1"
 if-addrs = "0.15"
 socket2 = "0.6"
+# 只有客户端要请路由器映射端口（UPnP 要 HTTP 客户端，依赖较多），服务端不编译它。
+igd-next = { version = "0.18", default-features = false, features = ["aio_tokio"], optional = true }
 
 [lints]
 workspace = true

@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Color32, RichText, TextEdit};
 use peerdesk_core::signal::format_code;
 use peerdesk_net::identity::to_hex;
+use peerdesk_net::netcheck::NetReport;
 use peerdesk_net::rendezvous::Lookup;
 use peerdesk_net::Identity;
 use peerdesk_platform::guide::{guide, Guide, Os};
@@ -69,6 +70,7 @@ struct App {
     port: String,
     server: ServerSettings,
     device_code: Option<u32>,
+    net: Option<NetReport>,
     os: Os,
     guide: Guide,
     guide_checked: Instant,
@@ -105,6 +107,7 @@ impl App {
             recent: RecentStore::load(&data_dir),
             server: ServerSettings::load(&data_dir),
             device_code: None,
+            net: None,
             os,
             guide: guide(os, peerdesk_platform::check_permissions()),
             guide_checked: Instant::now(),
@@ -203,6 +206,9 @@ impl App {
         for event in events {
             if let HostEvent::Registered { code, .. } = event {
                 self.device_code = Some(code);
+            }
+            if let HostEvent::Network(report) = &event {
+                self.net = Some(report.clone());
             }
             let (phase, status) = self.phase.apply(&event, self.s);
             self.phase = phase;
@@ -364,6 +370,22 @@ impl App {
                     self.status = Status::info(format!("{} {shown}", s.copied));
                 }
             });
+        }
+        if let Some(report) = &self.net {
+            // 网络体检：开启被控时做一次，连接时直接用；出问题时让用户一眼看到卡在哪一段。
+            egui::CollapsingHeader::new(s.network_check)
+                .id_salt("network-check")
+                .show(ui, |ui| {
+                    egui::Grid::new("network-check-grid")
+                        .num_columns(2)
+                        .show(ui, |ui| {
+                            for (item, value) in report.lines() {
+                                ui.label(item);
+                                ui.label(value);
+                                ui.end_row();
+                            }
+                        });
+                });
         }
         match self.fingerprint.clone() {
             Ok(fp) => self.copy_row(ui, s.fingerprint, &short_fingerprint(&fp), &fp),

@@ -9,7 +9,7 @@ rust-version.workspace = true
 [dependencies]
 log = "0.4"
 peerdesk-core.workspace = true
-peerdesk-net = { workspace = true, features = ["media"] }
+peerdesk-net = { workspace = true, features = ["media", "portmap"] }
 peerdesk-platform.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
 # 测试控制台的图形界面。只开 glow 后端和必要的功能，控制体积。

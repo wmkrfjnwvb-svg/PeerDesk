@@ -19,7 +19,8 @@ use peerdesk_core::signal::format_code;
 use peerdesk_net::controller::{self, ControllerOptions, ScreenSink};
 use peerdesk_net::host::{self, HostOptions, ScreenSource, FRAME_DEADLINE_US};
 use peerdesk_net::identity::to_hex;
-use peerdesk_net::rendezvous::{dial, register, Path as Route, Server};
+use peerdesk_net::netcheck::{prepare_host, NetReport};
+use peerdesk_net::rendezvous::{dial, register_with, Path as Route, Server};
 use peerdesk_net::{Identity, NetError, Node};
 use tokio::sync::watch;
 
@@ -129,6 +130,8 @@ pub enum HostEvent {
         /// 服务器分配的设备码。
         code: u32,
     },
+    /// 网络体检的结果。
+    Network(NetReport),
     /// 登记失败（不影响直连）。
     RegisterFailed(NetError),
     /// 有控制端连上来，正在验证。
@@ -298,7 +301,13 @@ async fn host_main(
                 .is_ok_and(|a| a.is_ipv4() == server.addr.is_ipv4())
         });
         if let Some(node) = same_family.or(nodes.first()) {
-            match register(node, &server).await {
+            // 先体检、请路由器映射端口（映射出来的地址也报告给服务器），结果给界面显示。
+            let (report, extra) = prepare_host(node, Some(&server)).await;
+            for (item, value) in report.lines() {
+                peerdesk_net::note!(info, "网络体检 {item}：{value}");
+            }
+            ev.send(HostEvent::Network(report));
+            match register_with(node, &server, extra.clone()).await {
                 Ok(registration) => {
                     peerdesk_net::note!(
                         info,
@@ -311,7 +320,12 @@ async fn host_main(
                         observed: registration.observed,
                         code: registration.code,
                     });
-                    tokio::spawn(stay_registered(Arc::clone(node), server, registration));
+                    tokio::spawn(stay_registered(
+                        Arc::clone(node),
+                        server,
+                        registration,
+                        extra,
+                    ));
                 }
                 Err(e) => {
                     peerdesk_net::note!(warn, "在服务器 {} 登记失败：{e}", server.addr);
@@ -503,6 +517,8 @@ pub enum ViewEvent {
         remote: SocketAddr,
         /// 直连还是中继。
         route: Route,
+        /// 路径的具体说明（种类和往返时间），直接连地址时为空。
+        detail: String,
     },
     /// 会话结束。
     Ended(Result<Summary, NetError>),
@@ -648,22 +664,32 @@ async fn watch_remote(
     ev: &Emitter<ViewEvent>,
 ) -> Result<Summary, NetError> {
     // 走中继时的本机转发器要保持到会话结束。
-    let (link, _shim, route) = match target {
-        Target::Addr { addr, pin } => {
-            (node.connect(addr, pin.as_ref()).await?, None, Route::Direct)
-        }
+    let (link, _shim, route, detail) = match target {
+        Target::Addr { addr, pin } => (
+            node.connect(addr, pin.as_ref()).await?,
+            None,
+            Route::Direct,
+            String::new(),
+        ),
         Target::Device {
             server,
             device,
             policy,
         } => {
             let dialed = dial(node, &server, &device, policy).await?;
-            (dialed.link, dialed.shim, dialed.path)
+            let rtt = dialed.rtt_us.map_or_else(String::new, |us| {
+                format!(
+                    " {:.1} ms",
+                    Duration::from_micros(us).as_secs_f64() * 1000.0
+                )
+            });
+            let detail = format!("{}{rtt}", dialed.route.label());
+            (dialed.link, dialed.shim, dialed.path, detail)
         }
     };
     peerdesk_net::note!(
         info,
-        "控制：已连上 {}（{}），路径 {route:?}",
+        "控制：已连上 {}（{}），路径 {route:?} {detail}",
         link.remote_addr(),
         to_hex(link.peer_fingerprint())
             .get(..16)
@@ -673,6 +699,7 @@ async fn watch_remote(
         peer: to_hex(link.peer_fingerprint()),
         remote: link.remote_addr(),
         route,
+        detail,
     });
     let started = Instant::now();
     let report = controller::run(

@@ -325,6 +325,19 @@ async fn serve_device(state: Arc<SignalState>, link: Link) -> Result<(), NetErro
                     lock(&state.outboxes).insert(conn, tx.clone());
                     if let Err(e) = write_signal(&mut send, &done.reply).await { break Err(e); }
                 }
+                Ok(SignalMsg::Check) => {
+                    let me = *link.peer_fingerprint();
+                    let checked = SignalMsg::Checked {
+                        observed: link.remote_addr(),
+                        probe: state.relay.as_ref().map(|r| r.addr()),
+                        seen: state.relay.as_ref().and_then(|r| r.observed(&me)),
+                    };
+                    // 下一次体检看的是这次之后的探测包。
+                    if let Some(relay) = state.relay.as_ref() {
+                        relay.forget(&me);
+                    }
+                    if let Err(e) = write_signal(&mut send, &checked).await { break Err(e); }
+                }
                 Ok(SignalMsg::Connect { target, locals }) => {
                     if let Err(e) = introduce(&state, &link, Some(target), locals, &mut probed, &mut send).await { break Err(e); }
                 }
@@ -337,6 +350,7 @@ async fn serve_device(state: Arc<SignalState>, link: Link) -> Result<(), NetErro
                 }
                 Ok(
                     SignalMsg::Registered { .. }
+                    | SignalMsg::Checked { .. }
                     | SignalMsg::Probe { .. }
                     | SignalMsg::Peer { .. }
                     | SignalMsg::Incoming { .. }

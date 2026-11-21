@@ -598,3 +598,74 @@ async fn registration_survives_a_closed_inbox() {
         .await;
     }
 }
+
+/// 网络体检：回环上没有 NAT，服务器在两个端口看到的地址一样，判为容易打洞；
+/// 服务器没开中继时判断不了；没有服务器时只测本机部分。被控端准备时还会请求端口映射
+/// （这里没有路由器，映射失败但给出原因）。
+#[tokio::test(flavor = "multi_thread")]
+async fn netcheck_reports_nat_type_and_latency() {
+    use peerdesk_core::signal::Nat;
+    use peerdesk_net::netcheck::{prepare_host, run};
+    let w = world(true).await;
+    let report = run(&w.ctrl, Some(&w.server)).await;
+    assert_eq!(report.nat, Some(Nat::Easy), "{report:?}");
+    assert_eq!(report.public, Some(w.ctrl.local_addr().unwrap()));
+    assert!(report.server_rtt.is_some() && report.server_error.is_none());
+    assert!(!report.lines().is_empty());
+
+    let plain = world(false).await;
+    let report = run(&plain.ctrl, Some(&plain.server)).await;
+    assert_eq!(report.nat, Some(Nat::Unknown));
+
+    let wrong = Server {
+        addr: w.server.addr,
+        pin: Some([1; 32]),
+    };
+    let report = run(&w.ctrl, Some(&wrong)).await;
+    assert!(report.server_error.is_some() && report.nat.is_none());
+
+    let (report, extra) = prepare_host(&w.host, None).await;
+    assert!(report.public.is_none());
+    assert!(report.mapping_error.is_some() || !extra.is_empty());
+}
+
+/// 被控端准备时向路由器申请端口映射：假的 NAT-PMP 路由器（127.0.0.1:5351）答应映射，
+/// 映射出来的公网地址作为候选报告给服务器。
+#[tokio::test(flavor = "multi_thread")]
+async fn host_reports_the_port_its_router_mapped() {
+    use peerdesk_core::paths::PathKind;
+    use peerdesk_net::netcheck::prepare_host_via;
+    let Ok(router) = tokio::net::UdpSocket::bind("127.0.0.1:5351").await else {
+        return; // 端口被占用（极少见）：跳过
+    };
+    tokio::spawn(async move {
+        let mut buf = [0u8; 128];
+        while let Ok((len, from)) = router.recv_from(&mut buf).await {
+            // NAT-PMP（版本 0）：外网地址请求和 UDP 映射请求；PCP（版本 2）不回应
+            let reply: Vec<u8> = match (buf.first(), buf.get(1), len) {
+                (Some(0), Some(0), 2) => {
+                    [&[0u8, 128, 0, 0, 0, 0, 0, 1][..], &[203, 0, 113, 5]].concat()
+                }
+                (Some(0), Some(1), 12) => {
+                    let internal = [buf[4], buf[5]];
+                    [
+                        &[0u8, 129, 0, 0, 0, 0, 0, 1][..],
+                        &internal,
+                        &[0x9c, 0x40],
+                        &[0, 0, 0x0e, 0x10],
+                    ]
+                    .concat()
+                }
+                _ => continue,
+            };
+            let _ = router.send_to(&reply, from).await;
+        }
+    });
+    let id = Identity::generate().unwrap();
+    let node = Node::bind(any(), &id, &Policy::recommended()).unwrap();
+    let (report, extra) = prepare_host_via(&node, None, vec!["127.0.0.1".parse().unwrap()]).await;
+    let mapped: SocketAddr = "203.0.113.5:40000".parse().unwrap();
+    assert_eq!(report.mapped, Some((mapped, "NAT-PMP")), "{report:?}");
+    assert_eq!(extra.len(), 1);
+    assert_eq!((extra[0].addr, extra[0].kind), (mapped, PathKind::Mapped));
+}

@@ -193,7 +193,14 @@ impl Viewer {
             format!("{}: {rate}", s.bitrate),
             format!("{}: {rtt}", s.rtt),
             format!("{}: {}", s.latency, s.not_available),
-            format!("{}: {}", s.path, route_name(self.phase.route(), s)),
+            format!(
+                "{}: {}",
+                s.path,
+                match self.phase.detail() {
+                    "" => route_name(self.phase.route(), s),
+                    detail => detail,
+                }
+            ),
             format!("{}: {}×{}", s.resolution, self.size[0], self.size[1]),
         ];
         let text = lines.join("\n");

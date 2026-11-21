@@ -45,6 +45,8 @@ const USAGE: &str = "\
   host [选项]             作为被控端等待连接
   connect <地址> [选项]   作为控制端直接连接被控端
   connect --server <地址> --device <设备码> [选项]
+  netcheck [--server <地址> [--server-pin <指纹>]]
+                          网络体检：NAT 类型、本机到路由器和服务器的延迟、IPv6
                           通过服务器找到被控端：先试直连（打洞），不通再走中继
   bench-transport         对比裸 UDP 和 QUIC 数据报在本机回环上的延迟
   screen-check [选项]     采集一帧本机屏幕，报告尺寸和耗时
@@ -282,6 +284,7 @@ pub fn run(args: &[String], out: &mut dyn Write) -> u8 {
         "host" => return remote::host(rest, out),
         "connect" => return remote::connect(rest, out),
         "bench-transport" => return remote::bench(rest, out),
+        "netcheck" => return remote::netcheck(rest, out),
         "screen-check" => return screen_check::screen_check(rest, out),
         "check-config" => cmd_check_config(rest, out),
         other => Ok(usage_error(out, &format!("未知命令：{other}"))),

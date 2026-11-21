@@ -105,6 +105,7 @@ impl HostPhase {
                 },
                 Some(Status::info(format!("{} {}", s.host_listening, port))),
             ),
+            HostEvent::Network(_) => (self.clone(), None),
             HostEvent::Registered { observed, code } => (
                 self.clone(),
                 Some(Status::info(format!(
@@ -183,6 +184,8 @@ pub enum ViewPhase {
         remote: SocketAddr,
         /// 直连还是中继。
         route: Route,
+        /// 路径的具体说明（例如“公网直连（打洞） 23.4 ms”），直接连地址时为空。
+        detail: String,
     },
     /// 结束了。
     Ended {
@@ -206,6 +209,15 @@ impl ViewPhase {
         }
     }
 
+    /// 路径的具体说明（没有时为空）。
+    #[must_use]
+    pub fn detail(&self) -> &str {
+        match self {
+            ViewPhase::Connected { detail, .. } => detail,
+            ViewPhase::Ended { .. } | ViewPhase::Connecting => "",
+        }
+    }
+
     /// 处理一个事件，返回新状态。
     #[must_use]
     pub fn apply(&self, event: &ViewEvent, s: &Strings) -> Self {
@@ -214,10 +226,12 @@ impl ViewPhase {
                 peer,
                 remote,
                 route,
+                detail,
             } => ViewPhase::Connected {
                 peer: peer.clone(),
                 remote: *remote,
                 route: *route,
+                detail: detail.clone(),
             },
             ViewEvent::Ended(result) => {
                 let status = match result {
@@ -400,10 +414,13 @@ mod tests {
                 peer: "ab".into(),
                 remote: addr(),
                 route: Route::Relay,
+                detail: "中继 30.0 ms".into(),
             },
             s,
         );
         assert_eq!(connected.route(), Some(Route::Relay));
+        assert_eq!(connected.detail(), "中继 30.0 ms");
+        assert_eq!(ViewPhase::Connecting.detail(), "");
         let summary = Summary {
             end: "peer left".into(),
             ..Summary::default()

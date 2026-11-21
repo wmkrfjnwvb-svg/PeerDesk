@@ -94,6 +94,18 @@ pub enum SignalMsg {
     },
     /// 服务器 → 控制端：目标设备不在线。
     NotFound,
+    /// 设备 → 服务器：网络体检，问服务器看到的本机地址。
+    Check,
+    /// 服务器 → 设备：体检结果。
+    Checked {
+        /// 服务器在信令端口看到的本机地址。
+        observed: SocketAddr,
+        /// 探测地址（服务器没开中继时为 `None`）：从同一个端口向这里发 [`observe_packet`]，
+        /// 再体检一次，`seen` 就是这次探测看到的地址。
+        probe: Option<SocketAddr>,
+        /// 上一次体检以后，服务器在探测地址看到的本机地址。
+        seen: Option<SocketAddr>,
+    },
 }
 
 fn put_addr(w: &mut Writer, addr: &SocketAddr) {
@@ -352,7 +364,9 @@ impl SignalMsg {
             | SignalMsg::Probe { .. }
             | SignalMsg::Connect { .. }
             | SignalMsg::ConnectCode { .. }
-            | SignalMsg::NotFound => None,
+            | SignalMsg::NotFound
+            | SignalMsg::Check
+            | SignalMsg::Checked { .. } => None,
         }
     }
 
@@ -368,6 +382,8 @@ impl SignalMsg {
             SignalMsg::Incoming { .. } => "Incoming",
             SignalMsg::Probe { .. } => "Probe",
             SignalMsg::NotFound => "NotFound",
+            SignalMsg::Check => "Check",
+            SignalMsg::Checked { .. } => "Checked",
         }
     }
 
@@ -429,6 +445,19 @@ impl SignalMsg {
             SignalMsg::NotFound => {
                 w.u8(6);
             }
+            SignalMsg::Check => {
+                w.u8(9);
+            }
+            SignalMsg::Checked {
+                observed,
+                probe,
+                seen,
+            } => {
+                w.u8(10);
+                put_addr(&mut w, observed);
+                put_opt_addr(&mut w, probe.as_ref());
+                put_opt_addr(&mut w, seen.as_ref());
+            }
             SignalMsg::ConnectCode { code, locals } => {
                 w.u8(7).u32(*code);
                 put_addrs(&mut w, locals);
@@ -472,6 +501,12 @@ impl SignalMsg {
                 relay: get_grant(&mut r)?,
             },
             6 => SignalMsg::NotFound,
+            9 => SignalMsg::Check,
+            10 => SignalMsg::Checked {
+                observed: get_addr(&mut r)?,
+                probe: get_opt_addr(&mut r)?,
+                seen: get_opt_addr(&mut r)?,
+            },
             7 => SignalMsg::ConnectCode {
                 code: r.u32()?,
                 locals: get_addrs(&mut r)?,
@@ -809,6 +844,12 @@ mod tests {
             SignalMsg::Probe {
                 relay: addr("203.0.113.1:3478"),
             },
+            SignalMsg::Check,
+            SignalMsg::Checked {
+                observed: addr("203.0.113.9:4000"),
+                probe: Some(addr("203.0.113.1:3478")),
+                seen: None,
+            },
             SignalMsg::Connect {
                 target: [1; 32],
                 locals: vec![lan("10.0.0.3:9")],
@@ -867,6 +908,8 @@ mod tests {
                 "Registered",
                 "Registered",
                 "Probe",
+                "Check",
+                "Checked",
                 "Connect",
                 "ConnectCode",
                 "Peer",
