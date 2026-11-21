@@ -44,7 +44,7 @@ fn office() -> Vec<Phase> {
 /// 仿真是确定性的，同一份代码每次结果相同，所以可以当硬门槛。
 fn gate(o: &Outcome, what: &str, ok: bool, detail: &str) {
     use std::io::Write as _;
-    // 门槛只卡产品默认的估计器；候选的估计器跑同样的场景，只报告，用来对比。
+    // 门槛只卡产品默认的估计器；另一个估计器跑同样的场景，只报告，用来对比。
     let product = EstimatorKind::PRODUCT
         .build(Profile::STABLE, 1, 1, 1)
         .name();
@@ -52,7 +52,7 @@ fn gate(o: &Outcome, what: &str, ok: bool, detail: &str) {
     let verdict = match (ok, hard) {
         (true, _) => "达标",
         (false, true) => "**未达标**",
-        (false, false) => "未达标（候选，不卡）",
+        (false, false) => "未达标（对照，不卡）",
     };
     let line = format!(
         "| {} | {}/{} | {what} | {verdict} | {detail} |\n",
@@ -114,7 +114,7 @@ fn finish(o: &Outcome) {
     );
 }
 
-/// 用产品默认的估计器（卡门槛）和候选的估计器（只报告）各跑一遍。
+/// 用产品默认的估计器（卡门槛）和另一个估计器（对照，只报告）各跑一遍。
 fn compare(s: &Scenario) {
     for estimator in [EstimatorKind::Legacy, EstimatorKind::ClassicV1] {
         let o = run(&Scenario {
@@ -190,5 +190,46 @@ fn office_on_cellular() {
         profile: Profile::CELLULAR,
         start_bps: 2_000_000,
         ..Scenario::new("office-cellular", office())
+    });
+}
+
+/// 起步码率很低、链路很宽：估计器多快把码率提上去（画面多快变清楚）。
+#[test]
+fn fast_ramp_on_a_fat_link() {
+    compare(&Scenario {
+        network: vec![(
+            0,
+            Link {
+                rate_bps: Some(50_000_000),
+                ..Link::lan()
+            },
+        )],
+        start_bps: 500_000,
+        ..Scenario::new(
+            "fast-ramp",
+            vec![phase(Action::Scrolling, 90), phase(Action::Idle, 30)],
+        )
+    });
+}
+
+/// Wi-Fi 上 3% 的随机丢包，但链路并不拥塞：估计器不该因此降码率。
+#[test]
+fn random_loss_without_congestion() {
+    compare(&Scenario {
+        network: vec![(
+            0,
+            Link {
+                delay_us: 3_000,
+                jitter_us: 2_000,
+                loss_permille: 30,
+                rate_bps: Some(30_000_000),
+                ..Link::lan()
+            },
+        )],
+        profile: Profile::WIRELESS,
+        ..Scenario::new(
+            "random-loss",
+            vec![phase(Action::Dragging, 150), phase(Action::Idle, 30)],
+        )
     });
 }
