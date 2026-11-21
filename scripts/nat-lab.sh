@@ -285,7 +285,10 @@ for c in $CASES; do
     # 两边路由器都不丢外网来包时，谁先发包都会让对面路由器换端口，已知做不到（应当走中继，不能失败）。
     case $c in sym-sym|leaky-leaky) want="中继" ;; *) ;; esac
     verdict="$want"
-    if [ "$result" != "成功" ] || [ "$path" != "$want" ]; then verdict="**$want（未达标）**"; bad=$((bad + 1)); fi
+    # 预期中继的组合偶尔也能直连（对端路由器换端口后靠对端反射地址连上），直连更好，同样算达标。
+    ok=no
+    if [ "$result" = "成功" ] && { [ "$path" = "$want" ] || [ "$path" = "直连" ]; }; then ok=yes; fi
+    if [ "$ok" = no ]; then verdict="**$want（未达标）**"; bad=$((bad + 1)); elif [ "$path" != "$want" ]; then verdict="$want（实际直连，更好）"; fi
     echo "| $c | $i | $result | ${path:--} | $verdict | ${plan:--} | ${t:-- | - | - | - | -} | ${route:--} | ${rtt:--} | ${why:--} |" >>"$summary"
     total=$((total + 1))
     if [ "$path" = "直连" ] && [ "$result" = "成功" ]; then direct=$((direct + 1)); fi
