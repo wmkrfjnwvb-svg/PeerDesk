@@ -33,10 +33,12 @@ pub mod demo;
 pub mod error;
 pub mod files;
 pub mod fs_store;
+pub mod gateway;
 #[cfg(feature = "media")]
 pub mod host;
 pub mod identity;
 pub mod node;
+pub mod portmap;
 pub mod punch;
 pub mod rendezvous;
 pub mod service;
