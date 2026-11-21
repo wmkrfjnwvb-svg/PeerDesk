@@ -6,12 +6,11 @@
   被控端按权限接受、能力位 CLIPBOARD）；端到端测试 crates/net/tests/clipboard.rs 通过；
   系统剪贴板 crates/platform/src/clipboard_sys.rs（arboard + 各系统变化计数 + 敏感内容跳过）。
 
-## 剪贴板还差
-1. 客户端接线：gui/session.rs、remote.rs 里 ControllerOptions.clipboard 和 HostOptions.clipboard
-   用 `peerdesk_platform::SystemClip::open(...)`；两端 SessionConfig.caps 加上 `Caps::CLIPBOARD`。
-2. 界面：ClipNote 提示（超限 → “请用文件传输”），被控端权限开关，远程窗口里的开关。
-3. Windows/macOS 交叉编译本机做不了（ring 的 C 构建），用 `[win]`/`[mac]` 在 CI 验证 clipboard_sys.rs。
-4. 跑全量 clippy、测试、覆盖率后推送。
+## 剪贴板状态（2026-11-21 三平台 CI 通过）
+- 已接进客户端：两端打开系统剪贴板，握手声明能力，超限在远程窗口提示 6 秒。
+- 还差（放进浮动助手一起做）：被控端“剪贴板”权限开关、远程窗口里的同步开关。
+- 顺带修了：Windows 上同一端口能开两个被控端；被控端拒绝文件时控制端偶发报错；
+  端口映射测试里只在 Linux 成立的假设。
 
 ## 调研已完成（待据此排期）
 - docs/research/G-unattended.md 无人值守、锁屏、无显示器
