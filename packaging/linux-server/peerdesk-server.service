@@ -1,0 +1,35 @@
+[Unit]
+Description=PeerDesk 服务端（信令、打洞、中继）
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=peerdesk
+Group=peerdesk
+ExecStart=/usr/local/bin/peerdesk-server /etc/peerdesk/server.toml
+Restart=always
+RestartSec=3
+# 目录 /var/lib/peerdesk 由 systemd 创建并交给 peerdesk 用户。
+StateDirectory=peerdesk
+StateDirectoryMode=0700
+LimitNOFILE=65536
+
+# 加固：这些选项都不影响 UDP 套接字（没有限制地址族和网络命名空间）。
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

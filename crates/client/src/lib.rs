@@ -6,6 +6,13 @@
 use std::io::Write;
 
 pub mod gui;
+pub mod logfile;
+
+/// 默认的数据目录（身份、设置、日志都在这里）。
+#[must_use]
+pub fn data_dir() -> std::path::PathBuf {
+    remote::default_data_dir()
+}
 mod local;
 mod remote;
 mod screen_check;
@@ -37,7 +44,7 @@ const USAGE: &str = "\
   sim [选项]              在仿真网络上跑一次完整会话
   host [选项]             作为被控端等待连接
   connect <地址> [选项]   作为控制端直接连接被控端
-  connect --server <地址> --device <指纹> [选项]
+  connect --server <地址> --device <设备码> [选项]
                           通过服务器找到被控端：先试直连（打洞），不通再走中继
   bench-transport         对比裸 UDP 和 QUIC 数据报在本机回环上的延迟
   screen-check [选项]     采集一帧本机屏幕，报告尺寸和耗时
@@ -65,7 +72,7 @@ connect 的选项：
   --pin <指纹>            被控端的指纹；给了就必须一致，否则拒绝连接（直连时用）
   --server <地址:端口>    信令服务器
   --server-pin <指纹>     信令服务器的指纹；给了就必须一致
-  --device <指纹>         要连接的被控端的指纹（同时用于核对身份）
+  --device <设备码|指纹>  要连接的被控端：服务器分配的 9 位设备码，或者它的指纹
   --relay-only            只走中继
   --direct-only           只走直连，不用中继
   --data-dir <目录>       保存设备身份的目录

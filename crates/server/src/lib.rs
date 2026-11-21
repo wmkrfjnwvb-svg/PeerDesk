@@ -5,6 +5,7 @@
 
 pub mod http;
 pub mod json;
+pub mod logging;
 pub mod node;
 pub mod status;
 

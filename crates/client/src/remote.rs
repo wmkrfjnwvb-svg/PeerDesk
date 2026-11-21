@@ -13,13 +13,14 @@ use peerdesk_core::crypto::Policy;
 use peerdesk_core::input::InputEvent;
 use peerdesk_core::proto::Caps;
 use peerdesk_core::session::SessionConfig;
+use peerdesk_core::signal::{format_code, parse_code};
 use peerdesk_net::controller::{self, ControllerOptions, Upload};
 use peerdesk_net::demo::{to_bmp, CountSink};
 use peerdesk_net::fs_store::scan;
 use peerdesk_net::host::{self, HostOptions, InputSink, Permissions};
 use peerdesk_net::identity::{parse_hex, to_hex};
 use peerdesk_net::rendezvous::{
-    answer, dial, register, Incoming, Path as PathKind, PathPolicy, Registration, Server,
+    answer, dial, register, Incoming, Lookup, Path as PathKind, PathPolicy, Registration, Server,
 };
 use peerdesk_net::{bench, Fingerprint, Identity, NetError, Node};
 use peerdesk_platform::CaptureOptions;
@@ -239,6 +240,7 @@ async fn host_async(args: HostArgs, out: &mut dyn Write) -> Result<u8, NetError>
             "已在服务器 {} 登记，服务器看到的本机地址 {}",
             server.addr, registration.observed
         );
+        let _ = writeln!(out, "设备码 {}", format_code(registration.code));
         tokio::spawn(stay_registered(Arc::clone(&node), server, registration));
     }
     let limiter = Arc::new(Mutex::new(Limiter::default()));
@@ -344,9 +346,20 @@ enum Target {
     /// 通过服务器找到这台设备。
     Device {
         server: Server,
-        device: Fingerprint,
+        device: Lookup,
         policy: PathPolicy,
     },
+}
+
+/// `--device` 的值：9 位设备码，或者 64 位十六进制指纹。
+fn parse_device(flag: &str, value: Option<&String>) -> Result<Lookup, String> {
+    let text = value.ok_or_else(|| format!("{flag} 需要一个值"))?;
+    if let Some(code) = parse_code(text) {
+        return Ok(Lookup::Code(code));
+    }
+    parse_hex(text)
+        .map(Lookup::Device)
+        .map_err(|_| format!("{flag} 要么是 9 位设备码，要么是 64 位十六进制指纹"))
 }
 
 struct ConnectArgs {
@@ -389,7 +402,7 @@ fn parse_connect(args: &[String]) -> Result<ConnectArgs, String> {
             "--pin" => parsed.pin = Some(parse_fingerprint(flag, it.next())?),
             "--server" => server = Some(parse_number(flag, it.next())?),
             "--server-pin" => server_pin = Some(parse_fingerprint(flag, it.next())?),
-            "--device" => device = Some(parse_fingerprint(flag, it.next())?),
+            "--device" => device = Some(parse_device(flag, it.next())?),
             "--relay-only" => relay_only = true,
             "--direct-only" => direct_only = true,
             "--data-dir" => parsed.data_dir = it.next().ok_or("--data-dir 需要一个值")?.into(),
@@ -416,8 +429,10 @@ fn parse_connect(args: &[String]) -> Result<ConnectArgs, String> {
     parsed.target = match (addr, server_of(server, server_pin)?, device) {
         (Some(addr), None, None) if policy == PathPolicy::Auto => Target::Addr(addr),
         (None, Some(server), Some(device)) if parsed.pin.is_none() => {
-            // 设备的指纹就是要核对的指纹。
-            parsed.pin = Some(device);
+            // 给的是指纹时，它就是要核对的指纹；给的是设备码时，由服务器告知指纹并在连接时核对。
+            if let Lookup::Device(fp) = device {
+                parsed.pin = Some(fp);
+            }
             Target::Device {
                 server,
                 device,
@@ -485,6 +500,17 @@ async fn connect_session(
                 PathKind::Relay => "中继",
             };
             let _ = writeln!(out, "连接路径      {path}");
+            let t = dialed.timing;
+            let _ = writeln!(
+                out,
+                "连接耗时      服务器 {} ms，查询 {} ms，直连 {} ms，中继 {} ms",
+                t.server_connect.as_millis(),
+                t.lookup.as_millis(),
+                t.direct.as_millis(),
+                t.relay.as_millis()
+            );
+            let why = dialed.direct_error.as_deref().unwrap_or("-");
+            let _ = writeln!(out, "直连失败原因  {why}");
             (dialed.link, dialed.shim)
         }
     };

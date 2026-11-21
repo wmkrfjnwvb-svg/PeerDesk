@@ -15,6 +15,8 @@ fn main() -> ExitCode {
         .skip(1)
         .filter(|a| !a.starts_with("-psn_"))
         .collect();
+    // 日志写到数据目录的 logs 里，出问题时把它发出来。
+    peerdesk::logfile::init(&peerdesk::data_dir().join("logs"), false);
     if args.is_empty() {
         return ExitCode::from(peerdesk::gui::run());
     }

@@ -412,12 +412,15 @@ fn connect_through_a_signaling_server() {
         "secret-pw",
         Some(server.server(Some(server.pin))),
     );
-    wait_for(
+    let registered = wait_for(
         || h.poll(),
         &mut host_seen,
         |e| matches!(e, HostEvent::Registered { .. }),
     );
-    let device = Identity::load_or_create(&host_dir).unwrap().fingerprint();
+    let HostEvent::Registered { code, .. } = registered else {
+        panic!("{registered:?}")
+    };
+    let device = peerdesk_net::rendezvous::Lookup::Code(code);
 
     let (repaint, _) = counter();
     let v = start_view(
@@ -482,7 +485,7 @@ fn pixels_are_converted() {
             addr: "[::1]:1".parse().unwrap(),
             pin: None
         },
-        device: [0; 32],
+        device: peerdesk_net::rendezvous::Lookup::Device([0; 32]),
         policy: peerdesk_net::rendezvous::PathPolicy::Auto,
     }));
 }

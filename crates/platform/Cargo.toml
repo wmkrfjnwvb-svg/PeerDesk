@@ -8,7 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 peerdesk-core.workspace = true
-peerdesk-net.workspace = true
+peerdesk-net = { workspace = true, features = ["media"] }
 
 # Linux：X11（MIT-SHM 采集、DAMAGE 变化检测、XTEST 注入）。x11rb 是纯 Rust 的 X11 协议实现，
 # 不依赖 libX11/libxcb；libc 只用于共享内存（memfd + mmap）和等待连接可读（poll）。

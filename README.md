@@ -82,9 +82,12 @@ peerdesk bench-transport                       # 本机回环上对比裸 UDP �
 ```bash
 peerdesk host --server <服务器地址:端口> --server-pin <服务器指纹>          # 被控端：登记在线
 peerdesk connect --server <服务器地址:端口> --server-pin <服务器指纹> \
-                 --device <被控端指纹>                                   # 先试直连（打洞），不通走中继
-peerdesk connect ... --device <被控端指纹> --relay-only                  # 只走中继（--direct-only 只走直连）
+                 --device <9 位设备码或被控端指纹>                      # 先试直连（打洞），不通走中继
+peerdesk connect ... --device <设备码> --relay-only                  # 只走中继（--direct-only 只走直连）
 ```
+
+在 Linux 服务器上部署服务端（systemd、防火墙、指纹、升级、排错）见 [docs/deploy-server.md](docs/deploy-server.md)。
+提交信息带 `[pkg]` 时 CI 会产出静态链接的 `peerdesk-<提交>-linux-server`。
 
 控制端会打印实际走的路径（直连 / 中继）。管理接口的 `/api/status` 里有在线设备数和中继的转发总量。
 

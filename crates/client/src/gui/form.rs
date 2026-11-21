@@ -2,8 +2,9 @@
 
 use std::net::{IpAddr, SocketAddr};
 
+use peerdesk_core::signal::parse_code;
 use peerdesk_net::identity::parse_hex;
-use peerdesk_net::rendezvous::{PathPolicy, Server};
+use peerdesk_net::rendezvous::{Lookup, PathPolicy, Server};
 use peerdesk_net::{Fingerprint, NetError};
 
 use super::i18n::Strings;
@@ -21,12 +22,12 @@ pub enum Target {
         /// 要核对的指纹。
         pin: Option<Fingerprint>,
     },
-    /// 通过服务器找到这台设备，先试直连，不通走中继。设备指纹同时用来核对。
+    /// 通过服务器找到这台设备（按设备码或指纹），先试直连，不通走中继。连接时核对设备指纹。
     Device {
         /// 信令服务器。
         server: Server,
-        /// 被控端指纹。
-        device: Fingerprint,
+        /// 被控端。
+        device: Lookup,
         /// 路径策略。
         policy: PathPolicy,
     },
@@ -68,46 +69,51 @@ pub fn parse_pin(text: &str, s: &Strings) -> Result<Option<Fingerprint>, String>
 /// 连接表单。
 #[derive(Debug, Clone, Default)]
 pub struct ConnectForm {
-    /// 被控端地址。
+    /// 对方的设备码，或者 `地址:端口`，或者设备指纹。
     pub addr: String,
-    /// 要核对的指纹。
+    /// 要核对的指纹（直连地址时可选）。
     pub pin: String,
-    /// 是否通过服务器连接。
-    pub via_server: bool,
-    /// 服务器地址。
-    pub server: String,
-    /// 服务器指纹。
-    pub server_pin: String,
-    /// 被控端指纹。
-    pub device: String,
 }
 
 impl ConnectForm {
-    /// 解析成连接目标。
-    pub fn target(&self, s: &Strings) -> Result<Target, String> {
-        if self.via_server {
-            if self.server.trim().is_empty() || self.device.trim().is_empty() {
-                return Err(s.err_need_target.to_owned());
-            }
-            let server = Server {
-                addr: parse_addr(&self.server, s.err_bad_server)?,
-                pin: parse_pin(&self.server_pin, s)?,
-            };
-            let device = parse_pin(&self.device, s)?.ok_or_else(|| s.err_bad_pin.to_owned())?;
-            Ok(Target::Device {
-                server,
+    /// 解析成连接目标。设备码和指纹要通过 `server` 查找。
+    pub fn target(
+        &self,
+        s: &Strings,
+        server: Result<Option<Server>, String>,
+    ) -> Result<Target, String> {
+        let text = self.addr.trim();
+        if text.is_empty() {
+            return Err(s.err_need_target.to_owned());
+        }
+        let lookup = parse_code(text).map(Lookup::Code).or_else(|| {
+            let hex: String = text
+                .chars()
+                .filter(|c| !c.is_whitespace() && *c != ':')
+                .collect();
+            (hex.len() == 64)
+                .then(|| parse_hex(&hex.to_ascii_lowercase()).ok())
+                .flatten()
+                .map(Lookup::Device)
+        });
+        match lookup {
+            Some(device) => Ok(Target::Device {
+                server: server?.ok_or_else(|| s.err_need_server.to_owned())?,
                 device,
                 policy: PathPolicy::Auto,
-            })
-        } else {
-            if self.addr.trim().is_empty() {
-                return Err(s.err_need_target.to_owned());
-            }
-            Ok(Target::Addr {
-                addr: parse_addr(&self.addr, s.err_bad_addr)?,
+            }),
+            None => Ok(Target::Addr {
+                addr: parse_addr(text, s.err_bad_addr)?,
                 pin: parse_pin(&self.pin, s)?,
-            })
+            }),
         }
+    }
+
+    /// 记进“最近连接”的文字：设备码去掉空格，其他原样。
+    #[must_use]
+    pub fn remembered(&self) -> String {
+        let text = self.addr.trim();
+        parse_code(text).map_or_else(|| text.to_owned(), |c| c.to_string())
     }
 }
 
@@ -190,44 +196,56 @@ mod tests {
     #[test]
     fn connect_targets() {
         let fp = "cd".repeat(32);
+        let server = Server {
+            addr: "10.0.0.9:7000".parse().unwrap(),
+            pin: None,
+        };
         let mut form = ConnectForm::default();
-        assert_eq!(form.target(&EN), Err(EN.err_need_target.to_owned()));
+        assert_eq!(
+            form.target(&EN, Ok(None)),
+            Err(EN.err_need_target.to_owned())
+        );
         form.addr = "10.0.0.2".into();
         assert_eq!(
-            form.target(&EN),
+            form.target(&EN, Ok(None)),
             Ok(Target::Addr {
                 addr: "10.0.0.2:4433".parse().unwrap(),
                 pin: None
             })
         );
         form.pin = "nope".into();
-        assert!(form.target(&EN).is_err());
+        assert!(form.target(&EN, Ok(None)).is_err());
+        form.pin = String::new();
+        form.addr = "nope".into();
+        assert_eq!(form.target(&EN, Ok(None)), Err(EN.err_bad_addr.to_owned()));
 
-        form.via_server = true;
-        assert_eq!(form.target(&EN), Err(EN.err_need_target.to_owned()));
-        form.server = "10.0.0.9:7000".into();
-        form.device = fp.clone();
+        // 设备码：需要服务器
+        form.addr = " 123 456 789 ".into();
+        assert_eq!(form.remembered(), "123456789");
         assert_eq!(
-            form.target(&EN),
+            form.target(&EN, Ok(None)),
+            Err(EN.err_need_server.to_owned())
+        );
+        assert_eq!(form.target(&EN, Err("bad".into())), Err("bad".to_owned()));
+        assert_eq!(
+            form.target(&EN, Ok(Some(server))),
             Ok(Target::Device {
-                server: Server {
-                    addr: "10.0.0.9:7000".parse().unwrap(),
-                    pin: None
-                },
-                device: [0xCD; 32],
+                server,
+                device: Lookup::Code(123_456_789),
                 policy: PathPolicy::Auto,
             })
         );
-        form.server = "nope".into();
-        assert_eq!(form.target(&EN), Err(EN.err_bad_server.to_owned()));
-        form.server = "10.0.0.9:7000".into();
-        form.server_pin = "zz".into();
-        assert!(form.target(&EN).is_err());
-        form.server_pin = String::new();
-        form.device = " ".into();
-        assert!(form.target(&EN).is_err());
-        form.device = ":".into();
-        assert_eq!(form.target(&EN), Err(EN.err_bad_pin.to_owned()));
+        // 指纹也可以
+        form.addr = fp.to_uppercase();
+        assert_eq!(form.remembered(), fp.to_uppercase());
+        assert_eq!(
+            form.target(&EN, Ok(Some(server))),
+            Ok(Target::Device {
+                server,
+                device: Lookup::Device([0xCD; 32]),
+                policy: PathPolicy::Auto,
+            })
+        );
     }
 
     #[test]

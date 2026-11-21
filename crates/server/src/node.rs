@@ -77,7 +77,15 @@ impl Services {
                 };
                 let node = Arc::new(peerdesk_net::Node::bind(cfg.listen, &identity, policy)?);
                 let addr = node.local_addr()?;
-                Ok::<_, NetError>((SignalService::start(node, relay.clone()), relay, addr))
+                Ok::<_, NetError>((
+                    SignalService::start_with_codes(
+                        node,
+                        relay.clone(),
+                        Some(cfg.data_dir.join("device-codes.txt")),
+                    ),
+                    relay,
+                    addr,
+                ))
             })
             .map_err(fail)?;
         Ok(Self {

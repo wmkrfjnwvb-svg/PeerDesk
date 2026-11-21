@@ -197,6 +197,14 @@ pub(crate) fn cursor_position() -> Option<(i32, i32)> {
     Some((p.x, p.y))
 }
 
+pub(crate) fn current_os() -> crate::guide::Os {
+    crate::guide::Os::Windows
+}
+
+pub(crate) fn perform(action: crate::guide::Action) -> Result<(), String> {
+    Err(format!("这个系统不需要这一步：{action:?}"))
+}
+
 pub(crate) fn permissions() -> PermissionStatus {
     // Windows 不需要用户授权。（注入到以管理员身份运行的窗口需要本进程也以管理员身份运行。）
     PermissionStatus {

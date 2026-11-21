@@ -11,7 +11,7 @@ repository = "https://github.com/peerdesk/peerdesk"
 
 [workspace.dependencies]
 peerdesk-core = { path = "crates/core" }
-peerdesk-net = { path = "crates/net" }
+peerdesk-net = { path = "crates/net", default-features = false }
 peerdesk-media = { path = "crates/media" }
 peerdesk-platform = { path = "crates/platform" }
 

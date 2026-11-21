@@ -215,6 +215,14 @@ pub(crate) fn cursor_position() -> Option<(i32, i32)> {
     Some((i32::from(r.root_x), i32::from(r.root_y)))
 }
 
+pub(crate) fn current_os() -> crate::guide::Os {
+    crate::guide::linux_session(std::env::var("XDG_SESSION_TYPE").ok().as_deref())
+}
+
+pub(crate) fn perform(action: crate::guide::Action) -> Result<(), String> {
+    Err(format!("这个系统不需要这一步：{action:?}"))
+}
+
 pub(crate) fn permissions() -> PermissionStatus {
     // X11 没有权限的概念：能连上 X 服务器就能采集和注入。
     PermissionStatus {

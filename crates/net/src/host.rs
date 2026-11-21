@@ -29,6 +29,8 @@ use crate::{Fingerprint, Link, NetError};
 pub(crate) const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 /// 会话结束时等待进行中的文件传输收尾的时间上限。
 const FILE_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+/// 统计日志的间隔。
+const STATS_EVERY: Duration = Duration::from_secs(1);
 
 /// 画面来源。屏幕采集实现这个接口；测试和演示用合成桌面。
 pub trait ScreenSource: Send {
@@ -313,6 +315,12 @@ pub async fn serve(
     let mut encoding = false;
     let mut pending_change = false;
 
+    // 每秒一行统计写进日志，用户发日志就能看到真实效果。
+    let mut stats_tick = tokio::time::interval(STATS_EVERY);
+    stats_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut last_stats = media.stats();
+    let mut last_encode_us = 0u64;
+
     let end = loop {
         tokio::select! {
             // 按顺序检查：先处理收到的数据报（输入、反馈）和控制消息，最后才采集、编码下一帧。
@@ -399,6 +407,7 @@ pub async fn serve(
                     None => break "编码线程结束".to_owned(),
                 };
                 media.set_encode_time(took);
+                last_encode_us = took;
                 let out = match result.and_then(|(encoded, refine)| media.finish_frame(link.now(), &job, encoded, refine)) {
                     Ok(out) => out,
                     Err(e) => break e.to_string(),
@@ -411,6 +420,25 @@ pub async fn serve(
                     .try_for_each(|o| link.send_flags(Channel::Video, o.flags, &o.body));
                 if let Err(e) = sent { break e.to_string(); }
                 tracer.record(link.now(), trace, Stage::FrameSent, u64::from(media.stats().frames));
+            }
+            _ = stats_tick.tick() => {
+                let now = media.stats();
+                crate::note!(info, target: "peerdesk::stats",
+                    "发送 帧 {} 关键帧 {} 画面 {} kbps 线上 {} kbps 目标 {} kbps 帧率上限 {} 编码 {} ms 在途 {} KB 丢失 {} 重传 {} RTT {} ms 估计器 {}",
+                    now.frames.saturating_sub(last_stats.frames),
+                    now.keyframes.saturating_sub(last_stats.keyframes),
+                    now.video_bytes.saturating_sub(last_stats.video_bytes) * 8 / 1000,
+                    now.wire_bytes.saturating_sub(last_stats.wire_bytes) * 8 / 1000,
+                    media.rate_bps() / 1000,
+                    media.fps(),
+                    last_encode_us / 1000,
+                    media.in_flight() / 1024,
+                    now.lost.saturating_sub(last_stats.lost),
+                    now.retransmitted.saturating_sub(last_stats.retransmitted),
+                    link.rtt().as_millis(),
+                    media.estimator(),
+                );
+                last_stats = now;
             }
             _ = ticker.tick() => {
                 // 先取变化计数再取画面：中间变了的话，下一帧会再编一次，不会漏。

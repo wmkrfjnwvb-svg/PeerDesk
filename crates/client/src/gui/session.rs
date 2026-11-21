@@ -15,6 +15,7 @@ use peerdesk_core::auth::{Auth, Limiter};
 use peerdesk_core::crypto::Policy;
 use peerdesk_core::input::InputEvent;
 use peerdesk_core::screen::Screen;
+use peerdesk_core::signal::format_code;
 use peerdesk_net::controller::{self, ControllerOptions, ScreenSink};
 use peerdesk_net::host::{self, HostOptions, ScreenSource, FRAME_DEADLINE_US};
 use peerdesk_net::identity::to_hex;
@@ -125,6 +126,8 @@ pub enum HostEvent {
     Registered {
         /// 服务器看到的本机地址。
         observed: SocketAddr,
+        /// 服务器分配的设备码。
+        code: u32,
     },
     /// 登记失败（不影响直连）。
     RegisterFailed(NetError),
@@ -298,12 +301,23 @@ async fn host_main(
         if let Some(node) = same_family.or(nodes.first()) {
             match register(node, &server).await {
                 Ok(registration) => {
+                    peerdesk_net::note!(
+                        info,
+                        "已在服务器 {} 登记：设备码 {}，服务器看到的本机地址 {}",
+                        server.addr,
+                        format_code(registration.code),
+                        registration.observed
+                    );
                     ev.send(HostEvent::Registered {
                         observed: registration.observed,
+                        code: registration.code,
                     });
                     tokio::spawn(stay_registered(Arc::clone(node), server, registration));
                 }
-                Err(e) => ev.send(HostEvent::RegisterFailed(e)),
+                Err(e) => {
+                    peerdesk_net::note!(warn, "在服务器 {} 登记失败：{e}", server.addr);
+                    ev.send(HostEvent::RegisterFailed(e));
+                }
             }
         }
     }
@@ -331,12 +345,21 @@ async fn host_main(
             next = incoming.recv() => match next {
                 Some(Ok(link)) => link,
                 Some(Err(e)) => {
+                    peerdesk_net::note!(warn, "被控：握手失败：{e}");
                     ev.send(HostEvent::HandshakeFailed(e));
                     continue;
                 }
                 None => break,
             },
         };
+        peerdesk_net::note!(
+            info,
+            "被控：{} 连上来（{}）",
+            link.remote_addr(),
+            to_hex(link.peer_fingerprint())
+                .get(..16)
+                .unwrap_or_default()
+        );
         ev.send(HostEvent::Peer {
             addr: link.remote_addr(),
             fingerprint: to_hex(link.peer_fingerprint()),
@@ -375,6 +398,10 @@ async fn host_main(
             () = stopped(&mut stop) => break,
             r = host::serve(link, opts, Box::new(source), input) => r.map(|report| report.end),
         };
+        match &result {
+            Ok(end) => peerdesk_net::note!(info, "被控：会话结束：{end}"),
+            Err(e) => peerdesk_net::note!(warn, "被控：会话出错：{e}"),
+        }
         ev.send(HostEvent::SessionEnded(result));
     }
     close_nodes(&nodes).await;
@@ -593,6 +620,17 @@ async fn view_main(
         r = watch_remote(&node, &identity, &policy, target, auth, sink, input, &ev) => r,
     };
     close_nodes(&[node]).await;
+    match &result {
+        Ok(summary) => peerdesk_net::note!(
+            info,
+            "控制：会话结束（{:?}），时长 {:?}，画面 {} KB，RTT {:?}",
+            summary.end,
+            summary.elapsed,
+            summary.video_bytes / 1024,
+            summary.rtt
+        ),
+        Err(e) => peerdesk_net::note!(warn, "控制：连接或会话失败：{e}"),
+    }
     result
 }
 
@@ -621,6 +659,14 @@ async fn watch_remote(
             (dialed.link, dialed.shim, dialed.path)
         }
     };
+    peerdesk_net::note!(
+        info,
+        "控制：已连上 {}（{}），路径 {route:?}",
+        link.remote_addr(),
+        to_hex(link.peer_fingerprint())
+            .get(..16)
+            .unwrap_or_default()
+    );
     ev.send(ViewEvent::Connected {
         peer: to_hex(link.peer_fingerprint()),
         remote: link.remote_addr(),

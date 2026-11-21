@@ -8,7 +8,7 @@ use std::time::Duration;
 use peerdesk_core::crypto::Policy;
 use peerdesk_core::proto::Channel;
 use peerdesk_core::signal::SignalMsg;
-use peerdesk_net::rendezvous::{answer, dial, register, Dialed, Path, PathPolicy, Server};
+use peerdesk_net::rendezvous::{answer, dial, register, Dialed, Lookup, Path, PathPolicy, Server};
 use peerdesk_net::service::{RelayService, SignalService};
 use peerdesk_net::stream::{read_kind, read_signal, write_kind, write_signal, StreamKind};
 use peerdesk_net::{Identity, Link, NetError, Node};
@@ -112,9 +112,14 @@ async fn direct_path_is_preferred() {
     let mut accepted = spawn_host(&w);
     wait_online(&w).await;
     let target = w.host_id.fingerprint();
-    let dialed = dial(&w.ctrl, &w.server, &target, PathPolicy::Auto)
-        .await
-        .unwrap();
+    let dialed = dial(
+        &w.ctrl,
+        &w.server,
+        &Lookup::Device(target),
+        PathPolicy::Auto,
+    )
+    .await
+    .unwrap();
     assert_eq!(dialed.path, Path::Direct);
     assert!(dialed.shim.is_none() && dialed.relay_session.is_none());
     assert_eq!(dialed.link.remote_addr(), w.host.local_addr().unwrap());
@@ -132,9 +137,14 @@ async fn relay_path_carries_the_session_and_is_metered() {
     let mut accepted = spawn_host(&w);
     wait_online(&w).await;
     let target = w.host_id.fingerprint();
-    let dialed = dial(&w.ctrl, &w.server, &target, PathPolicy::RelayOnly)
-        .await
-        .unwrap();
+    let dialed = dial(
+        &w.ctrl,
+        &w.server,
+        &Lookup::Device(target),
+        PathPolicy::RelayOnly,
+    )
+    .await
+    .unwrap();
     assert_eq!(dialed.path, Path::Relay);
     let shim_addr = dialed.shim.as_ref().unwrap().local_addr();
     assert_eq!(
@@ -178,7 +188,14 @@ async fn offline_device_and_missing_relay_are_reported() {
     let w = world(false).await;
     // 没有人登记
     let nobody = [9u8; 32];
-    match dial(&w.ctrl, &w.server, &nobody, PathPolicy::Auto).await {
+    match dial(
+        &w.ctrl,
+        &w.server,
+        &Lookup::Device(nobody),
+        PathPolicy::Auto,
+    )
+    .await
+    {
         Err(NetError::Connect(why)) => assert_eq!(why, "设备不在线"),
         other => panic!("{other:?}"),
     }
@@ -186,14 +203,26 @@ async fn offline_device_and_missing_relay_are_reported() {
     let mut accepted = spawn_host(&w);
     wait_online(&w).await;
     let target = w.host_id.fingerprint();
-    match dial(&w.ctrl, &w.server, &target, PathPolicy::RelayOnly).await {
+    match dial(
+        &w.ctrl,
+        &w.server,
+        &Lookup::Device(target),
+        PathPolicy::RelayOnly,
+    )
+    .await
+    {
         Err(NetError::Connect(why)) => assert_eq!(why, "服务器没有提供中继"),
         other => panic!("{other:?}"),
     }
     // 只走直连：可以
-    let dialed = dial(&w.ctrl, &w.server, &target, PathPolicy::DirectOnly)
-        .await
-        .unwrap();
+    let dialed = dial(
+        &w.ctrl,
+        &w.server,
+        &Lookup::Device(target),
+        PathPolicy::DirectOnly,
+    )
+    .await
+    .unwrap();
     assert_eq!(dialed.path, Path::Direct);
     assert!(accepted.recv().await.is_some());
     assert!(format!("{:?}", w.signal).contains("online"));
@@ -211,7 +240,7 @@ async fn wrong_server_or_wrong_device_identity_is_refused() {
     };
     let target = w.host_id.fingerprint();
     assert!(matches!(
-        dial(&w.ctrl, &fake, &target, PathPolicy::Auto).await,
+        dial(&w.ctrl, &fake, &Lookup::Device(target), PathPolicy::Auto).await,
         Err(NetError::PinMismatch { .. })
     ));
     assert!(matches!(
@@ -248,9 +277,14 @@ async fn relay_works_over_ipv6_with_a_wildcard_host() {
     let mut accepted = spawn_host(&w);
     wait_online(&w).await;
     let target = w.host_id.fingerprint();
-    let dialed = dial(&w.ctrl, &w.server, &target, PathPolicy::RelayOnly)
-        .await
-        .unwrap();
+    let dialed = dial(
+        &w.ctrl,
+        &w.server,
+        &Lookup::Device(target),
+        PathPolicy::RelayOnly,
+    )
+    .await
+    .unwrap();
     assert_eq!(dialed.path, Path::Relay);
     assert!(dialed.shim.as_ref().unwrap().local_addr().is_ipv6());
     let host_link = accepted.recv().await.unwrap();
@@ -264,9 +298,14 @@ async fn relay_works_with_a_wildcard_ipv4_host() {
     let mut accepted = spawn_host(&w);
     wait_online(&w).await;
     let target = w.host_id.fingerprint();
-    let dialed = dial(&w.ctrl, &w.server, &target, PathPolicy::RelayOnly)
-        .await
-        .unwrap();
+    let dialed = dial(
+        &w.ctrl,
+        &w.server,
+        &Lookup::Device(target),
+        PathPolicy::RelayOnly,
+    )
+    .await
+    .unwrap();
     let host_link = accepted.recv().await.unwrap();
     echo(&dialed, &host_link).await;
 }
@@ -339,18 +378,103 @@ async fn a_lying_server_cannot_misdirect_us() {
         Err(NetError::Protocol(_))
     ));
     assert!(matches!(
-        dial(&me, &server, &target, PathPolicy::Auto).await,
+        dial(&me, &server, &Lookup::Device(target), PathPolicy::Auto).await,
         Err(NetError::Protocol(_))
     ));
     // 给的地址上是另一台设备：指纹不符，直接失败
     let server = fake_server(move |_| SignalMsg::Peer {
+        device: target,
         addr: other_addr,
         relay: None,
     });
     assert!(matches!(
-        dial(&me, &server, &target, PathPolicy::Auto).await,
+        dial(&me, &server, &Lookup::Device(target), PathPolicy::Auto).await,
         Err(NetError::PinMismatch { .. })
     ));
+    // 服务器说的设备不是我们要找的那台：不连
+    let server = fake_server(move |_| SignalMsg::Peer {
+        device: [5; 32],
+        addr: other_addr,
+        relay: None,
+    });
+    assert!(matches!(
+        dial(&me, &server, &Lookup::Device(target), PathPolicy::Auto).await,
+        Err(NetError::Protocol(_))
+    ));
+}
+
+/// 按服务器分配的设备码连接：找到的就是登记的那台设备，并核对它的指纹。
+#[tokio::test(flavor = "multi_thread")]
+async fn device_code_finds_the_registered_device() {
+    let w = world(true).await;
+    let mut registration = register(&w.host, &w.server).await.unwrap();
+    let code = registration.code;
+    assert!((100_000_000..=999_999_999).contains(&code));
+    let node = Arc::clone(&w.host);
+    let (tx, mut accepted) = tokio::sync::mpsc::channel(4);
+    tokio::spawn(async move {
+        let mut shims = Vec::new();
+        loop {
+            tokio::select! {
+                Some(i) = registration.incoming.recv() => shims.push(answer(&node, &i).await.unwrap()),
+                Some(link) = node.accept() => { let _ = tx.send(link.unwrap()).await; }
+            }
+        }
+    });
+    let dialed = dial(&w.ctrl, &w.server, &Lookup::Code(code), PathPolicy::Auto)
+        .await
+        .unwrap();
+    assert_eq!(dialed.device, w.host_id.fingerprint());
+    assert_eq!(dialed.path, Path::Direct);
+    assert!(dialed.timing.lookup > Duration::ZERO && dialed.timing.relay == Duration::ZERO);
+    assert!(dialed.direct_error.is_none());
+    assert!(accepted.recv().await.is_some());
+    // 不存在的码
+    let wrong = if code == 999_999_999 {
+        100_000_000
+    } else {
+        code + 1
+    };
+    match dial(&w.ctrl, &w.server, &Lookup::Code(wrong), PathPolicy::Auto).await {
+        Err(NetError::Connect(why)) => assert!(why.contains("不存在"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// 设备码簿存盘：服务器重启后同一台设备拿到同一个码。
+#[tokio::test(flavor = "multi_thread")]
+async fn device_codes_persist_across_server_restarts() {
+    let dir = std::env::temp_dir().join(format!("peerdesk-codes-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("device-codes.txt");
+    let _ = std::fs::remove_file(&path);
+    let policy = Policy::recommended();
+    let host = Node::bind(any(), &Identity::generate().unwrap(), &policy).unwrap();
+    let mut codes = Vec::new();
+    for _ in 0..2 {
+        let server_id = Identity::generate().unwrap();
+        let node = Arc::new(Node::bind(any(), &server_id, &policy).unwrap());
+        let server = Server {
+            addr: node.local_addr().unwrap(),
+            pin: Some(server_id.fingerprint()),
+        };
+        let signal = SignalService::start_with_codes(node, None, Some(path.clone()));
+        codes.push(register(&host, &server).await.unwrap().code);
+        drop(signal);
+    }
+    assert_eq!(codes[0], codes[1]);
+    assert!(std::fs::read_to_string(&path)
+        .unwrap()
+        .starts_with(&codes[0].to_string()));
+    // 码簿是个目录（写不进去）时服务照常，只是不存盘
+    let node = Arc::new(Node::bind(any(), &Identity::generate().unwrap(), &policy).unwrap());
+    let server = Server {
+        addr: node.local_addr().unwrap(),
+        pin: None,
+    };
+    let _signal = SignalService::start_with_codes(node, None, Some(dir.clone()));
+    assert!(register(&host, &server).await.is_ok());
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// 被控端不再处理连接请求（丢掉了接收端）时，登记任务自己结束，不会卡住。
@@ -361,6 +485,12 @@ async fn registration_survives_a_closed_inbox() {
     registration.incoming.close();
     let target = w.host_id.fingerprint();
     for _ in 0..2 {
-        let _ = dial(&w.ctrl, &w.server, &target, PathPolicy::DirectOnly).await;
+        let _ = dial(
+            &w.ctrl,
+            &w.server,
+            &Lookup::Device(target),
+            PathPolicy::DirectOnly,
+        )
+        .await;
     }
 }

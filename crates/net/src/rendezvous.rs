@@ -5,10 +5,10 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use peerdesk_core::relay::{unwrap, wrap, SessionId, RELAY_HEADER};
-use peerdesk_core::signal::{RelayGrant, SignalMsg};
+use peerdesk_core::signal::{format_code, RelayGrant, SignalMsg};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -156,6 +156,8 @@ pub struct Incoming {
 pub struct Registration {
     /// 服务器看到的本机公网地址。
     pub observed: SocketAddr,
+    /// 服务器分配的 9 位设备码。
+    pub code: u32,
     /// 连接请求从这里来。服务器断开时通道关闭。
     pub incoming: mpsc::Receiver<Incoming>,
     _link: Arc<Link>,
@@ -174,7 +176,7 @@ pub async fn register(node: &Node, server: &Server) -> Result<Registration, NetE
     let (mut send, mut recv) = link.open_stream().await?;
     write_kind(&mut send, StreamKind::Signal).await?;
     write_signal(&mut send, &SignalMsg::Register).await?;
-    let SignalMsg::Registered { observed } = read_signal(&mut recv).await? else {
+    let SignalMsg::Registered { observed, code } = read_signal(&mut recv).await? else {
         return Err(NetError::Protocol("服务器没有确认登记"));
     };
     let (tx, incoming) = mpsc::channel(8);
@@ -191,6 +193,7 @@ pub async fn register(node: &Node, server: &Server) -> Result<Registration, NetE
     });
     Ok(Registration {
         observed,
+        code,
         incoming,
         _link: link,
         task,
@@ -215,6 +218,15 @@ pub async fn answer(node: &Node, incoming: &Incoming) -> Result<Option<Shim>, Ne
     Ok(shim)
 }
 
+/// 要连哪台设备。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lookup {
+    /// 按指纹。
+    Device(Fingerprint),
+    /// 按服务器分配的设备码。
+    Code(u32),
+}
+
 /// 一条已经连到目标设备的连接。
 #[derive(Debug)]
 pub struct Dialed {
@@ -222,45 +234,109 @@ pub struct Dialed {
     pub link: Link,
     /// 走的是哪条路。
     pub path: Path,
+    /// 对方设备的指纹（按设备码连接时由服务器告知，连接本身核对过）。
+    pub device: Fingerprint,
+    /// 各阶段耗时，写日志和诊断用。
+    pub timing: DialTiming,
+    /// 直连失败的原因（走了中继时）。
+    pub direct_error: Option<String>,
     /// 走中继时的会话号，可以用来对账。
     pub relay_session: Option<SessionId>,
     /// 走中继时的本机转发器，要保持到会话结束。
     pub shim: Option<Shim>,
 }
 
-/// 控制端：通过服务器连接 `target`。
+/// 通过服务器建立连接时各阶段的耗时。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DialTiming {
+    /// 连上服务器。
+    pub server_connect: Duration,
+    /// 向服务器查询对方地址。
+    pub lookup: Duration,
+    /// 尝试直连（包括失败的情况）。
+    pub direct: Duration,
+    /// 经中继连上（没走中继时为 0）。
+    pub relay: Duration,
+}
+
+/// 控制端：通过服务器连接 `lookup` 指定的设备。
 pub async fn dial(
     node: &Node,
     server: &Server,
-    target: &Fingerprint,
+    lookup: &Lookup,
     policy: PathPolicy,
 ) -> Result<Dialed, NetError> {
+    let started = Instant::now();
     let signal = node.connect(server.addr, server.pin.as_ref()).await?;
+    let mut timing = DialTiming {
+        server_connect: started.elapsed(),
+        ..DialTiming::default()
+    };
     let (mut send, mut recv) = signal.open_stream().await?;
     write_kind(&mut send, StreamKind::Signal).await?;
-    write_signal(&mut send, &SignalMsg::Connect { target: *target }).await?;
-    let (addr, relay) = match read_signal(&mut recv).await? {
-        SignalMsg::Peer { addr, relay } => (addr, relay),
-        SignalMsg::NotFound => return Err(NetError::Connect("设备不在线".into())),
+    let ask = match lookup {
+        Lookup::Device(target) => SignalMsg::Connect { target: *target },
+        Lookup::Code(code) => SignalMsg::ConnectCode { code: *code },
+    };
+    let asked = Instant::now();
+    write_signal(&mut send, &ask).await?;
+    let (device, addr, relay) = match read_signal(&mut recv).await? {
+        SignalMsg::Peer {
+            device,
+            addr,
+            relay,
+        } => (device, addr, relay),
+        SignalMsg::NotFound => {
+            return Err(NetError::Connect(match lookup {
+                Lookup::Device(_) => "设备不在线".into(),
+                Lookup::Code(code) => format!("设备码 {} 不存在或设备不在线", format_code(*code)),
+            }));
+        }
         SignalMsg::Register
         | SignalMsg::Registered { .. }
         | SignalMsg::Connect { .. }
+        | SignalMsg::ConnectCode { .. }
         | SignalMsg::Incoming { .. } => return Err(NetError::Protocol("服务器的应答不是地址")),
     };
+    timing.lookup = asked.elapsed();
+    if let Lookup::Device(target) = lookup {
+        if *target != device {
+            return Err(NetError::Protocol("服务器给的设备不是要连的那台"));
+        }
+    }
     signal.close("done");
+    crate::note!(
+        info,
+        "服务器 {}：连上 {:?}，查到对方 {addr}（{:?}），中继{}",
+        server.addr,
+        timing.server_connect,
+        timing.lookup,
+        if relay.is_some() {
+            "可用"
+        } else {
+            "未开启"
+        }
+    );
+    let target = &device;
 
     let try_direct = !matches!(policy, PathPolicy::RelayOnly);
     let direct_error = if try_direct {
         // 对方同时也在向我们打洞。
         node.punch(addr);
-        match node
+        let tried = Instant::now();
+        let direct = node
             .connect_within(addr, Some(target), DIRECT_TIMEOUT)
-            .await
-        {
+            .await;
+        timing.direct = tried.elapsed();
+        match direct {
             Ok(link) => {
+                crate::note!(info, "直连 {addr} 成功，用时 {:?}", timing.direct);
                 return Ok(Dialed {
                     link,
                     path: Path::Direct,
+                    device,
+                    timing,
+                    direct_error: None,
                     relay_session: None,
                     shim: None,
                 });
@@ -280,11 +356,25 @@ pub async fn dial(
         }
         (PathPolicy::Auto | PathPolicy::RelayOnly, Some(grant)) => grant,
     };
+    let tried = Instant::now();
     let shim = Shim::start(grant, None).await?;
     let link = node.connect(shim.local_addr(), Some(target)).await?;
+    timing.relay = tried.elapsed();
+    crate::note!(
+        info,
+        "经中继 {} 连上，用时 {:?}；直连失败：{}",
+        grant.addr,
+        timing.relay,
+        direct_error
+            .as_ref()
+            .map_or_else(|| "没有尝试".to_owned(), ToString::to_string)
+    );
     Ok(Dialed {
         link,
         path: Path::Relay,
+        device,
+        timing,
+        direct_error: direct_error.map(|e| e.to_string()),
         relay_session: Some(grant.session),
         shim: Some(shim),
     })

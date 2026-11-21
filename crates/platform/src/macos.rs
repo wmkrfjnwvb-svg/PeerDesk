@@ -15,6 +15,8 @@
 #![allow(unsafe_code)]
 
 use std::collections::HashSet;
+use std::ffi::c_void;
+use std::path::Path;
 use std::ptr::NonNull;
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, Once, PoisonError};
@@ -77,6 +79,112 @@ const KVK_TAB: u16 = 0x30;
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
     fn AXIsProcessTrusted() -> u8;
+    fn AXIsProcessTrustedWithOptions(options: *const c_void) -> u8;
+    static kAXTrustedCheckOptionPrompt: *const c_void;
+}
+
+#[link(name = "CoreFoundation", kind = "framework")]
+extern "C" {
+    static kCFBooleanTrue: *const c_void;
+    static kCFTypeDictionaryKeyCallBacks: u8;
+    static kCFTypeDictionaryValueCallBacks: u8;
+    fn CFDictionaryCreate(
+        allocator: *const c_void,
+        keys: *const *const c_void,
+        values: *const *const c_void,
+        count: isize,
+        key_callbacks: *const c_void,
+        value_callbacks: *const c_void,
+    ) -> *const c_void;
+    fn CFRelease(object: *const c_void);
+}
+
+/// 系统设置里“屏幕录制”和“辅助功能”页面的地址（macOS 10.15 到 26 都认）。
+const SCREEN_SETTINGS_URL: &str =
+    "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture";
+const INPUT_SETTINGS_URL: &str =
+    "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility";
+
+pub(crate) fn current_os() -> crate::guide::Os {
+    // 读不到版本号时按较新的系统处理。
+    let (major, minor) = std::process::Command::new("sw_vers")
+        .arg("-productVersion")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|v| crate::guide::parse_mac_version(&v))
+        .unwrap_or((15, 0));
+    crate::guide::Os::MacOs { major, minor }
+}
+
+fn open_url(url: &str) -> Result<(), String> {
+    std::process::Command::new("open")
+        .arg(url)
+        .status()
+        .map_err(|e| format!("打不开系统设置：{e}"))
+        .and_then(|s| {
+            if s.success() {
+                Ok(())
+            } else {
+                Err(format!("打不开系统设置（open 退出码 {s}）"))
+            }
+        })
+}
+
+/// 请系统弹出“辅助功能”授权对话框；同时把本程序加进设置里的列表。
+fn prompt_accessibility() {
+    // SAFETY: 系统导出的常量和 CoreFoundation 的标准用法：用一对键值建一个字典，
+    // 传给查询函数，然后释放。键值数组在调用期间有效，字典由我们创建、由我们释放。
+    unsafe {
+        let keys = [kAXTrustedCheckOptionPrompt];
+        let values = [kCFBooleanTrue];
+        let options = CFDictionaryCreate(
+            std::ptr::null(),
+            keys.as_ptr(),
+            values.as_ptr(),
+            1,
+            std::ptr::addr_of!(kCFTypeDictionaryKeyCallBacks).cast(),
+            std::ptr::addr_of!(kCFTypeDictionaryValueCallBacks).cast(),
+        );
+        if !options.is_null() {
+            let _ = AXIsProcessTrustedWithOptions(options);
+            CFRelease(options);
+        }
+    }
+}
+
+/// 一秒后重新打开本程序（程序包时用 `open -n`），然后退出当前进程。
+fn relaunch() -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| format!("找不到程序位置：{e}"))?;
+    let target = exe
+        .ancestors()
+        .find(|p| p.extension().is_some_and(|e| e == "app"))
+        .map_or_else(|| exe.clone(), Path::to_path_buf);
+    std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg("sleep 1; open -n \"$0\"")
+        .arg(&target)
+        .spawn()
+        .map_err(|e| format!("无法重新打开：{e}"))?;
+    std::process::exit(0)
+}
+
+pub(crate) fn perform(action: crate::guide::Action) -> Result<(), String> {
+    use crate::guide::Action;
+    match action {
+        Action::OpenScreenSettings => open_url(SCREEN_SETTINGS_URL),
+        Action::OpenInputSettings => open_url(INPUT_SETTINGS_URL),
+        Action::RequestScreen => {
+            let _ = CGRequestScreenCaptureAccess();
+            // 以前拒绝过时系统不再弹窗：直接打开设置页面。
+            open_url(SCREEN_SETTINGS_URL)
+        }
+        Action::RequestInput => {
+            prompt_accessibility();
+            Ok(())
+        }
+        Action::Relaunch => relaunch(),
+    }
 }
 
 fn screen_allowed() -> bool {

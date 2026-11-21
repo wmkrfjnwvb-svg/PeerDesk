@@ -53,6 +53,20 @@ pub struct ControllerOptions {
     pub duration: Option<Duration>,
 }
 
+/// 统计日志的一个窗口：上一次写日志时的累计值，以及这一秒里的帧数和最长间隔。
+#[derive(Debug, Default)]
+struct StatsWindow {
+    frames: u32,
+    max_gap_us: u64,
+    bytes: u64,
+    expired: u64,
+    recovered: u64,
+    bad: u32,
+}
+
+/// 统计日志的间隔。
+const STATS_EVERY: Duration = Duration::from_secs(1);
+
 /// 控制端会话的结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControllerReport {
@@ -201,6 +215,12 @@ pub async fn run(
     let mut reported_floor = 0u32;
     let mut last_feedback = link.now();
 
+    // 每秒一行统计：收到几帧、码率、两帧之间最长隔了多久（卡顿）、作废和纠错。
+    let mut stats_tick = tokio::time::interval(STATS_EVERY);
+    stats_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut window = StatsWindow::default();
+    let mut last_shown = link.now();
+
     let end = loop {
         if time_up && upload_task.is_none() {
             break "到达时长上限".to_owned();
@@ -211,6 +231,10 @@ pub async fn run(
             done = decoded_rx.recv() => match done {
                 Some((frame_id, Ok(Some(screen)))) => {
                     media.decode_succeeded();
+                    let now = link.now();
+                    window.frames = window.frames.saturating_add(1);
+                    window.max_gap_us = window.max_gap_us.max(now.since(last_shown));
+                    last_shown = now;
                     tracer.record(link.now(), trace, Stage::FrameDelivered, u64::from(frame_id));
                     sink.present(&screen);
                     last_screen = Some(screen);
@@ -261,6 +285,31 @@ pub async fn run(
                 }
                 None => input_open = false,
             },
+            _ = stats_tick.tick() => {
+                let now = link.now();
+                // 这一秒一帧都没显示：从上一帧到现在都算等待。
+                let gap = window.max_gap_us.max(now.since(last_shown));
+                let reassembly = media.reassembly();
+                let stats = media.stats();
+                crate::note!(info, target: "peerdesk::stats",
+                    "接收 帧 {} 画面 {} kbps 最长间隔 {} ms 作废 {} 纠错恢复 {} 坏帧 {} RTT {} ms 输入未确认 {}",
+                    window.frames,
+                    stats.video_bytes.saturating_sub(window.bytes) * 8 / 1000,
+                    gap / 1000,
+                    reassembly.expired.saturating_sub(window.expired),
+                    reassembly.recovered.saturating_sub(window.recovered),
+                    stats.bad.saturating_sub(window.bad),
+                    link.rtt().as_millis(),
+                    sender.pending(),
+                );
+                window = StatsWindow {
+                    bytes: stats.video_bytes,
+                    expired: reassembly.expired,
+                    recovered: reassembly.recovered,
+                    bad: stats.bad,
+                    ..StatsWindow::default()
+                };
+            }
             _ = resend.tick() => {
                 let now = link.now();
                 // 反馈：哪些帧到了、排队延迟、丢包率、接收速率。

@@ -3,6 +3,7 @@
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
+    peerdesk_server::logging::init();
     let args: Vec<String> = std::env::args().skip(1).collect();
     match peerdesk_server::node::launch(&args, &mut std::io::stdout().lock()) {
         Ok(node) => {

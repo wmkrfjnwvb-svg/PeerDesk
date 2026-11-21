@@ -1,0 +1,236 @@
+# F. NAT 穿透（打洞）与分段延迟诊断调研
+
+调研日期：2026-11-21。约定：每个数字后附来源；**[猜测]** 表示无出处的推断；**[未证实]** 表示只有论坛/二手来源；**[未查到]** 表示这次没搜到，不要当结论用。
+
+## 0. 结论先行
+
+1. 业界公开的“直连成功率”：Tailscale 内部指标称典型条件下“远高于 90%”（https://tailscale.com/blog/nat-traversal-improvements-pt-1）；iroh 文档称“约 9/10 的网络配置能直连”，无出处（https://docs.iroh.computer/concepts/holepunching）；libp2p 在生产 IPFS 网络实测 4.4M 次、85,000+ 网络、167 个国家，打洞阶段成功率约 70% ± 7.1%，TCP 与 QUIC 无显著差别，97.6% 的成功发生在第一次尝试（https://arxiv.org/abs/2510.27500）。这三个数口径不同（Tailscale 含 UPnP/IPv6/重试且用户多是技术用户；libp2p 是单次 DCUtR、无 UPnP/IPv6 路径），**我们的目标应定在 85-90%（含 IPv6、UPnP）**，70% 是只靠 IPv4 打洞的下限参照。
+2. PeerDesk 当前的“单个观测地址 + 2 秒”只覆盖了最简单的情形（双方锥形 NAT）。最大收益依次是：**同一 NAT 下的 LAN 候选 > IPv6 直连 > 多 STUN 分类 + 快速判定对称（避免白等 2 秒）> UPnP/PCP/NAT-PMP > 一边对称时的生日攻击 > 中继→直连升级**。
+3. 双边都是难 NAT 时打洞基本无望（Tailscale 估算两边都是 hard NAT 时 20 秒成功率 0.01%，https://tailscale.com/blog/how-nat-traversal-works），应在约 1 秒内判定并走中继，不要傻等。
+4. 中国大陆没有找到公开的、按运营商划分的 NAT 类型统计 **[未查到]**；只有论坛个案（同一条宽带 NAT1/NAT4 随机漂移，见 §2）。所以我们必须**自己采集匿名的 NAT 类型遥测**，这本身就是壁垒。
+
+## 1. 业界做法（具体到包与时间）
+
+| 系统 | 做法要点 | 数字与来源 |
+|---|---|---|
+| Tailscale（magicsock/disco） | 所有连接先走 DERP（HTTPS 中继）保证立即可用，同时经 DERP 交换候选地址，双方同时向对方所有候选发 disco ping，收到 pong 即升级，之后取最低延迟路径；候选包括 LAN、公网（STUN 得到）、IPv6、端口映射 | 升级通常在“几秒”内；用 UDP 空闲 30 秒为常见防火墙超时，所以要保活（https://tailscale.com/blog/how-nat-traversal-works）；两个 IPv6 对端优先 IPv6（https://tailscale.com/blog/nat-traversal-improvements-pt-1） |
+| Tailscale 难 NAT（生日攻击） | “难”侧（每目的地不同端口）开 256 个本地 socket，“易”侧向随机端口探测 | 探测 174 个包 50%，256 个 64%，1024 个 98%，2048 个 99.9%；100 包/秒时一半情况 2 秒内连上，20 秒后探测空间不到 4%；两边都难：20 秒仅 0.01%，99.9% 需约 17 万包/28 分钟（同上 how-nat-traversal-works） |
+| Tailscale 端口映射 | 同时试 UPnP-IGD、NAT-PMP、PCP；监控映射 epoch，路由器重启后重建，避免掉回 DERP | https://tailscale.com/blog/nat-traversal-improvements-pt-1 |
+| Tailscale 诊断 | `tailscale netcheck` 给出 UDP 是否可用、`MappingVariesByDestIP`（判断对称/难 NAT 的关键字段）、HairPinning、PMP/PCP/UPnP；`tailscale ping` 显示 `via DERP(xxx)` 或直连 | https://tailscale.com/kb/1411/device-connectivity |
+| iroh | 先走 relay 立即可用，经 relay 交换公网地址+本地地址，双方同时发 UDP 探测；打洞包与 QUIC 包共用 socket，用 QUIC 位=0 区分；成功后把 QUIC 包切到直连路径，QUIC 栈看不到路径变化，路径切换时重置拥塞控制，目前切换会有“几秒”应用卡顿；计划迁移到 QUIC-MULTIPATH（每路径独立 RTT/拥塞控制）和 draft-seemann-quic-nat-traversal（探测包放进 QUIC 包里） | https://iroh.computer/blog/iroh-on-QUIC-multipath ；失败多见于企业防火墙与蜂窝网络（https://docs.iroh.computer/concepts/holepunching）。QAD 具体报文这次没查到 **[未查到]**；本质是 relay 在 QUIC 握手里回报“你看起来的 ip:port”，作用等同 STUN |
+| libp2p DCUtR | 经中继双方协商；一方量出 RTT，对端按 RTT/2 延后发起，使双方同时发包 | 70% ± 7.1%（见 §0，https://arxiv.org/abs/2510.27500）；受控测试台上 go/rust 实现在所有可打洞 NAT 上 100% 互通（https://probelab.io/blog/can-libp2p-punch-through-nats/） |
+| WebRTC ICE | 收集 host/srflx/relay 候选，Trickle ICE 边收集边发；连通性检查按 Ta 间隔（常见 50 ms）配对发送；RFC 7675 同意刷新（我记忆为约 5 秒一次、30 秒无响应判失效，搜索结果里没有确认 **[需核对原文]**，https://www.rfc-editor.org/rfc/rfc7675） | 失败率：Hancke 约 10 万通话样本里 6.7% 失败，22% 的失败通话需要媒体中继；后来重做的统计约 0.5%（口径不同，https://medium.com/@fippo/67b185e49765）。ICE-lite 是服务器端只回应不主动检查，适合有公网 IP 的我们的中继/服务端 |
+| RustDesk | hbbs（21116 UDP 注册心跳、21115 TCP 做 NAT 类型测试、21116 TCP 做 TCP 打洞）+ hbbr（21117 TCP 中继）；先尝试打洞，失败走中继；官方称“多数情况打洞成功，不用中继” | https://rustdesk.com/docs/en/self-host/ ；代码细节来自自动生成的 wiki，**[未证实]**：对称 NAT 直接走中继（https://deepwiki.com/rustdesk/rustdesk/2.4-nat-traversal-and-relay）。注意：RustDesk 的中继全是 TCP，所以不受 UDP QoS 影响但延迟更差 |
+| Parsec | 后端 TCP 443，STUN 服务器 UDP 3478，对端 UDP；主机起始端口默认随机，UPnP 或 STUN 打洞成功则开箱即用；失败时文档建议手工转发 8000-8010（每个端口多容纳一个并发客户端）；错误码文档把 CGNAT、访客 Wi-Fi 关 UPnP 列为常见失败原因 | https://support.parsec.app/hc/en-us/articles/32361410290324-Components-and-Connection-Sequence ；https://support.parsec.app/hc/en-us/articles/32381279119252-How-to-port-forward-Parsec ；https://support.parsec.app/hc/en-us/articles/4440911373325-Parsec-Connectivity-Requirements 。Parsec 不提供官方中继 **[未证实]**，这是它的短板 |
+| ZeroTier | 自建根服务器 + 打洞，失败走根服务器中继 | 未查到数字 **[未查到]** |
+| 经典论文 | 2005 年测 NAT：约 82% 支持 UDP 打洞，约 64% 支持 TCP 打洞 | https://usenix.org/legacy/event/usenix05/tech/general/full_papers/ford/ford_html |
+
+要点：所有第一梯队都是**“中继先行、直连后升级”**，不是“直连失败才中继”。这样首帧时间由中继决定（确定、快），直连只负责降成本、降延迟。PeerDesk 现在是“先等 2 秒直连，不行再中继”，首帧最差 +2 秒，且连上中继后永不升级。
+
+## 2. NAT 现状，特别是中国大陆
+
+| 议题 | 已知 | 来源/备注 |
+|---|---|---|
+| 三大运营商的 NAT 类型分布 | **没有公开统计** [未查到]。论坛个案：广东移动宽带从 NAT1 变 NAT4，客服称“系统自动分配无法固定”；北京丰台移动在 NAT1 与 NAT4 之间随机漂移；上海移动稳定 NAT3 | V2EX 个人帖，**[未证实]**，如 https://v2ex.com/t/668456 。说明 NAT 类型会随时间变，**不能缓存**，每次连接前要重测 |
+| CGNAT/NAT444 | 全球：估计 CGN 部署数 2014 年 1200 个 → 2016 年 3400 个，其中 28.85% 在移动运营商（https://arxiv.org/pdf/1605.05606v1）。中国电信在无锡做过 NAT444 测试（2012，华为设备），只做应用兼容性，没有流行度数据（https://datatracker.ietf.org/doc/draft-li-behave-nat444-test/00/）。中国家宽/移动的具体占比 [未查到] | 判断：蜂窝网络基本都是 CGNAT **[猜测]**，家宽按地区和运营商不同 |
+| 分布式 CGN 下的行为 | 论坛称分布式 CGN + BAS 设备下可满足 NAT1 要求，即映射对目的地无关、过滤宽松 | 个人帖 **[未证实]**；意味着 CGNAT 不等于对称，经常 UDP 可打洞 |
+| 端口分配方式 | 顺序、随机、端口块三种在业界都有；中国运营商具体比例 [未查到]。FRP xtcp 在“移动 NAT4 对联通 NAT4”的个例中成功，但评论认为测试工具结论可能不可靠 | **[未证实]**，https://v2ex.com/t/995966 附近；建议自己采集 |
+| UDP 映射超时 | 赫尔辛基大学对家用网关的测量：单向出站建立的绑定中位数 90 秒，仅入站刷新时中位数 180 秒（单位推测为秒）；更早的 P2P 测量里 62% 的绑定在 2-2.5 分钟超时；Tailscale 认为 30 秒是常见防火墙值；专利文献举例 10% 设备 45 秒，90% 设备 120 秒 | https://www.cs.helsinki.fi/group/wiseciti/public-seminar2010/NAT_UDP_Binding_Results_Hatonen_UH.pdf ；https://tailscale.com/blog/how-nat-traversal-works ；https://patents.google.com/patent/US9742728 。运营商级 NAT 的超时更短（Tailscale：“短端口超时”）。**保活间隔应取 ≤15 秒**（30 秒的一半），中继路径同理；这个取值是推断 **[猜测]** |
+| UDP QoS/限速 | 论坛反映：UDP 持续一段时间后被限到约 5 Mbps，IPv6 下更明显，切 TCP 恢复；“固定 1 Mbps”被认为是 QoS 特征；移动比电信更严（2019 年帖） | 全部为个人经验，**[未证实]**，如 https://v2ex.com/t/1190188 。**应对：e2e 里加“UDP 带宽被限”的场景，传输层要能测到平台期并把码率限制在其下；准备 TCP/443（或 QUIC over 443 + TCP 回退）通道** |
+| IPv6 普及 | 截至 2025-12，中国 IPv6 活跃用户 8.69 亿，占网民 77.38%；移动网络 IPv6 流量占比 70.85%，固定网络 32.38%；三大运营商家庭宽带 IPv6 覆盖全国所有地市 | APNIC 引《中国 IPv6 发展报告(2026)》，https://blog.apnic.net/2025/12/04/china-reports-major-ipv6-growth/ 。注意：“有 IPv6”不等于“入站可达”|
+| 光猫 IPv6 入站防火墙 | 光猫/路由器的 IPv6 防火墙通常只有开/关两档，开启即挡住外部主动入站；不同机型叫“IPv6 SESSION/IPv6 防火墙控制转发/Ipv6spi”；部分联通 HG2201U 防火墙无法关闭；电信光猫普通用户看不到该设置 | V2EX/博客个案，**[未证实]**，如 https://v2ex.com/t/709257 。**对 UDP 打洞是好消息**：状态防火墙对“出站在先”的流量放行，所以 IPv6 双方同时互发包同样可以“打洞”，不需要关防火墙 [猜测，依据：状态防火墙的普遍行为，需实测确认] |
+| 企业防火墙 | 只放行 TCP 80/443 与 UDP 53 的“企业”形态、以及“连 UDP 也全封”的强制门户形态，在 patchbay 里都有预设（https://n0-computer.github.io/patchbay/guide/nat-and-firewalls.html）；Hancke 与多个 WebRTC 文档的建议是 TURN over TLS 443 | 必须有 TCP/443 通道，否则整类企业用户用不了（这类用户付费意愿高） |
+
+## 3. 技术排序（价值/成本）
+
+对称 = 端点相关映射（每个目的地一个端口）。“增益”是对总体直连成功率的估计，均为 **[猜测]**，除非标出来源；上线后用遥测校准。
+
+| 排名 | 技术 | 预期增益 | 复杂度 | 风险 | 说明 |
+|---|---|---|---|---|---|
+| 1 | **LAN/host 候选**（含同 NAT 下的发夹问题） | 同局域网/同公司的场景从“靠运营商发夹，常失败”到 100%，延迟 <1 ms；这类场景在远程办公里占比大 [猜测 10-20% 会话] | 低（枚举网卡地址，经信令交换，同时探测） | 低；注意 VPN/虚拟网卡/docker 地址要过滤，探测前不信任对端地址（防止让我们对任意地址发包的放大/反射滥用，只发小包、限速） | 无需新基础设施 |
+| 2 | **中继先行 + 直连升级（路径升级）** | 首帧时间稳定；不再“白等 2 秒”；中继占比下降，直接降成本 | 中（QUIC 路径管理，iroh 目前切换有几秒卡顿，说明难点在拥塞控制重置） | 切换时卡顿：必须在关键帧边界切换并预留 RTT 变化的拥塞状态 | 是 Tailscale/iroh 的共同模式 |
+| 3 | **IPv6 候选** | 双方都有可达 IPv6 时绕开 NAT；中国移动网络 IPv6 流量 70.85%（见 §2）说明蜂窝侧极有潜力；家宽侧受光猫防火墙影响，但状态防火墙放行出站在先的流量 | 低-中（socket 双栈，候选带 v6，同时探测） | 低；隐私上 v6 地址暴露设备，需用临时地址 | 增益 [猜测] 在中国高于欧美 |
+| 4 | **多 STUN + NAT 分类**（把 `classify_nat` 接进主路径） | 本身不增加成功率，但决定其他技术用不用、什么时候放弃：对称检测让“双难”场景 1 秒内去中继，省下 2 秒首帧 | 低（代码已有，需要 2 个以上不同 IP 的 STUN 端点，我们自己的信令服务器加一个第二地址/端口即可） | 低 | 要测“映射”（EIM/EDM）和“过滤”两个维度（RFC 4787 术语）；还要测 UDP 是否被封、IPv6 可用性、发夹支持 |
+| 5 | **UPnP-IGD / NAT-PMP / PCP** | 让“难”侧变成“易”侧（有显式映射），Tailscale 与 Parsec 都靠它；iroh 的 issue 里用户反映成功与否“取决于 UPnP 是否开启或有无公网 IPv6”（https://github.com/n0-computer/iroh/issues/2317）；对 CGNAT 无效（映射在用户路由器上，外层仍是 CGNAT） | 中（有现成 crate，如 igd-next、crab_nat 等 [需评估许可证]） | 中：路由器 UPnP 实现质量参差（pfSense NAT-PMP 失败案例 https://forum.tailscale.com/t/pfsense-nat-pmp-failures/2300 ）；安全上要映射完关闭、只映射一个端口、设租期 | 也是“可告诉用户的补救办法” |
+| 6 | **同时发包的时间协调**（经信令服务器对表，借鉴 DCUtR 的 RTT/2） | 对严格过滤的 NAT（地址+端口限制）提升首包命中；libp2p 97.6% 的成功在第一次尝试，说明时机对了一次就够 | 低 | 低 | 现有“几轮包”可改为：服务端下发统一的 T0，双方在 T0 起 200 ms 间隔（patchbay 同值，https://n0-computer.github.io/patchbay/reference/holepunching.html）连发，每包前后各 50 ms 抖动 |
+| 7 | **生日攻击**（一边是随机端口 NAT） | 把“一易一难”从 ~0% 提高到 98%（1024 包，Tailscale 数字）；这是增益最大的 IPv4 打洞改进，但只对“一边易”有用 | 中-高：难侧需开 256 个 socket，易侧要按 100 包/秒向随机端口发 10 秒；NAT 表项占用（Tailscale 提到 Juniper SRX 300 上限 6.4 万会话）；对运营商 CGNAT 可能触发滥用检测 | 中：看起来像端口扫描；要限速、限时（≤ 10 秒）、限制每会话次数 | 数学：难侧开 n 个端口，易侧随机探测 k 次，P ≈ 1 − (1 − n/65535)^k；n=256 时 k=174 → 49.6%，k=1024 → 98%，与 Tailscale 表一致 |
+| 8 | **顺序端口预测** | 对“每个连接端口 +1/+N”的对称 NAT，通常几次探测就中。中国运营商是否有这类分配 [未查到] | 低-中 | 低；但现代 NAT 多为随机或端口块，收益不确定 | 需先用两个 STUN 端点测出步长，才有意义；有 NAT 遥测后再决定做不做 |
+| 9 | **QUIC 连接迁移** | 不增加初次成功率；用于换网络（Wi-Fi→4G）、对端 NAT 重绑定后不重新握手，保持会话 | 中（quinn 支持迁移，但要处理 NAT 重绑定后源地址变化；与路径升级可以共用代码） | 低 | 对手机端更重要 |
+| 10 | **TCP/443 回退（含 TLS 伪装）** | 企业/强制门户/严格 UDP QoS 用户从“连不上”变为“能用但延迟高”。覆盖比例 [猜测] 2-5% 会话，但这些是付费意愿最强的企业客户 | 中-高：TCP 上做实时视频有队头阻塞，需要单独的拥塞与丢帧策略；RustDesk 全 TCP 中继的体验就是这样 | 中 | 必须做，但优先级排在能带来大头增益的直连优化之后；同时也是 UDP 被运营商限速时的备路 |
+| 11 | **TCP 同时打开打洞** | 低：论文测得只有约 64% NAT 支持（见 §1），且实现不统一 | 中 | 中 | **不建议做**，直接走 TCP 中继 |
+
+## 4. 打洞失败模式与诊断策略（产品负责人追加）
+
+核心思想：**失败几乎总是“某一侧”造成的，要能自动判断是哪一侧，并给出对用户有用的话**。下面每一类都定义了：现象、自动判定依据（每端上报的遥测）、补救动作。
+
+### 4.1 每端需要采集的探针（连接前和连接中）
+
+| 探针 | 怎么测 | 判定什么 |
+|---|---|---|
+| P1 UDP 出站是否可用 | 向我们服务器两个不同 IP:端口各发 UDP 探测并等回包 | 全无回包 = UDP 被封（企业/强制门户）→ 直接走 TCP/443 |
+| P2 映射行为 | 向两个不同目的 IP（及不同端口）各发一个包，比较服务器看到的 `ip:port` | 相同 = 端点无关映射（EIM，易）；不同 = 端点相关（EDM，难/对称）；Tailscale 的 `MappingVariesByDestIP` 等价物 |
+| P3 端口分配规律 | 连发 N 个不同 socket 到同一目的，看外部端口序列 | 顺序（步长）/ 随机 / 端口块（范围窄）→ 决定是否做端口预测、生日攻击 |
+| P4 过滤行为 | 让服务器用另一个 IP/端口回包 | 全锥 / 地址受限 / 端口受限 |
+| P5 发夹（hairpin） | 向自己的公网映射地址发包 | 不支持 = 同一 NAT 下必须靠 LAN 候选，不能靠公网地址 |
+| P6 IPv6 | 本机有无全局 v6 地址；向服务器 v6 地址探测并让服务器回连探测 | 有地址但回连不通 = 光猫/路由器入站防火墙；两端同时互发才能判断是否可“打洞” |
+| P7 外层 IP 是否是私网/共享地址段 | 比较本机路由器 WAN 口地址（UPnP/PCP 可读）与服务器看到的公网地址；100.64.0.0/10 或私网段即 CGNAT/双层 NAT（光猫拨号 + 路由器二级 NAT） | 双层 NAT 时 UPnP 只能映射到内层，外层无效，别浪费时间 |
+| P8 端口映射可用性 | UPnP/NAT-PMP/PCP 发现与申请 | 成功则直接作为候选；失败记录原因 |
+| P9 路径健康 | 直连建立后的保活往返、丢失；记录 NAT 映射失效时刻 | 发现“静默 30 秒后失效”类问题，自动把保活缩短 |
+| P10 本机环境 | 是否有 VPN/代理软件/虚拟网卡（影响源地址）；Windows 防火墙是否阻止了本程序入站；杀软 | 见 4.2 |
+
+服务端汇总：每次会话记录 `(A 的 NAT 画像, B 的 NAT 画像, 每个阶段结果与耗时)`。**画像只含类别（EIM/EDM、过滤、有无 v6、运营商/ASN 粒度），不含地址，符合“不收集用户数据”的要求**。
+
+### 4.2 失败模式表
+
+| 失败模式 | 症状 | 自动判定“哪一侧的错” | 补救与用户提示 |
+|---|---|---|---|
+| 一侧对称/CGNAT（EDM），另一侧易 | 直连不通；对端地址探测无回包；双方 STUN 看到的端口不同 | 哪一侧 P2 显示 EDM，哪一侧就是问题侧 | 先走中继（立即可用），后台对“难”侧开生日攻击（≤10 秒、限速）；提示：“对方网络为对称 NAT，已走中继；在对方路由器开启 UPnP 可提速”（来源：难 NAT 解法见 Tailscale 文章；UPnP 对 CGNAT 无效，所以只在 P7 显示非 CGNAT 时才提示） |
+| 双方都是 EDM | 几乎必然失败（20 秒 0.01%，Tailscale） | 双方 P2 都是 EDM | 不要尝试打洞，立刻中继；提示用户走 IPv6 或等待 UPnP。**不能让用户等待 2 秒再失败** |
+| 企业防火墙/强制门户丢 UDP | 一侧 P1 全无回包；信令（TCP/443）正常 | P1 失败的一侧 | 直接 TCP/443 通道（经中继），提示：“当前网络屏蔽 UDP，已切到 TCP 模式，延迟较高；请联系网管放行 UDP 或使用 4G”。对应 patchbay 的 Corporate / CaptivePortal 预设 |
+| UDP QoS 限速（运营商） | 连上后跑一段时间吞吐被压到平台期（论坛经验约 5 Mbps，**[未证实]**），丢包突增 | 直连后的丢包/吞吐曲线：平台期 + 丢包，换 TCP 恢复 | 传输层把码率限制在平台下；可选并行 TCP 探针确认；提示“网络对 UDP 限速，画质已自动降低，换到其他网络或使用 IPv4/IPv6 另一栈可能改善”；IPv6 与 IPv4 两栈分别测 |
+| 同局域网/同出口，发夹不支持 | 两台同一路由器后的设备用公网地址互连失败 | 双方出口公网 IP 相同，且 P5 失败 | 优先 LAN 候选（排名 1）；提示无需 |
+| NAT 映射超时短于保活间隔 | 连上后空闲一段时间即断，重新操作又“卡几秒才恢复” | 直连后保活往返在固定时间点后失联；多次出现在同一间隔 | 自动把保活降为 15 秒 → 10 秒；记录到画像。远程桌面静止时无视频包，只有保活，所以这最容易发生 |
+| 端口受限锥形 + 对称 | 同“一侧对称”行（见上） | 同 | 同 |
+| 双层 NAT（光猫拨号 + 路由器） | 内层路由器 UPnP 成功，外面仍不通；P7 显示 WAN 口为私网或共享段 | P7 | 不要把 UPnP 映射当成功；提示“建议把光猫改为桥接，由路由器拨号” |
+| 光猫 IPv6 入站防火墙 | 有 v6 地址，但对端主动来的包被丢 | P6：回连失败；双方同时互发成功 = 可“打洞”；仍失败 = 防火墙非状态型 | 同时互发 v6；失败则回退 v4/中继；提示“关闭光猫 IPv6 防火墙或放行 UDP 可直连”（论坛经验，机型而异 [未证实]） |
+| VPN/代理软件、虚拟网卡 | STUN 看到的地址是 VPN 出口；LAN 候选错误；全局代理把 UDP 变 TCP | P10：检测默认路由接口、TUN/TAP；P1 对不同 IP 结果不一致 | 候选过滤（不上报 VPN 网卡）；提示“检测到 VPN/代理，可能影响直连，已走中继” |
+| Windows 防火墙/杀毒软件拦截 | 本机有出站但入站被拦；首次运行弹窗没点“允许” | P10：本机能发不能收；对端能收到我们的包而我们收不到回包 | 安装包阶段加防火墙规则；运行时检测并提示“请在防火墙中允许 peerdesk（路径）”，不要静默降级（CLAUDE.md：诚实、失败要给原因和办法） |
+| 对端离线/信令过期 | 无回包 | 服务器看对端心跳 | 提示对端离线，不是网络问题 |
+
+### 4.3 决策树（直连尝试的顺序和放弃条件）
+
+时间从“用户点击连接”开始。**原则：中继在 t=0 就建立并开始出画面；下面所有直连尝试都在后台并行，不阻塞首帧。**
+
+```
+t=0   经信令：双方交换 画像(P1-P10) + 候选(host/v6/srflx/映射)
+      同时 建立中继路径，开始传画面
+      ├─ P1 任一侧 UDP 不可用 → 仅 TCP/443 中继；告知用户；结束
+      ├─ 双方同出口 IP → 先试 LAN 候选（200 ms 内），成功即升级
+      ├─ 双方都有可达 v6 → 同时互发 v6，约 1 秒内判定
+      ├─ 任一侧有 UPnP/PCP/NAT-PMP 映射 → 把映射当候选
+t≈0.5s  双方 EIM（易）→ 服务器下发统一 T0，双方同时互发（200 ms 间隔，最多约 3 秒）
+        ├─ 成功 → 验证后在关键帧边界切到直连（QUIC 路径迁移）
+        └─ 失败 → 继续
+        一侧 EDM、另一侧 EIM → 生日攻击（难侧 256 socket，易侧约 100 包/秒，≤10 秒）
+        ├─ 成功 → 同上
+        └─ 失败 → 留在中继
+        双方 EDM → 不打洞（20 秒 0.01%）；仅试 v6/UPnP；留在中继
+之后   每 60 秒（带抖动，最多 N 次）重试一次直连；网络变化（IP 变）立即重试
+       记录最终路径、耗时、失败阶段，上报画像对
+```
+
+放弃规则：每种方法有自己的预算（时间和包数），超预算即放弃；不会因为某个方法失败而卡住画面。**用户提示按“最可能的原因 + 能做的一件事”给出**，例如“对方网络是对称 NAT，已走中继；可在对方路由器开启 UPnP 提速”。不确定时不要乱猜原因，要说“原因待定”并给出已测数据。
+
+## 5. 分段延迟诊断
+
+### 5.1 竞品公开信息
+
+| 产品 | 展示内容 | 来源与不确定性 |
+|---|---|---|
+| Parsec | 叠加层：解码延迟（客户端解一帧耗时）、编码延迟（主机）、网络延迟（主机到客户端 RTT）、码率；有“指标图”（基本/音频/高级）；黄色告警分别提示硬件解码跟不上、网络丢包/拥塞；60fps 时解码不宜超过 15 ms，30fps 时 32 ms；官方称编解码合计约 10 ms | https://support.parsec.app/hc/en-us/articles/32381603663636-Stream-Overlay-Stats-and-Logging （本次抓取 403，内容经搜索摘要）；https://support.parsec.app/hc/en-us/articles/32381352822804-Troubleshooting-Lag-Latency-and-Quality-Issues ；https://blog.parsec.app/latency-and-bandwidth-availability-across-the-world-make-cloud-gaming-a-real-possibility-a5fc422e5908 |
+| ToDesk | 官方宣传“智能网络引擎”在条件好时自动 P2P，波动时切换到更优中转；**没有找到**其客户端按“本机→路由器→运营商→服务器→对端”分段显示的文档或截图 **[未查到]** | 新浪众测、凤凰科技评测，均无分段信息 |
+| 向日葵 | 宣传 P2P 优先、失败切中继，多线 BGP，两百多个接入/边缘节点；**没有找到**分段延迟的官方文档 **[未查到]** | https://news.mydrivers.com/1/1077/1077734.htm 等宣传稿 |
+| Tailscale | 路径类型（direct/DERP 区域/peer relay）、`netcheck` 的 UDP/映射/发夹/各 DERP 区域延迟 | https://tailscale.com/kb/1411/device-connectivity |
+| iroh | 指标：连接是否曾变直连（direct_connection_rate）、直连流量占比 | https://docs.iroh.computer/iroh-services/metrics/glossary |
+
+结论：产品负责人提到的“逐跳分段展示”在 ToDesk/向日葵上我们**没有查到证据**，不能当成既有标准；Parsec 的“编码/网络/解码”分段是有文档证据的。我们若做成**网络分段 + 流水线分段**的完整模型，就是差异化。他们如果有逐跳显示，推测实现方式（均为 **[猜测]**）：ping 网关（本机→路由器）、向 ISP 首跳做 TTL 探测（类似 MTR，阿里云/腾讯云文档说明 MTR 是 ping+traceroute 的合并，https://help.aliyun.com/document_detail/98706.html ）、到平台服务器的 RTT。
+
+### 5.2 我们的分段模型（建议）
+
+端到端 = 输入到画面变化的“动作到光子”延迟，拆成两条链，每段都有“测量方法”和“门槛”。
+
+| 段 | 含义 | 测量方法 | 备注 |
+|---|---|---|---|
+| S0 输入 | 控制端收到键鼠到发出 | 控制端本地时间戳 | 输入优先、独立通道 |
+| N1 本机到网关 | Wi-Fi/有线 | ICMP/ARP 探测默认网关（需权限，退化为 UDP 到网关 53/不可用时显示“未测”，不造假） | Wi-Fi 抖动常是真正原因 |
+| N2 到运营商 | 接入网 | TTL 探测第 2-3 跳（权限与跨平台复杂，ICMP TTL exceeded 可能被丢） | 可选，先不做 |
+| N3 到平台服务器 | 本机到我们的信令/中继 | QUIC RTT（来自信令连接，无需额外探测） | 与 N4 对比可看出“绕路” |
+| N4 端到端网络 | 直连或中继 | 数据报往返：每个包带发送时间，对端回显；用 QUIC 数据报的 ACK 延迟；时钟不同步则只用 RTT/2 | 并标注路径类型：直连 v4/v6/LAN/中继 UDP/中继 TCP |
+| P1 采集 | 被控端屏幕抓取到拿到帧 | 被控端本地单调时钟 | 与 Parsec 的“编码”分开 |
+| P2 编码 | 一帧编码耗时 | 同上 | 与 §CLAUDE.md 里“编码挪独立线程”相关 |
+| P3 发送队列 | 帧在传输层排队等待 | 传输层时间戳（帧入队到首包发出）| 拥塞时的主要增量；Parsec 叠加层里没有这项，我们应有 |
+| P4 解码 | 控制端解码一帧 | 本地 | 对应 Parsec 解码延迟 |
+| P5 渲染/显示 | 解码完成到显示 | 本地（vsync 对齐后的显示时刻） | 需平台层 |
+| 抖动缓冲/重组 | 控制端等待 FEC/重传的时间 | 本地 | 我们特有 |
+
+呈现：一条堆叠条（采集|编码|排队|网络|解码|渲染）+ 路径类型标签 + 一个“最可能的瓶颈”结论（例如“网络段占 70%，对方走中继，建议开启 UPnP”）。被控端的指标通过控制通道上报，**所有时间只用同一端的单调时钟求差，跨端只用 RTT，不依赖时钟同步**。同样的数据直接进 e2e 门槛。
+
+## 6. 测试：确定性的 NAT 仿真
+
+### 6.1 现成参考
+
+| 项目 | 做法 | 来源 |
+|---|---|---|
+| n0-computer/patchbay（iroh 在用） | Rust 库，Linux 用户命名空间，测试时无需 root，用 nftables 实现 NAT；预设：Open（EIM/EIF）、Moderate（EIM/地址端口受限，家用/RFC 6888 CGNAT）、Strict（EDM/地址端口受限，企业网关/对称 CGNAT）；路由器预设 Home/IspCgnat/IspV6；防火墙预设 BlockInbound/Corporate（只放行 TCP 80/443、UDP 53）/CaptivePortal（再封所有其他 UDP）；全锥映射表项 300 秒；打洞探测 200 ms 一次，收到后再补发 3 个包；对称 NAT 预期失败；conntrack 超时可配（udp/udp_stream/tcp_established 字段） | https://n0-computer.github.io/patchbay/guide/nat-and-firewalls.html ；https://n0-computer.github.io/patchbay/reference/holepunching.html 。Apache/MIT 许可需确认后再引用 **[未核对]**；最好直接作为 dev-dependency 或抄思路自己写 |
+| Tailscale natlab/vnet | Go，虚拟互联网，多个网络各带 NAT 类型（“easy”=Linux 风格，“hard”=FreeBSD 风格），可接入 VM 做端到端 | https://pkg.go.dev/tailscale.com@v1.96.4/tstest/natlab/vnet |
+| libp2p test-plans hole-punch | Docker Compose，每个测试 5 个容器、3 个网络（两个 NAT 路由器容器、WAN 上的中继、拨号端、监听端），路由器容器带 NET_ADMIN | https://blog.libp2p.io/blog/new-test-plans ；https://docs.libp2p.io/docs/write-a-hole-punch-test-app |
+| pion/transport vnet | Go，纯用户态虚拟网络（不用内核），适合单元测试；本次没抓取原文 **[未核对]** | — |
+
+### 6.2 我们的方案（Linux 命名空间 + nftables）
+
+- 每个测试用例：3 个 netns（A 侧 LAN、B 侧 LAN、公网：信令/STUN×2/中继）+ 2 个 NAT 路由器 netns，veth 连接。**无需 root**：进入 user+net namespace（与 patchbay 相同方法）；CI 的 Linux 容器通常允许，不允许时 e2e 退化为“跳过并明确标红”，不要悄悄通过。
+- NAT 行为用 nftables（`masquerade` 与 `snat`/`dnat` 组合）实现：
+  - 端点无关映射（EIM）：`snat to <ip>:<port-range> persistent`/默认保持端口；过滤用 conntrack 状态（`ct state established`）得到“端口受限”；地址受限/全锥用额外的 dnat 规则表达；
+  - 端点相关映射（EDM，对称）：`masquerade random`（随机端口）或 `random-fully`（iptables 的 `--random` / `--random-fully` 对应）；
+  - 顺序端口：`snat ... to :1024-65535` 加单线程、不带 random（内核默认会尽量保持端口，需多个源并发才能构造顺序漂移，具体行为要实测 **[猜测]**）；
+  - 端口块：把 snat 端口范围限制为一个窄区间；
+  - 超时：`sysctl net.netfilter.nf_conntrack_udp_timeout`（Linux 默认 30 秒，stream 120 秒，我的记忆 **[需核对]**）设成 15/30/60 秒，测保活；
+  - 发夹：开关 NAT 的回环规则；
+  - 双层 NAT：A 侧串联两个路由器；
+  - 防火墙：`drop` 出站 UDP（企业/强制门户）、仅放 TCP 443；IPv6：仅放行出站（光猫默认状态防火墙）。
+- 链路特性：`tc netem` 加延迟/丢包（同一种子，可重现）；`tc tbf` 加 UDP 限速（模拟运营商 QoS 平台期）。
+- 用例矩阵（每次 CI 都跑）：{Open, Moderate(EIM+端口受限), Strict(EDM random), Strict-sequential, 双层, 企业(仅 TCP 443), 封 UDP} × 同样集合，对称去重，约 28 对；每对跑 N=5 次，输出：成功率、首帧时间、首次直连时间、中继占比、保活存活时长。**期望值写进测试**（例如“Moderate×Moderate 必须直连，≤3 秒”“Strict×Strict 必须在 ≤1.5 秒内明确走中继并出画面”），只升不降。
+- 确定性：时间用真实时间（命名空间无法虚拟化时钟），但随机种子固定；对依赖随机端口的用例要报告“成功率 ± 区间”而不是单次布尔（生日攻击本身是概率的：1024 包约 98%）。
+
+## 7. 路线与门槛
+
+### 7.1 分阶段（按“单位工作量的成功率增益”）
+
+| 阶段 | 内容 | 预期 | 备注 |
+|---|---|---|---|
+| P0（1-2 周） | **NAT 仿真 e2e（§6）先行**；把 `classify_nat` 接进主路径（多 STUN，含 EIM/EDM、UDP 可用性、v6）；中继先行 + 后台直连；用 T0 同步发包 | 首帧不再等 2 秒；基线数据（每对 NAT 的成功率） | 没有仿真就没法判断后面的增益 |
+| P1（2-3 周） | LAN 候选；IPv6 候选；保活 15 秒；直连→中继的断线检测与快速回退；失败原因与提示文案（§4） | 同网和 v6 场景 100%；中国移动网络受益大 | |
+| P2（3-4 周） | 中继→直连升级（关键帧边界切换）；QUIC 路径迁移；UPnP/NAT-PMP/PCP | 降中继占比；手机换网不断 | |
+| P3（3-4 周） | TCP/443 回退；UDP 限速检测并限制码率 | 企业客户可用 | |
+| P4（按遥测决定） | 生日攻击；顺序端口预测；AI 网络预估也可喂 NAT 画像 | 一易一难场景 | 先看画像，再决定做不做 |
+
+### 7.2 门槛（进 e2e/遥测，只升不降）
+
+- 每个可打洞 NAT 对（Open/Moderate 互联）：直连成功率 100%（仿真），首次直连 ≤3 秒；
+- 不可打洞对（Strict×Strict、封 UDP）：中继出画面时间 ≤ 基线 + 0.2 秒，**不能因为等直连而延迟首帧**；
+- 首帧时间 P95：中继先行；线上遥测按 NAT 对分桶；
+- 线上：直连成功率（分母=可打洞对）、直连流量占比（iroh 同时统计“连接是否曾直连”和“直连流量占比”，我们照搬，https://docs.iroh.computer/iroh-services/metrics/glossary ）、中继流量占比、保活失败重连次数、失败原因分类占比（§4.2）。
+- 目标：线上整体直连率 ≥ 85%（参照 Tailscale“远高于 90%”，libp2p 70%，见 §0），中国移动蜂窝场景另设基线，上线后再定。
+
+### 7.3 成本
+
+- 阿里云 CDT 公网出方向（中国大陆）：每月 20 GB 免费，0-10 TB 0.80 元/GB，10-50 TB 0.75，50-150 TB 0.70，150 TB 以上 0.65；入方向免费（https://help.aliyun.com/zh/cdt/internet-data-transfers/）。腾讯云价格 **[未查到]**；按带宽包月通常更便宜，需要报价对比。
+- 估算 **[猜测]**：一路 1080p 远程桌面平均 3-8 Mbps（静止时更低），中继是双向转发，按单向出口计费，2 Mbps~5 Mbps 平均约 0.9-2.3 GB/小时，按 0.8 元/GB 约 0.7-1.8 元/小时/路（算式：Mbps ×3600÷8÷1000 = GB/小时）。**中继每小时成本约 1 元量级**，这就是为什么直连率每提升 10 个百分点都直接是利润，也是限制免费用户中继时长/码率的理由（计费挂账户，不挂设备指纹）。
+- 实际可用更便宜的方案：固定带宽包月的轻量服务器、多线 BGP 的差价、对中继做限速上限，另外 TCP 中继也要按同样计费。
+
+## 8. 与现状的差距（总表）
+
+| 项 | 现状 | 业界 | 差距与优先级 |
+|---|---|---|---|
+| 候选 | 单个观测地址 | host + 反射 + v6 + 映射 | 大，P1 |
+| 时序 | 几轮包 + 2 秒再退 | 服务器对表 T0，200 ms 间隔；中继先行 | 大，P0 |
+| NAT 分类 | 有模块，未接线 | netcheck 分类决定策略 | P0 |
+| 难 NAT | 无 | 生日攻击（Tailscale） | P4，视遥测 |
+| 端口映射 | 无 | UPnP/PMP/PCP | P2 |
+| 路径升级/迁移 | 无 | Tailscale/iroh 都有 | P2 |
+| TCP 回退 | 无 | RustDesk/TURN-TLS | P3 |
+| 失败原因告知 | 静默回退 | Tailscale netcheck、Parsec 错误码 | P1（与 CLAUDE.md 诚实原则一致） |
+
+## 8.1 审查意见（2026-11-21）
+
+- quinn 不能给已有连接换**对端**地址（只支持本端重新绑定），所以“中继 → 直连”不能靠 QUIC 路径迁移完成，要另建直连连接、在关键帧边界把会话搬过去（`crates/net/src/rendezvous.rs` 开头已写明）。决策树里的“QUIC 路径迁移”按这个理解。
+- 第一步先做 P0：NAT 仿真（命名空间 + nftables）进 e2e，把现状的成功率和连接耗时量出来，再按 §7.1 的顺序逐项加方法，每加一项都看同一组数字的变化（What → Why → How）。
+- 这一版已经加了连接各阶段的耗时和直连失败原因的日志（服务器连接、查询、直连、中继），用户实测的日志可以先当作真实数据的样本。
+
+## 9. 未解决/需要补的数据
+
+1. 中国三大运营商（家宽/蜂窝）NAT 类型、端口分配、UDP 超时的真实分布：没有公开资料，上线后遥测采集。
+2. ToDesk/向日葵是否有逐跳显示：没找到证据，可以让人用客户端抓一次界面确认。
+3. QAD 报文格式、RFC 7675 具体计时、pion vnet、Linux conntrack UDP 超时默认值：按 [需核对] 处理，实现前回读原文。
+4. 腾讯云流量单价。
+5. 关于 UPnP 库的许可证与维护状况。

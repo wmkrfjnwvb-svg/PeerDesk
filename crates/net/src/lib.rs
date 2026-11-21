@@ -7,12 +7,32 @@
 //!
 //! 这一层只做 IO 和计时，协议决策都在 `peerdesk-core` 里。
 
+/// 写一行日志。和 `log::info!` 等不同，内容总是先格式化好：日志器没打开时也一样，
+/// 这样测试覆盖到的就是真实会写出的那行。日志都是低频的（连接事件、每秒统计），格式化的开销可以忽略。
+///
+/// 用法：`note!(info, "直连成功 {addr}")`，或者带目标 `note!(info, target: "peerdesk::stats", "…")`。
+#[macro_export]
+macro_rules! note {
+    ($level:ident, target: $target:expr, $($arg:tt)+) => {{
+        let line = format!($($arg)+);
+        ::log::$level!(target: $target, "{line}");
+    }};
+    ($level:ident, $($arg:tt)+) => {{
+        let line = format!($($arg)+);
+        ::log::$level!("{line}");
+    }};
+}
+
+#[cfg(feature = "media")]
 pub mod bench;
+#[cfg(feature = "media")]
 pub mod controller;
+#[cfg(feature = "media")]
 pub mod demo;
 pub mod error;
 pub mod files;
 pub mod fs_store;
+#[cfg(feature = "media")]
 pub mod host;
 pub mod identity;
 pub mod node;

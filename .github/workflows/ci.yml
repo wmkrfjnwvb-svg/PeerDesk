@@ -213,6 +213,35 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # Linux 服务端安装包：musl 静态链接（服务端不含视频编解码，只需 musl-gcc），带 systemd 单元和安装脚本。
+  # 和 package 同样只在 [pkg] 时跑。
+  package-server-linux:
+    name: package (linux-server)
+    if: ${{ (github.event_name == 'workflow_dispatch' && (inputs.scope == 'packages' || inputs.scope == 'full')) || contains(github.event.head_commit.message, '[pkg]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - run: rustup target add x86_64-unknown-linux-musl
+      - run: sudo apt-get install -y musl-tools
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: package-server-linux
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Build console
+        run: npm ci --no-audit --no-fund && npm run build
+        working-directory: web
+      - name: Package
+        run: scripts/package-server-linux.sh dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: peerdesk-${{ github.sha }}-linux-server
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
   # 在虚拟显示器上打开图形界面（自测模式：开启被控并连接本机），截一张图。
   gui-screenshot:
     name: gui screenshot (linux)

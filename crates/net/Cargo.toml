@@ -6,9 +6,16 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+# 画面编解码（会话的被控端和控制端）。服务端只做信令和中继，不需要它，也就不用编译 C++ 的 openh264，
+# 可以静态链接 musl 发布。
+default = ["media"]
+media = ["dep:peerdesk-media"]
+
 [dependencies]
+log = "0.4"
 peerdesk-core.workspace = true
-peerdesk-media.workspace = true
+peerdesk-media = { workspace = true, optional = true }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }

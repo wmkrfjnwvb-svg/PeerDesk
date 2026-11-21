@@ -8,6 +8,7 @@ rust-version.workspace = true
 build = "build.rs"
 
 [dependencies]
+log = "0.4"
 peerdesk-core.workspace = true
 peerdesk-net.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread"] }

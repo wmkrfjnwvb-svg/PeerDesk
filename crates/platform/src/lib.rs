@@ -17,6 +17,7 @@
 
 pub mod capture;
 mod error;
+pub mod guide;
 pub mod keymap;
 pub mod pixel;
 pub mod pointer;
@@ -181,6 +182,18 @@ pub fn check_permissions() -> PermissionStatus {
     sys::permissions()
 }
 
+/// 现在运行的系统（macOS 带版本号，Linux 区分 X11 和 Wayland），给权限向导用。
+#[must_use]
+pub fn current_os() -> guide::Os {
+    sys::current_os()
+}
+
+/// 执行权限向导里一个按钮的动作（打开系统设置、弹出授权对话框、重新打开程序）。
+/// 失败时返回给用户看的原因。
+pub fn perform(action: guide::Action) -> Result<(), String> {
+    sys::perform(action)
+}
+
 /// 鼠标光标现在的位置（桌面坐标，单位同 [`DisplayInfo::x`]）。拿不到时为 `None`。
 #[must_use]
 pub fn cursor_position() -> Option<(i32, i32)> {
@@ -216,6 +229,17 @@ pub(crate) fn sort_displays(mut list: Vec<DisplayInfo>) -> Vec<DisplayInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Linux 上不需要授权：向导里的动作都不适用，系统类型按会话判断。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn guide_actions_on_linux() {
+        assert!(matches!(
+            current_os(),
+            guide::Os::LinuxX11 | guide::Os::LinuxWayland
+        ));
+        assert!(perform(guide::Action::Relaunch).is_err());
+    }
 
     fn display(x: i32, primary: bool) -> DisplayInfo {
         DisplayInfo {

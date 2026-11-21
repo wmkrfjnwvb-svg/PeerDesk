@@ -15,6 +15,7 @@ pub mod netinfo;
 pub mod password;
 pub mod recent;
 pub mod session;
+pub mod settings;
 pub mod state;
 pub mod stats;
 mod viewer;

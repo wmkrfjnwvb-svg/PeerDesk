@@ -2,17 +2,19 @@
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use peerdesk_core::relay::{Record, Relay, SessionId, Usage};
-use peerdesk_core::signal::{Registry, SignalMsg};
+use peerdesk_core::signal::{format_code, DeviceId, Registry, SignalMsg};
 use peerdesk_core::Time;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use crate::identity::to_hex;
 use crate::stream::{read_kind, read_signal, write_signal, StreamKind};
 use crate::{Link, NetError, Node};
 
@@ -119,6 +121,31 @@ struct SignalState {
     outboxes: Mutex<BTreeMap<u64, mpsc::Sender<SignalMsg>>>,
     relay: Option<Arc<RelayService>>,
     next_conn: AtomicU64,
+    /// 设备码簿的存盘位置；`None` 表示只在内存里（测试用）。
+    codes: Option<PathBuf>,
+}
+
+/// 设备码用的随机数。
+fn random_u32() -> u32 {
+    use ring::rand::SecureRandom;
+    let mut b = [0u8; 4];
+    // 取随机数失败极少见；退回到时钟，码仍然会做冲突检查。
+    let ok = ring::rand::SystemRandom::new().fill(&mut b).is_ok();
+    let clock = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    if ok {
+        u32::from_le_bytes(b)
+    } else {
+        clock
+    }
+}
+
+/// 把码簿写到磁盘：先写临时文件再改名，写一半断电也不会坏掉原文件。
+fn save_codes(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, text)?;
+    std::fs::rename(&tmp, path)
 }
 
 /// 信令服务：接受设备的连接，登记在线设备，为控制端和被控端牵线。
@@ -142,6 +169,50 @@ fn new_session_id() -> Option<SessionId> {
     Some(id)
 }
 
+/// 控制端要连 `target`（`None` 表示找不到这台设备）：分配中继，通知被控端，回复控制端。
+async fn introduce(
+    state: &SignalState,
+    link: &Link,
+    target: Option<DeviceId>,
+    send: &mut quinn::SendStream,
+) -> Result<(), NetError> {
+    let Some(target) = target else {
+        return write_signal(send, &SignalMsg::NotFound).await;
+    };
+    let me = *link.peer_fingerprint();
+    // 中继通道记在发起连接的设备名下。
+    let relay = state.relay.as_ref().and_then(|relay| {
+        let session = new_session_id()?;
+        relay
+            .allocate(session, me)
+            .then_some((relay.addr(), session))
+    });
+    let intro = lock(&state.registry).connect(me, link.remote_addr(), &target, relay);
+    crate::note!(
+        info,
+        "牵线 {} → {}：{}，中继{}",
+        link.remote_addr(),
+        to_hex(&target).get(..16).unwrap_or_default(),
+        if intro.to_host.is_some() {
+            "对方在线"
+        } else {
+            "对方不在线"
+        },
+        if relay.is_some() {
+            "已分配"
+        } else {
+            "未开启"
+        },
+    );
+    if let Some((host_conn, msg)) = intro.to_host {
+        let host = lock(&state.outboxes).get(&host_conn).cloned();
+        if let Some(host) = host {
+            let _ = host.send(msg).await;
+        }
+    }
+    write_signal(send, &intro.to_controller).await
+}
+
 async fn serve_device(state: Arc<SignalState>, link: Link) -> Result<(), NetError> {
     let conn = state.next_conn.fetch_add(1, Ordering::Relaxed);
     let (mut send, mut recv) = link.accept_stream().await?;
@@ -157,26 +228,37 @@ async fn serve_device(state: Arc<SignalState>, link: Link) -> Result<(), NetErro
             msg = read_signal(&mut recv) => match msg {
                 Err(_) => break Ok(()),
                 Ok(SignalMsg::Register) => {
-                    let reply = lock(&state.registry)
-                        .register(conn, *link.peer_fingerprint(), link.remote_addr());
-                    lock(&state.outboxes).insert(conn, tx.clone());
-                    if let Err(e) = write_signal(&mut send, &reply).await { break Err(e); }
-                }
-                Ok(SignalMsg::Connect { target }) => {
-                    let me = *link.peer_fingerprint();
-                    // 中继通道记在发起连接的设备名下。
-                    let relay = state.relay.as_ref().and_then(|relay| {
-                        let session = new_session_id()?;
-                        relay.allocate(session, me).then_some((relay.addr(), session))
-                    });
-                    let intro = lock(&state.registry).connect(me, link.remote_addr(), &target, relay);
-                    if let Some((host_conn, msg)) = intro.to_host {
-                        let host = lock(&state.outboxes).get(&host_conn).cloned();
-                        if let Some(host) = host {
-                            let _ = host.send(msg).await;
+                    let (done, text) = {
+                        let mut registry = lock(&state.registry);
+                        let done = registry
+                            .register(conn, *link.peer_fingerprint(), link.remote_addr(), &mut random_u32);
+                        let text = done.as_ref().filter(|d| d.new_code).map(|_| registry.codes_text());
+                        (done, text)
+                    };
+                    let Some(done) = done else { break Err(NetError::Protocol("设备码已分配完")); };
+                    if let (Some(path), Some(text)) = (&state.codes, text) {
+                        if let Err(e) = save_codes(path, &text) {
+                            crate::note!(error, "保存设备码簿 {} 失败：{e}", path.display());
                         }
                     }
-                    if let Err(e) = write_signal(&mut send, &intro.to_controller).await { break Err(e); }
+                    crate::note!(info,
+                        "设备登记 {} 码 {} 地址 {}",
+                        to_hex(link.peer_fingerprint()).get(..16).unwrap_or_default(),
+                        format_code(done.code),
+                        link.remote_addr(),
+                    );
+                    lock(&state.outboxes).insert(conn, tx.clone());
+                    if let Err(e) = write_signal(&mut send, &done.reply).await { break Err(e); }
+                }
+                Ok(SignalMsg::Connect { target }) => {
+                    if let Err(e) = introduce(&state, &link, Some(target), &mut send).await { break Err(e); }
+                }
+                Ok(SignalMsg::ConnectCode { code }) => {
+                    let target = lock(&state.registry).device_of(code);
+                    if target.is_none() {
+                        crate::note!(info, "按设备码 {} 连接：码不存在，来自 {}", format_code(code), link.remote_addr());
+                    }
+                    if let Err(e) = introduce(&state, &link, target, &mut send).await { break Err(e); }
                 }
                 Ok(
                     SignalMsg::Registered { .. }
@@ -194,14 +276,41 @@ async fn serve_device(state: Arc<SignalState>, link: Link) -> Result<(), NetErro
 }
 
 impl SignalService {
-    /// 在一个已绑定的端点上启动。`relay` 是可选的中继服务。
+    /// 在一个已绑定的端点上启动。`relay` 是可选的中继服务。设备码只记在内存里。
     #[must_use]
     pub fn start(node: Arc<Node>, relay: Option<Arc<RelayService>>) -> Self {
+        Self::start_with_codes(node, relay, None)
+    }
+
+    /// 同 [`SignalService::start`]，设备码簿存在 `codes` 文件里，服务器重启后设备码不变。
+    #[must_use]
+    pub fn start_with_codes(
+        node: Arc<Node>,
+        relay: Option<Arc<RelayService>>,
+        codes: Option<PathBuf>,
+    ) -> Self {
+        let mut registry = Registry::new();
+        if let Some(path) = &codes {
+            match std::fs::read_to_string(path) {
+                Ok(text) => {
+                    let bad = registry.load_codes(&text);
+                    crate::note!(
+                        info,
+                        "读取设备码簿 {}：{} 台设备，跳过 {bad} 行",
+                        path.display(),
+                        registry.known()
+                    );
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => crate::note!(error, "读取设备码簿 {} 失败：{e}", path.display()),
+            }
+        }
         let state = Arc::new(SignalState {
-            registry: Mutex::new(Registry::new()),
+            registry: Mutex::new(registry),
             outboxes: Mutex::new(BTreeMap::new()),
             relay,
             next_conn: AtomicU64::new(1),
+            codes,
         });
         let accept_state = Arc::clone(&state);
         let task = tokio::spawn(async move {

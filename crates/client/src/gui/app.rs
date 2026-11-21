@@ -5,17 +5,21 @@ use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, RichText, TextEdit};
+use peerdesk_core::signal::format_code;
 use peerdesk_net::identity::to_hex;
-use peerdesk_net::rendezvous::Server;
+use peerdesk_net::rendezvous::Lookup;
 use peerdesk_net::Identity;
+use peerdesk_platform::guide::{guide, Guide, Os};
 
-use super::form::{parse_addr, parse_pin, parse_port, ConnectForm, Target, DEFAULT_PORT};
+use super::form::{parse_pin, parse_port, ConnectForm, Target, DEFAULT_PORT};
 use super::i18n::{strings, system_lang, Strings};
 use super::netinfo::lan_addresses;
 use super::recent::RecentStore;
-use super::session::{start_host, start_view, HostConfig, HostHandle, Repaint};
+use super::session::{start_host, start_view, HostConfig, HostEvent, HostHandle, Repaint};
+use super::settings::ServerSettings;
 use super::state::{HostPhase, Status};
 use super::stats::short_fingerprint;
 use super::viewer::Viewer;
@@ -25,6 +29,8 @@ use crate::{EXIT_FAILED, EXIT_OK};
 
 /// 自测模式：启动后自动开启被控、再连接本机。值为 `host` 时只开启被控。CI 用它截图。
 const SELFTEST_ENV: &str = "PEERDESK_GUI_SELFTEST";
+/// 权限向导多久重新检查一次权限。
+const GUIDE_REFRESH: Duration = Duration::from_secs(1);
 
 /// 打开图形界面，直到窗口关闭。返回进程退出码。
 pub fn run() -> u8 {
@@ -61,9 +67,11 @@ struct App {
     fingerprint: Result<String, String>,
     password: String,
     port: String,
-    register: bool,
-    reg_server: String,
-    reg_pin: String,
+    server: ServerSettings,
+    device_code: Option<u32>,
+    os: Os,
+    guide: Guide,
+    guide_checked: Instant,
     host: Option<HostHandle>,
     phase: HostPhase,
     addrs: Vec<IpAddr>,
@@ -91,16 +99,19 @@ impl App {
             Err(e) => (String::new(), Status::error(e)),
         };
         let ctx2 = ctx.clone();
+        let os = peerdesk_platform::current_os();
         Self {
             s,
             recent: RecentStore::load(&data_dir),
+            server: ServerSettings::load(&data_dir),
+            device_code: None,
+            os,
+            guide: guide(os, peerdesk_platform::check_permissions()),
+            guide_checked: Instant::now(),
             data_dir,
             fingerprint,
             password,
             port: DEFAULT_PORT.to_string(),
-            register: false,
-            reg_server: String::new(),
-            reg_pin: String::new(),
             host: None,
             phase: HostPhase::Off,
             addrs: lan_addresses(),
@@ -121,19 +132,11 @@ impl App {
             Ok(port) => port,
             Err(e) => return self.status = Status::error(e),
         };
-        let server = if self.register && !self.reg_server.trim().is_empty() {
-            let addr = match parse_addr(&self.reg_server, s.err_bad_server) {
-                Ok(addr) => addr,
-                Err(e) => return self.status = Status::error(e),
-            };
-            let pin = match parse_pin(&self.reg_pin, s) {
-                Ok(pin) => pin,
-                Err(e) => return self.status = Status::error(e),
-            };
-            Some(Server { addr, pin })
-        } else {
-            None
+        let server = match self.server.server(s) {
+            Ok(server) => server,
+            Err(e) => return self.status = Status::error(e),
         };
+        self.device_code = None;
         let config = HostConfig {
             port,
             data_dir: self.data_dir.clone(),
@@ -161,9 +164,14 @@ impl App {
         self.serial += 1;
         let title = match &target {
             Target::Addr { addr, .. } => format!("PeerDesk — {addr}"),
-            Target::Device { device, .. } => {
-                format!("PeerDesk — {}", short_fingerprint(&to_hex(device)))
-            }
+            Target::Device {
+                device: Lookup::Device(device),
+                ..
+            } => format!("PeerDesk — {}", short_fingerprint(&to_hex(device))),
+            Target::Device {
+                device: Lookup::Code(code),
+                ..
+            } => format!("PeerDesk — {}", format_code(*code)),
         };
         let handle = start_view(
             target,
@@ -177,10 +185,13 @@ impl App {
     }
 
     fn connect_from_form(&mut self) {
-        match self.form.target(self.s) {
+        match self.form.target(self.s, self.server.server(self.s)) {
             Ok(target) => {
-                let remember = matches!(target, Target::Addr { .. })
-                    .then(|| (self.form.addr.clone(), self.form.pin.clone()));
+                let pin = match target {
+                    Target::Addr { .. } => self.form.pin.clone(),
+                    Target::Device { .. } => String::new(),
+                };
+                let remember = Some((self.form.remembered(), pin));
                 self.connect(target, remember);
             }
             Err(e) => self.status = Status::error(e),
@@ -190,6 +201,9 @@ impl App {
     fn poll_host(&mut self) {
         let events = self.host.as_ref().map(HostHandle::poll).unwrap_or_default();
         for event in events {
+            if let HostEvent::Registered { code, .. } = event {
+                self.device_code = Some(code);
+            }
             let (phase, status) = self.phase.apply(&event, self.s);
             self.phase = phase;
             if let Some(status) = status {
@@ -197,6 +211,7 @@ impl App {
             }
             if self.phase == HostPhase::Off {
                 self.host = None;
+                self.device_code = None;
             }
             if self.selftest {
                 if let HostPhase::Listening { port, .. } = self.phase {
@@ -226,11 +241,53 @@ impl App {
         });
     }
 
+    /// 权限向导：每秒重新检查一次权限，用户在系统设置里打开开关后这里立刻变成打勾。
+    fn permission_guide(&mut self, ui: &mut egui::Ui) {
+        if self.guide_checked.elapsed() >= GUIDE_REFRESH {
+            self.guide = guide(self.os, peerdesk_platform::check_permissions());
+            self.guide_checked = Instant::now();
+        }
+        ui.ctx().request_repaint_after(GUIDE_REFRESH);
+        if self.guide.steps.is_empty() {
+            return;
+        }
+        let color = if self.guide.ready {
+            Color32::from_rgb(60, 160, 90)
+        } else {
+            Color32::from_rgb(220, 140, 40)
+        };
+        let title = self.guide.title.clone();
+        egui::CollapsingHeader::new(RichText::new(title).color(color).strong())
+            .id_salt("permission-guide")
+            .default_open(!self.guide.ready)
+            .show(ui, |ui| {
+                for step in self.guide.steps.clone() {
+                    ui.horizontal_wrapped(|ui| {
+                        let mark = if step.done { "✔" } else { "○" };
+                        ui.label(RichText::new(mark).color(color));
+                        ui.label(&step.text);
+                        if let Some((label, action)) = step.button {
+                            if ui.button(label).clicked() {
+                                if let Err(e) = peerdesk_platform::perform(action) {
+                                    self.status = Status::error(e);
+                                }
+                                // 授权对话框关掉后马上重新检查。
+                                self.guide_checked = Instant::now() - GUIDE_REFRESH;
+                            }
+                        }
+                    });
+                }
+            });
+    }
+
     fn this_device(&mut self, ui: &mut egui::Ui) {
         let s = self.s;
         ui.heading(s.this_device);
+        self.permission_guide(ui);
         let mut on = self.phase.is_on();
-        let enabled = !matches!(self.phase, HostPhase::Stopping | HostPhase::Starting);
+        // 权限不全时不能开启被控（关闭总是可以）。
+        let enabled = !matches!(self.phase, HostPhase::Stopping | HostPhase::Starting)
+            && (self.guide.ready || self.phase.is_on());
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(enabled, egui::Checkbox::new(&mut on, s.allow_control))
@@ -297,6 +354,17 @@ impl App {
             });
         }
 
+        if let Some(code) = self.device_code {
+            let shown = format_code(code);
+            ui.horizontal(|ui| {
+                ui.label(format!("{}:", s.device_code));
+                ui.label(RichText::new(&shown).monospace().size(22.0).strong());
+                if ui.small_button(s.copy).clicked() {
+                    ui.ctx().copy_text(code.to_string());
+                    self.status = Status::info(format!("{} {shown}", s.copied));
+                }
+            });
+        }
         match self.fingerprint.clone() {
             Ok(fp) => self.copy_row(ui, s.fingerprint, &short_fingerprint(&fp), &fp),
             Err(e) => {
@@ -361,32 +429,47 @@ impl App {
                 self.connect(target, None);
             }
         }
-        let editable = self.phase == HostPhase::Off;
-        egui::CollapsingHeader::new(s.register_server).show(ui, |ui| {
-            ui.add_enabled_ui(editable, |ui| {
-                let _ = ui.checkbox(&mut self.register, s.register_server);
-                labeled(ui, s.server_addr, &mut self.reg_server, false);
-                labeled(ui, s.server_pin, &mut self.reg_pin, false);
+    }
+
+    fn server_panel(&mut self, ui: &mut egui::Ui) {
+        let s = self.s;
+        egui::CollapsingHeader::new(s.register_server)
+            .default_open(!self.server.is_set())
+            .show(ui, |ui| {
+                ui.small(s.via_server);
+                let mut save = labeled(ui, s.server_addr, &mut self.server.addr, false);
+                save |= labeled(ui, s.server_pin, &mut self.server.pin, false);
+                ui.horizontal(|ui| {
+                    save |= ui.button(s.save).clicked();
+                    if ui.button(s.open_logs).clicked() {
+                        self.status = match open_folder(&self.data_dir.join("logs")) {
+                            Ok(()) => {
+                                Status::info(self.data_dir.join("logs").display().to_string())
+                            }
+                            Err(e) => Status::error(e),
+                        };
+                    }
+                });
+                if save {
+                    self.status = match self.server.server(s) {
+                        Err(e) => Status::error(e),
+                        Ok(_) => match self.server.save(&self.data_dir) {
+                            // 本机正在被控：下次开启时用新服务器登记。
+                            Ok(()) => Status::info(s.saved),
+                            Err(e) => Status::error(e.to_string()),
+                        },
+                    };
+                }
             });
-        });
     }
 
     fn connect_panel(&mut self, ui: &mut egui::Ui) {
         let s = self.s;
         ui.heading(s.connect_title);
-        let mut go = false;
-        ui.add_enabled_ui(!self.form.via_server, |ui| {
-            go |= labeled(ui, s.remote_addr, &mut self.form.addr, false);
-            go |= labeled(ui, s.pin, &mut self.form.pin, false);
-        });
+        let mut go = labeled(ui, s.remote_addr, &mut self.form.addr, false);
         go |= labeled(ui, s.password, &mut self.form_password, true);
-        egui::CollapsingHeader::new(s.via_server).show(ui, |ui| {
-            let _ = ui.checkbox(&mut self.form.via_server, s.via_server);
-            ui.add_enabled_ui(self.form.via_server, |ui| {
-                labeled(ui, s.server_addr, &mut self.form.server, false);
-                labeled(ui, s.server_pin, &mut self.form.server_pin, false);
-                labeled(ui, s.device, &mut self.form.device, false);
-            });
+        egui::CollapsingHeader::new(s.pin).show(ui, |ui| {
+            go |= labeled(ui, s.pin, &mut self.form.pin, false);
         });
         if ui.button(RichText::new(s.connect).strong()).clicked() || go {
             self.connect_from_form();
@@ -407,10 +490,26 @@ impl App {
             if let Some(item) = pick {
                 self.form.addr = item.addr;
                 self.form.pin = item.pin;
-                self.form.via_server = false;
             }
         }
     }
+}
+
+/// 用系统的文件管理器打开文件夹（不存在时先建好）。
+fn open_folder(dir: &std::path::Path) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("{}：{e}", dir.display()))?;
+    let program = if cfg!(target_os = "windows") {
+        "explorer"
+    } else if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    std::process::Command::new(program)
+        .arg(dir)
+        .spawn()
+        .map(drop)
+        .map_err(|e| format!("{}：{e}", dir.display()))
 }
 
 /// 一行“标签 + 输入框”。在输入框里按回车返回 `true`。
@@ -452,6 +551,11 @@ impl eframe::App for App {
                 ui.group(|ui| {
                     ui.set_width(ui.available_width());
                     self.connect_panel(ui);
+                });
+                ui.add_space(8.0);
+                ui.group(|ui| {
+                    ui.set_width(ui.available_width());
+                    self.server_panel(ui);
                 });
             });
         });

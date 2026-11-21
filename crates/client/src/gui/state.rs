@@ -2,6 +2,8 @@
 
 use std::net::SocketAddr;
 
+use peerdesk_core::signal::format_code;
+
 use super::form::explain;
 use super::i18n::Strings;
 use super::session::{HostEvent, Summary, ViewEvent};
@@ -103,9 +105,13 @@ impl HostPhase {
                 },
                 Some(Status::info(format!("{} {}", s.host_listening, port))),
             ),
-            HostEvent::Registered { observed } => (
+            HostEvent::Registered { observed, code } => (
                 self.clone(),
-                Some(Status::info(format!("{} {observed}", s.registered))),
+                Some(Status::info(format!(
+                    "{} {}（{observed}）",
+                    s.registered,
+                    format_code(*code)
+                ))),
             ),
             HostEvent::RegisterFailed(e) | HostEvent::HandshakeFailed(e) => {
                 (self.clone(), Some(Status::error(explain(e, s))))
@@ -336,7 +342,13 @@ mod tests {
             HostPhase::Stopping
         );
 
-        let (same, status) = listening.apply(&HostEvent::Registered { observed: addr() }, s);
+        let (same, status) = listening.apply(
+            &HostEvent::Registered {
+                observed: addr(),
+                code: 123_456_789,
+            },
+            s,
+        );
         assert_eq!(same, listening);
         assert!(!status.unwrap().error);
         for e in [
