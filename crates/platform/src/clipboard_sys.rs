@@ -7,7 +7,7 @@
 use std::sync::{Mutex, PoisonError};
 
 use peerdesk_core::clipboard::{Clip, ClipKind};
-use peerdesk_net::clipsync::{ClipNote, SystemClipboard};
+use peerdesk_net::clipsync::{ClipNote, ClipboardHandle, SystemClipboard};
 
 use crate::clipboard::{png_to_rgba, rgba_to_png};
 
@@ -158,5 +158,17 @@ impl SystemClipboard for SystemClip {
 
     fn note(&self, note: ClipNote) {
         (self.on_note)(note);
+    }
+}
+
+/// 打开系统剪贴板，放进会话选项；打不开时记日志并返回 `None`（会话照常，只是不同步剪贴板）。
+#[must_use]
+pub fn open_clipboard(on_note: OnNote) -> Option<ClipboardHandle> {
+    match SystemClip::open(on_note) {
+        Ok(clip) => Some(ClipboardHandle(std::sync::Arc::new(clip))),
+        Err(e) => {
+            peerdesk_net::note!(warn, "剪贴板不可用，不同步：{e}");
+            None
+        }
     }
 }

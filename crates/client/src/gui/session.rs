@@ -547,13 +547,7 @@ pub enum ViewEvent {
 /// 打开本机系统剪贴板。测试构建里没有（测试不碰开发者电脑的剪贴板）。
 #[cfg(not(test))]
 fn system_clipboard(on_note: peerdesk_platform::OnNote) -> Option<ClipboardHandle> {
-    match peerdesk_platform::SystemClip::open(on_note) {
-        Ok(clip) => Some(ClipboardHandle(Arc::new(clip))),
-        Err(e) => {
-            peerdesk_net::note!(warn, "剪贴板不可用，不同步：{e}");
-            None
-        }
-    }
+    peerdesk_platform::open_clipboard(on_note)
 }
 
 #[cfg(test)]

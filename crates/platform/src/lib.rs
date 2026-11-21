@@ -18,7 +18,7 @@
 pub mod capture;
 pub mod clipboard;
 mod clipboard_sys;
-pub use clipboard_sys::{OnNote, SystemClip};
+pub use clipboard_sys::{open_clipboard, OnNote, SystemClip};
 mod error;
 pub mod guide;
 pub mod keymap;

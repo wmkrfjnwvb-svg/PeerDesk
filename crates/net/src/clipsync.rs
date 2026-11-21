@@ -186,3 +186,35 @@ pub async fn run(
 fn len64(clip: &Clip) -> u64 {
     u64::try_from(clip.data.len()).unwrap_or(u64::MAX)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 只实现必需方法的剪贴板：`note` 用默认实现。
+    struct Plain;
+    impl SystemClipboard for Plain {
+        fn change_count(&self) -> u64 {
+            0
+        }
+        fn read(&self) -> Option<Clip> {
+            None
+        }
+        fn write(&self, _clip: &Clip) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn handle_and_default_note() {
+        let handle = ClipboardHandle(Arc::new(Plain));
+        assert_eq!(format!("{handle:?}"), "ClipboardHandle");
+        handle.0.note(ClipNote::Received {
+            kind: ClipKind::Text,
+            size: 1,
+        });
+        assert_eq!(handle.0.change_count(), 0);
+        assert!(handle.0.read().is_none());
+        assert!(handle.0.write(&Clip::text("x")).is_ok());
+    }
+}
