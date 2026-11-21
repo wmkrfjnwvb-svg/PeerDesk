@@ -38,15 +38,26 @@ pub async fn send_files(
     let mut store = FsStore::new(root);
     let mut sender = FileSender::new(files.clone())?;
     let (mut send, mut recv) = link.open_stream().await?;
-    write_kind(&mut send, StreamKind::File).await?;
-    write_file_msg(&mut send, &sender.offer()?).await?;
+    let offer = sender.offer()?;
+    // 对端拒绝（例如没有文件权限）时会先写 Abort 再停止接收：这时我们写清单可能失败，
+    // 但仍要读它的答复，拿到拒绝原因，而不是把整个会话当成出错。
+    let wrote = async {
+        write_kind(&mut send, StreamKind::File).await?;
+        write_file_msg(&mut send, &offer).await
+    }
+    .await;
 
     let mut deframer = Deframer::new();
     let mut answered = false;
     while !answered {
-        let msgs = read_file_msgs(&mut recv, &mut deframer).await?;
+        let msgs = match read_file_msgs(&mut recv, &mut deframer).await {
+            Ok(msgs) => msgs,
+            Err(e) => return Err(wrote.err().unwrap_or(e)),
+        };
         if msgs.is_empty() {
-            return Err(NetError::Closed("对端在答复前关闭了文件流".into()));
+            return Err(wrote
+                .err()
+                .unwrap_or_else(|| NetError::Closed("对端在答复前关闭了文件流".into())));
         }
         for msg in &msgs {
             sender.on_msg(msg, &mut store)?;
