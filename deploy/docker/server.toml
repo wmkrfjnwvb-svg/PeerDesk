@@ -1,0 +1,14 @@
+# 镜像内置的默认配置：单机、只开信令（打洞），不开中继。
+# 要开中继、加入集群，请挂载自己的配置覆盖 /etc/peerdesk/server.toml，
+# 例子见 node1.toml；中继要写 relay_advertise = "<公网IP>:3478"。
+node_id = 1
+region = "default"
+# 管理页面在容器里监听所有地址，宿主机上请只映射到 127.0.0.1（-p 127.0.0.1:8080:8080）。
+http_listen = "0.0.0.0:8080"
+cluster_listen = "0.0.0.0:7946"
+advertise = "127.0.0.1:7946"
+signal_listen = "0.0.0.0:4433"
+data_dir = "/var/lib/peerdesk"
+
+[crypto]
+preset = "recommended"
