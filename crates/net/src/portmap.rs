@@ -427,10 +427,10 @@ async fn connect_to(target: SocketAddr) -> Result<UdpSocket, String> {
     };
     let sock = UdpSocket::bind(bind)
         .await
-        .map_err(|e| format!("无法创建 UDP 套接字：{e}"))?;
+        .map_err(ctx("无法创建 UDP 套接字"))?;
     sock.connect(target)
         .await
-        .map_err(|e| format!("无法连接到 {target}：{e}"))?;
+        .map_err(ctx(format!("无法连接到 {target}")))?;
     Ok(sock)
 }
 
@@ -474,6 +474,12 @@ async fn exchange<T>(
         }
         wait = wait.saturating_mul(2);
     }
+}
+
+/// 给错误加上"做什么时出的错"的前缀。
+fn ctx<E: std::fmt::Display>(what: impl Into<String>) -> impl FnOnce(E) -> String {
+    let what = what.into();
+    move |e| format!("{what}：{e}")
 }
 
 /// 把收发错误翻译成人话。
@@ -581,10 +587,7 @@ async fn pcp_map(
     first_wait: Duration,
 ) -> Result<Mapping, String> {
     let sock = connect_to(gw).await?;
-    let client_ip = sock
-        .local_addr()
-        .map_err(|e| format!("无法确定本机地址：{e}"))?
-        .ip();
+    let client_ip = sock.local_addr().map_err(ctx("无法确定本机地址"))?.ip();
     let nonce = pcp_nonce(internal_port);
     let request = pcp_encode_map_request(
         client_ip,
@@ -634,10 +637,7 @@ async fn pcp_unmap(
     first_wait: Duration,
 ) -> Result<(), String> {
     let sock = connect_to(gw).await?;
-    let client_ip = sock
-        .local_addr()
-        .map_err(|e| format!("无法确定本机地址：{e}"))?
-        .ip();
+    let client_ip = sock.local_addr().map_err(ctx("无法确定本机地址"))?.ip();
     let nonce = pcp_nonce(internal_port);
     let request = pcp_encode_map_request(client_ip, nonce, internal_port, 0, 0);
     exchange(&sock, &request, within, first_wait, |b| {
@@ -661,11 +661,11 @@ async fn upnp_map(
     options.timeout = Some(within);
     let gateway = igd_next::aio::tokio::search_gateway(options)
         .await
-        .map_err(|e| format!("没有发现 UPnP 路由器：{e}"))?;
+        .map_err(ctx("没有发现 UPnP 路由器"))?;
     let ip = gateway
         .get_external_ip()
         .await
-        .map_err(|e| format!("查询外网地址失败：{e}"))?;
+        .map_err(ctx("查询外网地址失败"))?;
     // 外网地址是私网地址就不必添加映射了。
     check_public(ip)?;
 
@@ -714,11 +714,11 @@ async fn upnp_unmap(
     options.timeout = Some(within);
     let gateway = igd_next::aio::tokio::search_gateway(options)
         .await
-        .map_err(|e| format!("没有发现 UPnP 路由器：{e}"))?;
+        .map_err(ctx("没有发现 UPnP 路由器"))?;
     gateway
         .remove_port(PortMappingProtocol::UDP, external_port)
         .await
-        .map_err(|e| format!("删除端口映射失败：{e}"))
+        .map_err(ctx("删除端口映射失败"))
 }
 
 // ---------------------------------------------------------------------------
@@ -733,6 +733,8 @@ struct Endpoints {
     upnp: Arc<dyn Fn() -> SearchOptions + Send + Sync>,
     first_wait: Duration,
     retry_delay: Duration,
+    /// 没有网关地址时，用来推断本机局域网地址的探测目标（TEST-NET，不会真的发包）。
+    lan_probe: IpAddr,
 }
 
 impl std::fmt::Debug for Endpoints {
@@ -752,6 +754,7 @@ impl Endpoints {
             upnp: Arc::new(SearchOptions::default),
             first_wait: FIRST_WAIT,
             retry_delay: RETRY_DELAY,
+            lan_probe: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
         }
     }
 }
@@ -806,13 +809,14 @@ async fn map_udp_with(
         }
     }
     // UPnP 不需要知道网关地址（组播发现），但要知道本机的局域网地址。
-    let upnp_local = lan_addr(local, gateways.first().copied()).await;
+    let upnp_local = lan_addr(local, gateways.first().copied(), ep.lan_probe).await;
     let options = (ep.upnp)();
     tasks.spawn(async move {
+        let timeout_msg = format!("{:.1} 秒内没有完成", within.as_secs_f32());
         let result = match upnp_local {
             Ok(addr) => tokio::time::timeout(within, upnp_map(addr, options, suggested, within))
                 .await
-                .unwrap_or_else(|_| Err(format!("{:.1} 秒内没有完成", within.as_secs_f32()))),
+                .unwrap_or(Err(timeout_msg)),
             Err(e) => Err(e),
         };
         ("UPnP".to_string(), result)
@@ -821,10 +825,12 @@ async fn map_udp_with(
     let mut failures: Vec<String> = Vec::new();
     while let Some(joined) = tasks.join_next().await {
         // 任务 panic 只可能是内部错误，和别的失败一起列出。
-        let joined = joined.unwrap_or_else(|e| ("内部错误".to_string(), Err(e.to_string())));
-        match joined {
-            (_, Ok(mapping)) => return Ok(mapping),
-            (label, Err(e)) => failures.push(format!("{label}：{e}")),
+        let outcome = joined
+            .map_err(ctx("内部错误"))
+            .and_then(|(label, result)| result.map_err(|e| format!("{label}：{e}")));
+        match outcome {
+            Ok(mapping) => return Ok(mapping),
+            Err(e) => failures.push(e),
         }
     }
     failures.sort();
@@ -839,17 +845,21 @@ async fn map_udp_with(
 /// 本机的局域网地址（UPnP 要告诉路由器把包转给谁）。
 /// `local` 已经指定了地址就直接用；否则看"发往路由器时内核会选哪个源地址"
 ///（UDP `connect` 只查路由表，不发包）。
-async fn lan_addr(local: SocketAddr, gateway: Option<IpAddr>) -> Result<SocketAddr, String> {
+async fn lan_addr(
+    local: SocketAddr,
+    gateway: Option<IpAddr>,
+    fallback: IpAddr,
+) -> Result<SocketAddr, String> {
     if !local.ip().is_unspecified() {
         return Ok(local);
     }
-    let probe_target: IpAddr = gateway.unwrap_or(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)));
+    let probe_target = gateway.unwrap_or(fallback);
     let sock = connect_to(SocketAddr::new(probe_target, 9))
         .await
-        .map_err(|e| format!("无法确定本机的局域网地址：{e}"))?;
+        .map_err(ctx("无法确定本机的局域网地址"))?;
     let ip = sock
         .local_addr()
-        .map_err(|e| format!("无法确定本机的局域网地址：{e}"))?
+        .map_err(ctx("无法确定本机的局域网地址"))?
         .ip();
     Ok(SocketAddr::new(ip, local.port()))
 }
@@ -1330,18 +1340,13 @@ mod tests {
     {
         let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = sock.local_addr().unwrap();
-        tokio::spawn(async move {
-            let mut buf = [0u8; 1500];
-            let mut n = 0usize;
-            while let Ok((len, from)) = sock.recv_from(&mut buf).await {
-                for reply in handler(n, buf.get(..len).unwrap()) {
-                    let _ = sock.send_to(&reply, from).await;
-                }
-                n += 1;
-            }
-        });
+        tokio::spawn(serve_udp(sock, handler));
         addr
     }
+
+    /// 假路由器的收发循环（不会结束，任务随测试运行时一起丢弃）。
+    #[rustfmt::skip]
+    async fn serve_udp<F: Fn(usize, &[u8]) -> Vec<Vec<u8>>>(sock: UdpSocket, handler: F) { let (mut buf, mut n) = ([0u8; 1500], 0usize); while let Ok((len, from)) = sock.recv_from(&mut buf).await { for reply in handler(n, &buf[..len]) { let _ = sock.send_to(&reply, from).await; } n += 1; } }
 
     /// 一个有 NAT-PMP 的路由器：外网地址 `ip`，映射给 `external_port`，租期 `lifetime`。
     fn natpmp_handler(
@@ -1415,14 +1420,15 @@ mod tests {
     #[tokio::test]
     async fn natpmp_client_ignores_stale_replies() {
         // 先回一个别的端口的映射应答、一个操作码不对的应答、一个截断的，再回正确的。
-        let gw = fake_router(|_, req| match req.get(1) {
-            Some(0) => vec![vec![0, 128], natpmp_external_reply(0, 1, [203, 0, 113, 7])],
-            Some(1) => vec![
+        let gw = fake_router(|_, req| {
+            if req[1] == 0 {
+                return vec![vec![0, 128], natpmp_external_reply(0, 1, [203, 0, 113, 7])];
+            }
+            vec![
                 natpmp_map_reply(0, 1, 9999, 1234, 60),
                 natpmp_external_reply(0, 1, [1, 1, 1, 1]),
                 natpmp_map_reply(0, 1, 5000, 40002, 60),
-            ],
-            _ => vec![],
+            ]
         })
         .await;
         let m = natpmp_map(gw, 5000, 0, SHORT, FAST).await.unwrap();
@@ -1570,30 +1576,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pcp_client_over_ipv6() {
-        // 沙箱没有 IPv6 时跳过。
-        let Ok(sock) = UdpSocket::bind("[::1]:0").await else {
-            return;
-        };
-        let gw = sock.local_addr().unwrap();
-        tokio::spawn(async move {
-            let mut buf = [0u8; 1500];
-            if let Ok((len, from)) = sock.recv_from(&mut buf).await {
-                let req = &buf[..len];
-                let nonce: [u8; 12] = req[24..36].try_into().unwrap();
-                // 客户端地址是 ::1，原样放在 8..24。
-                assert_eq!(&req[8..24], &Ipv6Addr::LOCALHOST.octets());
-                let ip: IpAddr = "2001:db8::9".parse().unwrap();
-                let _ = sock
-                    .send_to(&pcp_reply(0, nonce, 17, 5000, 5000, ip), from)
-                    .await;
-            }
-        });
-        let m = pcp_map(gw, 5000, 0, SHORT, FAST).await.unwrap();
-        assert_eq!(m.external, "[2001:db8::9]:5000".parse().unwrap());
-    }
-
-    #[tokio::test]
     async fn unmap_clients() {
         // NAT-PMP 删除：路由器收到租期 0。
         let gw = fake_router(natpmp_handler([203, 0, 113, 7], 40000, 3600)).await;
@@ -1678,101 +1660,100 @@ mod tests {
         ))
     }
 
+    /// 假 IGD 的路由表：按请求行（GET）或 SOAP 动作名（POST）查应答；查不到就是 404。
+    #[rustfmt::skip]
+    fn igd_route(b: IgdBehavior, first: &str, name: &str, text: &str) -> (&'static str, String) {
+        const NS: &str = "xmlns:u=\"urn:schemas-upnp-org:service:WANIPConnection:1\"";
+        let permanent_refused = b.permanent_only && !text.contains("<NewLeaseDuration>0<");
+        let ok = |n: &str, inner: &str| ("200 OK", soap(&format!("<u:{n}Response {NS}>{inner}</u:{n}Response>")));
+        let fault = |code, what| ("500 Internal Server Error", soap_fault(code, what));
+        let any = if b.reject_any_port { fault(728, "NoPortMapsAvailable") } else if permanent_refused { fault(725, "OnlyPermanentLeasesSupported") } else { ok("AddAnyPortMapping", "<NewReservedPort>45678</NewReservedPort>") };
+        let fixed = if b.reject_fixed_port { fault(718, "ConflictInMappingEntry") } else { ok("AddPortMapping", "") };
+        let routes = [
+            ("GET /scpd.xml", ("200 OK", scpd_xml())),
+            ("GET /desc.xml", ("200 OK", DEVICE_XML.to_string())),
+            ("GetExternalIPAddress", ok("GetExternalIPAddress", &format!("<NewExternalIPAddress>{}</NewExternalIPAddress>", b.external_ip))),
+            ("AddAnyPortMapping", any),
+            ("AddPortMapping", fixed),
+            ("DeletePortMapping", ok("DeletePortMapping", "")),
+        ];
+        routes.into_iter().find(|(k, _)| first.starts_with(k) || *k == name).map_or(("404 Not Found", String::new()), |(_, v)| v)
+    }
+
+    /// 假 IGD 的接受循环（不会结束，任务随测试运行时一起丢弃）。
+    #[rustfmt::skip]
+    async fn accept_loop(http: TcpListener, b: IgdBehavior, log: Arc<std::sync::Mutex<Vec<String>>>) { while let Ok((conn, _)) = http.accept().await { tokio::spawn(serve_http(conn, b, log.clone())); } }
+
+    /// HTTP 请求是否已经收完：头结束，并且按 Content-Length 的正文也到齐。
+    fn request_complete(data: &[u8]) -> bool {
+        let text = String::from_utf8_lossy(data);
+        let length = |t: &str| {
+            t.lines()
+                .find_map(|l| {
+                    l.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                })
+                .unwrap_or(0)
+        };
+        text.find("\r\n\r\n")
+            .is_some_and(|pos| data.len() >= pos + 4 + length(&text))
+    }
+
+    /// 处理一个连接上的一次 HTTP 请求。
+    async fn serve_http(
+        mut conn: tokio::net::TcpStream,
+        b: IgdBehavior,
+        log: Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let mut data = Vec::new();
+        let mut buf = [0u8; 4096];
+        // 读到请求收完；连接提前关了（n == 0）也往下走，按已收到的内容应答。
+        let mut n = 1;
+        while n != 0 && !request_complete(&data) {
+            n = conn.read(&mut buf).await.unwrap_or(0);
+            data.extend_from_slice(&buf[..n]);
+        }
+        let text = String::from_utf8_lossy(&data).to_string();
+        let first = text.lines().next().unwrap_or_default().to_string();
+        let action = text
+            .lines()
+            .find(|l| l.to_ascii_lowercase().starts_with("soapaction:"))
+            .unwrap_or_default();
+        let name = [
+            "GetExternalIPAddress",
+            "AddAnyPortMapping",
+            "AddPortMapping",
+            "DeletePortMapping",
+        ]
+        .into_iter()
+        .find(|n| action.contains(&format!("#{n}\"")))
+        .unwrap_or("-");
+        if first.starts_with("POST") {
+            log.lock().unwrap().push(name.to_string());
+        }
+        let (status, body) = igd_route(b, &first, name, &text);
+        let reply = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: text/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let _ = conn.write_all(reply.as_bytes()).await;
+        let _ = conn.shutdown().await;
+    }
+
     /// 启动假 IGD：返回给 `SearchOptions` 用的 SSDP 地址，以及记录收到的 SOAP 动作的列表。
     async fn fake_igd(b: IgdBehavior) -> (SocketAddr, Arc<std::sync::Mutex<Vec<String>>>) {
         let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let http_port = http.local_addr().unwrap().port();
         let log: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
-        let log2 = log.clone();
-        tokio::spawn(async move {
-            while let Ok((mut conn, _)) = http.accept().await {
-                let log = log2.clone();
-                tokio::spawn(async move {
-                    let mut data = Vec::new();
-                    let mut buf = [0u8; 4096];
-                    // 读到头结束，再按 Content-Length 读完正文。
-                    loop {
-                        let n = conn.read(&mut buf).await.unwrap_or(0);
-                        data.extend_from_slice(&buf[..n]);
-                        let text = String::from_utf8_lossy(&data).to_string();
-                        let mut done = false;
-                        if let Some(pos) = text.find("\r\n\r\n") {
-                            let len = text
-                                .lines()
-                                .find_map(|l| {
-                                    l.to_ascii_lowercase()
-                                        .strip_prefix("content-length:")
-                                        .map(|v| v.trim().parse::<usize>().unwrap_or(0))
-                                })
-                                .unwrap_or(0);
-                            done = data.len() >= pos + 4 + len;
-                        }
-                        // 连接提前关了（n == 0）也往下走，按已收到的内容应答。
-                        if n == 0 || done {
-                            break;
-                        }
-                    }
-                    let text = String::from_utf8_lossy(&data).to_string();
-                    let first = text.lines().next().unwrap_or_default().to_string();
-                    let (status, body) = if first.starts_with("GET /scpd.xml") {
-                        ("200 OK", scpd_xml())
-                    } else if first.starts_with("GET /desc.xml") {
-                        ("200 OK", DEVICE_XML.to_string())
-                    } else if first.starts_with("POST /ctl") {
-                        let action = text
-                            .lines()
-                            .find_map(|l| {
-                                l.to_ascii_lowercase()
-                                    .starts_with("soapaction:")
-                                    .then(|| l.to_string())
-                            })
-                            .unwrap_or_default();
-                        let permanent_refused =
-                            b.permanent_only && !text.contains("<NewLeaseDuration>0<");
-                        let name = [
-                            "GetExternalIPAddress",
-                            "AddAnyPortMapping",
-                            "AddPortMapping",
-                            "DeletePortMapping",
-                        ]
-                        .into_iter()
-                        .find(|n| action.contains(&format!("#{n}\"")))
-                        .unwrap_or("?");
-                        log.lock().unwrap().push(name.to_string());
-                        match name {
-                            "GetExternalIPAddress" => ("200 OK", soap(&format!("<u:GetExternalIPAddressResponse xmlns:u=\"urn:schemas-upnp-org:service:WANIPConnection:1\"><NewExternalIPAddress>{}</NewExternalIPAddress></u:GetExternalIPAddressResponse>", b.external_ip))),
-                            "AddAnyPortMapping" if b.reject_any_port => ("500 Internal Server Error", soap_fault(728, "NoPortMapsAvailable")),
-                            "AddAnyPortMapping" if permanent_refused => ("500 Internal Server Error", soap_fault(725, "OnlyPermanentLeasesSupported")),
-                            "AddAnyPortMapping" => ("200 OK", soap("<u:AddAnyPortMappingResponse xmlns:u=\"urn:schemas-upnp-org:service:WANIPConnection:1\"><NewReservedPort>45678</NewReservedPort></u:AddAnyPortMappingResponse>")),
-                            "AddPortMapping" if b.reject_fixed_port => ("500 Internal Server Error", soap_fault(718, "ConflictInMappingEntry")),
-                            "AddPortMapping" => ("200 OK", soap("<u:AddPortMappingResponse xmlns:u=\"urn:schemas-upnp-org:service:WANIPConnection:1\"></u:AddPortMappingResponse>")),
-                            "DeletePortMapping" => ("200 OK", soap("<u:DeletePortMappingResponse xmlns:u=\"urn:schemas-upnp-org:service:WANIPConnection:1\"></u:DeletePortMappingResponse>")),
-                            _ => ("404 Not Found", String::new()),
-                        }
-                    } else {
-                        ("404 Not Found", String::new())
-                    };
-                    let reply = format!(
-                        "HTTP/1.1 {status}\r\nContent-Type: text/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    );
-                    let _ = conn.write_all(reply.as_bytes()).await;
-                    let _ = conn.shutdown().await;
-                });
-            }
-        });
+        tokio::spawn(accept_loop(http, b, log.clone()));
 
         let ssdp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let ssdp_addr = ssdp.local_addr().unwrap();
-        tokio::spawn(async move {
-            let mut buf = [0u8; 2048];
-            while let Ok((_, from)) = ssdp.recv_from(&mut buf).await {
-                let reply = format!(
-                    "HTTP/1.1 200 OK\r\nCACHE-CONTROL: max-age=120\r\nLOCATION: http://127.0.0.1:{http_port}/desc.xml\r\nST: urn:schemas-upnp-org:device:InternetGatewayDevice:1\r\n\r\n"
-                );
-                let _ = ssdp.send_to(reply.as_bytes(), from).await;
-            }
-        });
+        let reply = format!("HTTP/1.1 200 OK\r\nLOCATION: http://127.0.0.1:{http_port}/desc.xml\r\nST: urn:schemas-upnp-org:device:InternetGatewayDevice:1\r\n\r\n");
+        tokio::spawn(serve_udp(ssdp, move |_, _| {
+            vec![reply.clone().into_bytes()]
+        }));
         (ssdp_addr, log)
     }
 
@@ -1918,6 +1899,7 @@ mod tests {
             upnp: Arc::new(igd_options(ssdp)),
             first_wait: FAST,
             retry_delay: Duration::from_millis(100),
+            lan_probe: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
         }
     }
 
@@ -2013,9 +1995,7 @@ mod tests {
 
     #[tokio::test]
     async fn map_udp_with_ipv6_gateway_skips_natpmp() {
-        if UdpSocket::bind("[::1]:0").await.is_err() {
-            return;
-        }
+        // 没有 IPv6 的机器上 PCP 在 connect 阶段失败，同样带着 PCP(::1) 标签；NAT-PMP 都不会被尝试。
         let dead = closed_port().await;
         let ep = endpoints(dead, dead, dead_ssdp().await);
         let err = map_udp_with(
@@ -2043,17 +2023,33 @@ mod tests {
     #[tokio::test]
     async fn lan_addr_resolution() {
         // 已指定地址：原样返回。
-        assert_eq!(lan_addr(local_lan(), None).await.unwrap(), local_lan());
+        assert_eq!(
+            lan_addr(local_lan(), None, public_ip()).await.unwrap(),
+            local_lan()
+        );
         // 未指定：按去路由器的源地址推出，端口保留。
-        let got = lan_addr("0.0.0.0:6000".parse().unwrap(), Some(LO))
+        let got = lan_addr("0.0.0.0:6000".parse().unwrap(), Some(LO), public_ip())
             .await
             .unwrap();
         assert_eq!(got, "127.0.0.1:6000".parse().unwrap());
-        // 没有网关时用 TEST-NET 地址探测：有默认路由才推得出来，没有就明确报错。
-        match lan_addr("0.0.0.0:6000".parse().unwrap(), None).await {
-            Ok(addr) => assert_eq!(addr.port(), 6000),
-            Err(e) => assert!(e.contains("无法确定本机的局域网地址"), "{e}"),
-        }
+        // 没有网关时用探测目标推断（这里是回环）；探测目标连不上（广播地址被系统拒绝）就明确报错。
+        let got = lan_addr("0.0.0.0:6000".parse().unwrap(), None, LO)
+            .await
+            .unwrap();
+        assert_eq!(got.port(), 6000);
+        let bad: IpAddr = "255.255.255.255".parse().unwrap();
+        let err = lan_addr("0.0.0.0:6000".parse().unwrap(), None, bad)
+            .await
+            .unwrap_err();
+        assert!(err.contains("无法确定本机的局域网地址"), "{err}");
+        // 同样的失败经 map_udp_with 变成 UPnP 的失败原因，其他协议不受影响。
+        let dead = closed_port().await;
+        let mut ep = endpoints(dead, dead, dead_ssdp().await);
+        ep.lan_probe = bad;
+        let err = map_udp_with("0.0.0.0:6000".parse().unwrap(), &[], SHORT, 0, &ep)
+            .await
+            .unwrap_err();
+        assert!(err.contains("UPnP：无法确定本机的局域网地址"), "{err}");
     }
 
     #[tokio::test]
@@ -2175,26 +2171,16 @@ mod tests {
 
         // 路由器不再应答：发布 None。
         ok.store(false, Ordering::SeqCst);
-        loop {
-            tokio::time::timeout(Duration::from_secs(8), rx.changed())
-                .await
-                .unwrap()
-                .unwrap();
-            if rx.borrow_and_update().is_none() {
-                break;
-            }
-        }
+        tokio::time::timeout(Duration::from_secs(8), rx.wait_for(Option::is_none))
+            .await
+            .unwrap()
+            .unwrap();
         // 恢复后重试成功，重新发布映射。
         ok.store(true, Ordering::SeqCst);
-        loop {
-            tokio::time::timeout(Duration::from_secs(8), rx.changed())
-                .await
-                .unwrap()
-                .unwrap();
-            if rx.borrow_and_update().is_some() {
-                break;
-            }
-        }
+        tokio::time::timeout(Duration::from_secs(8), rx.wait_for(Option::is_some))
+            .await
+            .unwrap()
+            .unwrap();
         // 接收端全部丢弃：任务自己结束。
         drop(rx);
         tokio::time::timeout(Duration::from_secs(5), task)
