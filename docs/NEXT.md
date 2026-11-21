@@ -18,6 +18,11 @@
 - docs/research/H-audio.md 声音（NetEQ 式抖动缓冲、Opus、RED）
 - docs/research/I-release.md 硬件编码、签名、自动更新
 
+## 新需求：远程键盘和快捷键
+键盘操作和系统快捷键要完整转到远程，并处理跨系统互操作（Mac↔Windows↔Linux 的 Cmd/Ctrl 映射、
+输入法、键盘布局、Win 键/Alt+Tab/Cmd+Tab 捕获、Ctrl+Alt+Del、防止修饰键卡住）。
+调研报告 docs/research/J-keyboard.md（子代理写，可能在下次开始时已提交）。排在剪贴板收尾之后。
+
 ## 之后的顺序（产品负责人同意的优先级）
 声音 → 硬件编码 → 无人值守（Windows 先）→ 自动更新和签名 → 文件传输界面 → 账户 + Stripe（数据库用 Supabase）
 → 客户端美观 + 英文官网（中英切换）。域名待定。
