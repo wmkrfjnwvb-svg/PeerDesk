@@ -1340,6 +1340,19 @@ mod tests {
     }
 
     #[test]
+    fn device_by_code_or_fingerprint() {
+        let code = "123456789".to_owned();
+        assert!(matches!(
+            parse_device("--device", Some(&code)),
+            Ok(Lookup::Code(123_456_789))
+        ));
+        let fp = "ab".repeat(32);
+        assert!(matches!(parse_device("--device", Some(&fp)), Ok(Lookup::Device(_))));
+        assert!(parse_device("--device", None).is_err());
+        assert!(parse_device("--device", Some(&"zz".to_owned())).is_err());
+    }
+
+    #[test]
     fn node_cache_round_trip() {
         let dir = temp_dir("nodes-cache");
         assert!(load_nodes(&dir).is_empty());

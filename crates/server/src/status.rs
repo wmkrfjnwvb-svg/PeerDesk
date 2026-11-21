@@ -201,5 +201,13 @@ mod tests {
              \"sessions\":2,\"bytes\":900,\"packets\":7,\"dropped\":3}}"
         ));
         assert_eq!(json.matches('{').count(), json.matches('}').count());
+
+        // 管理中心的集群列表：节点 2 心跳停了 5 秒变“可疑”，再过一阵变“下线”
+        let _ = cluster.tick(Time::from_millis(6000));
+        let listed = cluster_json(&cluster, 6000);
+        assert!(listed.contains("\"suspect\""), "{listed}");
+        let _ = cluster.tick(Time::from_millis(20_000));
+        let listed = cluster_json(&cluster, 20_000);
+        assert!(listed.contains("\"dead\""), "{listed}");
     }
 }
