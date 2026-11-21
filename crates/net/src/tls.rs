@@ -80,9 +80,19 @@ fn transport() -> Arc<quinn::TransportConfig> {
         .keep_alive_interval(Some(KEEP_ALIVE))
         .datagram_receive_buffer_size(Some(DATAGRAM_BUFFER))
         .datagram_send_buffer_size(DATAGRAM_BUFFER)
-        .mtu_discovery_config(Some(mtu));
-    // M2：在这里接入自研的拥塞控制器（congestion_controller_factory）。
+        .mtu_discovery_config(Some(mtu))
+        .congestion_controller_factory(congestion(std::env::var("PEERDESK_CC").ok().as_deref()));
     Arc::new(transport)
+}
+
+/// QUIC 层的拥塞控制。画面和输入的码率由我们自己的实时层决定，这里只是安全网；
+/// 选哪一种由实验决定（`PEERDESK_CC`：cubic、newreno、bbr，默认 cubic），见 scripts/e2e-live.sh。
+fn congestion(name: Option<&str>) -> Arc<dyn quinn::congestion::ControllerFactory + Send + Sync> {
+    match name {
+        Some("bbr") => Arc::new(quinn::congestion::BbrConfig::default()),
+        Some("newreno") => Arc::new(quinn::congestion::NewRenoConfig::default()),
+        Some(_) | None => Arc::new(quinn::congestion::CubicConfig::default()),
+    }
 }
 
 /// 构造一对 QUIC 配置：作为被连接方和作为发起方。
@@ -163,5 +173,23 @@ mod tests {
         }
         assert!(configs(&identity, &Policy::fips()).is_ok());
         assert!(configs(&identity, &Policy::none()).is_err());
+    }
+}
+
+#[cfg(test)]
+mod cc_tests {
+    use super::*;
+
+    #[test]
+    fn every_congestion_choice_builds() {
+        for name in [
+            None,
+            Some("cubic"),
+            Some("newreno"),
+            Some("bbr"),
+            Some("other"),
+        ] {
+            let _ = congestion(name);
+        }
     }
 }

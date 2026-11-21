@@ -109,6 +109,10 @@ jobs:
             echo
             cat target/e2e-live/summary.md 2>/dev/null || echo "没有运行"
             echo
+            echo "#### 实验：画面大量变化时 QUIC 层拥塞控制的影响（只报告）"
+            echo
+            cat target/e2e-live/congestion.md 2>/dev/null || true
+            echo
             echo "截图在构建产物 e2e-<提交>：每个场景一个目录，左边源画面、中间控制端看到的画面、右边差异（放大 8 倍）。"
           } >> "$GITHUB_STEP_SUMMARY"
       # 截图几十 MB：只在失败或完整运行时上传。
