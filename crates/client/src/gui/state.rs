@@ -346,6 +346,14 @@ mod tests {
         // 剪贴板事件不改变会话状态
         let phase = ViewPhase::Connecting;
         assert_eq!(phase.apply(&ViewEvent::Clipboard(ok), s), phase);
+        assert_eq!(phase.headline(s), s.connecting);
+        let connected = ViewPhase::Connected {
+            peer: String::new(),
+            remote: "127.0.0.1:1".parse().unwrap(),
+            route: peerdesk_net::rendezvous::Path::Direct,
+            detail: String::new(),
+        };
+        assert_eq!(connected.headline(s), "");
     }
     use crate::gui::i18n::EN;
     use peerdesk_net::NetError;
