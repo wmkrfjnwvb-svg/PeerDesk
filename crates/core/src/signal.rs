@@ -28,14 +28,26 @@ pub struct RelayGrant {
 /// 信令消息。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SignalMsg {
-    /// 设备 → 服务器：我在线，可以被连接。
-    Register,
+    /// 设备 → 服务器：我在线，可以被连接。附上本机网卡上的地址（端口是同一个），
+    /// 同一个局域网里的控制端可以直接连，不用绕到公网（很多路由器不支持回环）。
+    Register {
+        /// 本机地址，最多 [`MAX_LOCALS`] 个。
+        locals: Vec<SocketAddr>,
+    },
     /// 服务器 → 设备：登记成功，这是我看到的你的公网地址和你的设备码。
     Registered {
         /// 服务器看到的设备地址。
         observed: SocketAddr,
         /// 服务器给这台设备分配的 9 位设备码，同一台设备每次登记都一样。
         code: u32,
+        /// 探测地址：设备从同一个端口向这里发 [`observe_packet`]，服务器比较两次看到的端口，
+        /// 判断设备的 NAT 是不是“换目的地就换端口”（难打洞）。服务器没开中继时为 `None`。
+        probe: Option<SocketAddr>,
+    },
+    /// 服务器 → 控制端：先从连接用的端口向 `relay` 发几个 [`observe_packet`]，再重发连接请求。
+    Probe {
+        /// 探测地址。
+        relay: SocketAddr,
     },
     /// 控制端 → 服务器：我要连这台设备。
     Connect {
@@ -53,6 +65,12 @@ pub enum SignalMsg {
         device: DeviceId,
         /// 被控端的公网地址。
         addr: SocketAddr,
+        /// 被控端的本机地址。
+        locals: Vec<SocketAddr>,
+        /// 服务器看到的控制端自己的地址：和被控端公网地址的 IP 相同时，两端在同一个出口后面。
+        you: SocketAddr,
+        /// 打洞方式。
+        punch: PunchInfo,
         /// 中继通道。
         relay: Option<RelayGrant>,
     },
@@ -62,6 +80,8 @@ pub enum SignalMsg {
         peer: DeviceId,
         /// 控制端的公网地址。
         addr: SocketAddr,
+        /// 打洞方式。
+        punch: PunchInfo,
         /// 中继通道。
         relay: Option<RelayGrant>,
     },
@@ -92,6 +112,176 @@ fn get_addr(r: &mut Reader<'_>) -> Result<SocketAddr, Error> {
         _ => return Err(Error::Inconsistent("未知的地址族")),
     };
     Ok(SocketAddr::new(ip, r.u16()?))
+}
+
+fn put_opt_addr(w: &mut Writer, addr: Option<&SocketAddr>) {
+    match addr {
+        None => {
+            w.u8(0);
+        }
+        Some(a) => {
+            w.u8(1);
+            put_addr(w, a);
+        }
+    }
+}
+
+fn get_opt_addr(r: &mut Reader<'_>) -> Result<Option<SocketAddr>, Error> {
+    match r.u8()? {
+        0 => Ok(None),
+        1 => Ok(Some(get_addr(r)?)),
+        _ => Err(Error::Inconsistent("地址标志不合法")),
+    }
+}
+
+/// 一台设备的 NAT 好不好打洞。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Nat {
+    /// 不知道（服务器没开中继，或者设备的探测包没到）。
+    Unknown,
+    /// 映射与目的地无关：发往不同目的地用同一个公网端口（各种锥形 NAT，或者没有 NAT）。
+    Easy,
+    /// 映射随目的地变化（对称型）：对方看到的端口和服务器看到的不一样。
+    Hard,
+}
+
+impl Nat {
+    /// 比较服务器在信令端口和探测端口看到的同一个设备端口的地址。
+    #[must_use]
+    pub fn classify(signal: SocketAddr, probe: Option<SocketAddr>) -> Self {
+        match probe {
+            None => Nat::Unknown,
+            Some(p) if p == signal => Nat::Easy,
+            Some(_) => Nat::Hard,
+        }
+    }
+
+    const fn code(self) -> u8 {
+        match self {
+            Nat::Unknown => 0,
+            Nat::Easy => 1,
+            Nat::Hard => 2,
+        }
+    }
+
+    fn from_code(code: u8) -> Result<Self, Error> {
+        match code {
+            0 => Ok(Nat::Unknown),
+            1 => Ok(Nat::Easy),
+            2 => Ok(Nat::Hard),
+            _ => Err(Error::Inconsistent("未知的 NAT 类型")),
+        }
+    }
+}
+
+/// 一次连接的打洞方式：两端的 NAT 类型和这次的随机暗号（探测包里带上，收到时核对）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PunchInfo {
+    /// 暗号。
+    pub nonce: [u8; 16],
+    /// 收到这条消息的一端的 NAT。
+    pub me: Nat,
+    /// 对端的 NAT。
+    pub peer: Nat,
+}
+
+/// 根据两端的 NAT 选的打洞方法（每一端各自算，结果互相对应）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PunchPlan {
+    /// 普通打洞：向对方的公网地址发包。
+    Plain,
+    /// 对方是难打洞的一端：向对方公网 IP 的随机端口撒探测包，等它的某个端口撞上。
+    Spray,
+    /// 本端是难打洞的一端：开很多个端口，都向对方发探测包，用最先收到对方探测包的那个端口连接。
+    Sockets,
+    /// 两端都难：打洞几乎不可能成功（两端各撒 256 个包时 20 秒成功率约万分之一），直接走中继。
+    Skip,
+}
+
+impl PunchInfo {
+    /// 这一端该用的打洞方法。
+    #[must_use]
+    pub const fn plan(&self) -> PunchPlan {
+        match (self.me, self.peer) {
+            (Nat::Hard, Nat::Hard) => PunchPlan::Skip,
+            (Nat::Hard, Nat::Easy | Nat::Unknown) => PunchPlan::Sockets,
+            (Nat::Easy | Nat::Unknown, Nat::Hard) => PunchPlan::Spray,
+            (Nat::Easy | Nat::Unknown, Nat::Easy | Nat::Unknown) => PunchPlan::Plain,
+        }
+    }
+
+    fn put(&self, w: &mut Writer) {
+        w.bytes(&self.nonce).u8(self.me.code()).u8(self.peer.code());
+    }
+
+    fn get(r: &mut Reader<'_>) -> Result<Self, Error> {
+        let mut nonce = [0u8; 16];
+        nonce.copy_from_slice(r.take(16)?);
+        Ok(Self {
+            nonce,
+            me: Nat::from_code(r.u8()?)?,
+            peer: Nat::from_code(r.u8()?)?,
+        })
+    }
+}
+
+/// 探测包的开头。
+pub const OBSERVE_MAGIC: &[u8; 8] = b"PDOBSV01";
+/// 打洞探测包的开头。
+pub const PROBE_MAGIC: &[u8; 8] = b"PDPROBE1";
+
+/// NAT 探测包：从连接用的端口发往服务器的探测地址，带上设备指纹。
+#[must_use]
+pub fn observe_packet(device: &DeviceId) -> Vec<u8> {
+    let mut p = OBSERVE_MAGIC.to_vec();
+    p.extend_from_slice(device);
+    p
+}
+
+/// 解析 NAT 探测包，返回设备指纹。
+#[must_use]
+pub fn parse_observe(packet: &[u8]) -> Option<DeviceId> {
+    let rest = packet.strip_prefix(OBSERVE_MAGIC.as_slice())?;
+    DeviceId::try_from(rest).ok()
+}
+
+/// 打洞探测包：带上这次连接的暗号和发往的端口（对方据此知道自己的公网端口）。
+#[must_use]
+pub fn probe_packet(nonce: &[u8; 16], to_port: u16) -> Vec<u8> {
+    let mut p = PROBE_MAGIC.to_vec();
+    p.extend_from_slice(nonce);
+    p.extend_from_slice(&to_port.to_be_bytes());
+    p
+}
+
+/// 解析打洞探测包：暗号对得上时返回包里写的目的端口。
+#[must_use]
+pub fn parse_probe(packet: &[u8], nonce: &[u8; 16]) -> Option<u16> {
+    let rest = packet.strip_prefix(PROBE_MAGIC.as_slice())?;
+    let (got, port) = rest.split_at_checked(16)?;
+    if got != nonce {
+        return None;
+    }
+    Some(u16::from_be_bytes(<[u8; 2]>::try_from(port).ok()?))
+}
+
+/// 一台设备最多报告这么多个本机地址。
+pub const MAX_LOCALS: usize = 8;
+
+fn put_addrs(w: &mut Writer, addrs: &[SocketAddr]) {
+    let addrs = addrs.get(..addrs.len().min(MAX_LOCALS)).unwrap_or_default();
+    w.u8(u8::try_from(addrs.len()).unwrap_or(0));
+    for addr in addrs {
+        put_addr(w, addr);
+    }
+}
+
+fn get_addrs(r: &mut Reader<'_>) -> Result<Vec<SocketAddr>, Error> {
+    let n = usize::from(r.u8()?);
+    if n > MAX_LOCALS {
+        return Err(Error::Inconsistent("本机地址太多"));
+    }
+    (0..n).map(|_| get_addr(r)).collect()
 }
 
 fn put_grant(w: &mut Writer, grant: Option<&RelayGrant>) {
@@ -135,16 +325,31 @@ fn get_id(r: &mut Reader<'_>) -> Result<DeviceId, Error> {
 }
 
 impl SignalMsg {
+    /// 消息里的打洞方式（只有 `Peer` 和 `Incoming` 带）。
+    #[must_use]
+    pub const fn punch(&self) -> Option<&PunchInfo> {
+        match self {
+            SignalMsg::Peer { punch, .. } | SignalMsg::Incoming { punch, .. } => Some(punch),
+            SignalMsg::Register { .. }
+            | SignalMsg::Registered { .. }
+            | SignalMsg::Probe { .. }
+            | SignalMsg::Connect { .. }
+            | SignalMsg::ConnectCode { .. }
+            | SignalMsg::NotFound => None,
+        }
+    }
+
     /// 消息名。
     #[must_use]
     pub const fn name(&self) -> &'static str {
         match self {
-            SignalMsg::Register => "Register",
+            SignalMsg::Register { .. } => "Register",
             SignalMsg::Registered { .. } => "Registered",
             SignalMsg::Connect { .. } => "Connect",
             SignalMsg::ConnectCode { .. } => "ConnectCode",
             SignalMsg::Peer { .. } => "Peer",
             SignalMsg::Incoming { .. } => "Incoming",
+            SignalMsg::Probe { .. } => "Probe",
             SignalMsg::NotFound => "NotFound",
         }
     }
@@ -154,13 +359,23 @@ impl SignalMsg {
     pub fn encode(&self) -> Vec<u8> {
         let mut w = Writer::new();
         match self {
-            SignalMsg::Register => {
+            SignalMsg::Register { locals } => {
                 w.u8(1);
+                put_addrs(&mut w, locals);
             }
-            SignalMsg::Registered { observed, code } => {
+            SignalMsg::Registered {
+                observed,
+                code,
+                probe,
+            } => {
                 w.u8(2);
                 put_addr(&mut w, observed);
                 w.u32(*code);
+                put_opt_addr(&mut w, probe.as_ref());
+            }
+            SignalMsg::Probe { relay } => {
+                w.u8(8);
+                put_addr(&mut w, relay);
             }
             SignalMsg::Connect { target } => {
                 w.u8(3).bytes(target);
@@ -168,15 +383,27 @@ impl SignalMsg {
             SignalMsg::Peer {
                 device,
                 addr,
+                locals,
+                you,
+                punch,
                 relay,
             } => {
                 w.u8(4).bytes(device);
                 put_addr(&mut w, addr);
+                put_addrs(&mut w, locals);
+                put_addr(&mut w, you);
+                punch.put(&mut w);
                 put_grant(&mut w, relay.as_ref());
             }
-            SignalMsg::Incoming { peer, addr, relay } => {
+            SignalMsg::Incoming {
+                peer,
+                addr,
+                punch,
+                relay,
+            } => {
                 w.u8(5).bytes(peer);
                 put_addr(&mut w, addr);
+                punch.put(&mut w);
                 put_grant(&mut w, relay.as_ref());
             }
             SignalMsg::NotFound => {
@@ -193,10 +420,16 @@ impl SignalMsg {
     pub fn decode(buf: &[u8]) -> Result<Self, Error> {
         let mut r = Reader::new(buf);
         let msg = match r.u8()? {
-            1 => SignalMsg::Register,
+            1 => SignalMsg::Register {
+                locals: get_addrs(&mut r)?,
+            },
             2 => SignalMsg::Registered {
                 observed: get_addr(&mut r)?,
                 code: r.u32()?,
+                probe: get_opt_addr(&mut r)?,
+            },
+            8 => SignalMsg::Probe {
+                relay: get_addr(&mut r)?,
             },
             3 => SignalMsg::Connect {
                 target: get_id(&mut r)?,
@@ -204,11 +437,15 @@ impl SignalMsg {
             4 => SignalMsg::Peer {
                 device: get_id(&mut r)?,
                 addr: get_addr(&mut r)?,
+                locals: get_addrs(&mut r)?,
+                you: get_addr(&mut r)?,
+                punch: PunchInfo::get(&mut r)?,
                 relay: get_grant(&mut r)?,
             },
             5 => SignalMsg::Incoming {
                 peer: get_id(&mut r)?,
                 addr: get_addr(&mut r)?,
+                punch: PunchInfo::get(&mut r)?,
                 relay: get_grant(&mut r)?,
             },
             6 => SignalMsg::NotFound,
@@ -254,9 +491,17 @@ pub fn parse_code(text: &str) -> Option<u32> {
 /// 设备码一经分配就固定在这台设备（指纹）上，码簿由 IO 层存盘，服务器重启后不变。
 #[derive(Debug, Clone, Default)]
 pub struct Registry {
-    devices: BTreeMap<DeviceId, (u64, SocketAddr)>,
+    devices: BTreeMap<DeviceId, Online>,
     codes: BTreeMap<DeviceId, u32>,
     owners: BTreeMap<u32, DeviceId>,
+}
+
+/// 一台在线设备。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Online {
+    conn: u64,
+    observed: SocketAddr,
+    locals: Vec<SocketAddr>,
 }
 
 /// [`Registry::connect`] 的结果：要发给谁什么消息。
@@ -337,6 +582,8 @@ impl Registry {
         conn: u64,
         device: DeviceId,
         observed: SocketAddr,
+        locals: &[SocketAddr],
+        probe: Option<SocketAddr>,
         random: &mut dyn FnMut() -> u32,
     ) -> Option<Registered> {
         let (code, new_code) = match self.codes.get(&device) {
@@ -351,12 +598,33 @@ impl Registry {
                 (code, true)
             }
         };
-        self.devices.insert(device, (conn, observed));
+        let locals = locals
+            .get(..locals.len().min(MAX_LOCALS))
+            .unwrap_or_default()
+            .to_vec();
+        self.devices.insert(
+            device,
+            Online {
+                conn,
+                observed,
+                locals,
+            },
+        );
         Some(Registered {
-            reply: SignalMsg::Registered { observed, code },
+            reply: SignalMsg::Registered {
+                observed,
+                code,
+                probe,
+            },
             code,
             new_code,
         })
+    }
+
+    /// 设备是否在线。
+    #[must_use]
+    pub fn is_online(&self, device: &DeviceId) -> bool {
+        self.devices.contains_key(device)
     }
 
     /// 设备码对应的设备。
@@ -367,7 +635,7 @@ impl Registry {
 
     /// 一条连接断开：如果它是某台设备当前的登记连接，把设备标为离线。
     pub fn disconnect(&mut self, conn: u64) {
-        self.devices.retain(|_, (c, _)| *c != conn);
+        self.devices.retain(|_, d| d.conn != conn);
     }
 
     /// 在线设备数。
@@ -376,7 +644,8 @@ impl Registry {
         self.devices.len()
     }
 
-    /// 控制端请求连接 `target`。`relay` 是为这次连接准备的中继地址和会话号（没有中继时为 `None`）。
+    /// 控制端请求连接 `target`。`relay` 是为这次连接准备的中继地址和会话号（没有中继时为 `None`）；
+    /// `nonce` 是这次连接的暗号；`probe_of` 给出服务器在探测地址上看到的某台设备的地址。
     #[must_use]
     pub fn connect(
         &self,
@@ -384,8 +653,10 @@ impl Registry {
         controller_addr: SocketAddr,
         target: &DeviceId,
         relay: Option<(SocketAddr, SessionId)>,
+        nonce: [u8; 16],
+        probe_of: &dyn Fn(&DeviceId) -> Option<SocketAddr>,
     ) -> Introduction {
-        let Some((conn, host_addr)) = self.devices.get(target) else {
+        let Some(host) = self.devices.get(target) else {
             return Introduction {
                 to_controller: SignalMsg::NotFound,
                 to_host: None,
@@ -398,17 +669,31 @@ impl Registry {
                 side,
             })
         };
+        let ctrl_nat = Nat::classify(controller_addr, probe_of(&controller));
+        let host_nat = Nat::classify(host.observed, probe_of(target));
         Introduction {
             to_controller: SignalMsg::Peer {
                 device: *target,
-                addr: *host_addr,
+                addr: host.observed,
+                locals: host.locals.clone(),
+                you: controller_addr,
+                punch: PunchInfo {
+                    nonce,
+                    me: ctrl_nat,
+                    peer: host_nat,
+                },
                 relay: grant(0),
             },
             to_host: Some((
-                *conn,
+                host.conn,
                 SignalMsg::Incoming {
                     peer: controller,
                     addr: controller_addr,
+                    punch: PunchInfo {
+                        nonce,
+                        me: host_nat,
+                        peer: ctrl_nat,
+                    },
                     relay: grant(1),
                 },
             )),
@@ -450,26 +735,57 @@ mod tests {
     #[test]
     fn messages_roundtrip() {
         let all = [
-            SignalMsg::Register,
+            SignalMsg::Register { locals: vec![] },
+            SignalMsg::Register {
+                locals: vec![addr("192.168.1.5:4433"), addr("[fd00::5]:4433")],
+            },
             SignalMsg::Registered {
                 observed: addr("203.0.113.9:40000"),
                 code: 123_456_789,
+                probe: Some(addr("203.0.113.1:3478")),
+            },
+            SignalMsg::Registered {
+                observed: addr("203.0.113.9:40000"),
+                code: 123_456_789,
+                probe: None,
+            },
+            SignalMsg::Probe {
+                relay: addr("203.0.113.1:3478"),
             },
             SignalMsg::Connect { target: [1; 32] },
             SignalMsg::ConnectCode { code: 987_654_321 },
             SignalMsg::Peer {
                 device: [3; 32],
                 addr: addr("[2001:db8::2]:1"),
+                locals: vec![addr("10.0.0.2:1")],
+                you: addr("[2001:db8::3]:2"),
+                punch: PunchInfo {
+                    nonce: [6; 16],
+                    me: Nat::Easy,
+                    peer: Nat::Hard,
+                },
                 relay: Some(grant(0)),
             },
             SignalMsg::Peer {
                 device: [4; 32],
                 addr: addr("1.2.3.4:5"),
+                locals: vec![],
+                you: addr("1.2.3.4:6"),
+                punch: PunchInfo {
+                    nonce: [6; 16],
+                    me: Nat::Easy,
+                    peer: Nat::Hard,
+                },
                 relay: None,
             },
             SignalMsg::Incoming {
                 peer: [2; 32],
                 addr: addr("1.2.3.4:5"),
+                punch: PunchInfo {
+                    nonce: [6; 16],
+                    me: Nat::Easy,
+                    peer: Nat::Hard,
+                },
                 relay: Some(grant(1)),
             },
             SignalMsg::NotFound,
@@ -483,7 +799,10 @@ mod tests {
             names,
             [
                 "Register",
+                "Register",
                 "Registered",
+                "Registered",
+                "Probe",
                 "Connect",
                 "ConnectCode",
                 "Peer",
@@ -496,8 +815,24 @@ mod tests {
 
     #[test]
     fn malformed_messages_are_rejected() {
+        let mut too_many = vec![1u8, 9];
+        too_many.extend([4, 1, 2, 3, 4, 0, 1]);
+        assert_eq!(
+            SignalMsg::decode(&too_many),
+            Err(Error::Inconsistent("本机地址太多"))
+        );
+        // 编码时多出来的地址截掉
+        let many = SignalMsg::Register {
+            locals: vec![addr("10.0.0.1:1"); 20],
+        };
+        assert_eq!(
+            SignalMsg::decode(&many.encode()),
+            Ok(SignalMsg::Register {
+                locals: vec![addr("10.0.0.1:1"); MAX_LOCALS]
+            })
+        );
         assert_eq!(SignalMsg::decode(&[0]), Err(Error::UnknownMessage(0)));
-        assert_eq!(SignalMsg::decode(&[1, 0]), Err(Error::TrailingBytes(1)));
+        assert_eq!(SignalMsg::decode(&[1, 0, 0]), Err(Error::TrailingBytes(1)));
         assert_eq!(
             SignalMsg::decode(&[2, 9]),
             Err(Error::Inconsistent("未知的地址族"))
@@ -513,6 +848,13 @@ mod tests {
         let mut bad_flag = SignalMsg::Peer {
             device: [4; 32],
             addr: addr("1.2.3.4:5"),
+            locals: vec![],
+            you: addr("1.2.3.4:6"),
+            punch: PunchInfo {
+                nonce: [6; 16],
+                me: Nat::Easy,
+                peer: Nat::Hard,
+            },
             relay: None,
         }
         .encode();
@@ -524,6 +866,13 @@ mod tests {
         let mut bad_side = SignalMsg::Peer {
             device: [4; 32],
             addr: addr("1.2.3.4:5"),
+            locals: vec![],
+            you: addr("1.2.3.4:6"),
+            punch: PunchInfo {
+                nonce: [6; 16],
+                me: Nat::Easy,
+                peer: Nat::Hard,
+            },
             relay: Some(grant(0)),
         }
         .encode();
@@ -535,6 +884,11 @@ mod tests {
         let good = SignalMsg::Incoming {
             peer: [2; 32],
             addr: addr("1.2.3.4:5"),
+            punch: PunchInfo {
+                nonce: [6; 16],
+                me: Nat::Easy,
+                peer: Nat::Hard,
+            },
             relay: Some(grant(1)),
         }
         .encode();
@@ -549,11 +903,19 @@ mod tests {
         let (host, ctrl) = ([1; 32], [2; 32]);
         let mut next = || 5;
         assert_eq!(
-            reg.register(10, host, addr("198.51.100.1:5000"), &mut next),
+            reg.register(
+                10,
+                host,
+                addr("198.51.100.1:5000"),
+                &[addr("192.168.0.9:5000"); 12],
+                None,
+                &mut next
+            ),
             Some(Registered {
                 reply: SignalMsg::Registered {
                     observed: addr("198.51.100.1:5000"),
                     code: CODE_MIN + 5,
+                    probe: None,
                 },
                 code: CODE_MIN + 5,
                 new_code: true,
@@ -562,12 +924,17 @@ mod tests {
         assert_eq!(reg.online(), 1);
 
         let relay = Some((addr("203.0.113.1:3478"), [8; 16]));
-        let intro = reg.connect(ctrl, addr("192.0.2.7:6000"), &host, relay);
+        let intro = reg.connect(ctrl, addr("192.0.2.7:6000"), &host, relay, [6; 16], &|_| {
+            None
+        });
         match (&intro.to_controller, &intro.to_host) {
             (
                 SignalMsg::Peer {
                     device,
                     addr: host_addr,
+                    locals,
+                    you,
+                    punch,
                     relay: Some(c),
                 },
                 Some((
@@ -576,10 +943,14 @@ mod tests {
                         peer,
                         addr: ctrl_addr,
                         relay: Some(h),
+                        ..
                     },
                 )),
             ) => {
                 assert_eq!(*device, host);
+                assert_eq!(punch.plan(), PunchPlan::Plain, "不知道 NAT 类型时普通打洞");
+                assert_eq!(locals.len(), MAX_LOCALS, "多报的地址截掉");
+                assert_eq!(*you, addr("192.0.2.7:6000"));
                 assert_eq!(*host_addr, addr("198.51.100.1:5000"));
                 assert_eq!(*ctrl_addr, addr("192.0.2.7:6000"));
                 assert_eq!(*peer, ctrl);
@@ -589,14 +960,23 @@ mod tests {
             other => panic!("{other:?}"),
         }
         // 没有中继可用
-        let intro = reg.connect(ctrl, addr("192.0.2.7:6000"), &host, None);
+        let intro = reg.connect(ctrl, addr("192.0.2.7:6000"), &host, None, [6; 16], &|_| {
+            None
+        });
         assert!(matches!(
             intro.to_controller,
             SignalMsg::Peer { relay: None, .. }
         ));
 
         // 目标不在线
-        let intro = reg.connect(ctrl, addr("192.0.2.7:6000"), &[9; 32], relay);
+        let intro = reg.connect(
+            ctrl,
+            addr("192.0.2.7:6000"),
+            &[9; 32],
+            relay,
+            [6; 16],
+            &|_| None,
+        );
         assert_eq!(
             intro,
             Introduction {
@@ -607,7 +987,7 @@ mod tests {
 
         // 重新登记：以新连接为准；旧连接断开不影响
         let again = reg
-            .register(11, host, addr("198.51.100.1:5001"), &mut next)
+            .register(11, host, addr("198.51.100.1:5001"), &[], None, &mut next)
             .unwrap();
         assert_eq!(
             (again.code, again.new_code),
@@ -627,10 +1007,10 @@ mod tests {
         let mut seq = [7u32, 7, 7, 9].into_iter();
         let mut next = || seq.next().unwrap_or(0);
         let a = reg
-            .register(1, [1; 32], addr("1.1.1.1:1"), &mut next)
+            .register(1, [1; 32], addr("1.1.1.1:1"), &[], None, &mut next)
             .unwrap();
         let b = reg
-            .register(2, [2; 32], addr("1.1.1.1:2"), &mut next)
+            .register(2, [2; 32], addr("1.1.1.1:2"), &[], None, &mut next)
             .unwrap();
         assert_eq!((a.code, b.code), (CODE_MIN + 7, CODE_MIN + 9));
         assert_eq!(reg.device_of(b.code), Some([2; 32]));
@@ -638,7 +1018,7 @@ mod tests {
         // 码簿装不下（随机数一直冲突）时拒绝登记
         let mut stuck = || 7;
         assert_eq!(
-            reg.register(3, [3; 32], addr("1.1.1.1:3"), &mut stuck),
+            reg.register(3, [3; 32], addr("1.1.1.1:3"), &[], None, &mut stuck),
             None
         );
 
@@ -653,7 +1033,7 @@ mod tests {
         assert_eq!(restarted.known(), 2);
         assert_eq!(restarted.online(), 0);
         let again = restarted
-            .register(5, [1; 32], addr("2.2.2.2:2"), &mut stuck)
+            .register(5, [1; 32], addr("2.2.2.2:2"), &[], None, &mut stuck)
             .unwrap();
         assert_eq!((again.code, again.new_code), (CODE_MIN + 7, false));
         assert_eq!(
@@ -671,5 +1051,77 @@ mod tests {
         assert_eq!(parse_code("1234567890"), None);
         assert_eq!(parse_code("12345678x"), None);
         assert_eq!(parse_code("012345678"), None, "首位不能是 0");
+    }
+
+    #[test]
+    fn nat_classes_pick_matching_plans() {
+        let a = addr("203.0.113.9:4000");
+        assert_eq!(Nat::classify(a, None), Nat::Unknown);
+        assert_eq!(Nat::classify(a, Some(a)), Nat::Easy);
+        assert_eq!(Nat::classify(a, Some(addr("203.0.113.9:4001"))), Nat::Hard);
+        let plan = |me, peer| {
+            PunchInfo {
+                nonce: [0; 16],
+                me,
+                peer,
+            }
+            .plan()
+        };
+        assert_eq!(plan(Nat::Hard, Nat::Hard), PunchPlan::Skip);
+        assert_eq!(plan(Nat::Hard, Nat::Easy), PunchPlan::Sockets);
+        assert_eq!(plan(Nat::Hard, Nat::Unknown), PunchPlan::Sockets);
+        assert_eq!(plan(Nat::Easy, Nat::Hard), PunchPlan::Spray);
+        assert_eq!(plan(Nat::Unknown, Nat::Hard), PunchPlan::Spray);
+        assert_eq!(plan(Nat::Easy, Nat::Unknown), PunchPlan::Plain);
+        assert_eq!(
+            Nat::from_code(3),
+            Err(Error::Inconsistent("未知的 NAT 类型"))
+        );
+
+        // 服务器按探测结果给两端算出对应的方法：难的一端开很多端口，容易的一端撒包
+        let mut reg = Registry::new();
+        let (host, ctrl) = ([1; 32], [2; 32]);
+        let host_seen = addr("198.51.100.1:5000");
+        let mut next = || 1;
+        reg.register(1, host, host_seen, &[], None, &mut next)
+            .unwrap();
+        let probes = move |d: &DeviceId| match d {
+            [1, ..] => Some(host_seen),
+            _ => Some(addr("192.0.2.7:6001")),
+        };
+        let intro = reg.connect(ctrl, addr("192.0.2.7:6000"), &host, None, [9; 16], &probes);
+        let ctrl_plan = intro.to_controller.punch().map(PunchInfo::plan);
+        let host_punch = intro.to_host.as_ref().and_then(|(_, m)| m.punch());
+        assert_eq!(ctrl_plan, Some(PunchPlan::Sockets));
+        assert_eq!(host_punch.map(PunchInfo::plan), Some(PunchPlan::Spray));
+        assert_eq!(host_punch.map(|p| p.nonce), Some([9; 16]));
+        assert_eq!(SignalMsg::NotFound.punch(), None);
+    }
+
+    #[test]
+    fn probe_packets_carry_nonce_and_port() {
+        let fp = [7u8; 32];
+        assert_eq!(parse_observe(&observe_packet(&fp)), Some(fp));
+        assert_eq!(parse_observe(b"PDOBSV01short"), None);
+        assert_eq!(parse_observe(b"other"), None);
+        let nonce = [3u8; 16];
+        let p = probe_packet(&nonce, 40_123);
+        assert_eq!(parse_probe(&p, &nonce), Some(40_123));
+        assert_eq!(parse_probe(&p, &[4; 16]), None, "暗号不对");
+        assert_eq!(parse_probe(&p[..p.len() - 1], &nonce), None);
+        assert_eq!(parse_probe(&p[..10], &nonce), None);
+        assert_eq!(parse_probe(b"junk", &nonce), None);
+        // 地址标志不合法
+        let mut bad = SignalMsg::Registered {
+            observed: addr("1.2.3.4:5"),
+            code: 1,
+            probe: None,
+        }
+        .encode();
+        *bad.last_mut().unwrap() = 9;
+        assert_eq!(
+            SignalMsg::decode(&bad),
+            Err(Error::Inconsistent("地址标志不合法"))
+        );
     }
 }

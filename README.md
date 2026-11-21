@@ -89,7 +89,10 @@ peerdesk connect ... --device <设备码> --relay-only                  # 只走
 在 Linux 服务器上部署服务端（systemd、防火墙、指纹、升级、排错）见 [docs/deploy-server.md](docs/deploy-server.md)。
 提交信息带 `[pkg]` 时 CI 会产出静态链接的 `peerdesk-<提交>-linux-server`。
 
-控制端会打印实际走的路径（直连 / 中继）。管理接口的 `/api/status` 里有在线设备数和中继的转发总量。
+控制端会打印实际走的路径（直连 / 中继）、打洞方式和各阶段耗时。
+
+打洞的效果用 `sudo scripts/nat-lab.sh` 测：网络命名空间 + nftables 搭出锥形、对称型、同一路由器、双层 NAT 等组合，
+真实二进制按设备码连接，CI 每次都跑（除两端都是对称型外必须直连）。结果和方法见 [docs/research/F-nat.md](docs/research/F-nat.md)。管理接口的 `/api/status` 里有在线设备数和中继的转发总量。
 
 ```bash
 cargo run -p peerdesk -- sim --link wifi --loss 30 --trace   # 在仿真网络上跑一次完整会话

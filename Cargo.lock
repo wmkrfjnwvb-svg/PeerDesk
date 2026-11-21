@@ -2036,7 +2036,6 @@ version = "0.1.0"
 dependencies = [
  "eframe",
  "getrandom 0.2.17",
- "if-addrs",
  "log",
  "num-traits",
  "peerdesk-core",
@@ -2085,6 +2084,7 @@ name = "peerdesk-net"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "if-addrs",
  "log",
  "peerdesk-core",
  "peerdesk-media",

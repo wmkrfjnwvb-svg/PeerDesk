@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use peerdesk_core::relay::{Record, Relay, SessionId, Usage};
-use peerdesk_core::signal::{format_code, DeviceId, Registry, SignalMsg};
+use peerdesk_core::signal::{format_code, parse_observe, DeviceId, Registry, SignalMsg};
 use peerdesk_core::Time;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
@@ -33,9 +33,30 @@ pub struct RelayService {
     addr: SocketAddr,
     relay: Arc<Mutex<Relay>>,
     records: Arc<Mutex<Vec<Record>>>,
+    /// NAT 探测：每台设备最近一次在这个端口上被看到的地址。
+    observed: Arc<Mutex<BTreeMap<DeviceId, SocketAddr>>>,
     started: Instant,
     task: JoinHandle<()>,
 }
+
+/// 记下一台设备的探测结果；表满了就清空重来（只影响打洞方法的选择，下次探测又会补上）。
+fn remember(
+    seen: &mut BTreeMap<DeviceId, SocketAddr>,
+    device: DeviceId,
+    from: SocketAddr,
+    max: usize,
+) {
+    if seen.len() >= max {
+        seen.clear();
+    }
+    seen.insert(device, from);
+}
+
+/// 等控制端探测包的步数和每步时长（最多 200 毫秒）。
+const PROBE_WAIT_STEPS: u32 = 20;
+const PROBE_WAIT_STEP: Duration = Duration::from_millis(10);
+/// 最多记住这么多台设备的探测结果；满了就清空重来（只影响打洞方法的选择）。
+const MAX_OBSERVED: usize = 100_000;
 
 impl RelayService {
     /// 在 `bind` 上启动。`advertise` 是告诉客户端的地址（服务器在 NAT 或负载均衡后面时与 `bind` 不同）。
@@ -46,7 +67,12 @@ impl RelayService {
         let relay = Arc::new(Mutex::new(Relay::new(RELAY_IDLE_US, RELAY_MAX_SESSIONS)));
         let records = Arc::new(Mutex::new(Vec::new()));
         let started = Instant::now();
-        let (relay2, records2) = (Arc::clone(&relay), Arc::clone(&records));
+        let observed = Arc::new(Mutex::new(BTreeMap::new()));
+        let (relay2, records2, observed2) = (
+            Arc::clone(&relay),
+            Arc::clone(&records),
+            Arc::clone(&observed),
+        );
         let task = tokio::spawn(async move {
             let now = || Time(u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX));
             let mut sweep = tokio::time::interval(Duration::from_secs(1));
@@ -60,6 +86,10 @@ impl RelayService {
                     received = socket.recv_from(&mut buf) => {
                         let Ok((len, from)) = received else { continue };
                         let packet = buf.get(..len).unwrap_or_default();
+                        if let Some(device) = parse_observe(packet) {
+                            remember(&mut lock(&observed2), device, from, MAX_OBSERVED);
+                            continue;
+                        }
                         let to = lock(&relay2).on_packet(now(), from, packet);
                         if let Some(to) = to {
                             let _ = socket.send_to(packet, to).await;
@@ -72,9 +102,21 @@ impl RelayService {
             addr,
             relay,
             records,
+            observed,
             started,
             task,
         })
+    }
+
+    /// 设备 `device` 最近一次的 NAT 探测包是从哪个地址来的。
+    #[must_use]
+    pub fn observed(&self, device: &DeviceId) -> Option<SocketAddr> {
+        lock(&self.observed).get(device).copied()
+    }
+
+    /// 忘掉设备 `device` 的探测结果（马上要重新探测）。
+    pub fn forget(&self, device: &DeviceId) {
+        let _ = lock(&self.observed).remove(device);
     }
 
     /// 客户端应当使用的中继地址。
@@ -174,12 +216,37 @@ async fn introduce(
     state: &SignalState,
     link: &Link,
     target: Option<DeviceId>,
+    probed: &mut bool,
     send: &mut quinn::SendStream,
 ) -> Result<(), NetError> {
-    let Some(target) = target else {
+    let online = target.filter(|t| lock(&state.registry).is_online(t));
+    let Some(target) = online else {
         return write_signal(send, &SignalMsg::NotFound).await;
     };
     let me = *link.peer_fingerprint();
+    // 先让控制端从连接用的端口向探测地址发包，好判断它的 NAT 类型（每条信令连接问一次）。
+    if let (Some(relay), false) = (state.relay.as_ref(), *probed) {
+        *probed = true;
+        relay.forget(&me);
+        return write_signal(
+            send,
+            &SignalMsg::Probe {
+                relay: relay.addr(),
+            },
+        )
+        .await;
+    }
+    if let Some(relay) = state.relay.as_ref() {
+        // 探测包走 UDP，可能比这条请求晚到一点。
+        for _ in 0..PROBE_WAIT_STEPS {
+            if relay.observed(&me).is_some() {
+                break;
+            }
+            tokio::time::sleep(PROBE_WAIT_STEP).await;
+        }
+    }
+    let nonce = new_session_id().unwrap_or_default();
+    let probe_of = |d: &DeviceId| state.relay.as_ref().and_then(|r| r.observed(d));
     // 中继通道记在发起连接的设备名下。
     let relay = state.relay.as_ref().and_then(|relay| {
         let session = new_session_id()?;
@@ -187,17 +254,18 @@ async fn introduce(
             .allocate(session, me)
             .then_some((relay.addr(), session))
     });
-    let intro = lock(&state.registry).connect(me, link.remote_addr(), &target, relay);
+    let intro =
+        lock(&state.registry).connect(me, link.remote_addr(), &target, relay, nonce, &probe_of);
+    let plan = intro
+        .to_controller
+        .punch()
+        .map(|p| format!("控制端 {:?}、被控端 {:?}", p.me, p.peer))
+        .unwrap_or_default();
     crate::note!(
         info,
-        "牵线 {} → {}：{}，中继{}",
+        "牵线 {} → {}（NAT：{plan}），中继{}",
         link.remote_addr(),
         to_hex(&target).get(..16).unwrap_or_default(),
-        if intro.to_host.is_some() {
-            "对方在线"
-        } else {
-            "对方不在线"
-        },
         if relay.is_some() {
             "已分配"
         } else {
@@ -220,6 +288,7 @@ async fn serve_device(state: Arc<SignalState>, link: Link) -> Result<(), NetErro
         return Err(NetError::Protocol("信令端口只接受信令流"));
     }
     let (tx, mut outbox) = mpsc::channel::<SignalMsg>(16);
+    let mut probed = false;
     let result = loop {
         tokio::select! {
             Some(msg) = outbox.recv() => {
@@ -227,11 +296,11 @@ async fn serve_device(state: Arc<SignalState>, link: Link) -> Result<(), NetErro
             }
             msg = read_signal(&mut recv) => match msg {
                 Err(_) => break Ok(()),
-                Ok(SignalMsg::Register) => {
+                Ok(SignalMsg::Register { locals }) => {
                     let (done, text) = {
                         let mut registry = lock(&state.registry);
                         let done = registry
-                            .register(conn, *link.peer_fingerprint(), link.remote_addr(), &mut random_u32);
+                            .register(conn, *link.peer_fingerprint(), link.remote_addr(), &locals, state.relay.as_ref().map(|r| r.addr()), &mut random_u32);
                         let text = done.as_ref().filter(|d| d.new_code).map(|_| registry.codes_text());
                         (done, text)
                     };
@@ -251,17 +320,18 @@ async fn serve_device(state: Arc<SignalState>, link: Link) -> Result<(), NetErro
                     if let Err(e) = write_signal(&mut send, &done.reply).await { break Err(e); }
                 }
                 Ok(SignalMsg::Connect { target }) => {
-                    if let Err(e) = introduce(&state, &link, Some(target), &mut send).await { break Err(e); }
+                    if let Err(e) = introduce(&state, &link, Some(target), &mut probed, &mut send).await { break Err(e); }
                 }
                 Ok(SignalMsg::ConnectCode { code }) => {
                     let target = lock(&state.registry).device_of(code);
                     if target.is_none() {
                         crate::note!(info, "按设备码 {} 连接：码不存在，来自 {}", format_code(code), link.remote_addr());
                     }
-                    if let Err(e) = introduce(&state, &link, target, &mut send).await { break Err(e); }
+                    if let Err(e) = introduce(&state, &link, target, &mut probed, &mut send).await { break Err(e); }
                 }
                 Ok(
                     SignalMsg::Registered { .. }
+                    | SignalMsg::Probe { .. }
                     | SignalMsg::Peer { .. }
                     | SignalMsg::Incoming { .. }
                     | SignalMsg::NotFound,
@@ -333,5 +403,23 @@ impl SignalService {
 impl Drop for SignalService {
     fn drop(&mut self) {
         self.task.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remember_clears_when_full() {
+        let a: SocketAddr = "1.2.3.4:5"
+            .parse()
+            .unwrap_or(SocketAddr::from(([0, 0, 0, 0], 0)));
+        let mut seen = BTreeMap::new();
+        remember(&mut seen, [1; 32], a, 2);
+        remember(&mut seen, [2; 32], a, 2);
+        remember(&mut seen, [3; 32], a, 2);
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen.get(&[3; 32]), Some(&a));
     }
 }

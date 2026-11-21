@@ -15,7 +15,6 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"
 # 测试控制台的图形界面。只开 glow 后端和必要的功能，控制体积。
 eframe = { version = "0.32", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
 sys-locale = "0.3"
-if-addrs = "0.15"
 getrandom = "0.2"
 num-traits = "0.2"
 

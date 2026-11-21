@@ -25,6 +25,7 @@ macro_rules! note {
 
 #[cfg(feature = "media")]
 pub mod bench;
+pub mod candidates;
 #[cfg(feature = "media")]
 pub mod controller;
 #[cfg(feature = "media")]
@@ -36,6 +37,7 @@ pub mod fs_store;
 pub mod host;
 pub mod identity;
 pub mod node;
+pub mod punch;
 pub mod rendezvous;
 pub mod service;
 pub mod stream;

@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use peerdesk_core::crypto::Policy;
 use peerdesk_core::proto::Channel;
-use peerdesk_core::signal::SignalMsg;
+use peerdesk_core::signal::{Nat, PunchInfo, SignalMsg};
 use peerdesk_net::rendezvous::{answer, dial, register, Dialed, Lookup, Path, PathPolicy, Server};
 use peerdesk_net::service::{RelayService, SignalService};
 use peerdesk_net::stream::{read_kind, read_signal, write_kind, write_signal, StreamKind};
@@ -336,6 +336,14 @@ async fn signal_server_drops_misbehaving_devices() {
 }
 
 /// 一个不守规矩的信令服务器：对每条信令用 `reply` 作答。
+fn plain() -> PunchInfo {
+    PunchInfo {
+        nonce: [0; 16],
+        me: Nat::Unknown,
+        peer: Nat::Unknown,
+    }
+}
+
 fn fake_server(reply: impl Fn(SignalMsg) -> SignalMsg + Send + Sync + 'static) -> Server {
     let id = Identity::generate().unwrap();
     let node = Node::bind(any(), &id, &Policy::recommended()).unwrap();
@@ -372,7 +380,7 @@ async fn a_lying_server_cannot_misdirect_us() {
     let target = Identity::generate().unwrap().fingerprint();
 
     // 答非所问
-    let server = fake_server(|_| SignalMsg::Register);
+    let server = fake_server(|_| SignalMsg::Register { locals: vec![] });
     assert!(matches!(
         register(&me, &server).await,
         Err(NetError::Protocol(_))
@@ -385,6 +393,9 @@ async fn a_lying_server_cannot_misdirect_us() {
     let server = fake_server(move |_| SignalMsg::Peer {
         device: target,
         addr: other_addr,
+        locals: vec![],
+        you: other_addr,
+        punch: plain(),
         relay: None,
     });
     assert!(matches!(
@@ -395,11 +406,77 @@ async fn a_lying_server_cannot_misdirect_us() {
     let server = fake_server(move |_| SignalMsg::Peer {
         device: [5; 32],
         addr: other_addr,
+        locals: vec![],
+        you: other_addr,
+        punch: plain(),
         relay: None,
     });
     assert!(matches!(
         dial(&me, &server, &Lookup::Device(target), PathPolicy::Auto).await,
         Err(NetError::Protocol(_))
+    ));
+}
+
+/// 两端在同一个出口后面（服务器看到的 IP 相同）：先试对方的局域网地址；
+/// 局域网地址不通时再试公网地址；局域网地址上是别的设备时不连。
+#[tokio::test(flavor = "multi_thread")]
+async fn same_exit_tries_lan_addresses_first() {
+    let policy = Policy::recommended();
+    let me = Node::bind(any(), &Identity::generate().unwrap(), &policy).unwrap();
+    let host_id = Identity::generate().unwrap();
+    let host = Arc::new(Node::bind(any(), &host_id, &policy).unwrap());
+    let host_addr = host.local_addr().unwrap();
+    let keep = Arc::clone(&host);
+    tokio::spawn(async move { while keep.accept().await.is_some() {} });
+    let target = host_id.fingerprint();
+    let dead: SocketAddr = "127.0.0.1:9".parse().unwrap();
+    let v6: SocketAddr = "[::1]:9".parse().unwrap();
+
+    // 公网地址不通，局域网地址通
+    let server = fake_server(move |_| SignalMsg::Peer {
+        device: target,
+        addr: dead,
+        locals: vec![v6, dead, host_addr],
+        you: "127.0.0.1:5".parse().unwrap(),
+        punch: plain(),
+        relay: None,
+    });
+    let dialed = dial(&me, &server, &Lookup::Device(target), PathPolicy::Auto)
+        .await
+        .unwrap();
+    assert_eq!(dialed.link.remote_addr(), host_addr);
+    assert!(dialed.timing.lan > Duration::ZERO && dialed.timing.direct == Duration::ZERO);
+
+    // 局域网地址不通，公网地址通
+    let server = fake_server(move |_| SignalMsg::Peer {
+        device: target,
+        addr: host_addr,
+        locals: vec!["127.0.0.2:9".parse().unwrap()],
+        you: "127.0.0.1:5".parse().unwrap(),
+        punch: plain(),
+        relay: None,
+    });
+    let dialed = dial(&me, &server, &Lookup::Device(target), PathPolicy::Auto)
+        .await
+        .unwrap();
+    assert_eq!(dialed.link.remote_addr(), host_addr);
+    assert!(dialed.timing.lan >= Duration::from_millis(500));
+
+    // 局域网地址上是另一台设备：指纹不符，直接失败
+    let other = Arc::new(Node::bind(any(), &Identity::generate().unwrap(), &policy).unwrap());
+    let other_addr = other.local_addr().unwrap();
+    tokio::spawn(async move { while other.accept().await.is_some() {} });
+    let server = fake_server(move |_| SignalMsg::Peer {
+        device: target,
+        addr: host_addr,
+        locals: vec![other_addr],
+        you: "127.0.0.1:5".parse().unwrap(),
+        punch: plain(),
+        relay: None,
+    });
+    assert!(matches!(
+        dial(&me, &server, &Lookup::Device(target), PathPolicy::Auto).await,
+        Err(NetError::PinMismatch { .. })
     ));
 }
 

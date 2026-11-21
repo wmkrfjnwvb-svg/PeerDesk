@@ -68,6 +68,9 @@ fn initial_suite() -> Result<rustls::quic::Suite, NetError> {
         .ok_or(NetError::Protocol("加密库缺少 QUIC 初始包所需的套件"))
 }
 
+/// 握手时的往返时间估计。
+const INITIAL_RTT: Duration = Duration::from_millis(100);
+
 fn transport() -> Arc<quinn::TransportConfig> {
     // 包长上限留出余量：经中继时每个包前面还要加中继包头，不能超过常见链路的 MTU。
     let mut mtu = quinn::MtuDiscoveryConfig::default();
@@ -78,6 +81,9 @@ fn transport() -> Arc<quinn::TransportConfig> {
             IDLE_TIMEOUT_MS,
         ))))
         .keep_alive_interval(Some(KEEP_ALIVE))
+        // 还没测到往返时间时按 100 毫秒估计（默认 333 毫秒）：打洞和中继刚接通时第一个握手包
+        // 常常被丢（对方还没打开 NAT 或还没接上中继），这样约 0.3 秒就重发，而不是约 1 秒。
+        .initial_rtt(INITIAL_RTT)
         .datagram_receive_buffer_size(Some(DATAGRAM_BUFFER))
         .datagram_send_buffer_size(DATAGRAM_BUFFER)
         .mtu_discovery_config(Some(mtu))

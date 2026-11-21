@@ -19,11 +19,82 @@ use crate::{Fingerprint, Identity, NetError};
 /// 握手的时间上限。
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
 
+/// 在 `socket` 上开一个 QUIC 端点，接受到的连接在后台完成握手后放进 `tx`。
+fn endpoint_on(
+    socket: std::net::UdpSocket,
+    server: &quinn::ServerConfig,
+    client: &quinn::ClientConfig,
+    tx: &mpsc::Sender<Result<Link, NetError>>,
+) -> std::io::Result<quinn::Endpoint> {
+    let runtime =
+        quinn::default_runtime().ok_or_else(|| std::io::Error::other("没有可用的异步运行时"))?;
+    let mut endpoint = quinn::Endpoint::new(
+        quinn::EndpointConfig::default(),
+        Some(server.clone()),
+        socket,
+        runtime,
+    )?;
+    endpoint.set_default_client_config(client.clone());
+    // 握手放在后台任务里做：调用方随时可以放弃等待，不会打断正在进行的握手。
+    let acceptor = endpoint.clone();
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        while let Some(incoming) = acceptor.accept().await {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let result = match tokio::time::timeout(HANDSHAKE_TIMEOUT, incoming).await {
+                    Err(_) => Err(NetError::Timeout("握手")),
+                    Ok(Err(e)) => Err(NetError::Connect(e.to_string())),
+                    Ok(Ok(conn)) => Link::new(conn),
+                };
+                let _ = tx.send(result).await;
+            });
+        }
+    });
+    Ok(endpoint)
+}
+
+/// 从 `endpoint` 连接 `addr`。给了 `pin` 时，对端指纹必须与之相同，否则立刻断开并报错。
+async fn connect_on(
+    endpoint: &quinn::Endpoint,
+    addr: SocketAddr,
+    pin: Option<&Fingerprint>,
+) -> Result<Link, NetError> {
+    let connecting = endpoint
+        .connect(addr, "peerdesk")
+        .map_err(|e| NetError::Connect(e.to_string()))?;
+    let conn = tokio::time::timeout(HANDSHAKE_TIMEOUT, connecting)
+        .await
+        .map_err(|_| NetError::Timeout("握手"))?
+        .map_err(|e| NetError::Connect(e.to_string()))?;
+    let link = Link::new(conn)?;
+    if let Some(expected) = pin {
+        if link.peer != *expected {
+            link.close("pin mismatch");
+            // 等关闭通知发出去再返回：否则调用方马上退出的话，对端要等到超时才知道连接没了。
+            let _ = tokio::time::timeout(Duration::from_millis(300), link.closed_locally()).await;
+            return Err(NetError::PinMismatch {
+                expected: to_hex(expected),
+                actual: to_hex(&link.peer),
+            });
+        }
+    }
+    Ok(link)
+}
+
 /// 一个 QUIC 端点。同一个端点既能发起连接也能接受连接，所以打洞后任一端都可以拨号。
 #[derive(Debug)]
 pub struct Node {
     endpoint: quinn::Endpoint,
     fingerprint: Fingerprint,
+    /// 本端的 TLS 配置，开新端口（打洞用）时沿用。
+    server_config: quinn::ServerConfig,
+    client_config: quinn::ClientConfig,
+    /// 接受到的连接放进这里；打洞时开的其他端口接受到的连接也放进来。只留弱引用：
+    /// 端点全部关闭后队列随之关闭，[`Node::accept`] 才会返回 `None`。
+    accepted_tx: mpsc::WeakSender<Result<Link, NetError>>,
+    /// 打洞时开的其他端口上的端点，和本端点一起关闭。
+    siblings: std::sync::Mutex<Vec<quinn::Endpoint>>,
     /// 与 QUIC 端点共用同一个 UDP 端口的另一份句柄，只用来发打洞包。
     punch: std::net::UdpSocket,
     /// 后台任务完成握手后把连接放进这个队列。
@@ -33,42 +104,74 @@ pub struct Node {
 impl Node {
     /// 绑定本地地址。必须在 tokio 运行时内调用。
     pub fn bind(addr: SocketAddr, identity: &Identity, policy: &Policy) -> Result<Self, NetError> {
-        let (server, client) = crate::tls::configs(identity, policy)?;
         let bind_err = |e: std::io::Error| NetError::Io(format!("绑定 {addr} 失败：{e}"));
         let socket = std::net::UdpSocket::bind(addr).map_err(bind_err)?;
+        Self::on_socket(socket, identity, policy)
+    }
+
+    /// 在一个已经打开的 UDP 端口上开端点（例如打洞时撞上的那个端口）。必须在 tokio 运行时内调用。
+    pub fn on_socket(
+        socket: std::net::UdpSocket,
+        identity: &Identity,
+        policy: &Policy,
+    ) -> Result<Self, NetError> {
+        let (server, client) = crate::tls::configs(identity, policy)?;
+        let bind_err = |e: std::io::Error| NetError::Io(format!("打开端点失败：{e}"));
+        socket.set_nonblocking(true).map_err(bind_err)?;
         let punch = socket.try_clone().map_err(bind_err)?;
-        let runtime =
-            quinn::default_runtime().ok_or_else(|| NetError::Io("没有可用的异步运行时".into()))?;
-        let mut endpoint = quinn::Endpoint::new(
-            quinn::EndpointConfig::default(),
-            Some(server),
-            socket,
-            runtime,
-        )
-        .map_err(bind_err)?;
-        endpoint.set_default_client_config(client);
-        // 握手放在后台任务里做：调用方随时可以放弃等待，不会打断正在进行的握手。
         let (tx, rx) = mpsc::channel(64);
-        let acceptor = endpoint.clone();
-        tokio::spawn(async move {
-            while let Some(incoming) = acceptor.accept().await {
-                let tx = tx.clone();
-                tokio::spawn(async move {
-                    let result = match tokio::time::timeout(HANDSHAKE_TIMEOUT, incoming).await {
-                        Err(_) => Err(NetError::Timeout("握手")),
-                        Ok(Err(e)) => Err(NetError::Connect(e.to_string())),
-                        Ok(Ok(conn)) => Link::new(conn),
-                    };
-                    let _ = tx.send(result).await;
-                });
-            }
-        });
+        let endpoint = endpoint_on(socket, &server, &client, &tx).map_err(bind_err)?;
         Ok(Self {
             endpoint,
             fingerprint: identity.fingerprint(),
+            server_config: server,
+            client_config: client,
+            accepted_tx: tx.downgrade(),
+            siblings: std::sync::Mutex::new(Vec::new()),
             punch,
             accepted: tokio::sync::Mutex::new(rx),
         })
+    }
+
+    /// 在另一个 UDP 端口上开一个端点（同一个身份），从它连接 `addr`。打洞时用：
+    /// 在许多端口里，最先收到对方探测包的那个端口才是通的。这个端点接受到的连接也进
+    /// [`Node::accept`]，它和本端点一起关闭。
+    pub async fn connect_via(
+        &self,
+        socket: std::net::UdpSocket,
+        addr: SocketAddr,
+        pin: Option<&Fingerprint>,
+        timeout: Duration,
+    ) -> Result<Link, NetError> {
+        let io = |e: std::io::Error| NetError::Io(format!("打洞端口：{e}"));
+        let tx = self
+            .accepted_tx
+            .upgrade()
+            .ok_or_else(|| NetError::Closed("端点已关闭".into()))?;
+        let endpoint =
+            endpoint_on(socket, &self.server_config, &self.client_config, &tx).map_err(io)?;
+        {
+            let mut siblings = self
+                .siblings
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            siblings.push(endpoint.clone());
+        }
+        tokio::time::timeout(timeout, connect_on(&endpoint, addr, pin))
+            .await
+            .map_err(|_| NetError::Timeout("直连"))?
+    }
+
+    /// 把一条本端主动建立的连接当作接受到的连接交给 [`Node::accept`]（打洞时被控端主动连控制端）。
+    pub async fn offer(&self, link: Link) {
+        if let Some(tx) = self.accepted_tx.upgrade() {
+            let _ = tx.send(Ok(link)).await;
+        }
+    }
+
+    /// 从本端点的端口向 `addr` 发一个任意内容的 UDP 包（打洞、探测用）。发不出去不是错误。
+    pub fn send_raw(&self, addr: SocketAddr, payload: &[u8]) {
+        let _ = self.punch.send_to(payload, addr);
     }
 
     /// 实际绑定的地址。
@@ -88,7 +191,7 @@ impl Node {
     /// 让本机的 NAT 为这个对端地址建立映射，对端发来的包才进得来。对端会直接丢弃它。
     pub fn punch(&self, addr: SocketAddr) {
         // 发不出去（例如地址族不匹配）不是错误：打洞本来就是尽力而为。
-        let _ = self.punch.send_to(&[0], addr);
+        self.send_raw(addr, &[0]);
     }
 
     /// 同 [`Node::connect`]，但握手最多等 `timeout`。用于尝试一条可能不通的直连路径。
@@ -109,28 +212,7 @@ impl Node {
         addr: SocketAddr,
         pin: Option<&Fingerprint>,
     ) -> Result<Link, NetError> {
-        let connecting = self
-            .endpoint
-            .connect(addr, "peerdesk")
-            .map_err(|e| NetError::Connect(e.to_string()))?;
-        let conn = tokio::time::timeout(HANDSHAKE_TIMEOUT, connecting)
-            .await
-            .map_err(|_| NetError::Timeout("握手"))?
-            .map_err(|e| NetError::Connect(e.to_string()))?;
-        let link = Link::new(conn)?;
-        if let Some(expected) = pin {
-            if link.peer != *expected {
-                link.close("pin mismatch");
-                // 等关闭通知发出去再返回：否则调用方马上退出的话，对端要等到超时才知道连接没了。
-                let _ =
-                    tokio::time::timeout(Duration::from_millis(300), link.closed_locally()).await;
-                return Err(NetError::PinMismatch {
-                    expected: to_hex(expected),
-                    actual: to_hex(&link.peer),
-                });
-            }
-        }
-        Ok(link)
+        connect_on(&self.endpoint, addr, pin).await
     }
 
     /// 等待并接受一个连接。端点关闭后返回 `None`；握手失败的连接返回 `Some(Err)`。
@@ -142,6 +224,13 @@ impl Node {
     /// 关闭端点和它的所有连接。
     pub fn close(&self) {
         self.endpoint.close(VarInt::from_u32(0), b"closed");
+        let siblings = self
+            .siblings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for sibling in siblings.iter() {
+            sibling.close(VarInt::from_u32(0), b"closed");
+        }
     }
 
     /// 等所有连接把关闭通知发完。

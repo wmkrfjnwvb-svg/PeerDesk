@@ -86,6 +86,15 @@ jobs:
           sudo apt-get update -qq && sudo apt-get install -y -qq xvfb xterm
           cargo build --release -p peerdesk
           ./scripts/e2e-live.sh
+      # 打洞：网络命名空间 + nftables 搭出各种 NAT 组合，真实二进制按设备码连接。
+      # 门槛：除了两端都是对称型（应当马上走中继），其余组合都必须直连。
+      - name: NAT lab (hole punching, real binaries)
+        if: always()
+        run: |
+          sudo apt-get install -y -qq nftables iproute2
+          sudo modprobe sch_netem 2>/dev/null || true
+          cargo build --release -p peerdesk -p peerdesk-server
+          sudo ./scripts/nat-lab.sh target/release 3
       - name: Summary
         if: always()
         run: |
@@ -113,6 +122,10 @@ jobs:
             echo
             cat target/e2e-live/congestion.md 2>/dev/null || true
             echo
+            echo "### 打洞（NAT 仿真，真实二进制）"
+            echo
+            cat target/nat-lab/summary.md 2>/dev/null || echo "没有运行"
+            echo
             echo "截图在构建产物 e2e-<提交>：每个场景一个目录，左边源画面、中间控制端看到的画面、右边差异（放大 8 倍）。"
           } >> "$GITHUB_STEP_SUMMARY"
       # 截图几十 MB：只在失败或完整运行时上传。
@@ -123,6 +136,7 @@ jobs:
           path: |
             target/e2e
             target/e2e-live
+            target/nat-lab
           retention-days: 3
 
   # 平台层实机测试：在三个系统的桌面上真的采集画面、注入键鼠（crates/platform/tests/live.rs），

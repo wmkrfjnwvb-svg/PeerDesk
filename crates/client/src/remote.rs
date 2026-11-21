@@ -500,12 +500,14 @@ async fn connect_session(
                 PathKind::Relay => "中继",
             };
             let _ = writeln!(out, "连接路径      {path}");
+            let _ = writeln!(out, "打洞方式      {:?}", dialed.plan);
             let t = dialed.timing;
             let _ = writeln!(
                 out,
-                "连接耗时      服务器 {} ms，查询 {} ms，直连 {} ms，中继 {} ms",
+                "连接耗时      服务器 {} ms，查询 {} ms，局域网 {} ms，直连 {} ms，中继 {} ms",
                 t.server_connect.as_millis(),
                 t.lookup.as_millis(),
+                t.lan.as_millis(),
                 t.direct.as_millis(),
                 t.relay.as_millis()
             );

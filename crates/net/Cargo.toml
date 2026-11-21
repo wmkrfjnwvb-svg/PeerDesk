@@ -22,6 +22,7 @@ rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"]
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "macros", "io-util"] }
 ring = "0.17"
 bytes = "1"
+if-addrs = "0.15"
 
 [lints]
 workspace = true
