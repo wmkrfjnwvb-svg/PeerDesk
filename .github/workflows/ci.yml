@@ -80,6 +80,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Run scenarios
         run: cargo test --release -p peerdesk-e2e -- --nocapture --test-threads 2
+      # 真实二进制的闭环：虚拟桌面上真采集、真注入，经回环网络和加了延迟丢包的网络各跑一次。
+      - name: Live loop (real binaries, X11, netem)
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq xvfb xterm
+          cargo build --release -p peerdesk
+          ./scripts/e2e-live.sh
       - name: Summary
         if: always()
         run: |
@@ -99,6 +105,10 @@ jobs:
               if [ $first = 1 ]; then cat "$f"; first=0; else tail -n +3 "$f"; fi
             done
             echo
+            echo "### 真实二进制闭环（采集 → 编码 → 传输 → 解码 → 显示，输入 → 被控端执行）"
+            echo
+            cat target/e2e-live/summary.md 2>/dev/null || echo "没有运行"
+            echo
             echo "截图在构建产物 e2e-<提交>：每个场景一个目录，左边源画面、中间控制端看到的画面、右边差异（放大 8 倍）。"
           } >> "$GITHUB_STEP_SUMMARY"
       # 截图几十 MB：只在失败或完整运行时上传。
@@ -106,7 +116,9 @@ jobs:
         if: ${{ failure() || (github.event_name == 'workflow_dispatch' && inputs.scope == 'full') || contains(github.event.head_commit.message, '[full]') }}
         with:
           name: e2e-${{ github.sha }}
-          path: target/e2e
+          path: |
+            target/e2e
+            target/e2e-live
           retention-days: 3
 
   # 平台层实机测试：在三个系统的桌面上真的采集画面、注入键鼠（crates/platform/tests/live.rs），

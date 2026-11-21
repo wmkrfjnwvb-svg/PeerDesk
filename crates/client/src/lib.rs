@@ -72,6 +72,7 @@ connect 的选项：
   --seconds <N>           会话时长（默认 5 秒）
   --send <路径>           上传一个文件或目录
   --snapshot <文件.bmp>   会话结束时把看到的画面存成图片
+  --type-line <文字>      看到第一帧后把指针移到画面中央，输入这行字并回车（测试输入链路用）
   被控端需要密码时，通过环境变量 PEERDESK_PASSWORD 提供。
 
 加密套件由配置决定；host 和 connect 目前使用推荐预设。

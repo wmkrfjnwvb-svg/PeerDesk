@@ -357,6 +357,8 @@ struct ConnectArgs {
     send: Option<PathBuf>,
     auth: Auth,
     snapshot: Option<PathBuf>,
+    /// 看到第一帧之后输入的一行字（后面自动回车）。
+    type_line: Option<String>,
 }
 
 fn parse_connect(args: &[String]) -> Result<ConnectArgs, String> {
@@ -379,6 +381,7 @@ fn parse_connect(args: &[String]) -> Result<ConnectArgs, String> {
         send: None,
         auth: password_from_env().map_or(Auth::Open, Auth::Password),
         snapshot: None,
+        type_line: None,
     };
     let mut it = rest.iter();
     while let Some(flag) = it.next() {
@@ -397,6 +400,9 @@ fn parse_connect(args: &[String]) -> Result<ConnectArgs, String> {
             }
             "--password" => {
                 parsed.auth = Auth::Password(it.next().ok_or("--password 需要一个值")?.clone());
+            }
+            "--type-line" => {
+                parsed.type_line = Some(it.next().ok_or("--type-line 需要一个值")?.clone());
             }
             other => return Err(format!("未知选项：{other}")),
         }
@@ -493,8 +499,27 @@ async fn connect_session(
     let _ = out.flush();
 
     let sink = CountSink::new();
-    // 输入采集接入之前没有事件可发；发送端保持打开直到会话结束。
-    let (_input_tx, input_rx) = tokio::sync::mpsc::channel(64);
+    // 命令行没有键鼠可采集；`--type-line` 时在看到第一帧之后输入一行字并回车（端到端测试用它验证
+    // 输入真的到了被控端）。发送端保持打开直到会话结束。
+    let (input_tx, input_rx) = tokio::sync::mpsc::channel(64);
+    let typing = args.type_line.clone().map(|line| {
+        let seen = sink.clone();
+        tokio::spawn(async move {
+            while seen.count() == 0 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            for (i, event) in type_line_events(&line).into_iter().enumerate() {
+                if input_tx.send(event).await.is_err() {
+                    break;
+                }
+                // 指针移过去之后等一下：窗口要先拿到键盘焦点（没有窗口管理器时焦点跟着指针）。
+                if i == 0 {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                }
+            }
+            input_tx
+        })
+    });
     let report = controller::run(
         link,
         ControllerOptions {
@@ -507,6 +532,9 @@ async fn connect_session(
         upload,
     )
     .await?;
+    if let Some(task) = typing {
+        task.abort();
+    }
 
     let lines = [
         format!("会话结束      {}", report.end),
@@ -538,6 +566,27 @@ async fn connect_session(
         }
     }
     Ok(EXIT_OK)
+}
+
+/// `--type-line` 发出的事件：指针移到画面中央（让那里的窗口收到键盘输入），输入文字，回车。
+fn type_line_events(line: &str) -> Vec<InputEvent> {
+    /// 回车键的 USB HID 用途码。
+    const ENTER: u16 = 0x28;
+    vec![
+        InputEvent::MouseMove {
+            x: u16::MAX / 2,
+            y: u16::MAX / 2,
+        },
+        InputEvent::Text(line.to_owned()),
+        InputEvent::Key {
+            code: ENTER,
+            down: true,
+        },
+        InputEvent::Key {
+            code: ENTER,
+            down: false,
+        },
+    ]
 }
 
 /// `peerdesk connect`。
@@ -681,6 +730,8 @@ mod tests {
             "3",
             "--send",
             files.join("docs").to_str().unwrap(),
+            "--type-line",
+            "ls",
         ]);
         assert_eq!(code, EXIT_OK, "{text}");
         assert!(text.contains(&format!("对端指纹 {pin}")));
@@ -699,6 +750,8 @@ mod tests {
         let host_text = host_out.text();
         assert!(host_text.contains("已连接"), "{host_text}");
         assert!(host_text.contains("收到 2 个文件"), "{host_text}");
+        // --type-line 的 4 个事件（移动、文字、回车按下、抬起）都到了被控端
+        assert!(host_text.contains("注入 4 个输入事件"), "{host_text}");
         assert_eq!(
             std::fs::read(host_dir.join("received/docs/a.txt")).unwrap(),
             b"alpha"
@@ -1286,5 +1339,29 @@ mod tests {
         let count = Arc::new(AtomicU64::new(0));
         CountInput(Arc::clone(&count)).inject(&InputEvent::ReleaseAll);
         assert_eq!(count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn type_line_moves_types_and_presses_enter() {
+        let events = type_line_events("ls");
+        assert!(matches!(events[0], InputEvent::MouseMove { .. }));
+        assert_eq!(events[1], InputEvent::Text("ls".into()));
+        assert_eq!(
+            events[2],
+            InputEvent::Key {
+                code: 0x28,
+                down: true
+            }
+        );
+        assert_eq!(
+            events[3],
+            InputEvent::Key {
+                code: 0x28,
+                down: false
+            }
+        );
+        let parsed = parse_connect(&strings(&["127.0.0.1:1", "--type-line", "echo hi"])).unwrap();
+        assert_eq!(parsed.type_line.as_deref(), Some("echo hi"));
+        assert!(parse_connect(&strings(&["127.0.0.1:1", "--type-line"])).is_err());
     }
 }

@@ -58,6 +58,7 @@ scripts         检查与发布脚本
 ```bash
 ./scripts/check.sh            # 格式、严格 lint、全部测试、99% 行覆盖率门槛
 ./scripts/build-release.sh    # 构建管理页面和两个发布二进制
+./scripts/e2e-live.sh         # 真实二进制闭环：Xvfb 上真采集、真注入，比对画面、验证输入执行（需要 Xvfb、xterm）
 ```
 
 **图形界面（测试控制台）**：不带参数运行 `peerdesk`（或双击）打开。“本机”面板开启被控并显示地址、
