@@ -30,6 +30,7 @@ pub mod file;
 pub mod governor;
 pub mod input;
 pub mod media;
+pub mod paths;
 pub mod probe;
 pub mod proto;
 pub mod region;

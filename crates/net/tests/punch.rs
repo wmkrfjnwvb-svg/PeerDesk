@@ -52,6 +52,17 @@ fn fake_server(reply: impl Fn(usize) -> SignalMsg + Send + Sync + 'static) -> Se
     server
 }
 
+/// 收下一个多端口打洞的探测包（跳过路径探测的 ping）。
+async fn recv_probe(socket: &UdpSocket, nonce: &[u8; 16]) -> (u16, SocketAddr) {
+    let mut buf = [0u8; 128];
+    loop {
+        let (len, from) = socket.recv_from(&mut buf).await.unwrap();
+        if let Some(port) = parse_probe(&buf[..len], nonce) {
+            return (port, from);
+        }
+    }
+}
+
 fn peer(device: [u8; 32], addr: SocketAddr, punch: PunchInfo) -> SignalMsg {
     SignalMsg::Peer {
         device,
@@ -102,8 +113,8 @@ async fn controller_on_a_hard_nat_connects_from_the_port_that_was_hit() {
     assert_eq!(parse_observe(&buf[..len]), Some(ctrl_id.fingerprint()));
 
     // 某个探测端口的包到了：回一个带暗号的包，撞上
-    let (len, from) = host_socket.recv_from(&mut buf).await.unwrap();
-    assert_eq!(parse_probe(&buf[..len], &nonce), Some(host_addr.port()));
+    let (port, from) = recv_probe(&host_socket, &nonce).await;
+    assert_eq!(port, host_addr.port());
     host_socket
         .send_to(&probe_packet(&nonce, from.port()), from)
         .await
@@ -150,9 +161,8 @@ async fn controller_on_an_easy_nat_sprays_and_waits_for_the_host() {
     });
 
     // 撒来的探测包（发往已知地址的那份）
-    let mut buf = [0u8; 128];
-    let (len, from) = host_socket.recv_from(&mut buf).await.unwrap();
-    assert_eq!(parse_probe(&buf[..len], &nonce), Some(host_addr.port()));
+    let (port, from) = recv_probe(&host_socket, &nonce).await;
+    assert_eq!(port, host_addr.port());
     assert_eq!(from, ctrl_addr);
 
     // 一个陌生设备先连过来：被断开
@@ -184,6 +194,7 @@ async fn host_answers_according_to_the_plan() {
     let incoming = |addr, punch| Incoming {
         peer: ctrl_id.fingerprint(),
         addr,
+        locals: vec![],
         punch,
         relay: None,
     };
@@ -199,10 +210,8 @@ async fn host_answers_according_to_the_plan() {
         info(Nat::Easy, Nat::Hard, nonce),
     );
     answer(&host, &spray).await.unwrap();
-    let mut buf = [0u8; 128];
-    let (len, from) = target.recv_from(&mut buf).await.unwrap();
+    let (_, from) = recv_probe(&target, &nonce).await;
     assert_eq!(from, host_addr);
-    assert!(parse_probe(&buf[..len], &nonce).is_some());
 
     // 本端难：撞上之后主动连控制端
     let ctrl_socket = UdpSocket::bind(any()).await.unwrap();
@@ -213,7 +222,7 @@ async fn host_answers_according_to_the_plan() {
     )
     .await
     .unwrap();
-    let (_, from) = ctrl_socket.recv_from(&mut buf).await.unwrap();
+    let (_, from) = recv_probe(&ctrl_socket, &nonce).await;
     ctrl_socket
         .send_to(&probe_packet(&nonce, from.port()), from)
         .await
@@ -239,7 +248,7 @@ async fn host_answers_according_to_the_plan() {
     )
     .await
     .unwrap();
-    let (_, from) = mute.recv_from(&mut buf).await.unwrap();
+    let (_, from) = recv_probe(&mute, &nonce).await;
     mute.send_to(&probe_packet(&nonce, from.port()), from)
         .await
         .unwrap();
@@ -348,4 +357,19 @@ async fn closing_the_node_stops_waiting_for_the_host() {
             .await,
         Err(NetError::Closed(_))
     ));
+}
+
+/// 依次试绑定：第一个地址绑不上（不是本机地址）时用下一个；都绑不上时报最后一个错误。
+#[tokio::test(flavor = "multi_thread")]
+async fn bind_first_falls_back_in_order() {
+    let id = Identity::generate().unwrap();
+    let policy = Policy::recommended();
+    let foreign: SocketAddr = "192.0.2.1:0".parse().unwrap();
+    let node = Node::bind_first(&[foreign, any()], &id, &policy).unwrap();
+    assert!(node.local_addr().unwrap().ip().is_loopback());
+    assert!(matches!(
+        Node::bind_first(&[foreign], &id, &policy),
+        Err(NetError::Io(_))
+    ));
+    assert!(Node::bind_first(&[], &id, &policy).is_err());
 }

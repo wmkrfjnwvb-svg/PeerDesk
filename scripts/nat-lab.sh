@@ -16,6 +16,10 @@
 #   open  没有 NAT，本机直接有公网地址。
 #   same  两台机器在同一个路由器（cone）后面，路由器不支持回环（hairpin）。
 #   cgnat 家庭路由器（cone）外面再套一层运营商 NAT（cone）。
+#   leaky 和 cone 一样，但路由器不丢外网主动发给它的包（有些路由器这样）：打洞包先到会占住映射，
+#         路由器给内网主机换端口，只能靠“探测中发现的新地址”接上。
+#   *-v6  IPv4 照旧走 NAT，另外两边都有全局 IPv6（路由器不做 NAT，只有状态防火墙，
+#         和光猫的 IPv6 防火墙一样）。两边都是对称型时，应当靠 IPv6 直连。
 #
 # 用法：sudo scripts/nat-lab.sh [二进制目录，默认 target/release] [每种组合跑几次，默认 3]
 # 需要 root（命名空间、nftables、tc）。结果在 $OUT（默认 target/nat-lab）的 summary.md。
@@ -25,8 +29,14 @@ BIN_DIR=${1:-target/release}
 RUNS=${2:-3}
 OUT=${OUT:-target/nat-lab}
 WAN_DELAY=${WAN_DELAY:-15ms}
-CASES=${CASES:-"open-open cone-cone cone-open open-cone cone-sym sym-cone sym-sym same cgnat-cone"}
+CASES=${CASES:-"open-open cone-cone cone-open open-cone cone-sym sym-cone sym-sym same cgnat-cone leaky-cone cone-leaky leaky-leaky sym-sym-v6"}
 BIN_DIR=$(cd "$BIN_DIR" && pwd)
+# 内核没有 IPv6 时跳过 IPv6 的组合（结果里注明）；GitHub 的 Ubuntu 主机有。
+NO_V6=""
+if [ ! -d /proc/sys/net/ipv6 ]; then
+  NO_V6=1
+  CASES=$(for c in $CASES; do case $c in *-v6) ;; *) printf '%s ' "$c" ;; esac; done)
+fi
 rm -rf "$OUT" && mkdir -p "$OUT"
 OUT=$(cd "$OUT" && pwd)
 
@@ -102,6 +112,8 @@ router() {
   ns "$name" sysctl -qw net.ipv4.ip_forward=1
   local how="masquerade"
   if [ "$mode" = sym ]; then how="masquerade random"; fi
+  local input_policy='iifname "wan" ct state new drop'
+  if [ "$mode" = leaky ]; then input_policy=""; fi
   ns "$name" nft -f - <<EOF
 table ip lab {
   chain natout { type nat hook postrouting priority 100; oifname "wan" $how; }
@@ -114,7 +126,7 @@ table ip lab {
   # 不丢的话，打洞包先到时会在路由器上留下一条记录，占住映射，路由器只好给内网主机换端口。
   chain filterin {
     type filter hook input priority 0; policy accept;
-    iifname "wan" ct state new drop
+    $input_policy
   }
 }
 EOF
@@ -153,7 +165,7 @@ place() {
       ns "$host" ip link set lo up
       attach_inet "$host" "$pub" eth0
       ;;
-    cone|sym)
+    cone|sym|leaky)
       router "r$host" "$pub" "$mode"
       attach_inet "r$host" "$pub" wan
       attach_lan "$host" "r$host" "$net"
@@ -206,6 +218,13 @@ build_case() {
       ns a ip addr add 10.0.1.2/24 dev eth0; ns a ip route add default via 10.0.1.1
       place b "${c#cgnat-}" 203.0.113.12 10.0.2
       ;;
+    *-v6)
+      local base=${c%-v6}
+      place a "${base%-*}" 203.0.113.11 10.0.1
+      place b "${base#*-}" 203.0.113.12 10.0.2
+      add_v6 a ra 1 2
+      add_v6 b rb 2 1
+      ;;
     *)
       place a "${c%-*}" 203.0.113.11 10.0.1
       place b "${c#*-}" 203.0.113.12 10.0.2
@@ -213,10 +232,26 @@ build_case() {
   esac
 }
 
+# 给主机 $1（在路由器 $2 后面，编号 $3）加全局 IPv6：路由器只转发不做 NAT，
+# 只有状态防火墙（外面主动来的包丢掉）；对端网段的编号是 $4。
+add_v6() {
+  local host=$1 r=$2 i=$3 j=$4
+  ns "$r" sysctl -qw net.ipv6.conf.all.forwarding=1
+  ns "$r" ip -6 addr add "2001:db8::1$i/64" dev wan nodad
+  ns "$r" ip -6 addr add "2001:db8:$i::1/64" dev "lan-$host" nodad
+  ns "$r" ip -6 route add "2001:db8:$j::/64" via "2001:db8::1$j"
+  printf '%s\n' 'table ip6 lab6 {' '  chain filterfw {' \
+    '    type filter hook forward priority 0; policy drop;' \
+    '    ct state established,related accept' \
+    '    iifname != "wan" accept' '  }' '}' | ns "$r" nft -f -
+  ns "$host" ip -6 addr add "2001:db8:$i::2/64" dev eth0 nodad
+  ns "$host" ip -6 route add default via "2001:db8:$i::1"
+}
+
 summary="$OUT/summary.md"
 {
-  echo "| 被控端-控制端 | 次 | 结果 | 路径 | 应为 | 打洞方式 | 连服务器 ms | 查询 ms | 局域网 ms | 直连 ms | 中继 ms | 直连失败原因 |"
-  echo "|---|---|---|---|---|---|---|---|---|---|---|---|"
+  echo "| 被控端-控制端 | 次 | 结果 | 路径 | 应为 | 打洞方式 | 连服务器 ms | 查询 ms | 探测 ms | 直连 ms | 中继 ms | 路径种类 | 往返 | 直连失败原因 |"
+  echo "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
 } >"$summary"
 
 server_ns
@@ -225,12 +260,12 @@ for c in $CASES; do
   build_case "$c"
   for i in $(seq "$RUNS"); do
     w="$OUT/$c-$i"; mkdir -p "$w"
-    ns a "$BIN_DIR/peerdesk" host --listen 0.0.0.0:0 --server 203.0.113.1:4433 --server-pin "$FP" \
+    ns a "$BIN_DIR/peerdesk" host --listen [::]:0 --server 203.0.113.1:4433 --server-pin "$FP" \
       --source demo --open --once --data-dir "$w/host" >"$w/host.log" 2>&1 &
     hostpid=$!; pids+=($hostpid)
     for _ in $(seq 40); do grep -q '^设备码' "$w/host.log" && break; sleep 0.25; done
     code=$(sed -n 's/^设备码 //p' "$w/host.log" | tr -d ' ')
-    result="失败"; path="-"; plan="-"; t="- | - | - | - | -"; why="-"
+    result="失败"; path="-"; plan="-"; route="-"; rtt="-"; t="- | - | - | - | -"; why="-"
     if [ -n "$code" ]; then
       if timeout 30 ip netns exec "$P-b" "$BIN_DIR/peerdesk" connect --server 203.0.113.1:4433 --server-pin "$FP" \
         --device "$code" --seconds 1 --data-dir "$w/ctrl" >"$w/ctrl.log" 2>&1; then
@@ -238,23 +273,29 @@ for c in $CASES; do
       fi
       path=$(sed -n 's/^连接路径 *//p' "$w/ctrl.log")
       plan=$(sed -n 's/^打洞方式 *//p' "$w/ctrl.log")
-      t=$(sed -n 's/^连接耗时 *服务器 \([0-9]*\) ms，查询 \([0-9]*\) ms，局域网 \([0-9]*\) ms，直连 \([0-9]*\) ms，中继 \([0-9]*\) ms/\1 | \2 | \3 | \4 | \5/p' "$w/ctrl.log")
+      route=$(sed -n 's/^路径种类 *//p' "$w/ctrl.log")
+      rtt=$(sed -n 's/^路径往返 *//p' "$w/ctrl.log")
+      t=$(sed -n 's/^连接耗时 *服务器 \([0-9]*\) ms，查询 \([0-9]*\) ms，探测 \([0-9]*\) ms，直连 \([0-9]*\) ms，中继 \([0-9]*\) ms/\1 | \2 | \3 | \4 | \5/p' "$w/ctrl.log")
       why=$(sed -n 's/^直连失败原因 *//p' "$w/ctrl.log")
     fi
     kill "$hostpid" 2>/dev/null || true
     wait "$hostpid" 2>/dev/null || true
     # 两端都是对称型时打洞几乎不可能，应当马上走中继；其余组合都应当直连。
     want="直连"
-    if [ "$c" = sym-sym ]; then want="中继"; fi
+    # 两边路由器都不丢外网来包时，谁先发包都会让对面路由器换端口，已知做不到（应当走中继，不能失败）。
+    case $c in sym-sym|leaky-leaky) want="中继" ;; *) ;; esac
     verdict="$want"
     if [ "$result" != "成功" ] || [ "$path" != "$want" ]; then verdict="**$want（未达标）**"; bad=$((bad + 1)); fi
-    echo "| $c | $i | $result | ${path:--} | $verdict | ${plan:--} | ${t:-- | - | - | - | -} | ${why:--} |" >>"$summary"
+    echo "| $c | $i | $result | ${path:--} | $verdict | ${plan:--} | ${t:-- | - | - | - | -} | ${route:--} | ${rtt:--} | ${why:--} |" >>"$summary"
     total=$((total + 1))
     if [ "$path" = "直连" ] && [ "$result" = "成功" ]; then direct=$((direct + 1)); fi
   done
 done
 echo >>"$summary"
 echo "直连 $direct / $total" >>"$summary"
+if [ -n "$NO_V6" ]; then
+  echo "注意：内核没有 IPv6，跳过了 IPv6 的组合。" >>"$summary"
+fi
 if [ -n "${NO_DELAY:-}" ]; then
   echo "注意：内核没有 netem，公网链路没有加 $WAN_DELAY 的延迟，打洞时序比真实网络宽松。" >>"$summary"
 else

@@ -2,6 +2,7 @@
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -14,40 +15,54 @@ use quinn::{RecvStream, SendStream, VarInt};
 use tokio::sync::mpsc;
 
 use crate::identity::{fingerprint_of, to_hex};
+use crate::sidechannel::{canonical, Heard, Listeners, SideChannel};
 use crate::{Fingerprint, Identity, NetError};
 
 /// 握手的时间上限。
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// 在 `socket` 上开一个 QUIC 端点，接受到的连接在后台完成握手后放进 `tx`。
+/// 一个端点和它的兄弟端点共享的东西：接受队列、探测任务登记、最近接受过的对端。
+#[derive(Debug, Clone)]
+struct Shared {
+    tx: mpsc::Sender<Result<Link, NetError>>,
+    listeners: Listeners,
+    recent: Arc<Mutex<Vec<(Fingerprint, Instant)>>>,
+}
+
 fn endpoint_on(
     socket: std::net::UdpSocket,
     server: &quinn::ServerConfig,
     client: &quinn::ClientConfig,
-    tx: &mpsc::Sender<Result<Link, NetError>>,
+    shared: &Shared,
 ) -> std::io::Result<quinn::Endpoint> {
     let runtime =
         quinn::default_runtime().ok_or_else(|| std::io::Error::other("没有可用的异步运行时"))?;
-    let mut endpoint = quinn::Endpoint::new(
+    let wrapped = runtime.wrap_udp_socket(socket)?;
+    let side = Arc::new(SideChannel::new(wrapped, Arc::clone(&shared.listeners)));
+    let mut endpoint = quinn::Endpoint::new_with_abstract_socket(
         quinn::EndpointConfig::default(),
         Some(server.clone()),
-        socket,
+        side,
         runtime,
     )?;
     endpoint.set_default_client_config(client.clone());
     // 握手放在后台任务里做：调用方随时可以放弃等待，不会打断正在进行的握手。
     let acceptor = endpoint.clone();
-    let tx = tx.clone();
+    let shared = shared.clone();
     tokio::spawn(async move {
         while let Some(incoming) = acceptor.accept().await {
-            let tx = tx.clone();
+            let shared = shared.clone();
             tokio::spawn(async move {
                 let result = match tokio::time::timeout(HANDSHAKE_TIMEOUT, incoming).await {
                     Err(_) => Err(NetError::Timeout("握手")),
                     Ok(Err(e)) => Err(NetError::Connect(e.to_string())),
                     Ok(Ok(conn)) => Link::new(conn),
                 };
-                let _ = tx.send(result).await;
+                if let Ok(link) = &result {
+                    note_accepted(&shared.recent, link.peer);
+                }
+                let _ = shared.tx.send(result).await;
             });
         }
     });
@@ -82,6 +97,54 @@ async fn connect_on(
     Ok(link)
 }
 
+/// 记下刚接受了 `peer` 的连接（只留最近的几个）。
+fn note_accepted(recent: &Mutex<Vec<(Fingerprint, Instant)>>, peer: Fingerprint) {
+    let mut recent = recent.lock().unwrap_or_else(PoisonError::into_inner);
+    recent.retain(|(p, at)| *p != peer && at.elapsed() < RECENT_ACCEPT);
+    recent.push((peer, Instant::now()));
+}
+
+/// 最近接受过的连接记多久。
+const RECENT_ACCEPT: Duration = Duration::from_secs(30);
+
+/// 一个暗号的探测任务登记；丢弃时注销。
+#[derive(Debug)]
+pub struct Subscription {
+    nonce: [u8; 16],
+    listeners: Listeners,
+    rx: mpsc::UnboundedReceiver<Heard>,
+}
+
+impl Subscription {
+    /// 下一个收到的探测包。
+    pub async fn recv(&mut self) -> Option<Heard> {
+        self.rx.recv().await
+    }
+}
+
+impl Drop for Subscription {
+    fn drop(&mut self) {
+        let _ = self
+            .listeners
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.nonce);
+    }
+}
+
+/// 打开一个 UDP 端口。绑定 IPv6 的“所有地址”时打开双栈（同时收发 IPv4），
+/// 这样一个端口就能同时走 IPv4 和 IPv6 两种直连。
+fn open_socket(addr: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
+    if addr.is_ipv6() && addr.ip().is_unspecified() {
+        // 系统不允许双栈时只用 IPv6。
+        let _ = socket.set_only_v6(false);
+    }
+    socket.bind(&addr.into())?;
+    Ok(socket.into())
+}
+
 /// 一个 QUIC 端点。同一个端点既能发起连接也能接受连接，所以打洞后任一端都可以拨号。
 #[derive(Debug)]
 pub struct Node {
@@ -94,19 +157,44 @@ pub struct Node {
     /// 端点全部关闭后队列随之关闭，[`Node::accept`] 才会返回 `None`。
     accepted_tx: mpsc::WeakSender<Result<Link, NetError>>,
     /// 打洞时开的其他端口上的端点，和本端点一起关闭。
-    siblings: std::sync::Mutex<Vec<quinn::Endpoint>>,
+    siblings: Mutex<Vec<quinn::Endpoint>>,
     /// 与 QUIC 端点共用同一个 UDP 端口的另一份句柄，只用来发打洞包。
     punch: std::net::UdpSocket,
     /// 后台任务完成握手后把连接放进这个队列。
     accepted: tokio::sync::Mutex<mpsc::Receiver<Result<Link, NetError>>>,
+    /// 探测任务登记（端口旁路按暗号把探测包交给它们）。
+    listeners: Listeners,
+    /// 最近接受过连接的对端。
+    recent: Arc<Mutex<Vec<(Fingerprint, Instant)>>>,
+    /// 端口是不是 IPv6（双栈）的：往 IPv4 地址发包时要换成映射地址。
+    v6: bool,
+    /// 时钟起点（探测包里的时间）。
+    epoch: Instant,
 }
 
 impl Node {
     /// 绑定本地地址。必须在 tokio 运行时内调用。
     pub fn bind(addr: SocketAddr, identity: &Identity, policy: &Policy) -> Result<Self, NetError> {
         let bind_err = |e: std::io::Error| NetError::Io(format!("绑定 {addr} 失败：{e}"));
-        let socket = std::net::UdpSocket::bind(addr).map_err(bind_err)?;
+        let socket = open_socket(addr).map_err(bind_err)?;
         Self::on_socket(socket, identity, policy)
+    }
+
+    /// 依次试着绑定 `addrs`，用第一个成功的；都失败时返回最后一个错误。
+    /// 用来“优先双栈端口，系统不支持 IPv6 时退回 IPv4”。
+    pub fn bind_first(
+        addrs: &[SocketAddr],
+        identity: &Identity,
+        policy: &Policy,
+    ) -> Result<Self, NetError> {
+        let mut last = NetError::Io("没有可绑定的地址".into());
+        for addr in addrs {
+            match Self::bind(*addr, identity, policy) {
+                Ok(node) => return Ok(node),
+                Err(e) => last = e,
+            }
+        }
+        Err(last)
     }
 
     /// 在一个已经打开的 UDP 端口上开端点（例如打洞时撞上的那个端口）。必须在 tokio 运行时内调用。
@@ -119,17 +207,29 @@ impl Node {
         let bind_err = |e: std::io::Error| NetError::Io(format!("打开端点失败：{e}"));
         socket.set_nonblocking(true).map_err(bind_err)?;
         let punch = socket.try_clone().map_err(bind_err)?;
+        let v6 = socket.local_addr().map_err(bind_err)?.is_ipv6();
         let (tx, rx) = mpsc::channel(64);
-        let endpoint = endpoint_on(socket, &server, &client, &tx).map_err(bind_err)?;
+        let listeners = Listeners::default();
+        let recent = Arc::new(Mutex::new(Vec::new()));
+        let shared = Shared {
+            tx,
+            listeners: Arc::clone(&listeners),
+            recent: Arc::clone(&recent),
+        };
+        let endpoint = endpoint_on(socket, &server, &client, &shared).map_err(bind_err)?;
         Ok(Self {
             endpoint,
             fingerprint: identity.fingerprint(),
             server_config: server,
             client_config: client,
-            accepted_tx: tx.downgrade(),
-            siblings: std::sync::Mutex::new(Vec::new()),
+            accepted_tx: shared.tx.downgrade(),
+            siblings: Mutex::new(Vec::new()),
             punch,
             accepted: tokio::sync::Mutex::new(rx),
+            listeners,
+            recent,
+            v6,
+            epoch: Instant::now(),
         })
     }
 
@@ -148,13 +248,15 @@ impl Node {
             .accepted_tx
             .upgrade()
             .ok_or_else(|| NetError::Closed("端点已关闭".into()))?;
+        let shared = Shared {
+            tx,
+            listeners: Arc::clone(&self.listeners),
+            recent: Arc::clone(&self.recent),
+        };
         let endpoint =
-            endpoint_on(socket, &self.server_config, &self.client_config, &tx).map_err(io)?;
+            endpoint_on(socket, &self.server_config, &self.client_config, &shared).map_err(io)?;
         {
-            let mut siblings = self
-                .siblings
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut siblings = self.siblings.lock().unwrap_or_else(PoisonError::into_inner);
             siblings.push(endpoint.clone());
         }
         tokio::time::timeout(timeout, connect_on(&endpoint, addr, pin))
@@ -171,7 +273,55 @@ impl Node {
 
     /// 从本端点的端口向 `addr` 发一个任意内容的 UDP 包（打洞、探测用）。发不出去不是错误。
     pub fn send_raw(&self, addr: SocketAddr, payload: &[u8]) {
-        let _ = self.punch.send_to(payload, addr);
+        let _ = self.punch.send_to(payload, self.fit(addr));
+    }
+
+    /// 双栈端口要用映射地址发往 IPv4。
+    fn fit(&self, addr: SocketAddr) -> SocketAddr {
+        match addr {
+            SocketAddr::V4(v4) if self.v6 => {
+                SocketAddr::new(std::net::IpAddr::V6(v4.ip().to_ipv6_mapped()), v4.port())
+            }
+            SocketAddr::V4(_) | SocketAddr::V6(_) => addr,
+        }
+    }
+
+    /// 登记一个探测任务：之后收到带这个暗号的 ping/pong 都交给它（ping 由端口自动回 pong）。
+    #[must_use]
+    pub fn subscribe(&self, nonce: [u8; 16]) -> Subscription {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let _ = self
+            .listeners
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(nonce, tx);
+        Subscription {
+            nonce,
+            listeners: Arc::clone(&self.listeners),
+            rx,
+        }
+    }
+
+    /// 探测包用的时钟：从端点创建开始的微秒数。
+    #[must_use]
+    pub fn now_us(&self) -> u64 {
+        u64::try_from(self.epoch.elapsed().as_micros()).unwrap_or(u64::MAX)
+    }
+
+    /// 某个时刻换算成探测时钟。
+    #[must_use]
+    pub fn at_us(&self, at: Instant) -> u64 {
+        u64::try_from(at.saturating_duration_since(self.epoch).as_micros()).unwrap_or(u64::MAX)
+    }
+
+    /// 最近 `within` 内是否接受过 `peer` 的连接。
+    #[must_use]
+    pub fn accepted_recently(&self, peer: &Fingerprint, within: Duration) -> bool {
+        self.recent
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .any(|(p, at)| p == peer && at.elapsed() < within)
     }
 
     /// 实际绑定的地址。
@@ -185,13 +335,6 @@ impl Node {
     #[must_use]
     pub const fn fingerprint(&self) -> &Fingerprint {
         &self.fingerprint
-    }
-
-    /// 向 `addr` 发一个打洞包：从本端点的端口发出一个很小的非 QUIC 包，
-    /// 让本机的 NAT 为这个对端地址建立映射，对端发来的包才进得来。对端会直接丢弃它。
-    pub fn punch(&self, addr: SocketAddr) {
-        // 发不出去（例如地址族不匹配）不是错误：打洞本来就是尽力而为。
-        self.send_raw(addr, &[0]);
     }
 
     /// 同 [`Node::connect`]，但握手最多等 `timeout`。用于尝试一条可能不通的直连路径。
@@ -224,10 +367,7 @@ impl Node {
     /// 关闭端点和它的所有连接。
     pub fn close(&self) {
         self.endpoint.close(VarInt::from_u32(0), b"closed");
-        let siblings = self
-            .siblings
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let siblings = self.siblings.lock().unwrap_or_else(PoisonError::into_inner);
         for sibling in siblings.iter() {
             sibling.close(VarInt::from_u32(0), b"closed");
         }
@@ -276,7 +416,7 @@ impl Link {
     /// 对端地址。
     #[must_use]
     pub fn remote_addr(&self) -> SocketAddr {
-        self.conn.remote_address()
+        canonical(self.conn.remote_address())
     }
 
     /// 通道绑定：由这条连接的 TLS 密钥导出的一段字节，两端相同，别的连接无法得到。

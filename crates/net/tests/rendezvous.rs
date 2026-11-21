@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use peerdesk_core::crypto::Policy;
+use peerdesk_core::paths::{Candidate, PathKind};
 use peerdesk_core::proto::Channel;
 use peerdesk_core::signal::{Nat, PunchInfo, SignalMsg};
 use peerdesk_net::rendezvous::{answer, dial, register, Dialed, Lookup, Path, PathPolicy, Server};
@@ -126,9 +127,9 @@ async fn direct_path_is_preferred() {
     let host_link = accepted.recv().await.unwrap();
     assert_eq!(host_link.peer_fingerprint(), &w.ctrl_id.fingerprint());
     echo(&dialed, &host_link).await;
-    // 直连不经过中继：中继没有转发任何数据
+    // 直连不经过中继：中继只转发了测速用的几个探测包，没有会话数据
     let (total, _, _) = w.relay.as_ref().unwrap().totals();
-    assert_eq!(total.bytes, 0);
+    assert!(total.bytes < 4_000, "{}", total.bytes);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -375,6 +376,7 @@ async fn a_lying_server_cannot_misdirect_us() {
     // 另一台设备：服务器会把它冒充成目标
     let other = Arc::new(Node::bind(any(), &other_id, &policy).unwrap());
     let other_addr = other.local_addr().unwrap();
+    let _other_sub = other.subscribe(plain().nonce);
     let keep = Arc::clone(&other);
     tokio::spawn(async move { while keep.accept().await.is_some() {} });
     let target = Identity::generate().unwrap().fingerprint();
@@ -417,26 +419,32 @@ async fn a_lying_server_cannot_misdirect_us() {
     ));
 }
 
-/// 两端在同一个出口后面（服务器看到的 IP 相同）：先试对方的局域网地址；
-/// 局域网地址不通时再试公网地址；局域网地址上是别的设备时不连。
+/// 并行探测所有候选：回应的那条被选中；局域网和公网都通时局域网优先；
+/// 选中的地址上是另一台设备时，指纹不符，直接失败。
 #[tokio::test(flavor = "multi_thread")]
-async fn same_exit_tries_lan_addresses_first() {
+async fn probing_picks_the_candidate_that_answers() {
     let policy = Policy::recommended();
     let me = Node::bind(any(), &Identity::generate().unwrap(), &policy).unwrap();
     let host_id = Identity::generate().unwrap();
     let host = Arc::new(Node::bind(any(), &host_id, &policy).unwrap());
     let host_addr = host.local_addr().unwrap();
+    // 被控端为这次连接的暗号登记探测，它的端口才会回 pong
+    let _host_sub = host.subscribe(plain().nonce);
     let keep = Arc::clone(&host);
     tokio::spawn(async move { while keep.accept().await.is_some() {} });
     let target = host_id.fingerprint();
     let dead: SocketAddr = "127.0.0.1:9".parse().unwrap();
-    let v6: SocketAddr = "[::1]:9".parse().unwrap();
+    let cand = |addr, kind| Candidate { addr, kind };
 
     // 公网地址不通，局域网地址通
     let server = fake_server(move |_| SignalMsg::Peer {
         device: target,
         addr: dead,
-        locals: vec![v6, dead, host_addr],
+        locals: vec![
+            cand("[::1]:9".parse().unwrap(), PathKind::Ipv6),
+            cand(dead, PathKind::Lan),
+            cand(host_addr, PathKind::Lan),
+        ],
         you: "127.0.0.1:5".parse().unwrap(),
         punch: plain(),
         relay: None,
@@ -445,13 +453,15 @@ async fn same_exit_tries_lan_addresses_first() {
         .await
         .unwrap();
     assert_eq!(dialed.link.remote_addr(), host_addr);
-    assert!(dialed.timing.lan > Duration::ZERO && dialed.timing.direct == Duration::ZERO);
+    assert_eq!(dialed.route, PathKind::Lan);
+    assert!(dialed.rtt_us.is_some());
+    assert!(dialed.report.contains("不通"), "{}", dialed.report);
 
-    // 局域网地址不通，公网地址通
+    // 只有公网地址通
     let server = fake_server(move |_| SignalMsg::Peer {
         device: target,
         addr: host_addr,
-        locals: vec!["127.0.0.2:9".parse().unwrap()],
+        locals: vec![cand("127.0.0.2:9".parse().unwrap(), PathKind::Lan)],
         you: "127.0.0.1:5".parse().unwrap(),
         punch: plain(),
         relay: None,
@@ -459,17 +469,34 @@ async fn same_exit_tries_lan_addresses_first() {
     let dialed = dial(&me, &server, &Lookup::Device(target), PathPolicy::Auto)
         .await
         .unwrap();
-    assert_eq!(dialed.link.remote_addr(), host_addr);
-    assert!(dialed.timing.lan >= Duration::from_millis(500));
+    assert_eq!(dialed.route, PathKind::Public);
+    assert!(dialed.timing.probe > Duration::ZERO);
 
-    // 局域网地址上是另一台设备：指纹不符，直接失败
+    // 一条都不通，又没有中继：报告原因
+    let server = fake_server(move |_| SignalMsg::Peer {
+        device: target,
+        addr: dead,
+        locals: vec![],
+        you: "127.0.0.1:5".parse().unwrap(),
+        punch: plain(),
+        relay: None,
+    });
+    // （普通打洞没通时还会退到多端口打洞，也不通）
+    assert!(matches!(
+        dial(&me, &server, &Lookup::Device(target), PathPolicy::Auto).await,
+        Err(NetError::Timeout(_))
+    ));
+
+    // 局域网地址上是另一台设备（也回应探测）：指纹不符，直接失败
     let other = Arc::new(Node::bind(any(), &Identity::generate().unwrap(), &policy).unwrap());
+    let _other_sub = other.subscribe(plain().nonce);
     let other_addr = other.local_addr().unwrap();
-    tokio::spawn(async move { while other.accept().await.is_some() {} });
+    let keep = Arc::clone(&other);
+    tokio::spawn(async move { while keep.accept().await.is_some() {} });
     let server = fake_server(move |_| SignalMsg::Peer {
         device: target,
-        addr: host_addr,
-        locals: vec![other_addr],
+        addr: dead,
+        locals: vec![cand(other_addr, PathKind::Lan)],
         you: "127.0.0.1:5".parse().unwrap(),
         punch: plain(),
         relay: None,

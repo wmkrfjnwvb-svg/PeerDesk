@@ -156,12 +156,27 @@ fn connect_by_device_prefers_the_direct_path() {
         status.contains("\"relay\":{\"enabled\":true,\"sessions\":"),
         "{status}"
     );
-    assert!(status.contains("\"bytes\":0,"), "直连不经过中继：{status}");
+    // 直连不经过中继：中继只转发了测速用的几个探测包，没有会话数据
+    let relay_bytes = relay_bytes(&status);
+    assert!(relay_bytes < 4_000, "直连不经过中继：{status}");
+}
+
+/// 状态接口里中继转发的字节数。
+fn relay_bytes(status: &str) -> u64 {
+    let after = status.split("\"relay\":").nth(1).unwrap();
+    let digits: String = after
+        .split("\"bytes\":")
+        .nth(1)
+        .unwrap()
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits.parse().unwrap()
 }
 
 #[test]
 fn connect_by_device_over_the_relay() {
     let (text, status) = session_through_server("relay", &["--relay-only"]);
     assert!(text.contains("连接路径      中继"), "{text}");
-    assert!(!status.contains("\"bytes\":0,"), "会话经过中继：{status}");
+    assert!(relay_bytes(&status) > 10_000, "会话经过中继：{status}");
 }

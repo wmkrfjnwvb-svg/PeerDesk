@@ -3,13 +3,11 @@
 //! 标准的 QUIC 库不能给一条已有的连接换对端地址，所以直连和中继是两条独立的连接尝试，
 //! 这里选能用的那条。会话建立之后从中继切换到直连在应用层做（另建连接后把会话搬过去）。
 
-use std::future::Future;
 use std::net::SocketAddr;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::Poll;
 use std::time::{Duration, Instant};
 
+use peerdesk_core::paths::{Candidate, Limits, PathKind};
 use peerdesk_core::relay::{unwrap, wrap, SessionId, RELAY_HEADER};
 use peerdesk_core::signal::{
     format_code, observe_packet, PunchInfo, PunchPlan, RelayGrant, SignalMsg,
@@ -21,17 +19,18 @@ use tokio::task::JoinHandle;
 use crate::stream::{read_signal, write_kind, write_signal, StreamKind};
 use crate::{Fingerprint, Link, NetError, Node};
 
+/// 被控端向控制端的候选地址发 ping 的时长（控制端探测加多端口打洞都在这之内）。
+const PINGING_TIME: Duration = Duration::from_millis(5000);
+/// 一端难打洞时，先让快路径试这么久再开始多端口打洞（和 `Limits::HARD` 的等待一致）。
+const HARD_HEAD_START: Duration = Duration::from_millis(600);
+/// 普通打洞时，等这么久控制端还没连上来，被控端就开始多端口打洞（和 `Limits::NORMAL` 的等待一致）。
+const PLAIN_FALLBACK: Duration = Duration::from_millis(1500);
 /// 多端口打洞（生日攻击）最多用这么久。
 const BIRTHDAY_TIMEOUT: Duration = Duration::from_millis(3500);
 /// NAT 探测包发几份。
 const OBSERVE_COPIES: usize = 3;
-/// 局域网地址的握手最多等这么久：同一个局域网里往返只要几毫秒。
-const LAN_TIMEOUT: Duration = Duration::from_millis(600);
 /// 直连握手最多等这么久，超时就改走中继。
 const DIRECT_TIMEOUT: Duration = Duration::from_millis(2500);
-/// 打洞包发几轮、每轮间隔多久。
-const PUNCH_ROUNDS: u32 = 5;
-const PUNCH_GAP: Duration = Duration::from_millis(100);
 /// 中继通道的保活间隔：让中继和沿途的 NAT 记住本端的地址。
 const SHIM_KEEPALIVE: Duration = Duration::from_secs(5);
 
@@ -62,14 +61,6 @@ pub enum PathPolicy {
     DirectOnly,
     /// 只走中继（用于测试，或者不想暴露自己地址的场合）。
     RelayOnly,
-}
-
-/// 向 `addr` 发几轮打洞包。
-pub async fn punch(node: &Node, addr: SocketAddr) {
-    for _ in 0..PUNCH_ROUNDS {
-        node.punch(addr);
-        tokio::time::sleep(PUNCH_GAP).await;
-    }
 }
 
 /// 本机地址：`loopback` 为真给回环地址，否则给“所有地址”。
@@ -158,6 +149,8 @@ pub struct Incoming {
     pub peer: Fingerprint,
     /// 控制端的公网地址。
     pub addr: SocketAddr,
+    /// 控制端的候选地址。
+    pub locals: Vec<Candidate>,
     /// 打洞方式。
     pub punch: PunchInfo,
     /// 备用的中继通道。
@@ -185,13 +178,23 @@ impl Drop for Registration {
 
 /// 被控端：向服务器登记在线。
 pub async fn register(node: &Node, server: &Server) -> Result<Registration, NetError> {
+    register_with(node, server, Vec::new()).await
+}
+
+/// 同 [`register`]，另外报告 `extra` 候选地址（例如路由器为本机映射出来的端口）。
+pub async fn register_with(
+    node: &Node,
+    server: &Server,
+    extra: Vec<Candidate>,
+) -> Result<Registration, NetError> {
     let link = Arc::new(node.connect(server.addr, server.pin.as_ref()).await?);
     let (mut send, mut recv) = link.open_stream().await?;
     write_kind(&mut send, StreamKind::Signal).await?;
-    let locals = crate::candidates::local_candidates(
+    let mut locals = extra;
+    locals.extend(crate::candidates::local_candidates(
         node.local_addr()?,
         &crate::candidates::lan_addresses(),
-    );
+    ));
     write_signal(&mut send, &SignalMsg::Register { locals }).await?;
     let SignalMsg::Registered {
         observed,
@@ -212,6 +215,7 @@ pub async fn register(node: &Node, server: &Server) -> Result<Registration, NetE
             if let SignalMsg::Incoming {
                 peer,
                 addr,
+                locals,
                 punch,
                 relay,
             } = msg
@@ -219,6 +223,7 @@ pub async fn register(node: &Node, server: &Server) -> Result<Registration, NetE
                 let incoming = Incoming {
                     peer,
                     addr,
+                    locals,
                     punch,
                     relay,
                 };
@@ -269,37 +274,39 @@ pub async fn answer(node: &Arc<Node>, incoming: &Incoming) -> Result<Option<Shim
         incoming.punch.me,
         incoming.punch.peer
     );
+    // 两端同时互相探测：向控制端的每个候选地址不停发 ping，让本机的 NAT 为它开门；
+    // 控制端发来的 ping 由端口自动回 pong，控制端据此测每条路径并选路。
+    let nonce = incoming.punch.nonce;
+    let sub = node.subscribe(nonce);
+    let mut remotes = incoming.locals.clone();
+    remotes.push(Candidate {
+        addr: incoming.addr,
+        kind: PathKind::Public,
+    });
+    let (pinger, peer) = (Arc::clone(node), incoming.peer);
+    tokio::spawn(async move {
+        crate::ice::keep_pinging(&pinger, sub, nonce, remotes, peer, PINGING_TIME).await;
+    });
+    // 一端难打洞时，控制端先用很短的时间试快路径（局域网、IPv6、端口映射），都不通才多端口打洞；
+    // 这边等同样的时间再开始，期间控制端已经连上来的话就不必了。
+    let (node, addr) = (Arc::clone(node), incoming.addr);
     match plan {
-        PunchPlan::Plain => punch(node, incoming.addr).await,
         PunchPlan::Skip => {}
-        PunchPlan::Spray => {
-            let (node, addr, nonce) = (Arc::clone(node), incoming.addr, incoming.punch.nonce);
-            tokio::spawn(async move { crate::punch::spray(&node, addr.ip(), addr, &nonce).await });
+        // 普通打洞没通（例如本端路由器把外网先到的包记了一笔，给本机换了端口，对控制端来说
+        // 本端就成了“难打洞”的一端）：和控制端同时退到多端口打洞。
+        PunchPlan::Plain => {
+            tokio::spawn(host_sockets(node, addr, peer, nonce, PLAIN_FALLBACK));
         }
-        PunchPlan::Sockets => {
-            let (node, addr, peer, nonce) = (
-                Arc::clone(node),
-                incoming.addr,
-                incoming.peer,
-                incoming.punch.nonce,
-            );
+        PunchPlan::Spray => {
             tokio::spawn(async move {
-                let Some(socket) = crate::punch::sockets(addr, nonce, BIRTHDAY_TIMEOUT).await
-                else {
-                    crate::note!(info, "被控：多端口打洞没有撞上 {addr}");
-                    return;
-                };
-                match node
-                    .connect_via(socket, addr, Some(&peer), DIRECT_TIMEOUT)
-                    .await
-                {
-                    Ok(link) => {
-                        crate::note!(info, "被控：多端口打洞成功，主动连上 {addr}");
-                        node.offer(link).await;
-                    }
-                    Err(e) => crate::note!(warn, "被控：多端口打洞连接 {addr} 失败：{e}"),
+                tokio::time::sleep(HARD_HEAD_START).await;
+                if !node.accepted_recently(&peer, PINGING_TIME) {
+                    crate::punch::spray(&node, addr.ip(), addr, &nonce).await;
                 }
             });
+        }
+        PunchPlan::Sockets => {
+            tokio::spawn(host_sockets(node, addr, peer, nonce, HARD_HEAD_START));
         }
     }
     Ok(shim)
@@ -321,6 +328,12 @@ pub struct Dialed {
     pub link: Link,
     /// 走的是哪条路。
     pub path: Path,
+    /// 具体是哪种路径（局域网、IPv6、打洞、中继……）。
+    pub route: PathKind,
+    /// 探测时测到的这条路径的往返时间（微秒）。
+    pub rtt_us: Option<u64>,
+    /// 探测结果的说明：每条路径通不通、多快。
+    pub report: String,
     /// 对方设备的指纹（按设备码连接时由服务器告知，连接本身核对过）。
     pub device: Fingerprint,
     /// 按两端 NAT 类型选的打洞方式。
@@ -349,34 +362,6 @@ async fn accept_from(node: &Node, device: &Fingerprint) -> Result<Link, NetError
 }
 
 /// 同时进行几次连接尝试，返回第一个成功的；都失败时返回最后一个错误（指纹不符优先）。
-/// 一次进行中的连接尝试。
-type Attempt<'a> = Pin<Box<dyn Future<Output = Result<Link, NetError>> + Send + 'a>>;
-
-async fn first_ok(mut attempts: Vec<Attempt<'_>>) -> Result<Link, NetError> {
-    let mut error = NetError::Timeout("直连");
-    std::future::poll_fn(|cx| {
-        let mut pending = Vec::with_capacity(attempts.len());
-        for mut attempt in attempts.drain(..) {
-            match attempt.as_mut().poll(cx) {
-                Poll::Ready(Ok(link)) => return Poll::Ready(Ok(link)),
-                Poll::Ready(Err(e @ NetError::PinMismatch { .. })) => return Poll::Ready(Err(e)),
-                Poll::Ready(Err(e)) => error = e,
-                Poll::Pending => pending.push(attempt),
-            }
-        }
-        attempts = pending;
-        if attempts.is_empty() {
-            Poll::Ready(Err(std::mem::replace(
-                &mut error,
-                NetError::Timeout("直连"),
-            )))
-        } else {
-            Poll::Pending
-        }
-    })
-    .await
-}
-
 /// 通过服务器建立连接时各阶段的耗时。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DialTiming {
@@ -384,8 +369,8 @@ pub struct DialTiming {
     pub server_connect: Duration,
     /// 向服务器查询对方地址。
     pub lookup: Duration,
-    /// 尝试对方的局域网地址（两端不在同一个出口后面时为 0）。
-    pub lan: Duration,
+    /// 并行探测所有候选路径。
+    pub probe: Duration,
     /// 尝试直连（包括失败的情况）。
     pub direct: Duration,
     /// 经中继连上（没走中继时为 0）。
@@ -407,9 +392,19 @@ pub async fn dial(
     };
     let (mut send, mut recv) = signal.open_stream().await?;
     write_kind(&mut send, StreamKind::Signal).await?;
+    let mine = crate::candidates::local_candidates(
+        node.local_addr()?,
+        &crate::candidates::lan_addresses(),
+    );
     let ask = match lookup {
-        Lookup::Device(target) => SignalMsg::Connect { target: *target },
-        Lookup::Code(code) => SignalMsg::ConnectCode { code: *code },
+        Lookup::Device(target) => SignalMsg::Connect {
+            target: *target,
+            locals: mine,
+        },
+        Lookup::Code(code) => SignalMsg::ConnectCode {
+            code: *code,
+            locals: mine,
+        },
     };
     let asked = Instant::now();
     write_signal(&mut send, &ask).await?;
@@ -452,7 +447,7 @@ pub async fn dial(
     let plan = punch_info.plan();
     crate::note!(
         info,
-        "服务器 {}：连上 {:?}，查到对方 {addr}（{:?}），打洞方式 {plan:?}（本机 NAT {:?}，对方 {:?}），中继{}",
+        "服务器 {}：连上 {:?}，查到对方 {addr}（{:?}），本机公网地址 {you}，打洞方式 {plan:?}（本机 NAT {:?}，对方 {:?}），中继{}",
         server.addr,
         timing.server_connect,
         timing.lookup,
@@ -465,98 +460,66 @@ pub async fn dial(
         }
     );
     let target = &device;
+    let nonce = punch_info.nonce;
+    let mut sub = node.subscribe(nonce);
 
-    let try_direct = !matches!(policy, PathPolicy::RelayOnly);
-    // 两端的公网 IP 相同：在同一个出口后面，先试对方的局域网地址。
-    let mine = node.local_addr()?;
-    let lan: Vec<SocketAddr> = locals
-        .into_iter()
-        .filter(|l| l.is_ipv4() == mine.is_ipv4() && *l != addr)
-        .collect();
-    if try_direct && you.ip() == addr.ip() && !lan.is_empty() {
-        let tried = Instant::now();
-        let mut attempts: Vec<Attempt<'_>> = Vec::with_capacity(lan.len());
-        for l in &lan {
-            attempts.push(Box::pin(node.connect_within(
-                *l,
-                Some(&device),
-                LAN_TIMEOUT,
-            )));
-        }
-        let found = first_ok(attempts).await;
-        timing.lan = tried.elapsed();
-        match found {
-            Ok(link) => {
-                crate::note!(
-                    info,
-                    "局域网直连 {} 成功，用时 {:?}",
-                    link.remote_addr(),
-                    timing.lan
-                );
-                return Ok(Dialed {
-                    link,
-                    path: Path::Direct,
-                    device,
-                    plan,
-                    timing,
-                    direct_error: None,
-                    relay_session: None,
-                    shim: None,
-                });
-            }
-            Err(e @ NetError::PinMismatch { .. }) => return Err(e),
-            Err(e) => crate::note!(info, "局域网地址 {lan:?} 都不通（{:?}）：{e}", timing.lan),
-        }
+    // 候选：对方报告的局域网 / IPv6 / 端口映射地址，服务器看到的公网地址，还有中继。
+    let mut remotes: Vec<Candidate> = Vec::new();
+    if !matches!(policy, PathPolicy::RelayOnly) {
+        remotes.extend(locals.iter().copied());
+        remotes.push(Candidate {
+            addr,
+            kind: PathKind::Public,
+        });
     }
-    let direct_error = if try_direct {
+    if matches!(policy, PathPolicy::RelayOnly) && relay.is_none() {
+        return Err(NetError::Connect("服务器没有提供中继".into()));
+    }
+    // 拿到对方地址立刻先发一轮 ping（不等中继转发器准备好）：本端路由器先为对方开门，
+    // 对方的包到达时就不会被本端路由器当成陌生来客（见 `ice::HOST_PING_DELAY`）。
+    crate::ice::ping_all(node, nonce, u32::MAX, &remotes);
+    let shim = match (policy, relay) {
+        (PathPolicy::DirectOnly, _) | (_, None) => None,
+        (PathPolicy::Auto | PathPolicy::RelayOnly, Some(grant)) => {
+            Some(Shim::start(grant, None).await?)
+        }
+    };
+    if let Some(shim) = &shim {
+        // 中继也作为一条路径参加探测：ping 经两端的转发器过去，能和直连比快慢。
+        remotes.push(Candidate {
+            addr: shim.local_addr(),
+            kind: PathKind::Relay,
+        });
+    }
+    // 有一端难打洞（包括两端都难）时，公网地址基本不会通，只等快路径。
+    let limits = if plan == PunchPlan::Plain {
+        Limits::NORMAL
+    } else {
+        Limits::HARD
+    };
+    let probing = Instant::now();
+    let direct_allowed = !matches!(policy, PathPolicy::RelayOnly);
+    let race = crate::ice::race(node, &mut sub, nonce, remotes, limits, direct_allowed).await;
+    timing.probe = probing.elapsed();
+    let report = crate::ice::describe(&race);
+    crate::note!(info, "{report}");
+    let any_direct = race.measured.iter().any(|m| m.candidate.kind.direct());
+
+    let mut direct_error = None;
+    if let Some(m) = race.picked.filter(|m| m.candidate.kind.direct()) {
         let tried = Instant::now();
-        let direct = match plan {
-            PunchPlan::Plain => {
-                // 对方同时也在向我们打洞。
-                node.punch(addr);
-                node.connect_within(addr, Some(&device), DIRECT_TIMEOUT)
-                    .await
-            }
-            PunchPlan::Skip => Err(NetError::Connect(
-                "两端的 NAT 都是对称型（换目的地就换端口），打洞几乎不可能成功，直接走中继".into(),
-            )),
-            PunchPlan::Sockets => {
-                match crate::punch::sockets(addr, punch_info.nonce, BIRTHDAY_TIMEOUT).await {
-                    Some(socket) => {
-                        node.connect_via(socket, addr, Some(&device), DIRECT_TIMEOUT)
-                            .await
-                    }
-                    None => Err(NetError::Timeout("多端口打洞")),
-                }
-            }
-            PunchPlan::Spray => {
-                let spraying = crate::punch::spray(node, addr.ip(), addr, &punch_info.nonce);
-                let accepting = accept_from(node, &device);
-                tokio::pin!(spraying, accepting);
-                let deadline = tokio::time::sleep(BIRTHDAY_TIMEOUT);
-                tokio::pin!(deadline);
-                let mut sprayed = false;
-                loop {
-                    tokio::select! {
-                        () = &mut spraying, if !sprayed => sprayed = true,
-                        link = &mut accepting => break link,
-                        () = &mut deadline => break Err(NetError::Timeout("等对方从撞上的端口连过来")),
-                    }
-                }
-            }
-        };
+        let link = node
+            .connect_within(m.candidate.addr, Some(target), DIRECT_TIMEOUT)
+            .await;
         timing.direct = tried.elapsed();
-        match direct {
+        match link {
             Ok(link) => {
-                crate::note!(
-                    info,
-                    "直连 {} 成功（{plan:?}），用时 {:?}",
-                    link.remote_addr(),
-                    timing.direct
-                );
                 return Ok(Dialed {
                     link,
                     path: Path::Direct,
+                    route: m.candidate.kind,
+                    rtt_us: Some(m.rtt_us),
+                    report,
                     device,
                     plan,
                     timing,
@@ -567,42 +530,141 @@ pub async fn dial(
             }
             // 指纹不符说明连到的不是目标设备：不能退到中继去掩盖它。
             Err(e @ NetError::PinMismatch { .. }) => return Err(e),
-            Err(e) => Some(e),
+            Err(e) => direct_error = Some(e),
         }
-    } else {
-        None
-    };
-    let grant = match (policy, relay) {
-        (PathPolicy::DirectOnly, _) | (_, None) => {
-            return Err(
-                direct_error.unwrap_or_else(|| NetError::Connect("服务器没有提供中继".into()))
-            );
+    } else if plan != PunchPlan::Skip && !any_direct && !matches!(policy, PathPolicy::RelayOnly) {
+        // 快路径都不通：多端口打洞（生日攻击）。普通打洞没通时，多半是对方的路由器给对方换了
+        // 端口（对方成了难打洞的一端），所以本端撒包、对方开很多端口。
+        let tried = Instant::now();
+        // 本端难时本端开很多端口；否则（对方难，或者普通打洞没通）本端撒包。
+        let found = birthday(node, plan == PunchPlan::Sockets, addr, nonce, target).await;
+        timing.direct = tried.elapsed();
+        match found {
+            Ok(link) => {
+                crate::note!(
+                    info,
+                    "多端口打洞直连 {} 成功，用时 {:?}",
+                    link.remote_addr(),
+                    timing.direct
+                );
+                return Ok(Dialed {
+                    link,
+                    path: Path::Direct,
+                    route: PathKind::PeerReflexive,
+                    rtt_us: None,
+                    report,
+                    device,
+                    plan,
+                    timing,
+                    direct_error: None,
+                    relay_session: None,
+                    shim: None,
+                });
+            }
+            Err(e @ NetError::PinMismatch { .. }) => return Err(e),
+            Err(e) => direct_error = Some(e),
         }
-        (PathPolicy::Auto | PathPolicy::RelayOnly, Some(grant)) => grant,
+    } else if !any_direct && !matches!(policy, PathPolicy::RelayOnly) {
+        direct_error = Some(NetError::Connect(
+            "两端的 NAT 都是对称型（换目的地就换端口），打洞几乎不可能成功，直接走中继".into(),
+        ));
+    }
+
+    let (Some(shim), Some(grant)) = (shim, relay) else {
+        return Err(direct_error.unwrap_or_else(|| NetError::Connect("服务器没有提供中继".into())));
     };
     let tried = Instant::now();
-    let shim = Shim::start(grant, None).await?;
     let link = node.connect(shim.local_addr(), Some(target)).await?;
     timing.relay = tried.elapsed();
+    let why = direct_error
+        .as_ref()
+        .map_or_else(|| "中继更快".to_owned(), ToString::to_string);
     crate::note!(
         info,
-        "经中继 {} 连上，用时 {:?}；直连失败：{}",
+        "经中继 {} 连上，用时 {:?}；不走直连的原因：{why}",
         grant.addr,
-        timing.relay,
-        direct_error
-            .as_ref()
-            .map_or_else(|| "没有尝试".to_owned(), ToString::to_string)
+        timing.relay
     );
+    let rtt_us = race
+        .measured
+        .iter()
+        .find(|m| m.candidate.kind == PathKind::Relay)
+        .map(|m| m.rtt_us);
     Ok(Dialed {
         link,
         path: Path::Relay,
+        route: PathKind::Relay,
+        rtt_us,
+        report,
         device,
         plan,
         timing,
-        direct_error: direct_error.map(|e| e.to_string()),
+        direct_error: Some(why),
         relay_session: Some(grant.session),
         shim: Some(shim),
     })
+}
+
+/// 被控端的多端口打洞：等 `after`（控制端先试快路径），控制端还没连上来就开很多端口找通路，
+/// 撞上后主动连控制端，这条连接从 [`Node::accept`] 出来。
+async fn host_sockets(
+    node: Arc<Node>,
+    addr: SocketAddr,
+    peer: Fingerprint,
+    nonce: [u8; 16],
+    after: Duration,
+) {
+    tokio::time::sleep(after).await;
+    if node.accepted_recently(&peer, PINGING_TIME) {
+        return;
+    }
+    let found = crate::punch::sockets(addr, nonce, BIRTHDAY_TIMEOUT).await;
+    // 撞上之前控制端可能已经从别的路连上了：不要再建第二条连接。
+    let socket = found.filter(|_| !node.accepted_recently(&peer, PINGING_TIME));
+    let linked = match socket {
+        Some(socket) => {
+            node.connect_via(socket, addr, Some(&peer), DIRECT_TIMEOUT)
+                .await
+        }
+        None => Err(NetError::Timeout("多端口打洞没有撞上或已经不需要")),
+    };
+    match linked {
+        Ok(link) => {
+            crate::note!(info, "被控：多端口打洞成功，主动连上 {addr}");
+            node.offer(link).await;
+        }
+        Err(e) => crate::note!(info, "被控：多端口打洞没有用上 {addr}：{e}"),
+    }
+}
+
+/// 多端口打洞：本端难时开很多端口；对方难时向它撒探测包，等它从撞上的端口连过来。
+async fn birthday(
+    node: &Node,
+    open_sockets: bool,
+    addr: SocketAddr,
+    nonce: [u8; 16],
+    target: &Fingerprint,
+) -> Result<Link, NetError> {
+    if open_sockets {
+        let found = crate::punch::sockets(addr, nonce, BIRTHDAY_TIMEOUT).await;
+        let socket = found.ok_or(NetError::Timeout("多端口打洞没有撞上"))?;
+        return node
+            .connect_via(socket, addr, Some(target), DIRECT_TIMEOUT)
+            .await;
+    }
+    let spraying = crate::punch::spray(node, addr.ip(), addr, &nonce);
+    let accepting = accept_from(node, target);
+    tokio::pin!(spraying, accepting);
+    let deadline = tokio::time::sleep(BIRTHDAY_TIMEOUT);
+    tokio::pin!(deadline);
+    let mut sprayed = false;
+    loop {
+        tokio::select! {
+            () = &mut spraying, if !sprayed => sprayed = true,
+            link = &mut accepting => break link,
+            () = &mut deadline => break Err(NetError::Timeout("等对方从撞上的端口连过来")),
+        }
+    }
 }
 
 #[cfg(test)]

@@ -35,11 +35,13 @@ pub mod files;
 pub mod fs_store;
 #[cfg(feature = "media")]
 pub mod host;
+pub mod ice;
 pub mod identity;
 pub mod node;
 pub mod punch;
 pub mod rendezvous;
 pub mod service;
+pub mod sidechannel;
 pub mod stream;
 mod tls;
 mod tls_verifier;

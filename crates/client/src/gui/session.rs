@@ -3,7 +3,7 @@
 //! 界面线程和会话线程之间只有通道：会话线程发事件过来并请求重绘，界面每帧取走；
 //! 界面通过句柄发输入、断开或停止。句柄被丢弃时会话自己结束。
 
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -237,16 +237,15 @@ fn bind_nodes(
     identity: &Identity,
     policy: &Policy,
 ) -> Result<(Vec<Arc<Node>>, bool), NetError> {
-    let v4 = Arc::new(Node::bind(
-        (Ipv4Addr::UNSPECIFIED, port).into(),
-        identity,
-        policy,
-    )?);
-    let port = v4.local_addr()?.port();
-    let v6 = Node::bind((Ipv6Addr::UNSPECIFIED, port).into(), identity, policy).ok();
-    let has_v6 = v6.is_some();
-    let nodes = std::iter::once(v4).chain(v6.map(Arc::new)).collect();
-    Ok((nodes, has_v6))
+    // 优先一个双栈端口（IPv4 和 IPv6 都收发，打洞和 IPv6 直连用同一个端口）；
+    // 系统不支持 IPv6 时只开 IPv4。
+    let tries = [
+        SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port),
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port),
+    ];
+    let node = Node::bind_first(&tries, identity, policy)?;
+    let ipv6 = node.local_addr()?.is_ipv6();
+    Ok((vec![Arc::new(node)], ipv6))
 }
 
 /// 画面来源的包装：第一次取画面时告诉界面“验证通过了”；界面要求断开时返回 `None` 结束会话。
@@ -586,10 +585,15 @@ pub fn start_view(
     }
 }
 
-const fn wants_ipv6(target: &Target) -> bool {
+/// 控制端绑定的地址：直接连地址时跟它同一地址族；通过服务器连接时用双栈端口
+/// （IPv4 和 IPv6 的候选路径都能探测）。
+const fn view_bind(target: &Target) -> SocketAddr {
     match target {
-        Target::Addr { addr, .. } => addr.is_ipv6(),
-        Target::Device { server, .. } => server.addr.is_ipv6(),
+        Target::Addr { addr, .. } if addr.is_ipv6() => {
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
+        }
+        Target::Addr { .. } => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+        Target::Device { .. } => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
     }
 }
 
@@ -604,12 +608,10 @@ async fn view_main(
 ) -> Result<Summary, NetError> {
     let policy = Policy::recommended();
     let identity = Identity::load_or_create(&data_dir)?;
-    let bind: SocketAddr = if wants_ipv6(&target) {
-        (Ipv6Addr::UNSPECIFIED, 0).into()
-    } else {
-        (Ipv4Addr::UNSPECIFIED, 0).into()
-    };
-    let node = Arc::new(Node::bind(bind, &identity, &policy)?);
+    let bind = view_bind(&target);
+    // 系统不支持 IPv6 时退回 IPv4。
+    let v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
+    let node = Arc::new(Node::bind_first(&[bind, v4], &identity, &policy)?);
     let started = Instant::now();
     let result = tokio::select! {
         () = stopped(&mut stop) => Ok(Summary {

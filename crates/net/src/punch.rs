@@ -50,13 +50,8 @@ pub(crate) fn unspecified(v6: bool) -> IpAddr {
 fn random_ports(count: usize) -> Vec<u16> {
     use ring::rand::SecureRandom;
     let mut bytes = vec![0u8; count * 2];
-    // 取随机数失败极少见；退回到按顺序扫，效果差一些但仍然有用。
-    if ring::rand::SystemRandom::new().fill(&mut bytes).is_err() {
-        bytes
-            .iter_mut()
-            .enumerate()
-            .for_each(|(i, b)| *b = u8::try_from(i % 251).unwrap_or(0));
-    }
+    // 取随机数失败极少见；那样端口全是同一个，这次多端口打洞基本无效，会退到中继。
+    let _ = ring::rand::SystemRandom::new().fill(&mut bytes);
     let span = u32::from(u16::MAX - LOW_PORT) + 1;
     bytes
         .chunks_exact(2)

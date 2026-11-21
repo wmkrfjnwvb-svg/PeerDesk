@@ -3,6 +3,8 @@
 
 use std::net::{IpAddr, SocketAddr};
 
+use peerdesk_core::paths::{local_kind, Candidate};
+
 /// 值得用的地址：去掉回环、未指定和链路本地地址（后者需要网卡序号），IPv4 在前，去重。
 #[must_use]
 pub fn usable(addrs: impl IntoIterator<Item = IpAddr>) -> Vec<IpAddr> {
@@ -32,19 +34,27 @@ pub fn lan_addresses() -> Vec<IpAddr> {
     )
 }
 
-/// 端点绑定在 `bound` 上时，别人能从局域网连进来的地址：绑定在“所有地址”上时是本机每个
-/// 同地址族的地址加上端口；绑定在具体地址上时就是它自己。
+/// 端点绑定在 `bound` 上时，别人能直接连进来的地址：绑定在“所有地址”上时是本机每个
+/// 地址加上端口（IPv6 的“所有地址”是双栈，两种地址都算；IPv4 的只算 IPv4）；
+/// 绑定在具体地址上时就是它自己。全局 IPv6 地址标为 IPv6 直连，其余为局域网。
 #[must_use]
-pub fn local_candidates(bound: SocketAddr, lan: &[IpAddr]) -> Vec<SocketAddr> {
-    if !bound.ip().is_unspecified() {
-        return usable([bound.ip()])
-            .into_iter()
-            .map(|ip| SocketAddr::new(ip, bound.port()))
-            .collect();
-    }
-    lan.iter()
-        .filter(|ip| ip.is_ipv4() == bound.is_ipv4())
-        .map(|ip| SocketAddr::new(*ip, bound.port()))
+pub fn local_candidates(bound: SocketAddr, lan: &[IpAddr]) -> Vec<Candidate> {
+    let ips: Vec<IpAddr> = if bound.ip().is_unspecified() {
+        lan.iter()
+            .copied()
+            .filter(|ip| bound.is_ipv6() || ip.is_ipv4())
+            .collect()
+    } else {
+        usable([bound.ip()])
+    };
+    ips.into_iter()
+        .map(|ip| {
+            let addr = SocketAddr::new(ip, bound.port());
+            Candidate {
+                addr,
+                kind: local_kind(&addr),
+            }
+        })
         .collect()
 }
 
@@ -52,6 +62,7 @@ pub fn local_candidates(bound: SocketAddr, lan: &[IpAddr]) -> Vec<SocketAddr> {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+    use peerdesk_core::paths::PathKind;
 
     #[test]
     fn filters_and_orders() {
@@ -80,19 +91,34 @@ mod tests {
 
     #[test]
     fn candidates_follow_the_binding() {
-        let lan: Vec<IpAddr> = ["10.0.0.2", "fd00::5"].map(|s| s.parse().unwrap()).to_vec();
+        let lan: Vec<IpAddr> = ["10.0.0.2", "fd00::5", "2408:8000::5"]
+            .map(|s| s.parse().unwrap())
+            .to_vec();
+        let addrs = |c: Vec<Candidate>| {
+            c.into_iter()
+                .map(|c| (c.addr.to_string(), c.kind))
+                .collect::<Vec<_>>()
+        };
         let any4: SocketAddr = "0.0.0.0:4433".parse().unwrap();
         let any6: SocketAddr = "[::]:4433".parse().unwrap();
         assert_eq!(
-            local_candidates(any4, &lan),
-            vec!["10.0.0.2:4433".parse().unwrap()]
+            addrs(local_candidates(any4, &lan)),
+            vec![("10.0.0.2:4433".to_owned(), PathKind::Lan)]
         );
         assert_eq!(
-            local_candidates(any6, &lan),
-            vec!["[fd00::5]:4433".parse().unwrap()]
+            addrs(local_candidates(any6, &lan)),
+            vec![
+                ("10.0.0.2:4433".to_owned(), PathKind::Lan),
+                ("[fd00::5]:4433".to_owned(), PathKind::Lan),
+                ("[2408:8000::5]:4433".to_owned(), PathKind::Ipv6),
+            ],
+            "双栈端口两种地址都算"
         );
         let one: SocketAddr = "192.168.1.9:7".parse().unwrap();
-        assert_eq!(local_candidates(one, &lan), vec![one]);
+        assert_eq!(
+            addrs(local_candidates(one, &lan)),
+            vec![(one.to_string(), PathKind::Lan)]
+        );
         let lo: SocketAddr = "127.0.0.1:7".parse().unwrap();
         assert!(local_candidates(lo, &lan).is_empty());
     }

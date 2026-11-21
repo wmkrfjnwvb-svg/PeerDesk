@@ -480,12 +480,23 @@ fn pixels_are_converted() {
             Color32::from_rgb(0xAA, 0xBB, 0xCC)
         ]
     );
-    assert!(wants_ipv6(&Target::Device {
+    // 通过服务器连接时用双栈端口；直接连地址时跟着地址族
+    assert!(view_bind(&Target::Device {
         server: Server {
-            addr: "[::1]:1".parse().unwrap(),
+            addr: "1.2.3.4:1".parse().unwrap(),
             pin: None
         },
         device: peerdesk_net::rendezvous::Lookup::Device([0; 32]),
         policy: peerdesk_net::rendezvous::PathPolicy::Auto,
-    }));
+    })
+    .is_ipv6());
+    let v4 = Target::Addr {
+        addr: "1.2.3.4:1".parse().unwrap(),
+        pin: None,
+    };
+    let v6 = Target::Addr {
+        addr: "[::1]:1".parse().unwrap(),
+        pin: None,
+    };
+    assert!(view_bind(&v4).is_ipv4() && view_bind(&v6).is_ipv6());
 }

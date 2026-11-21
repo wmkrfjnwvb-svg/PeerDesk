@@ -7,8 +7,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
+use peerdesk_core::paths::Candidate;
 use peerdesk_core::relay::{Record, Relay, SessionId, Usage};
-use peerdesk_core::signal::{format_code, parse_observe, DeviceId, Registry, SignalMsg};
+use peerdesk_core::signal::{format_code, parse_observe, Caller, DeviceId, Registry, SignalMsg};
 use peerdesk_core::Time;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
@@ -216,6 +217,7 @@ async fn introduce(
     state: &SignalState,
     link: &Link,
     target: Option<DeviceId>,
+    locals: Vec<Candidate>,
     probed: &mut bool,
     send: &mut quinn::SendStream,
 ) -> Result<(), NetError> {
@@ -254,8 +256,12 @@ async fn introduce(
             .allocate(session, me)
             .then_some((relay.addr(), session))
     });
-    let intro =
-        lock(&state.registry).connect(me, link.remote_addr(), &target, relay, nonce, &probe_of);
+    let caller = Caller {
+        device: me,
+        addr: link.remote_addr(),
+        locals,
+    };
+    let intro = lock(&state.registry).connect(&caller, &target, relay, nonce, &probe_of);
     let plan = intro
         .to_controller
         .punch()
@@ -319,15 +325,15 @@ async fn serve_device(state: Arc<SignalState>, link: Link) -> Result<(), NetErro
                     lock(&state.outboxes).insert(conn, tx.clone());
                     if let Err(e) = write_signal(&mut send, &done.reply).await { break Err(e); }
                 }
-                Ok(SignalMsg::Connect { target }) => {
-                    if let Err(e) = introduce(&state, &link, Some(target), &mut probed, &mut send).await { break Err(e); }
+                Ok(SignalMsg::Connect { target, locals }) => {
+                    if let Err(e) = introduce(&state, &link, Some(target), locals, &mut probed, &mut send).await { break Err(e); }
                 }
-                Ok(SignalMsg::ConnectCode { code }) => {
+                Ok(SignalMsg::ConnectCode { code, locals }) => {
                     let target = lock(&state.registry).device_of(code);
                     if target.is_none() {
                         crate::note!(info, "按设备码 {} 连接：码不存在，来自 {}", format_code(code), link.remote_addr());
                     }
-                    if let Err(e) = introduce(&state, &link, target, &mut probed, &mut send).await { break Err(e); }
+                    if let Err(e) = introduce(&state, &link, target, locals, &mut probed, &mut send).await { break Err(e); }
                 }
                 Ok(
                     SignalMsg::Registered { .. }

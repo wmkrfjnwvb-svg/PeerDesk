@@ -219,7 +219,14 @@ pub(crate) async fn stay_registered(node: Arc<Node>, server: Server, registratio
 async fn host_async(args: HostArgs, out: &mut dyn Write) -> Result<u8, NetError> {
     let policy = Policy::recommended();
     let identity = Identity::load_or_create(&args.data_dir)?;
-    let node = Arc::new(Node::bind(args.listen, &identity, &policy)?);
+    // 系统不支持 IPv6 时，“所有 IPv6 地址”退回“所有 IPv4 地址”，端口不变。
+    let fallback = SocketAddr::from(([0, 0, 0, 0], args.listen.port()));
+    let tries = if args.listen.is_ipv6() && args.listen.ip().is_unspecified() {
+        vec![args.listen, fallback]
+    } else {
+        vec![args.listen]
+    };
+    let node = Arc::new(Node::bind_first(&tries, &identity, &policy)?);
     let recv_root = args
         .recv_dir
         .unwrap_or_else(|| args.data_dir.join("received"));
@@ -468,7 +475,14 @@ async fn connect_async(args: ConnectArgs, out: &mut dyn Write) -> Result<u8, Net
     let policy = Policy::recommended();
     let identity = Identity::load_or_create(&args.data_dir)?;
     let upload = args.send.as_deref().map(plan_upload).transpose()?;
-    let node = Node::bind(([0, 0, 0, 0], 0).into(), &identity, &policy)?;
+    // 通过服务器连接时用双栈端口（IPv6 的候选路径也能探测）；直接连地址时跟它同一地址族。
+    // 系统不支持 IPv6 时退回 IPv4。
+    let v4: SocketAddr = ([0, 0, 0, 0], 0).into();
+    let bind = match &args.target {
+        Target::Addr(addr) if addr.is_ipv4() => v4,
+        Target::Addr(_) | Target::Device { .. } => (std::net::Ipv6Addr::UNSPECIFIED, 0).into(),
+    };
+    let node = Node::bind_first(&[bind, v4], &identity, &policy)?;
     let result = connect_session(&node, &identity, &policy, args, upload, out).await;
     // 无论成功失败，都等关闭通知送到对端再退出：
     // 否则被控端要等到超时才知道这条连接没了，期间不能接待下一个连接。
@@ -500,14 +514,21 @@ async fn connect_session(
                 PathKind::Relay => "中继",
             };
             let _ = writeln!(out, "连接路径      {path}");
+            let _ = writeln!(out, "路径种类      {}", dialed.route.label());
+            let rtt = dialed.rtt_us.map_or_else(
+                || "-".to_owned(),
+                |us| format!("{:.1} ms", Duration::from_micros(us).as_secs_f64() * 1000.0),
+            );
+            let _ = writeln!(out, "路径往返      {rtt}");
             let _ = writeln!(out, "打洞方式      {:?}", dialed.plan);
+            let _ = writeln!(out, "路径探测      {}", dialed.report);
             let t = dialed.timing;
             let _ = writeln!(
                 out,
-                "连接耗时      服务器 {} ms，查询 {} ms，局域网 {} ms，直连 {} ms，中继 {} ms",
+                "连接耗时      服务器 {} ms，查询 {} ms，探测 {} ms，直连 {} ms，中继 {} ms",
                 t.server_connect.as_millis(),
                 t.lookup.as_millis(),
-                t.lan.as_millis(),
+                t.probe.as_millis(),
                 t.direct.as_millis(),
                 t.relay.as_millis()
             );
