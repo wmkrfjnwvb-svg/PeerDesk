@@ -99,8 +99,11 @@ pub fn install(defs: &mut FontDefinitions, found: &Candidate, bytes: Vec<u8>) {
 /// 自带字体加上找到的系统中文字体。返回用了哪个文件（没找到时为 `None`）。
 #[must_use]
 pub fn definitions() -> (FontDefinitions, Option<PathBuf>) {
+    definitions_from(load_first(&candidates(), |p| std::fs::read(p)))
+}
+
+fn definitions_from(found: Option<(Candidate, Vec<u8>)>) -> (FontDefinitions, Option<PathBuf>) {
     let mut defs = FontDefinitions::default();
-    let found = load_first(&candidates(), |p| std::fs::read(p));
     let used = found.map(|(c, bytes)| {
         install(&mut defs, &c, bytes);
         c.path
@@ -139,6 +142,15 @@ mod tests {
         for family in [FontFamily::Proportional, FontFamily::Monospace] {
             assert_eq!(defs.families[&family].last().unwrap(), "system-cjk");
         }
+    }
+
+    #[test]
+    fn definitions_with_and_without_a_cjk_font() {
+        let (defs, used) = definitions_from(Some((candidate("/x.ttc", 0), vec![0; 4])));
+        assert_eq!(used, Some(PathBuf::from("/x.ttc")));
+        assert!(defs.font_data.contains_key("system-cjk"));
+        let (defs, used) = definitions_from(None);
+        assert!(used.is_none() && !defs.font_data.contains_key("system-cjk"));
     }
 
     #[test]

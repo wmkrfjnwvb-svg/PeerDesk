@@ -407,14 +407,10 @@ pub async fn serve(
                 let seq = source.change_seq();
                 let Some(screen) = source.capture() else {
                     // 画面来源结束：正在编的那一帧编完发出去再结束。
-                    if encoding {
-                        if let Some((job, Ok((encoded, refine)))) = encoded_rx.recv().await {
-                            let out = media.finish_frame(link.now(), &job, encoded, refine).unwrap_or_default();
-                            for o in &out {
-                                let _ = link.send_flags(Channel::Video, o.flags, &o.body);
-                            }
-                        }
-                    }
+                    let last = if encoding { encoded_rx.recv().await } else { None };
+                    let last = last.and_then(|(job, r)| r.ok().map(|(e, f)| (job, e, f)));
+                    let out = last.map(|(job, e, f)| media.finish_frame(link.now(), &job, e, f).unwrap_or_default());
+                    out.unwrap_or_default().iter().for_each(|o| drop(link.send_flags(Channel::Video, o.flags, &o.body)));
                     break "画面来源结束".to_owned();
                 };
                 let changed = match seq {
