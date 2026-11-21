@@ -368,6 +368,29 @@ mod tests {
         assert_eq!(static_asset(&[], "/x").status, 404);
     }
 
+    fn post(path: &str, body: &str) -> Response {
+        let request = parse_request(&format!(
+            "POST {path} HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        ))
+        .unwrap();
+        respond(&request, &Fake, ASSETS)
+    }
+
+    #[test]
+    fn default_cluster_usage_and_admin() {
+        assert_eq!(body(&get("/api/cluster")), "{\"nodes\":[]}");
+        assert_eq!(body(&get("/api/usage?month=202611")), "{\"accounts\":[]}");
+        // 参数不对：400；默认实现不允许管理操作：403
+        assert_eq!(post("/api/peers", "{}").status, 400);
+        assert_eq!(post("/api/accounts", "{\"quota_gb\":\"x\"}").status, 400);
+        assert_eq!(post("/api/peers", "{\"addr\":\"1.2.3.4:9\"}").status, 403);
+        assert_eq!(post("/api/accounts", "{\"quota_gb\":5}").status, 403);
+        assert_eq!(post("/api/nope", "").status, 405);
+        let request = parse_request("PUT / HTTP/1.1\r\n\r\n").unwrap();
+        assert_eq!(respond(&request, &Fake, ASSETS).status, 405);
+    }
+
     #[test]
     fn only_get_is_allowed() {
         let request = parse_request("POST /api/status HTTP/1.1\r\n\r\n").unwrap();

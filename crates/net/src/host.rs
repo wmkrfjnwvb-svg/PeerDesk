@@ -389,7 +389,9 @@ pub async fn serve(
                     let pong = write_control(&mut ctrl_send, &Control::Pong { nonce }).await;
              if let Err(e) = pong { break e.to_string(); }
                 }
-                Some(Control::Bye) | None => break "对端结束会话".to_owned(),
+                Some(Control::Bye) => break "对端结束会话".to_owned(),
+                // 控制流断了：网络断开时报网络原因（控制端据此换通道重连），否则是对端结束。
+                None => break link.lost_reason().unwrap_or_else(|| "对端结束会话".to_owned()),
                 Some(
                     Control::Hello { .. }
                     | Control::Accept { .. }

@@ -19,7 +19,7 @@ use peerdesk_core::region::NodeId;
 use peerdesk_core::relay::FreePolicy;
 use peerdesk_core::{Error, Time};
 use peerdesk_net::identity::to_hex;
-use peerdesk_net::service::{Directory, LocalDirectory, RelayOptions, RelayService, SignalService};
+use peerdesk_net::service::{Directory, RelayOptions, RelayService, SignalService};
 use peerdesk_net::{Fingerprint, Identity, NetError};
 
 use crate::accounting::{hex, Accounting, ClusterDirectory};
@@ -69,7 +69,7 @@ impl Services {
         cfg: &SignalConfig,
         policy: &Policy,
         options: RelayOptions,
-        directory: Option<ClusterDirectory>,
+        directory: ClusterDirectory,
     ) -> Result<Self, Error> {
         let fail = |e: NetError| Error::Config(format!("启动信令服务失败：{e}"));
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -88,13 +88,7 @@ impl Services {
                 };
                 let node = Arc::new(peerdesk_net::Node::bind(cfg.listen, &identity, policy)?);
                 let addr = node.local_addr()?;
-                let directory: Arc<dyn Directory> = match directory {
-                    Some(d) => Arc::new(d),
-                    None => Arc::new(LocalDirectory::new(
-                        relay.clone(),
-                        Some(options.key.clone()),
-                    )),
-                };
+                let directory: Arc<dyn Directory> = Arc::new(directory);
                 Ok::<_, NetError>((
                     SignalService::start_with_directory(
                         node,
@@ -305,7 +299,17 @@ fn bookkeeping(shared: &Shared, socket: &UdpSocket) {
         peerdesk_net::note!(error, "{e}");
     }
     let (total, sessions, _) = relay.totals();
-    let load = load_permille(shared.capacity_mbps, sessions, total.bytes, shared);
+    let delta = {
+        let mut last = shared
+            .last_bytes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let delta = total.bytes.saturating_sub(*last);
+        *last = total.bytes;
+        delta
+    };
+    let millis = u64::try_from(shared.bill_every.as_millis()).unwrap_or(u64::MAX);
+    let load = load_permille(shared.capacity_mbps, sessions, delta, millis);
     shared
         .cluster()
         .set_load(load, u32::try_from(sessions).unwrap_or(u32::MAX));
@@ -331,20 +335,14 @@ fn bookkeeping(shared: &Shared, socket: &UdpSocket) {
 }
 
 /// 负载（千分比）：配置了带宽时按最近一段的转发速率算，否则每 100 个会话算满。
-fn load_permille(capacity_mbps: u64, sessions: usize, total_bytes: u64, shared: &Shared) -> u16 {
+/// `delta_bytes` 是最近 `millis` 毫秒里转发的字节数。
+fn load_permille(capacity_mbps: u64, sessions: usize, delta_bytes: u64, millis: u64) -> u16 {
     let by_sessions = u16::try_from(sessions.saturating_mul(10).min(1000)).unwrap_or(1000);
     if capacity_mbps == 0 {
         return by_sessions;
     }
-    let mut last = shared
-        .last_bytes
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
-    let delta = total_bytes.saturating_sub(*last);
-    *last = total_bytes;
-    let millis = u64::try_from(shared.bill_every.as_millis())
-        .unwrap_or(u64::MAX)
-        .max(1);
+    let delta = delta_bytes;
+    let millis = millis.max(1);
     let bits_per_sec = delta.saturating_mul(8_000) / millis;
     let capacity = capacity_mbps.saturating_mul(1_000_000).max(1);
     u16::try_from((bits_per_sec.saturating_mul(1000) / capacity).min(1000)).unwrap_or(1000)
@@ -510,7 +508,7 @@ impl Node {
         };
         let services = cfg
             .signal()?
-            .map(|signal| Services::start(&signal, &policy, options, Some(directory)))
+            .map(|signal| Services::start(&signal, &policy, options, directory))
             .transpose()?;
         if let Some(services) = &services {
             let info = services.info;
@@ -705,5 +703,23 @@ pub fn launch(args: &[String], out: &mut dyn Write) -> Result<Node, u8> {
             let _ = writeln!(out, "错误：{e}");
             Err(EXIT_FAILED)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::load_permille;
+
+    #[test]
+    fn load_by_sessions_or_bandwidth() {
+        // 没配带宽：每 100 个会话算满
+        assert_eq!(load_permille(0, 0, 999, 1000), 0);
+        assert_eq!(load_permille(0, 50, 0, 1000), 500);
+        assert_eq!(load_permille(0, 5000, 0, 1000), 1000);
+        // 100 Mbps 容量，1 秒内转发 6.25 MB = 50 Mbps → 500‰
+        assert_eq!(load_permille(100, 0, 6_250_000, 1000), 500);
+        assert_eq!(load_permille(100, 0, u64::MAX, 1000), 1000);
+        // 间隔为 0 时不除零
+        assert_eq!(load_permille(100, 0, 0, 0), 0);
     }
 }

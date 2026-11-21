@@ -26,6 +26,9 @@ use crate::{Fingerprint, Link, NetError};
 const INPUT_RESEND: Duration = Duration::from_millis(20);
 /// 没有新情况时两次反馈之间的间隔（微秒）。
 const IDLE_FEEDBACK_US: u64 = 1_000_000;
+/// 这么久一个包都没收到就认为网络断了（QUIC 保活每 2 秒一次，正常时不会这么久没包），
+/// 不等 10 秒的空闲超时，好让界面尽快显示“网络重连中”并换通道。
+const SILENCE_LOST_US: u64 = 3_000_000;
 
 /// 画面去向。窗口显示实现这个接口。
 pub trait ScreenSink: Send {
@@ -192,6 +195,7 @@ pub async fn run(
     });
     let mut upload_result: Option<Result<(Vec<FileResult>, u64), NetError>> = None;
 
+    let (mut last_received, mut last_heard) = (link.received_packets(), link.now());
     let mut resend = tokio::time::interval(INPUT_RESEND);
     resend.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let time_limit = tokio::time::sleep(opts.duration.unwrap_or(Duration::MAX / 4));
@@ -312,6 +316,13 @@ pub async fn run(
             }
             _ = resend.tick() => {
                 let now = link.now();
+                let received = link.received_packets();
+                if received != last_received {
+                    last_received = received;
+                    last_heard = now;
+                } else if now.since(last_heard) >= SILENCE_LOST_US {
+                    break format!("connection lost：{} 秒没有收到对端的数据", SILENCE_LOST_US / 1_000_000);
+                }
                 // 反馈：哪些帧到了、排队延迟、丢包率、接收速率。
                 let (floor, expired) = media.settle(now);
                 for frame_id in expired {
@@ -331,7 +342,9 @@ pub async fn run(
                 }
             }
             msg = ctrl_rx.recv() => match msg {
-                Some(Control::Bye) | None => break "对端结束会话".to_owned(),
+                Some(Control::Bye) => break "对端结束会话".to_owned(),
+                // 控制流断了：网络断开时报网络原因（控制端据此换通道重连），否则是对端结束。
+                None => break link.lost_reason().unwrap_or_else(|| "对端结束会话".to_owned()),
                 Some(
                     Control::Hello { .. }
                     | Control::Accept { .. }

@@ -342,11 +342,20 @@ struct TestServer {
 
 impl TestServer {
     fn start(dir: &Path) -> Self {
+        Self::start_with(dir, peerdesk_core::relay::FreePolicy::UNLIMITED)
+    }
+
+    /// 免费通道额度为 `free` 的服务器。
+    fn start_with(dir: &Path, free: peerdesk_core::relay::FreePolicy) -> Self {
         let identity = Identity::load_or_create(dir).unwrap();
         let rt = runtime().unwrap();
         let (node, signal, relay) = rt.block_on(async {
+            let options = peerdesk_net::service::RelayOptions {
+                free,
+                ..peerdesk_net::service::RelayOptions::local()
+            };
             let relay = Arc::new(
-                RelayService::start(([127, 0, 0, 1], 0).into(), None)
+                RelayService::start_with(([127, 0, 0, 1], 0).into(), None, options)
                     .await
                     .unwrap(),
             );
@@ -468,6 +477,130 @@ fn connect_through_a_signaling_server() {
     for dir in [server_dir, host_dir, ctrl_dir] {
         let _ = std::fs::remove_dir_all(dir);
     }
+}
+
+/// 被控端在 `server` 上登记，控制端按设备码只走中继连过去，等到连上。
+fn relay_session(
+    server: &TestServer,
+    host_dir: &Path,
+    ctrl_dir: &Path,
+) -> (HostHandle, Log<HostEvent>, ViewHandle, Log<ViewEvent>) {
+    let (h, _, mut host_seen) = host(host_dir, "secret-pw", Some(server.server(Some(server.pin))));
+    let HostEvent::Registered { code, .. } = wait_for(
+        || h.poll(),
+        &mut host_seen,
+        |e| matches!(e, HostEvent::Registered { .. }),
+    ) else {
+        panic!("不是 Registered")
+    };
+    let (repaint, _) = counter();
+    let v = start_view(
+        Target::Device {
+            server: server.server(None),
+            device: peerdesk_net::rendezvous::Lookup::Code(code),
+            policy: peerdesk_net::rendezvous::PathPolicy::RelayOnly,
+            account: String::new(),
+        },
+        "secret-pw",
+        ctrl_dir.to_path_buf(),
+        repaint,
+    );
+    let mut seen = Log::new();
+    wait_for(
+        || v.poll(),
+        &mut seen,
+        |e| matches!(e, ViewEvent::Connected { .. }),
+    );
+    (h, host_seen, v, seen)
+}
+
+#[test]
+fn free_relay_quota_ends_the_session_with_a_notice() {
+    let (server_dir, host_dir, ctrl_dir) = (temp_dir("s4"), temp_dir("h4"), temp_dir("c4"));
+    // 每台设备每 10 分钟只给 30 KB：握手后传一会儿就超
+    let server = TestServer::start_with(
+        &server_dir,
+        peerdesk_core::relay::FreePolicy {
+            window_us: 600_000_000,
+            device_bytes: 30_000,
+            ip_bytes: 0,
+        },
+    );
+    let (h, _, v, mut seen) = relay_session(&server, &host_dir, &ctrl_dir);
+    let notice = wait_for(
+        || v.poll(),
+        &mut seen,
+        |e| matches!(e, ViewEvent::Notice(_)),
+    );
+    let ViewEvent::Notice(text) = notice else {
+        panic!("{notice:?}")
+    };
+    assert!(text.contains("免费服务器拥挤"), "{text}");
+    let summary = ended(&v, &mut seen).unwrap();
+    assert_eq!(summary.end, text);
+    drop(v);
+    drop(h);
+    drop(server);
+    for dir in [server_dir, host_dir, ctrl_dir] {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[test]
+fn server_crash_shows_reconnecting_then_gives_up() {
+    let (server_dir, host_dir, ctrl_dir) = (temp_dir("s5"), temp_dir("h5"), temp_dir("c5"));
+    let server = TestServer::start(&server_dir);
+    let (h, _, v, mut seen) = relay_session(&server, &host_dir, &ctrl_dir);
+    // 中继所在的服务器崩了：控制端显示重连中，换通道（这里没有别的节点）重试，用完次数报错
+    drop(server);
+    let crashed = Instant::now();
+    let mut first = None;
+    let mut attempts = Vec::new();
+    let result = loop {
+        match wait_for(
+            || v.poll(),
+            &mut seen,
+            |e| matches!(e, ViewEvent::Reconnecting { .. } | ViewEvent::Ended(_)),
+        ) {
+            ViewEvent::Reconnecting { attempt, .. } => {
+                first.get_or_insert_with(|| crashed.elapsed());
+                attempts.push(attempt);
+            }
+            ViewEvent::Ended(r) => break r,
+            other @ (ViewEvent::Connected { .. } | ViewEvent::Notice(_)) => panic!("{other:?}"),
+        }
+    };
+    assert_eq!(
+        attempts,
+        (1..=RECONNECT_TRIES).collect::<Vec<_>>(),
+        "{result:?}"
+    );
+    assert!(result.is_err(), "{result:?}");
+    // 门槛：崩溃后 5 秒内显示“网络重连中”（不等 10 秒空闲超时）
+    let first = first.unwrap();
+    assert!(first < Duration::from_secs(5), "{first:?}");
+    drop(v);
+    drop(h);
+    for dir in [server_dir, host_dir, ctrl_dir] {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[test]
+fn reconnect_helpers() {
+    assert!(network_lost("timed out"));
+    assert!(network_lost("connection lost"));
+    assert!(!network_lost("对端结束会话：timed out"));
+    assert!(!network_lost("用户结束"));
+    assert!(free_limit_text(0).contains("约 1 分钟"));
+    assert!(free_limit_text(61).contains("约 2 分钟"));
+    let server = |port: u16| Server {
+        addr: (Ipv4Addr::LOCALHOST, port).into(),
+        pin: None,
+    };
+    let order = server_order(server(1), vec![server(2), server(1), server(3), server(2)]);
+    let ports: Vec<u16> = order.iter().map(|s| s.addr.port()).collect();
+    assert_eq!(ports, [1, 2, 3]);
 }
 
 #[test]

@@ -121,6 +121,15 @@ fn http_rejects_malformed_and_oversized_requests() {
         get(addr, "/api/route?region=mars").starts_with("HTTP/1.1 200"),
         "单节点时回退到自己"
     );
+    // 没配 admin_token 的节点不能做管理操作
+    let body = "{\"quota_gb\":1}";
+    let req = format!(
+        "POST /api/accounts HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    assert!(http(addr, &req).starts_with("HTTP/1.1 403"));
+    assert!(get(addr, "/api/usage").contains("\"window_secs\""));
+    assert!(get(addr, "/api/cluster").contains("\"nodes\""));
     let huge = format!("GET / HTTP/1.1\r\nX: {}\r\n\r\n", "a".repeat(20_000));
     assert!(http(addr, &huge).starts_with("HTTP/1.1 431"));
     // 不是 UTF-8 的请求头

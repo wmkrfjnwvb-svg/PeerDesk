@@ -543,4 +543,25 @@ impl Link {
     pub async fn closed(&self) -> String {
         self.conn.closed().await.to_string()
     }
+
+    /// 到目前为止从对端收到的 UDP 包数。
+    #[must_use]
+    pub fn received_packets(&self) -> u64 {
+        self.conn.stats().udp_rx.datagrams
+    }
+
+    /// 连接是不是因为网络原因断了（超时、被重置、传输层出错），是的话返回原因。
+    /// 对端或本端正常关闭、连接还开着时为 `None`。
+    #[must_use]
+    pub fn lost_reason(&self) -> Option<String> {
+        use quinn::ConnectionError as E;
+        match self.conn.close_reason()? {
+            e @ (E::TimedOut | E::Reset | E::TransportError(_) | E::ConnectionClosed(_)) => {
+                Some(e.to_string())
+            }
+            E::ApplicationClosed(_) | E::LocallyClosed | E::VersionMismatch | E::CidsExhausted => {
+                None
+            }
+        }
+    }
 }

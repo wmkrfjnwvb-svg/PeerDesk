@@ -1318,6 +1318,140 @@ mod tests {
         ));
     }
 
+    /// 把节点列表固定为 `nodes` 的目录，中继交给单机目录。
+    struct ListDirectory {
+        nodes: Vec<(SocketAddr, Fingerprint, bool)>,
+        local: peerdesk_net::service::LocalDirectory,
+    }
+
+    impl peerdesk_net::service::Directory for ListDirectory {
+        fn plan_relay(
+            &self,
+            caller: &Fingerprint,
+            account: &str,
+        ) -> peerdesk_net::service::RelayPlan {
+            self.local.plan_relay(caller, account)
+        }
+        fn nodes(&self) -> Vec<(SocketAddr, Fingerprint, bool)> {
+            self.nodes.clone()
+        }
+    }
+
+    #[test]
+    fn node_cache_round_trip() {
+        let dir = temp_dir("nodes-cache");
+        assert!(load_nodes(&dir).is_empty());
+        let nodes = vec![
+            Server {
+                addr: "127.0.0.1:4433".parse().unwrap(),
+                pin: Some([7; 32]),
+            },
+            // 没有指纹的不存
+            Server {
+                addr: "127.0.0.1:4434".parse().unwrap(),
+                pin: None,
+            },
+        ];
+        save_nodes(&dir, &nodes).unwrap();
+        // 读不懂的行跳过
+        let mut text = std::fs::read_to_string(dir.join(NODES_FILE)).unwrap();
+        text.push_str("garbage\n1.2.3.4:5 zz\nnope 00\n");
+        std::fs::write(dir.join(NODES_FILE), text).unwrap();
+        let back = load_nodes(&dir);
+        assert_eq!(back.len(), 1);
+        assert_eq!(
+            back.first().map(|n| (n.addr, n.pin)),
+            Some((nodes[0].addr, Some([7; 32])))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn host_joins_every_cluster_node_and_falls_back_to_the_cache() {
+        let (a_dir, b_dir, host_dir) = (
+            temp_dir("join-a"),
+            temp_dir("join-b"),
+            temp_dir("join-host"),
+        );
+        let b_id = Identity::load_or_create(&b_dir).unwrap();
+        let b = TestServer::start(&b_id, ([127, 0, 0, 1], 0).into()).unwrap();
+        let b_addr: SocketAddr = b.addr().parse().unwrap();
+
+        // 节点 A：节点列表里有 A 自己和 B
+        let a_id = Identity::load_or_create(&a_dir).unwrap();
+        let rt = runtime().unwrap();
+        let (a_node, _a_signal) = rt.block_on(async {
+            let node = Arc::new(
+                Node::bind(([127, 0, 0, 1], 0).into(), &a_id, &Policy::recommended()).unwrap(),
+            );
+            let a_addr = node.local_addr().unwrap();
+            let directory = Arc::new(ListDirectory {
+                nodes: vec![
+                    (a_addr, a_id.fingerprint(), false),
+                    (b_addr, b_id.fingerprint(), false),
+                ],
+                local: peerdesk_net::service::LocalDirectory::new(None, None),
+            });
+            // 没有中继的单机目录：不安排中继
+            let plan = peerdesk_net::service::Directory::plan_relay(&*directory, &[0; 32], "");
+            assert!(plan.relay.is_none(), "{plan:?}");
+            assert!(format!("{:?}", directory.local).contains("LocalDirectory"));
+            let signal =
+                SignalService::start_with_directory(Arc::clone(&node), None, directory, None);
+            (node, signal)
+        });
+        let seed = Server {
+            addr: a_node.local_addr().unwrap(),
+            pin: Some(a_id.fingerprint()),
+        };
+
+        // 被控端只知道 A，也会登记到 B 上，并把节点列表存下来
+        let host_id = Identity::load_or_create(&host_dir).unwrap();
+        let host_rt = runtime().unwrap();
+        let host = host_rt.block_on(async {
+            Arc::new(
+                Node::bind(([127, 0, 0, 1], 0).into(), &host_id, &Policy::recommended()).unwrap(),
+            )
+        });
+        let task = host_rt.spawn(join_cluster(
+            Arc::clone(&host),
+            seed,
+            Vec::new(),
+            host_dir.clone(),
+        ));
+        b.wait_online(1);
+        assert_eq!(load_nodes(&host_dir).len(), 2);
+        task.abort();
+        host.close();
+        drop(host_rt);
+        b.shut_down();
+
+        // A 下线后再开一个被控端：问不到节点列表，用缓存里的 B
+        a_node.close();
+        drop(rt);
+        let b = TestServer::start(&b_id, b_addr).unwrap();
+        let host_rt = runtime().unwrap();
+        let host = host_rt.block_on(async {
+            Arc::new(
+                Node::bind(([127, 0, 0, 1], 0).into(), &host_id, &Policy::recommended()).unwrap(),
+            )
+        });
+        let task = host_rt.spawn(join_cluster(
+            Arc::clone(&host),
+            seed,
+            Vec::new(),
+            host_dir.clone(),
+        ));
+        b.wait_online(1);
+        task.abort();
+        host.close();
+        drop(host_rt);
+        b.shut_down();
+        for dir in [a_dir, b_dir, host_dir] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
     /// 测试用的信令服务器（带中继），跑在自己的运行时上。
     struct TestServer {
         node: Arc<Node>,
