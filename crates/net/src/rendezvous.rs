@@ -22,7 +22,7 @@ use crate::stream::{read_signal, write_kind, write_signal, StreamKind};
 use crate::{Fingerprint, Link, NetError, Node};
 
 /// 多端口打洞（生日攻击）最多用这么久。
-const BIRTHDAY_TIMEOUT: Duration = Duration::from_millis(3000);
+const BIRTHDAY_TIMEOUT: Duration = Duration::from_millis(3500);
 /// NAT 探测包发几份。
 const OBSERVE_COPIES: usize = 3;
 /// 局域网地址的握手最多等这么久：同一个局域网里往返只要几毫秒。

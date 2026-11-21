@@ -43,6 +43,8 @@ pids=()
 cleanup() {
   for p in "${pids[@]}"; do kill "$p" 2>/dev/null || true; done
   wait 2>/dev/null || true
+  # 结果目录是 root 建的：放开读权限，CI 才能把日志作为构建产物上传。
+  chmod -R a+rX "$OUT" 2>/dev/null || true
   for n in $(ip netns list | awk '{print $1}' | grep "^$P-" || true); do ip netns del "$n" 2>/dev/null || true; done
 }
 trap cleanup EXIT
