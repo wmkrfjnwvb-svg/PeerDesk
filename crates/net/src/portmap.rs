@@ -2037,19 +2037,23 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(got.port(), 6000);
-        let bad: IpAddr = "255.255.255.255".parse().unwrap();
-        let err = lan_addr("0.0.0.0:6000".parse().unwrap(), None, bad)
-            .await
-            .unwrap_err();
-        assert!(err.contains("无法确定本机的局域网地址"), "{err}");
-        // 同样的失败经 map_udp_with 变成 UPnP 的失败原因，其他协议不受影响。
-        let dead = closed_port().await;
-        let mut ep = endpoints(dead, dead, dead_ssdp().await);
-        ep.lan_probe = bad;
-        let err = map_udp_with("0.0.0.0:6000".parse().unwrap(), &[], SHORT, 0, &ep)
-            .await
-            .unwrap_err();
-        assert!(err.contains("UPnP：无法确定本机的局域网地址"), "{err}");
+        // Windows 允许 UDP 套接字 connect 到广播地址，下面的失败只在 Linux/macOS 上出现。
+        #[cfg(not(windows))]
+        {
+            let bad: IpAddr = "255.255.255.255".parse().unwrap();
+            let err = lan_addr("0.0.0.0:6000".parse().unwrap(), None, bad)
+                .await
+                .unwrap_err();
+            assert!(err.contains("无法确定本机的局域网地址"), "{err}");
+            // 同样的失败经 map_udp_with 变成 UPnP 的失败原因，其他协议不受影响。
+            let dead = closed_port().await;
+            let mut ep = endpoints(dead, dead, dead_ssdp().await);
+            ep.lan_probe = bad;
+            let err = map_udp_with("0.0.0.0:6000".parse().unwrap(), &[], SHORT, 0, &ep)
+                .await
+                .unwrap_err();
+            assert!(err.contains("UPnP：无法确定本机的局域网地址"), "{err}");
+        }
     }
 
     #[tokio::test]

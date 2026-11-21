@@ -189,9 +189,14 @@ impl Node {
     ) -> Result<Self, NetError> {
         let mut last = NetError::Io("没有可绑定的地址".into());
         for addr in addrs {
-            match Self::bind(*addr, identity, policy) {
-                Ok(node) => return Ok(node),
-                Err(e) => last = e,
+            match open_socket(*addr) {
+                Ok(socket) => return Self::on_socket(socket, identity, policy),
+                // 端口被占用时不换地址族重试：Windows 上双栈的 [::]:p 和 0.0.0.0:p 可以同时绑定，
+                // 换成 IPv4 会“成功”，结果两个程序开在同一个端口上。只有系统不支持 IPv6 时才退回 IPv4。
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                    return Err(NetError::Io(format!("绑定 {addr} 失败：{e}")));
+                }
+                Err(e) => last = NetError::Io(format!("绑定 {addr} 失败：{e}")),
             }
         }
         Err(last)
