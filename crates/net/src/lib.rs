@@ -26,6 +26,7 @@ macro_rules! note {
 #[cfg(feature = "media")]
 pub mod bench;
 pub mod candidates;
+pub mod clipsync;
 #[cfg(feature = "media")]
 pub mod controller;
 #[cfg(feature = "media")]

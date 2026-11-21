@@ -125,6 +125,7 @@ async fn attempt(
             session: cfg(&w.ctrl_id, ctrl_auth),
             deadline_us: 100_000,
             duration: Some(Duration::from_millis(200)),
+            clipboard: None,
         },
         Box::new(Null),
         rx,
@@ -242,6 +243,7 @@ async fn view_only_and_no_files_permissions_are_enforced() {
         o.permissions = Permissions {
             input: false,
             files: false,
+            clipboard: false,
         }
     };
 
@@ -269,7 +271,8 @@ async fn view_only_and_no_files_permissions_are_enforced() {
         Permissions::default(),
         Permissions {
             input: true,
-            files: true
+            files: true,
+            clipboard: true,
         }
     );
 }

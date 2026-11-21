@@ -18,6 +18,9 @@ use peerdesk_core::trace::{Stage, TraceId, Tracer};
 use peerdesk_core::video::{EncodedFrame, TileEncoder, VideoEncoder};
 use peerdesk_media::H264Encoder;
 use tokio::sync::mpsc;
+
+use crate::clipsync::ClipboardHandle;
+use peerdesk_core::clipboard::Limits;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
@@ -69,6 +72,8 @@ pub struct Permissions {
     pub input: bool,
     /// 是否允许向本机传文件。
     pub files: bool,
+    /// 是否同步剪贴板。
+    pub clipboard: bool,
 }
 
 impl Default for Permissions {
@@ -76,6 +81,7 @@ impl Default for Permissions {
         Self {
             input: true,
             files: true,
+            clipboard: true,
         }
     }
 }
@@ -99,6 +105,8 @@ pub struct HostOptions {
     pub fps: u32,
     /// 收到的文件放在哪个目录。
     pub recv_root: PathBuf,
+    /// 本机剪贴板；`None` 表示不同步剪贴板。
+    pub clipboard: Option<ClipboardHandle>,
 }
 
 impl HostOptions {
@@ -114,6 +122,7 @@ impl HostOptions {
             max_bps: DEFAULT_MAX_BPS,
             fps,
             recv_root,
+            clipboard: None,
         }
     }
 }
@@ -279,6 +288,13 @@ pub async fn serve(
     let mut receiver = InputReceiver::new();
     let mut keys = KeyState::new();
     let mut file_tasks: Vec<JoinHandle<Result<Vec<FileResult>, NetError>>> = Vec::new();
+    // 会话结束时通知剪贴板同步停下（它的流要等连接关闭才会断）。
+    let (stop_clip, clip_stopped) = tokio::sync::watch::channel(false);
+    // 剪贴板：双方都支持、本机允许并且有剪贴板时才同步。
+    let clipboard = opts
+        .clipboard
+        .clone()
+        .filter(|_| opts.permissions.clipboard && caps.has(Caps::CLIPBOARD));
     let (mut input_events, mut bad_datagrams) = (0u64, 0u64);
     let mut input_denied = 0u64;
     let rtt_us = u64::try_from(link.rtt().as_micros()).unwrap_or(u64::MAX);
@@ -367,6 +383,8 @@ pub async fn serve(
                 Ok((mut send, mut recv)) => {
                     let root = opts.recv_root.clone();
                     let allowed = opts.permissions.files;
+                    let clipboard = clipboard.clone();
+                    let mut clip_stopped = clip_stopped.clone();
                     file_tasks.push(tokio::spawn(async move {
                         match read_kind(&mut recv).await? {
                             StreamKind::File if !allowed => {
@@ -376,6 +394,16 @@ pub async fn serve(
                                 Err(NetError::Protocol("没有文件传输权限"))
                             }
                             StreamKind::File => receive_files(send, recv, &root).await,
+                            StreamKind::Clipboard => {
+                                let Some(clipboard) = clipboard else {
+                                    return Err(NetError::Protocol("没有协商剪贴板，或者本机不允许"));
+                                };
+                                tokio::select! {
+                                    r = crate::clipsync::run(send, recv, clipboard.0, Limits::DEFAULT) => r?,
+                                    _ = clip_stopped.wait_for(|stop| *stop) => {}
+                                }
+                                Ok(Vec::new())
+                            }
                             StreamKind::Control | StreamKind::Signal => {
                                 Err(NetError::Protocol("会话里不该出现这种流"))
                             }
@@ -486,6 +514,7 @@ pub async fn serve(
     let _ = write_control(&mut ctrl_send, &bye).await;
     let _ = ctrl_send.finish();
 
+    let _ = stop_clip.send(true);
     let mut files = Vec::new();
     for task in file_tasks {
         if let Ok(Ok(Ok(results))) = tokio::time::timeout(FILE_DRAIN_TIMEOUT, task).await {

@@ -865,6 +865,7 @@ async fn one_session(
             session: session(identity, policy, auth.clone()),
             deadline_us: FRAME_DEADLINE_US,
             duration: None,
+            clipboard: None,
         },
         Box::new(sink),
         input,

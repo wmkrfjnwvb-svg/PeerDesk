@@ -16,6 +16,8 @@ pub enum StreamKind {
     File,
     /// 信令（设备与服务器之间）。
     Signal,
+    /// 剪贴板同步（双方协商出剪贴板能力才有）。
+    Clipboard,
 }
 
 impl StreamKind {
@@ -24,6 +26,7 @@ impl StreamKind {
             StreamKind::Control => 1,
             StreamKind::File => 2,
             StreamKind::Signal => 3,
+            StreamKind::Clipboard => 4,
         }
     }
 
@@ -32,6 +35,7 @@ impl StreamKind {
             1 => Some(StreamKind::Control),
             2 => Some(StreamKind::File),
             3 => Some(StreamKind::Signal),
+            4 => Some(StreamKind::Clipboard),
             _ => None,
         }
     }
@@ -132,10 +136,15 @@ mod tests {
 
     #[test]
     fn stream_kind_ids() {
-        for kind in [StreamKind::Control, StreamKind::File, StreamKind::Signal] {
+        for kind in [
+            StreamKind::Control,
+            StreamKind::File,
+            StreamKind::Signal,
+            StreamKind::Clipboard,
+        ] {
             assert_eq!(StreamKind::from_id(kind.id()), Some(kind));
         }
         assert_eq!(StreamKind::from_id(0), None);
-        assert_eq!(StreamKind::from_id(4), None);
+        assert_eq!(StreamKind::from_id(5), None);
     }
 }

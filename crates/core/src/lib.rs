@@ -19,6 +19,7 @@
 pub mod adaptive;
 pub mod auth;
 pub mod billing;
+pub mod clipboard;
 pub mod cluster;
 pub mod codec;
 pub mod config;

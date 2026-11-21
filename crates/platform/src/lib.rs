@@ -16,6 +16,9 @@
 //! Wayland 不在支持范围内：会返回明确的错误（见 [`PlatformError::Unsupported`]）。
 
 pub mod capture;
+pub mod clipboard;
+mod clipboard_sys;
+pub use clipboard_sys::{OnNote, SystemClip};
 mod error;
 pub mod guide;
 pub mod keymap;

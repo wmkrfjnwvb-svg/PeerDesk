@@ -54,6 +54,8 @@ pub struct ControllerOptions {
     pub deadline_us: u64,
     /// 会话时长上限；`None` 表示一直运行到对端结束。到时间后仍会等上传完成。
     pub duration: Option<Duration>,
+    /// 本机剪贴板；`None` 表示不同步剪贴板。双方都协商出剪贴板能力时才同步。
+    pub clipboard: Option<crate::clipsync::ClipboardHandle>,
 }
 
 /// 统计日志的一个窗口：上一次写日志时的累计值，以及这一秒里的帧数和最长间隔。
@@ -176,7 +178,10 @@ pub async fn run(
                     RejectReason::Unauthorized => "密码错误，或被控端需要密码".to_owned(),
                     RejectReason::Locked => "被控端因多次认证失败暂时锁定".to_owned(),
                     RejectReason::Busy => "被控端正在被其他设备控制".to_owned(),
-                    RejectReason::Version | RejectReason::NoCommonSuite => {
+                    RejectReason::Version => {
+                        "对方的 PeerDesk 版本太旧，不能连接，请先升级对方".to_owned()
+                    }
+                    RejectReason::NoCommonSuite => {
                         format!("被控端拒绝：{reason:?}")
                     }
                 }));
@@ -188,6 +193,21 @@ pub async fn run(
         }
     };
     let mut ctrl_rx = control_reader(ctrl_recv);
+
+    // 剪贴板同步：由控制端打开专用的流。对方是不支持剪贴板的老版本时不开。
+    let clip_task = match opts.clipboard.clone().filter(|_| caps.has(Caps::CLIPBOARD)) {
+        Some(clipboard) => {
+            let (mut send, recv) = link.open_stream().await?;
+            write_kind(&mut send, StreamKind::Clipboard).await?;
+            Some(tokio::spawn(crate::clipsync::run(
+                send,
+                recv,
+                clipboard.0,
+                peerdesk_core::clipboard::Limits::DEFAULT,
+            )))
+        }
+        None => None,
+    };
 
     let mut upload_task = upload.map(|u| {
         let link = Arc::clone(&link);
@@ -362,6 +382,9 @@ pub async fn run(
     let _ = write_control(&mut ctrl_send, &bye).await;
     let _ = ctrl_send.finish();
     if let Some(task) = upload_task {
+        task.abort();
+    }
+    if let Some(task) = clip_task {
         task.abort();
     }
     let rtt = link.rtt();

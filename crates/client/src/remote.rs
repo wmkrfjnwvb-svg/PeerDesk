@@ -693,6 +693,7 @@ async fn connect_session(
             session: session(identity, policy, args.auth.clone()),
             deadline_us: 100_000,
             duration: Some(Duration::from_secs(args.seconds)),
+            clipboard: None,
         },
         Box::new(sink.clone()),
         input_rx,
