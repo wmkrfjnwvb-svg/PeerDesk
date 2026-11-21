@@ -1,7 +1,5 @@
 //! 被控端的画面来源和输入去向：本机屏幕和键鼠（平台层），或者合成的演示桌面。
 
-use std::io::Write;
-
 use peerdesk_net::demo::DemoDesktop;
 use peerdesk_net::host::{InputSink, ScreenSource};
 use peerdesk_platform::{CaptureOptions, PlatformError};
@@ -29,6 +27,9 @@ impl SourceKind {
     }
 }
 
+/// 一次会话的画面来源和输入去向。
+pub(crate) type Opened = (Box<dyn ScreenSource>, Box<dyn InputSink>);
+
 type OpenScreen = fn(CaptureOptions) -> Result<Box<dyn ScreenSource>, PlatformError>;
 type OpenInput = fn(usize) -> Result<Box<dyn InputSink>, PlatformError>;
 
@@ -53,32 +54,31 @@ pub(crate) struct Sources {
     opts: CaptureOptions,
     opener: Opener,
     screen: bool,
+    need_input: bool,
 }
 
 impl Sources {
-    /// 决定用本机屏幕还是演示桌面。指定了 `screen` 而屏幕打不开时报错；
-    /// 没有指定时改用演示桌面并给出警告。
+    /// 决定画面来源。默认（`Auto`）和 `Screen` 一样要求本机屏幕；`need_input` 时还要求能控制键鼠。
+    /// 打不开就报错：没有权限就不提供远程，绝不拿演示画面顶替真实屏幕。
+    /// 演示桌面只在明确指定 `--source demo` 时使用（测试、调试）。
     pub(crate) fn choose(
         kind: SourceKind,
         opts: CaptureOptions,
         opener: Opener,
-        out: &mut dyn Write,
+        need_input: bool,
     ) -> Result<Self, String> {
         let screen = match kind {
             SourceKind::Demo => false,
-            SourceKind::Screen | SourceKind::Auto => match (opener.screen)(opts) {
-                Ok(_) => true,
-                Err(e) if kind == SourceKind::Auto => {
-                    let _ = writeln!(out, "警告：无法采集屏幕（{e}），改为提供演示桌面。");
-                    false
-                }
-                Err(e) => return Err(format!("无法采集屏幕：{e}")),
-            },
+            SourceKind::Screen | SourceKind::Auto => {
+                check(opener, opts, need_input)?;
+                true
+            }
         };
         Ok(Self {
             opts,
             opener,
             screen,
+            need_input,
         })
     }
 
@@ -91,30 +91,30 @@ impl Sources {
         }
     }
 
-    /// 为一次会话打开画面来源和输入去向。`fallback` 是不注入、只计数的输入去向：
-    /// 用演示桌面时用它（不能让对方控制本机却看着假画面），键鼠打不开时也用它（只能观看）。
-    pub(crate) fn open(
-        &self,
-        fallback: Box<dyn InputSink>,
-        out: &mut dyn Write,
-    ) -> (Box<dyn ScreenSource>, Box<dyn InputSink>) {
-        let demo: Box<dyn ScreenSource> = Box::new(DemoDesktop::new(1280, 720, 1));
+    /// 为一次会话打开画面来源和输入去向。`record` 是不注入、只计数的输入去向：
+    /// 用演示桌面时、或者被控端设置了不允许输入时用它（不能让对方控制本机却看着假画面）。
+    /// 会话开始时屏幕或键鼠打不开了（例如权限被撤销）：报错，这次不提供远程。
+    pub(crate) fn open(&self, record: Box<dyn InputSink>) -> Result<Opened, String> {
         if !self.screen {
-            return (demo, fallback);
+            return Ok((Box::new(DemoDesktop::new(1280, 720, 1)), record));
         }
-        let source = match (self.opener.screen)(self.opts) {
-            Ok(source) => source,
-            Err(e) => {
-                let _ = writeln!(out, "警告：无法采集屏幕（{e}），这次会话提供演示桌面。");
-                return (demo, fallback);
-            }
+        let source = (self.opener.screen)(self.opts).map_err(|e| format!("无法采集屏幕：{e}"))?;
+        let sink = if self.need_input {
+            (self.opener.input)(self.opts.display).map_err(|e| format!("无法控制键鼠：{e}"))?
+        } else {
+            record
         };
-        let sink = (self.opener.input)(self.opts.display).unwrap_or_else(|e| {
-            let _ = writeln!(out, "警告：无法控制键鼠（{e}），这次会话只能观看。");
-            fallback
-        });
-        (source, sink)
+        Ok((source, sink))
     }
+}
+
+/// 检查屏幕和键鼠能不能打开（打开后马上关掉）。
+fn check(opener: Opener, opts: CaptureOptions, need_input: bool) -> Result<(), String> {
+    drop((opener.screen)(opts).map_err(|e| format!("无法采集屏幕：{e}"))?);
+    if need_input {
+        drop((opener.input)(opts.display).map_err(|e| format!("无法控制键鼠：{e}"))?);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -162,17 +162,15 @@ mod tests {
         max_fps: 30,
     };
 
-    fn fallback() -> Box<dyn InputSink> {
+    fn record() -> Box<dyn InputSink> {
         Box::new(Tagged(&FALLBACK))
     }
 
-    /// 打开一次会话，注入一个事件，返回画面宽度和输出。
-    fn session(sources: &Sources) -> (u16, String) {
-        let mut out = Vec::new();
-        let (mut source, mut sink) = sources.open(fallback(), &mut out);
+    /// 打开一次会话，注入一个事件，返回画面宽度。
+    fn session(sources: &Sources) -> Result<u16, String> {
+        let (mut source, mut sink) = sources.open(record())?;
         sink.inject(&InputEvent::ReleaseAll);
-        let width = source.capture().unwrap().width();
-        (width, String::from_utf8(out).unwrap())
+        Ok(source.capture().unwrap().width())
     }
 
     #[test]
@@ -193,59 +191,65 @@ mod tests {
             screen: screen_ok,
             input: input_ok,
         };
-        let mut out = Vec::new();
-        // 演示桌面：不碰屏幕和键鼠
-        let demo = Sources::choose(SourceKind::Demo, OPTS, ok, &mut out).unwrap();
+        // 演示桌面：只在明确指定时用，不碰屏幕和键鼠
+        let demo = Sources::choose(SourceKind::Demo, OPTS, ok, true).unwrap();
         assert_eq!(demo.describe(), "演示桌面");
         let before = FALLBACK.load(Ordering::Relaxed);
-        assert_eq!(session(&demo).0, 1280);
+        assert_eq!(session(&demo), Ok(1280));
         assert!(FALLBACK.load(Ordering::Relaxed) > before);
-        // 屏幕能用
+        // 屏幕和键鼠都能用
         for kind in [SourceKind::Auto, SourceKind::Screen] {
-            let s = Sources::choose(kind, OPTS, ok, &mut out).unwrap();
+            let s = Sources::choose(kind, OPTS, ok, true).unwrap();
             assert_eq!(s.describe(), "本机屏幕");
             let before = REAL.load(Ordering::Relaxed);
-            let (width, text) = session(&s);
-            assert_eq!(width, 320);
-            assert!(text.is_empty());
+            assert_eq!(session(&s), Ok(320));
             assert!(REAL.load(Ordering::Relaxed) > before);
         }
-        assert!(out.is_empty());
+        // 被控端不允许输入：不需要键鼠权限，输入只记录
+        let view = Opener {
+            screen: screen_ok,
+            input: input_fails,
+        };
+        let s = Sources::choose(SourceKind::Auto, OPTS, view, false).unwrap();
+        let before = FALLBACK.load(Ordering::Relaxed);
+        assert_eq!(session(&s), Ok(320));
+        assert!(FALLBACK.load(Ordering::Relaxed) > before);
     }
 
     #[test]
-    fn falls_back_when_the_screen_is_unavailable() {
-        let broken = Opener {
+    fn refuses_without_permission_instead_of_showing_a_demo() {
+        let no_screen = Opener {
             screen: screen_fails,
             input: input_ok,
         };
-        let mut out = Vec::new();
-        let err = Sources::choose(SourceKind::Screen, OPTS, broken, &mut out).unwrap_err();
-        assert!(err.contains("没有桌面"), "{err}");
-        let s = Sources::choose(SourceKind::Auto, OPTS, broken, &mut out).unwrap();
-        assert_eq!(s.describe(), "演示桌面");
-        assert!(String::from_utf8(out)
-            .unwrap()
-            .contains("警告：无法采集屏幕"));
+        for kind in [SourceKind::Auto, SourceKind::Screen] {
+            let err = Sources::choose(kind, OPTS, no_screen, true).unwrap_err();
+            assert!(
+                err.contains("无法采集屏幕") && err.contains("没有桌面"),
+                "{err}"
+            );
+        }
+        let no_input = Opener {
+            screen: screen_ok,
+            input: input_fails,
+        };
+        let err = Sources::choose(SourceKind::Auto, OPTS, no_input, true).unwrap_err();
+        assert!(err.contains("无法控制键鼠"), "{err}");
 
-        // 选的时候屏幕还在，会话开始时不在了：这次会话用演示桌面
+        // 选的时候屏幕还在，会话开始时不在了：这次会话拒绝
         let flaky = Opener {
             screen: screen_once,
             input: input_ok,
         };
-        let s = Sources::choose(SourceKind::Screen, OPTS, flaky, &mut Vec::new()).unwrap();
-        let (width, text) = session(&s);
-        assert_eq!(width, 1280);
-        assert!(text.contains("这次会话提供演示桌面"), "{text}");
-
-        // 键鼠打不开：只能观看
-        let view_only = Opener {
-            screen: screen_ok,
-            input: input_fails,
+        let s = Sources::choose(SourceKind::Screen, OPTS, flaky, true).unwrap();
+        assert!(session(&s).unwrap_err().contains("无法采集屏幕"));
+        // 会话开始时键鼠不在了：也拒绝
+        let s = Sources {
+            opts: OPTS,
+            opener: no_input,
+            screen: true,
+            need_input: true,
         };
-        let s = Sources::choose(SourceKind::Screen, OPTS, view_only, &mut Vec::new()).unwrap();
-        let (width, text) = session(&s);
-        assert_eq!(width, 320);
-        assert!(text.contains("只能观看"), "{text}");
+        assert!(session(&s).unwrap_err().contains("无法控制键鼠"));
     }
 }

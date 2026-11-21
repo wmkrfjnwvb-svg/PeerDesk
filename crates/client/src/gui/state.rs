@@ -145,12 +145,20 @@ impl HostPhase {
                 | HostPhase::Listening { .. }
                 | HostPhase::Stopping => (self.clone(), None),
             },
+            HostEvent::Unavailable(why) => (
+                HostPhase::Off,
+                Some(Status::error(format!("{}（{why}）", s.host_unavailable))),
+            ),
             HostEvent::SessionEnded(Ok(end)) => (
                 listening(),
                 Some(Status::info(format!("{}：{end}", s.session_ended))),
             ),
             HostEvent::SessionEnded(Err(e)) => (listening(), Some(Status::error(explain(e, s)))),
-            HostEvent::Stopped(None) => (HostPhase::Off, Some(Status::info(s.host_off))),
+            // 已经关了（例如因为没有权限）：保留之前的说明，不用“已关闭”盖掉它。
+            HostEvent::Stopped(None) => (
+                HostPhase::Off,
+                (*self != HostPhase::Off).then(|| Status::info(s.host_off)),
+            ),
             HostEvent::Stopped(Some(e)) => (HostPhase::Off, Some(Status::error(explain(e, s)))),
         }
     }
@@ -348,6 +356,25 @@ mod tests {
         );
         assert_eq!(off, HostPhase::Off);
         assert!(status.unwrap().text.starts_with(EN.err_port_in_use));
+    }
+
+    #[test]
+    fn no_permission_means_no_remote() {
+        let s = &EN;
+        let listening = HostPhase::Listening {
+            port: 1,
+            ipv6: false,
+        };
+        let (phase, status) =
+            listening.apply(&HostEvent::Unavailable("screen recording".into()), s);
+        assert_eq!(phase, HostPhase::Off, "没有权限：被控关闭");
+        let status = status.unwrap();
+        assert!(status.text.contains("screen recording") && status.text.contains("Accessibility"));
+        // 之后的“已停止”不盖掉这条说明
+        assert_eq!(
+            phase.apply(&HostEvent::Stopped(None), s),
+            (HostPhase::Off, None)
+        );
     }
 
     #[test]

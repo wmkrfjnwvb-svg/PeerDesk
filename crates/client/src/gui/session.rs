@@ -23,7 +23,7 @@ use peerdesk_net::{Identity, NetError, Node};
 use tokio::sync::watch;
 
 use super::form::Target;
-use crate::local::{local_input, local_screen, Tap};
+use crate::local::{check_local, local_input, local_screen, Tap};
 use crate::remote::{runtime, session, stay_registered};
 
 /// 请求界面重绘。
@@ -137,6 +137,8 @@ pub enum HostEvent {
     },
     /// 控制端通过了验证，开始发画面。
     Established,
+    /// 本机屏幕或键鼠打不开（多半是没有权限）：不提供远程，被控已关闭。带着原因。
+    Unavailable(String),
     /// 会话结束：结束原因，或者失败原因（例如密码错误）。
     SessionEnded(Result<String, NetError>),
     /// 连接握手失败。
@@ -273,6 +275,11 @@ async fn host_main(
     mut stop: watch::Receiver<bool>,
     ev: Emitter<HostEvent>,
 ) -> Result<(), NetError> {
+    // 没有权限就不提供远程：先确认屏幕和键鼠都能用，再开始监听。
+    if let Err(why) = check_local() {
+        ev.send(HostEvent::Unavailable(why));
+        return Ok(());
+    }
     let policy = Policy::recommended();
     let identity = Identity::load_or_create(&config.data_dir)?;
     let (nodes, ipv6) = bind_nodes(config.port, &identity, &policy)?;
@@ -349,12 +356,21 @@ async fn host_main(
             )
         };
         seed = seed.wrapping_add(1);
+        // 会话开始时屏幕或键鼠打不开了（例如权限被撤销）：拒绝这次连接，停止被控。
+        let opened = local_screen().and_then(|s| Ok((s, local_input(Arc::clone(&shared.tap))?)));
+        let (screen, input) = match opened {
+            Ok(opened) => opened,
+            Err(why) => {
+                link.close("host cannot share its screen");
+                ev.send(HostEvent::Unavailable(why));
+                break;
+            }
+        };
         let source = Watched {
-            inner: local_screen(seed),
+            inner: screen,
             shared: Arc::clone(&shared),
             announce: Some(ev.clone()),
         };
-        let input = local_input(Arc::clone(&shared.tap));
         let result = tokio::select! {
             () = stopped(&mut stop) => break,
             r = host::serve(link, opts, Box::new(source), input) => r.map(|report| report.end),

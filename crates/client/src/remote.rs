@@ -246,8 +246,8 @@ async fn host_async(args: HostArgs, out: &mut dyn Write) -> Result<u8, NetError>
         display: args.display,
         max_fps: args.fps,
     };
-    let sources =
-        Sources::choose(args.source, capture, Opener::SYSTEM, out).map_err(NetError::Io)?;
+    let sources = Sources::choose(args.source, capture, Opener::SYSTEM, args.permissions.input)
+        .map_err(NetError::Io)?;
     let _ = writeln!(out, "画面来源：{}", sources.describe());
     let _ = out.flush();
 
@@ -267,7 +267,14 @@ async fn host_async(args: HostArgs, out: &mut dyn Write) -> Result<u8, NetError>
         );
         let _ = out.flush();
         let inputs = Arc::new(AtomicU64::new(0));
-        let (source, sink) = sources.open(Box::new(CountInput(Arc::clone(&inputs))), out);
+        // 没有权限就不提供远程：拒绝这次连接并停止被控。
+        let (source, sink) = match sources.open(Box::new(CountInput(Arc::clone(&inputs)))) {
+            Ok(opened) => opened,
+            Err(why) => {
+                link.close("host cannot share its screen");
+                return Err(NetError::Io(why));
+            }
+        };
         let result = host::serve(
             link,
             HostOptions {
@@ -669,8 +676,9 @@ mod tests {
             ctrl_dir.to_str().unwrap(),
             "--snapshot",
             ctrl_dir.join("seen.bmp").to_str().unwrap(),
+            // 足够解出第一帧：覆盖率构建（插桩、未优化）里第一帧要一两秒。
             "--seconds",
-            "1",
+            "3",
             "--send",
             files.join("docs").to_str().unwrap(),
         ]);
@@ -750,8 +758,9 @@ mod tests {
             &addr,
             "--data-dir",
             ctrl_dir.to_str().unwrap(),
+            // 足够解出第一帧：覆盖率构建（插桩、未优化）里第一帧要一两秒。
             "--seconds",
-            "1",
+            "3",
         ]);
         assert_eq!(code, EXIT_OK, "{text}");
         assert!(text.contains("警告"));
@@ -823,8 +832,9 @@ mod tests {
             c,
             "--password",
             "correct horse",
+            // 足够解出第一帧：覆盖率构建（插桩、未优化）里第一帧要一两秒。
             "--seconds",
-            "1",
+            "3",
         ]);
         assert_eq!(code, EXIT_OK, "{text}");
         assert_eq!(host_thread.join().unwrap(), EXIT_OK);
@@ -868,8 +878,9 @@ mod tests {
             &pin,
             "--data-dir",
             friend_dir.to_str().unwrap(),
+            // 足够解出第一帧：覆盖率构建（插桩、未优化）里第一帧要一两秒。
             "--seconds",
-            "1",
+            "3",
         ]);
         assert_eq!(code, EXIT_OK, "{text}");
         assert_eq!(host_thread.join().unwrap(), EXIT_OK);
@@ -1128,8 +1139,9 @@ mod tests {
             "--relay-only",
             "--data-dir",
             c,
+            // 足够解出第一帧：覆盖率构建（插桩、未优化）里第一帧要一两秒。
             "--seconds",
-            "1",
+            "3",
         ]);
         assert_eq!(code, EXIT_OK, "{text}");
         assert!(text.contains("连接路径      中继"), "{text}");
@@ -1185,8 +1197,9 @@ mod tests {
             &pin,
             "--data-dir",
             ctrl_dir.to_str().unwrap(),
+            // 足够解出第一帧：覆盖率构建（插桩、未优化）里第一帧要一两秒。
             "--seconds",
-            "1",
+            "3",
         ]);
         assert_eq!(code, EXIT_OK, "{text}");
         assert!(text.contains("连接路径      直连"), "{text}");
@@ -1230,26 +1243,21 @@ mod tests {
 
     /// 指定了 `--source screen` 而屏幕打不开：报错退出；没有指定时改用演示桌面并提示。
     #[test]
-    fn screen_source_falls_back_to_demo_only_when_not_requested() {
+    fn host_refuses_when_the_screen_cannot_be_opened() {
         let dir = temp_dir("source");
         let d = dir.to_str().unwrap();
         let base = ["host", "--listen", "127.0.0.1:0", "--data-dir", d, "--open"];
-        let mut explicit = base.to_vec();
-        explicit.extend(["--source", "screen", "--display", "999"]);
-        let (code, text) = run(&explicit);
-        assert_eq!(code, EXIT_FAILED);
-        assert!(text.contains("无法采集屏幕"), "{text}");
-
-        // 没有指定来源：被控端照常启动，提供演示桌面（没人连接，线程留在后台等待，测试结束时随进程退出）
-        let out = Shared::default();
-        let mut writer = out.clone();
-        let mut args = strings(&base);
-        args.extend(strings(&["--display", "999", "--once"]));
-        let host = std::thread::spawn(move || crate::run(&args, &mut writer));
-        let text = out.wait_for("画面来源：");
-        assert_eq!(text, "演示桌面");
-        assert!(out.text().contains("警告：无法采集屏幕"));
-        drop(host);
+        // 不管写不写 --source screen：屏幕打不开就报错，不拿演示画面顶替
+        for extra in [
+            &["--source", "screen", "--display", "999"][..],
+            &["--display", "999"][..],
+        ] {
+            let mut args = base.to_vec();
+            args.extend(extra);
+            let (code, text) = run(&args);
+            assert_eq!(code, EXIT_FAILED, "{text}");
+            assert!(text.contains("无法采集屏幕"), "{text}");
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 
