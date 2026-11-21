@@ -37,6 +37,8 @@ pub struct Viewer {
     fps: FpsMeter,
     frames_seen: u64,
     started: Instant,
+    /// 通知弹框里展开了升级说明。
+    show_upgrade: bool,
 }
 
 impl Viewer {
@@ -54,6 +56,7 @@ impl Viewer {
             fps: FpsMeter::default(),
             frames_seen: 0,
             started: Instant::now(),
+            show_upgrade: false,
         }
     }
 
@@ -114,6 +117,9 @@ impl Viewer {
                 let _ = ui.toggle_value(&mut self.overlay, s.stats);
                 match &self.phase {
                     ViewPhase::Connecting => ui.label(s.connecting),
+                    ViewPhase::Reconnecting { .. } => {
+                        ui.colored_label(Color32::from_rgb(230, 160, 40), self.phase.headline(s))
+                    }
                     ViewPhase::Connected { remote, .. } => {
                         ui.label(format!("{} {remote}", s.connected))
                     }
@@ -141,8 +147,11 @@ impl Viewer {
                     painter.image(texture.id(), rect, uv, Color32::WHITE);
                     picture = Some(rect);
                 } else {
+                    let headline = self.phase.headline(s);
                     let text = match &self.phase {
-                        ViewPhase::Ended { status, .. } => status.text.as_str(),
+                        ViewPhase::Ended { .. } | ViewPhase::Reconnecting { .. } => {
+                            headline.as_str()
+                        }
                         ViewPhase::Connecting | ViewPhase::Connected { .. } => s.waiting_frame,
                     };
                     let _ = painter.text(
@@ -156,7 +165,39 @@ impl Viewer {
                 if self.overlay {
                     self.paint_stats(painter, avail, now, s);
                 }
+                // 重连中：盖一层提示，画面停在最后一帧。
+                if matches!(self.phase, ViewPhase::Reconnecting { .. }) && self.texture.is_some() {
+                    let _ = painter.text(
+                        avail.center(),
+                        Align2::CENTER_CENTER,
+                        self.phase.headline(s),
+                        FontId::proportional(20.0),
+                        Color32::from_rgb(230, 160, 40),
+                    );
+                }
             });
+
+        // 服务器通知（免费额度用完）：弹框，附升级会员的入口。
+        if let ViewPhase::Ended {
+            notice: Some(text), ..
+        } = &self.phase
+        {
+            let text = text.clone();
+            egui::Window::new(s.busy_title)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    ui.label(text);
+                    ui.add_space(8.0);
+                    if ui.button(egui::RichText::new(s.upgrade).strong()).clicked() {
+                        self.show_upgrade = true;
+                    }
+                    if self.show_upgrade {
+                        ui.label(s.upgrade_hint);
+                    }
+                });
+        }
 
         self.forward_input(ctx, picture);
         if ctx.input(|i| i.viewport().close_requested()) {
@@ -183,7 +224,10 @@ impl Viewer {
                     .map_or_else(|| s.not_available.to_owned(), millis),
                 bitrate(average_bps(summary.video_bytes, summary.elapsed)),
             ),
-            ViewPhase::Connecting | ViewPhase::Connected { .. } | ViewPhase::Ended { .. } => (
+            ViewPhase::Connecting
+            | ViewPhase::Connected { .. }
+            | ViewPhase::Reconnecting { .. }
+            | ViewPhase::Ended { .. } => (
                 s.live_stats_pending.to_owned(),
                 s.live_stats_pending.to_owned(),
             ),

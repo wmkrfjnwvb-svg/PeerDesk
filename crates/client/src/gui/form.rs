@@ -30,6 +30,8 @@ pub enum Target {
         device: Lookup,
         /// 路径策略。
         policy: PathPolicy,
+        /// 会员令牌（空表示免费用户）。
+        account: String,
     },
 }
 
@@ -101,6 +103,7 @@ impl ConnectForm {
                 server: server?.ok_or_else(|| s.err_need_server.to_owned())?,
                 device,
                 policy: PathPolicy::Auto,
+                account: String::new(),
             }),
             None => Ok(Target::Addr {
                 addr: parse_addr(text, s.err_bad_addr)?,
@@ -233,6 +236,7 @@ mod tests {
                 server,
                 device: Lookup::Code(123_456_789),
                 policy: PathPolicy::Auto,
+                account: String::new(),
             })
         );
         // 指纹也可以
@@ -244,6 +248,7 @@ mod tests {
                 server,
                 device: Lookup::Device([0xCD; 32]),
                 policy: PathPolicy::Auto,
+                account: String::new(),
             })
         );
     }

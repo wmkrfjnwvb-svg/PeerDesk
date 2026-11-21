@@ -187,6 +187,13 @@ pub enum ViewPhase {
         /// 路径的具体说明（例如“公网直连（打洞） 23.4 ms”），直接连地址时为空。
         detail: String,
     },
+    /// 网络断了，正在换通道重连。
+    Reconnecting {
+        /// 第几次重连。
+        attempt: u32,
+        /// 断开的原因。
+        why: String,
+    },
     /// 结束了。
     Ended {
         /// 给用户看的结束原因。
@@ -195,6 +202,8 @@ pub enum ViewPhase {
         summary: Option<Summary>,
         /// 结束前连到过的路径。
         route: Option<Route>,
+        /// 服务器的通知（例如免费额度用完），界面弹框显示，附升级会员的入口。
+        notice: Option<String>,
     },
 }
 
@@ -205,7 +214,7 @@ impl ViewPhase {
         match self {
             ViewPhase::Connected { route, .. } => Some(*route),
             ViewPhase::Ended { route, .. } => *route,
-            ViewPhase::Connecting => None,
+            ViewPhase::Connecting | ViewPhase::Reconnecting { .. } => None,
         }
     }
 
@@ -214,7 +223,7 @@ impl ViewPhase {
     pub fn detail(&self) -> &str {
         match self {
             ViewPhase::Connected { detail, .. } => detail,
-            ViewPhase::Ended { .. } | ViewPhase::Connecting => "",
+            ViewPhase::Ended { .. } | ViewPhase::Connecting | ViewPhase::Reconnecting { .. } => "",
         }
     }
 
@@ -243,8 +252,36 @@ impl ViewPhase {
                     status,
                     summary: result.as_ref().ok().cloned(),
                     route: self.route(),
+                    notice: None,
                 }
             }
+            ViewEvent::Reconnecting { attempt, why } => ViewPhase::Reconnecting {
+                attempt: *attempt,
+                why: why.clone(),
+            },
+            ViewEvent::Notice(text) => ViewPhase::Ended {
+                status: Status::error(text.clone()),
+                summary: None,
+                route: self.route(),
+                notice: Some(text.clone()),
+            },
+        }
+    }
+
+    /// 状态栏里显示的一句话（连接中、重连中、结束原因）。
+    #[must_use]
+    pub fn headline(&self, s: &Strings) -> String {
+        match self {
+            ViewPhase::Connecting => s.connecting.to_owned(),
+            ViewPhase::Connected { .. } => String::new(),
+            ViewPhase::Reconnecting { attempt, why } => {
+                format!(
+                    "{}（{attempt}/{}）：{why}",
+                    s.reconnecting,
+                    crate::gui::session::RECONNECT_TRIES
+                )
+            }
+            ViewPhase::Ended { status, .. } => status.text.clone(),
         }
     }
 
@@ -443,8 +480,26 @@ mod tests {
         );
         let failed = connecting.apply(&ViewEvent::Ended(Err(NetError::Timeout("握手"))), s);
         assert!(
-            matches!(failed, ViewPhase::Ended { ref status, summary: None, route: None } if status.error)
+            matches!(failed, ViewPhase::Ended { ref status, summary: None, route: None, notice: None } if status.error)
         );
+        // 网络断了：重连中；服务器通知：结束并带通知
+        let again = connecting.apply(
+            &ViewEvent::Reconnecting {
+                attempt: 2,
+                why: "timed out".into(),
+            },
+            s,
+        );
+        assert!(again.headline(s).contains("(2/3)") || again.headline(s).contains("（2/3）"));
+        assert_eq!(again.route(), None);
+        assert_eq!(again.detail(), "");
+        assert!(!again.is_ended());
+        let busy = again.apply(&ViewEvent::Notice("免费服务器拥挤".into()), s);
+        assert!(
+            matches!(busy, ViewPhase::Ended { notice: Some(ref t), .. } if t == "免费服务器拥挤")
+        );
+        assert_eq!(busy.headline(s), "免费服务器拥挤");
+        assert_eq!(ViewPhase::Connecting.headline(s), EN.connecting);
 
         assert_eq!(route_name(Some(Route::Direct), s), "direct");
         assert_eq!(route_name(Some(Route::Relay), s), "relay");

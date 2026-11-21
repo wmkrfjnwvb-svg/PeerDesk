@@ -2,7 +2,7 @@
 
 use std::fmt::Write as _;
 
-use peerdesk_core::cluster::{Cluster, NodeInfo};
+use peerdesk_core::cluster::{Cluster, NodeInfo, NodeState};
 use peerdesk_core::crypto::Policy;
 use peerdesk_core::relay::Usage;
 use peerdesk_core::Time;
@@ -24,6 +24,38 @@ fn node_fields(info: &NodeInfo) -> String {
 #[must_use]
 pub fn node_json(info: &NodeInfo) -> String {
     format!("{{{}}}", node_fields(info))
+}
+
+/// 管理中心的集群总览：自己和所有成员，带角色、状态、信令和中继地址、负载。
+#[must_use]
+pub fn cluster_json(cluster: &Cluster, now_ms: u64) -> String {
+    let row = |info: &NodeInfo, state: &str, me: bool| {
+        format!(
+            "{{\"id\":{},\"region\":{},\"role\":\"{}\",\"state\":\"{state}\",\"addr\":{},\"signal\":{},\"relay\":{},\"load_permille\":{},\"sessions\":{},\"self\":{me}}}",
+            info.id.0,
+            json::string(&info.region),
+            info.role.name(),
+            json::string(&info.addr),
+            json::string(&info.signal),
+            json::string(&info.relay),
+            info.load_permille,
+            info.sessions,
+        )
+    };
+    let mut rows = vec![row(cluster.me(), "alive", true)];
+    rows.extend(cluster.members_with_state().map(|(info, state)| {
+        let state = match state {
+            NodeState::Alive => "alive",
+            NodeState::Suspect => "suspect",
+            NodeState::Dead => "dead",
+        };
+        row(info, state, false)
+    }));
+    format!(
+        "{{\"self\":{},\"generated_ms\":{now_ms},\"nodes\":[{}]}}",
+        cluster.me().id.0,
+        rows.join(",")
+    )
 }
 
 /// 信令和中继的运行数据。
@@ -102,6 +134,10 @@ mod tests {
             addr: format!("10.0.0.{id}:7946"),
             load_permille: 5,
             sessions: 2,
+            signal: String::new(),
+            fingerprint: [0; 32],
+            role: peerdesk_core::cluster::Role::Free,
+            relay: String::new(),
         }
     }
 

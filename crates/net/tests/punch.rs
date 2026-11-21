@@ -72,6 +72,7 @@ fn peer(device: [u8; 32], addr: SocketAddr, punch: PunchInfo) -> SignalMsg {
         you: "127.0.0.2:1".parse().unwrap(),
         punch,
         relay: None,
+        note: String::new(),
     }
 }
 

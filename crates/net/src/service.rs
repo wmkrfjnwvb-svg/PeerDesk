@@ -7,8 +7,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
+use peerdesk_core::billing::{AccountId, PUBLIC_ACCOUNT};
 use peerdesk_core::paths::Candidate;
-use peerdesk_core::relay::{Record, Relay, SessionId, Usage};
+use peerdesk_core::relay::{
+    unwrap, FreePolicy, Record, Relay, SessionId, Ticket, Usage, TICKET_LEN, TICKET_MAGIC,
+};
 use peerdesk_core::signal::{format_code, parse_observe, Caller, DeviceId, Registry, SignalMsg};
 use peerdesk_core::Time;
 use tokio::net::UdpSocket;
@@ -36,8 +39,72 @@ pub struct RelayService {
     records: Arc<Mutex<Vec<Record>>>,
     /// NAT 探测：每台设备最近一次在这个端口上被看到的地址。
     observed: Arc<Mutex<BTreeMap<DeviceId, SocketAddr>>>,
+    /// 验证中继票据的密钥（集群共享）。
+    key: Vec<u8>,
     started: Instant,
     task: JoinHandle<()>,
+}
+
+/// 中继的设置。
+#[derive(Debug, Clone)]
+pub struct RelayOptions {
+    /// 签发和验证中继票据的密钥。集群里所有节点相同，信令节点签的票据其他节点才认。
+    pub key: Vec<u8>,
+    /// 免费通道的额度。
+    pub free: FreePolicy,
+    /// 记账间隔。
+    pub bill_every: Duration,
+}
+
+impl RelayOptions {
+    /// 单机用：随机密钥，免费通道不限额。
+    #[must_use]
+    pub fn local() -> Self {
+        let mut key = vec![0u8; 32];
+        {
+            use ring::rand::SecureRandom;
+            // 取随机数失败极少见；那样密钥全 0，票据仍然只在本进程内使用。
+            let _ = ring::rand::SystemRandom::new().fill(&mut key);
+        }
+        Self {
+            key,
+            free: FreePolicy::UNLIMITED,
+            bill_every: BILL_EVERY,
+        }
+    }
+}
+
+/// 多久记一次账（崩溃最多丢这么久的用量）。
+pub const BILL_EVERY: Duration = Duration::from_secs(10);
+
+/// 现在的 Unix 毫秒。
+pub(crate) fn wall_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+/// 处理中继端口收到的一个包，返回要转给谁。带票据的包（转发器的登记和保活）：
+/// 会话还没开就凭票据开通，然后只登记发送方的地址，不转发、不计费。
+fn handle(
+    relay: &mut Relay,
+    key: &[u8],
+    now: Time,
+    from: SocketAddr,
+    packet: &[u8],
+) -> Option<SocketAddr> {
+    let ticket = unwrap(packet).filter(|(_, _, payload)| payload.starts_with(TICKET_MAGIC));
+    let Some((session, _, payload)) = ticket else {
+        return relay.on_packet(now, from, packet);
+    };
+    if !relay.knows(&session) {
+        let valid = Ticket::open(key, payload, wall_ms()).filter(|t| t.session == session)?;
+        if !relay.admit(now, &valid) {
+            return None;
+        }
+    }
+    relay.touch(now, from, packet);
+    None
 }
 
 /// 记下一台设备的探测结果；表满了就清空重来（只影响打洞方法的选择，下次探测又会补上）。
@@ -60,29 +127,47 @@ const PROBE_WAIT_STEP: Duration = Duration::from_millis(10);
 const MAX_OBSERVED: usize = 100_000;
 
 impl RelayService {
-    /// 在 `bind` 上启动。`advertise` 是告诉客户端的地址（服务器在 NAT 或负载均衡后面时与 `bind` 不同）。
+    /// 在 `bind` 上启动（单机：随机票据密钥，免费通道不限额）。`advertise` 是告诉客户端的地址
+    /// （服务器在 NAT 或负载均衡后面时与 `bind` 不同）。
     pub async fn start(bind: SocketAddr, advertise: Option<SocketAddr>) -> Result<Self, NetError> {
+        Self::start_with(bind, advertise, RelayOptions::local()).await
+    }
+
+    /// 同 [`RelayService::start`]，指定票据密钥和免费额度。
+    pub async fn start_with(
+        bind: SocketAddr,
+        advertise: Option<SocketAddr>,
+        options: RelayOptions,
+    ) -> Result<Self, NetError> {
         let io = |e: std::io::Error| NetError::Io(format!("启动中继失败：{e}"));
         let socket = UdpSocket::bind(bind).await.map_err(io)?;
         let addr = advertise.unwrap_or(socket.local_addr().map_err(io)?);
-        let relay = Arc::new(Mutex::new(Relay::new(RELAY_IDLE_US, RELAY_MAX_SESSIONS)));
+        let relay = Arc::new(Mutex::new(
+            Relay::new(RELAY_IDLE_US, RELAY_MAX_SESSIONS).with_free_policy(options.free),
+        ));
         let records = Arc::new(Mutex::new(Vec::new()));
         let started = Instant::now();
         let observed = Arc::new(Mutex::new(BTreeMap::new()));
-        let (relay2, records2, observed2) = (
+        let (relay2, records2, observed2, key) = (
             Arc::clone(&relay),
             Arc::clone(&records),
             Arc::clone(&observed),
+            options.key.clone(),
         );
         let task = tokio::spawn(async move {
             let now = || Time(u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX));
             let mut sweep = tokio::time::interval(Duration::from_secs(1));
+            let mut bill = tokio::time::interval(options.bill_every);
             let mut buf = vec![0u8; 2048];
             loop {
                 tokio::select! {
                     _ = sweep.tick() => {
                         let ended = lock(&relay2).expire(now());
                         lock(&records2).extend(ended);
+                    }
+                    _ = bill.tick() => {
+                        let deltas = lock(&relay2).bill();
+                        lock(&records2).extend(deltas);
                     }
                     received = socket.recv_from(&mut buf) => {
                         let Ok((len, from)) = received else { continue };
@@ -91,9 +176,15 @@ impl RelayService {
                             remember(&mut lock(&observed2), device, from, MAX_OBSERVED);
                             continue;
                         }
-                        let to = lock(&relay2).on_packet(now(), from, packet);
+                        let (to, notices) = {
+                            let mut relay = lock(&relay2);
+                            (handle(&mut relay, &key, now(), from, packet), relay.take_notices())
+                        };
                         if let Some(to) = to {
                             let _ = socket.send_to(packet, to).await;
+                        }
+                        for (to, notice) in notices {
+                            let _ = socket.send_to(&notice, to).await;
                         }
                     }
                 }
@@ -104,9 +195,24 @@ impl RelayService {
             relay,
             records,
             observed,
+            key: options.key,
             started,
             task,
         })
+    }
+
+    /// 签发中继票据用的密钥。
+    #[must_use]
+    pub fn key(&self) -> &[u8] {
+        &self.key
+    }
+
+    /// 被限流的设备数（当前窗口里免费额度用完的）和启动以来停掉的免费通道数。
+    #[must_use]
+    pub fn limited(&self) -> (usize, u64) {
+        let now = Time(u64::try_from(self.started.elapsed().as_micros()).unwrap_or(u64::MAX));
+        let relay = lock(&self.relay);
+        (relay.limited_now(now), relay.limited())
     }
 
     /// 设备 `device` 最近一次的 NAT 探测包是从哪个地址来的。
@@ -124,12 +230,6 @@ impl RelayService {
     #[must_use]
     pub const fn addr(&self) -> SocketAddr {
         self.addr
-    }
-
-    /// 为一次连接开一条通道。满了时返回 false。
-    pub fn allocate(&self, session: SessionId, account: [u8; 32]) -> bool {
-        let now = Time(u64::try_from(self.started.elapsed().as_micros()).unwrap_or(u64::MAX));
-        lock(&self.relay).allocate(now, session, account)
     }
 
     /// 某个进行中的会话的用量。
@@ -163,25 +263,134 @@ struct SignalState {
     /// 每条已登记连接的发件箱。
     outboxes: Mutex<BTreeMap<u64, mpsc::Sender<SignalMsg>>>,
     relay: Option<Arc<RelayService>>,
+    /// 中继放在哪、集群里有哪些节点。
+    directory: Arc<dyn Directory>,
     next_conn: AtomicU64,
     /// 设备码簿的存盘位置；`None` 表示只在内存里（测试用）。
     codes: Option<PathBuf>,
 }
 
-/// 设备码用的随机数。
-fn random_u32() -> u32 {
-    use ring::rand::SecureRandom;
-    let mut b = [0u8; 4];
-    // 取随机数失败极少见；退回到时钟，码仍然会做冲突检查。
-    let ok = ring::rand::SystemRandom::new().fill(&mut b).is_ok();
-    let clock = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.subsec_nanos());
-    if ok {
-        u32::from_le_bytes(b)
-    } else {
-        clock
+/// 一次连接的中继安排。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayPlan {
+    /// 中继地址、会话号和票据；`None` 表示没有中继可用。
+    pub relay: Option<(SocketAddr, SessionId, [u8; TICKET_LEN])>,
+    /// 给用户看的说明：走会员通道还是免费通道，或者为什么没有中继。
+    pub note: String,
+}
+
+/// 信令服务向“目录”查询：这次连接的中继放在哪台节点上、集群里有哪些节点。
+/// 服务端的集群实现它（按节点角色、负载、会员额度选中继）；单机部署用 [`LocalDirectory`]。
+pub trait Directory: Send + Sync {
+    /// 为发起连接的 `caller`（带着会员令牌 `account`，空表示免费用户）安排中继。
+    fn plan_relay(&self, caller: &DeviceId, account: &str) -> RelayPlan;
+    /// 集群里存活的节点：（信令地址，证书指纹，是否付费节点）。
+    fn nodes(&self) -> Vec<(SocketAddr, DeviceId, bool)>;
+}
+
+/// 签一张中继票据，返回会话号和票据。票据 60 秒内有效（只用来开通道，开了以后不再检查）。
+#[must_use]
+pub fn sign_ticket(
+    key: &[u8],
+    caller: &DeviceId,
+    account: AccountId,
+    vip: bool,
+) -> (SessionId, [u8; TICKET_LEN]) {
+    let session = new_session_id().unwrap_or_default();
+    let mut subject = [0u8; 8];
+    for (d, s) in subject.iter_mut().zip(caller.iter()) {
+        *d = *s;
     }
+    let ticket = Ticket {
+        session,
+        account,
+        vip,
+        subject,
+        expires_ms: wall_ms().saturating_add(TICKET_TTL_MS),
+    }
+    .seal(key);
+    let mut fixed = [0u8; TICKET_LEN];
+    for (d, s) in fixed.iter_mut().zip(ticket.iter()) {
+        *d = *s;
+    }
+    (session, fixed)
+}
+
+/// 票据的有效期。
+const TICKET_TTL_MS: u64 = 60_000;
+
+/// 单机部署的目录：中继就是本机的中继；会员令牌用本机的密钥验证；集群只有自己。
+pub struct LocalDirectory {
+    relay: Option<Arc<RelayService>>,
+    billing_key: Option<Vec<u8>>,
+}
+
+impl std::fmt::Debug for LocalDirectory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LocalDirectory")
+            .field("relay", &self.relay.as_ref().map(|r| r.addr()))
+            .finish_non_exhaustive()
+    }
+}
+
+impl LocalDirectory {
+    /// 本机的中继（可以没有）和会员令牌的密钥（可以没有：那样所有人都按免费用户）。
+    #[must_use]
+    pub fn new(relay: Option<Arc<RelayService>>, billing_key: Option<Vec<u8>>) -> Self {
+        Self { relay, billing_key }
+    }
+}
+
+/// 验证会员令牌：有效时返回账户；空令牌、无效令牌返回 `None`，并说明原因（空令牌没有说明）。
+#[must_use]
+pub fn member(
+    key: Option<&[u8]>,
+    token: &str,
+) -> (Option<peerdesk_core::billing::Account>, Option<String>) {
+    if token.trim().is_empty() {
+        return (None, None);
+    }
+    match key.map(|k| peerdesk_core::billing::verify(k, token)) {
+        Some(Ok(account)) => (Some(account), None),
+        Some(Err(_)) | None => (None, Some("会员令牌无效，按免费用户处理".into())),
+    }
+}
+
+impl Directory for LocalDirectory {
+    fn plan_relay(&self, caller: &DeviceId, account: &str) -> RelayPlan {
+        let (member, why) = member(self.billing_key.as_deref(), account);
+        let Some(relay) = &self.relay else {
+            return RelayPlan {
+                relay: None,
+                note: "服务器没有开中继".into(),
+            };
+        };
+        let vip = member.is_some();
+        let id = member.map_or(PUBLIC_ACCOUNT, |m| m.id);
+        let (session, ticket) = sign_ticket(relay.key(), caller, id, vip);
+        let channel = if vip { "会员通道" } else { "免费通道" };
+        RelayPlan {
+            relay: Some((relay.addr(), session, ticket)),
+            note: why.map_or_else(|| channel.to_owned(), |w| format!("{channel}（{w}）")),
+        }
+    }
+
+    fn nodes(&self) -> Vec<(SocketAddr, DeviceId, bool)> {
+        Vec::new()
+    }
+}
+
+/// 设备码的候选：由设备指纹算出（第 `k` 个候选，冲突时试下一个）。集群里每个节点对同一台设备
+/// 算出同一个码，不用互相协调；只有极少见的哈希冲突时，不同节点上的码才可能不同。
+fn code_candidate(device: &DeviceId, k: u32) -> u32 {
+    let mut input = device.to_vec();
+    input.extend_from_slice(&k.to_be_bytes());
+    let digest = ring::digest::digest(&ring::digest::SHA256, &input);
+    let mut b = [0u8; 4];
+    for (d, s) in b.iter_mut().zip(digest.as_ref()) {
+        *d = *s;
+    }
+    u32::from_be_bytes(b)
 }
 
 /// 把码簿写到磁盘：先写临时文件再改名，写一半断电也不会坏掉原文件。
@@ -218,6 +427,7 @@ async fn introduce(
     link: &Link,
     target: Option<DeviceId>,
     locals: Vec<Candidate>,
+    account: String,
     probed: &mut bool,
     send: &mut quinn::SendStream,
 ) -> Result<(), NetError> {
@@ -249,19 +459,18 @@ async fn introduce(
     }
     let nonce = new_session_id().unwrap_or_default();
     let probe_of = |d: &DeviceId| state.relay.as_ref().and_then(|r| r.observed(d));
-    // 中继通道记在发起连接的设备名下。
-    let relay = state.relay.as_ref().and_then(|relay| {
-        let session = new_session_id()?;
-        relay
-            .allocate(session, me)
-            .then_some((relay.addr(), session))
-    });
+    // 中继记在发起连接一端的账户上（会员令牌），没有令牌时是免费通道。
+    let plan = state.directory.plan_relay(&me, &account);
+    let relay = plan.relay;
     let caller = Caller {
         device: me,
         addr: link.remote_addr(),
         locals,
     };
-    let intro = lock(&state.registry).connect(&caller, &target, relay, nonce, &probe_of);
+    let mut intro = lock(&state.registry).connect(&caller, &target, relay, nonce, &probe_of);
+    if let SignalMsg::Peer { note, .. } = &mut intro.to_controller {
+        note.clone_from(&plan.note);
+    }
     let plan = intro
         .to_controller
         .punch()
@@ -303,10 +512,16 @@ async fn serve_device(state: Arc<SignalState>, link: Link) -> Result<(), NetErro
             msg = read_signal(&mut recv) => match msg {
                 Err(_) => break Ok(()),
                 Ok(SignalMsg::Register { locals }) => {
+                    let device = *link.peer_fingerprint();
+                    let mut k = 0u32;
+                    let mut next_code = || {
+                        k = k.wrapping_add(1);
+                        code_candidate(&device, k)
+                    };
                     let (done, text) = {
                         let mut registry = lock(&state.registry);
                         let done = registry
-                            .register(conn, *link.peer_fingerprint(), link.remote_addr(), &locals, state.relay.as_ref().map(|r| r.addr()), &mut random_u32);
+                            .register(conn, *link.peer_fingerprint(), link.remote_addr(), &locals, state.relay.as_ref().map(|r| r.addr()), &mut next_code);
                         let text = done.as_ref().filter(|d| d.new_code).map(|_| registry.codes_text());
                         (done, text)
                     };
@@ -338,18 +553,23 @@ async fn serve_device(state: Arc<SignalState>, link: Link) -> Result<(), NetErro
                     }
                     if let Err(e) = write_signal(&mut send, &checked).await { break Err(e); }
                 }
-                Ok(SignalMsg::Connect { target, locals }) => {
-                    if let Err(e) = introduce(&state, &link, Some(target), locals, &mut probed, &mut send).await { break Err(e); }
+                Ok(SignalMsg::Connect { target, locals, account }) => {
+                    if let Err(e) = introduce(&state, &link, Some(target), locals, account, &mut probed, &mut send).await { break Err(e); }
                 }
-                Ok(SignalMsg::ConnectCode { code, locals }) => {
+                Ok(SignalMsg::Nodes) => {
+                    let list = SignalMsg::NodeList { nodes: state.directory.nodes() };
+                    if let Err(e) = write_signal(&mut send, &list).await { break Err(e); }
+                }
+                Ok(SignalMsg::ConnectCode { code, locals, account }) => {
                     let target = lock(&state.registry).device_of(code);
                     if target.is_none() {
                         crate::note!(info, "按设备码 {} 连接：码不存在，来自 {}", format_code(code), link.remote_addr());
                     }
-                    if let Err(e) = introduce(&state, &link, target, locals, &mut probed, &mut send).await { break Err(e); }
+                    if let Err(e) = introduce(&state, &link, target, locals, account, &mut probed, &mut send).await { break Err(e); }
                 }
                 Ok(
                     SignalMsg::Registered { .. }
+                    | SignalMsg::NodeList { .. }
                     | SignalMsg::Checked { .. }
                     | SignalMsg::Probe { .. }
                     | SignalMsg::Peer { .. }
@@ -379,6 +599,19 @@ impl SignalService {
         relay: Option<Arc<RelayService>>,
         codes: Option<PathBuf>,
     ) -> Self {
+        let directory = Arc::new(LocalDirectory::new(relay.clone(), None));
+        Self::start_with_directory(node, relay, directory, codes)
+    }
+
+    /// 同 [`SignalService::start_with_codes`]，中继安排和节点列表由 `directory` 决定（集群用）。
+    /// `relay` 是本机的中继，只用来做 NAT 探测。
+    #[must_use]
+    pub fn start_with_directory(
+        node: Arc<Node>,
+        relay: Option<Arc<RelayService>>,
+        directory: Arc<dyn Directory>,
+        codes: Option<PathBuf>,
+    ) -> Self {
         let mut registry = Registry::new();
         if let Some(path) = &codes {
             match std::fs::read_to_string(path) {
@@ -399,6 +632,7 @@ impl SignalService {
             registry: Mutex::new(registry),
             outboxes: Mutex::new(BTreeMap::new()),
             relay,
+            directory,
             next_conn: AtomicU64::new(1),
             codes,
         });
@@ -429,6 +663,13 @@ impl Drop for SignalService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codes_derive_from_the_fingerprint() {
+        assert_eq!(code_candidate(&[1; 32], 1), code_candidate(&[1; 32], 1));
+        assert_ne!(code_candidate(&[1; 32], 1), code_candidate(&[1; 32], 2));
+        assert_ne!(code_candidate(&[1; 32], 1), code_candidate(&[2; 32], 1));
+    }
 
     #[test]
     fn remember_clears_when_full() {

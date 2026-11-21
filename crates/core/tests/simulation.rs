@@ -92,6 +92,10 @@ fn info(id: u64, region: &str) -> NodeInfo {
         addr: format!("n{id}"),
         load_permille: 0,
         sessions: 0,
+        signal: String::new(),
+        fingerprint: [0; 32],
+        role: peerdesk_core::cluster::Role::Free,
+        relay: String::new(),
     }
 }
 

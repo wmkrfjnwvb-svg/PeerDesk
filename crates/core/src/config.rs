@@ -164,9 +164,61 @@ pub struct ServerConfig {
     /// 保存服务器身份（证书和私钥）的目录。开启信令时必须设置。
     #[serde(default)]
     pub data_dir: Option<String>,
+    /// 客户端连接本节点信令的公网地址（集群里的其他节点把它告诉客户端，用于故障切换）。
+    /// 不写时用 signal_listen（监听在“所有地址”上时，客户端只能用自己配置的地址连本节点）。
+    #[serde(default)]
+    pub signal_advertise: Option<String>,
+    /// 本节点在集群里的角色：free（免费集群，默认）或 paid（付费集群，会员优先走）。
+    #[serde(default)]
+    pub role: crate::cluster::Role,
+    /// 计费密钥：签发和验证会员账户令牌、中继票据。集群里所有节点必须相同，至少 16 个字符。
+    /// 不写时用 cluster_secret；两个都没有时只有本节点自己签发的中继票据有效（单机部署）。
+    #[serde(default)]
+    pub billing_secret: Option<String>,
+    /// 管理令牌：管理中心的写操作（加入节点、签发会员令牌）要带上它。不写时不能做写操作。
+    #[serde(default)]
+    pub admin_token: Option<String>,
+    /// 中继流量单价（分/GB），只用于管理中心显示费用。
+    #[serde(default)]
+    pub relay_price_cents_per_gb: u64,
+    /// 免费通道的统计窗口（秒），默认 600（10 分钟）。
+    #[serde(default = "default_free_window")]
+    pub free_window_secs: u64,
+    /// 免费通道每台设备每个窗口最多转发多少 MB，默认 200；0 表示不限。
+    #[serde(default = "default_free_device_mb")]
+    pub free_device_mb: u64,
+    /// 免费通道每个公网 IP 每个窗口最多转发多少 MB，默认 600；0 表示不限。
+    #[serde(default = "default_free_ip_mb")]
+    pub free_ip_mb: u64,
+    /// 付费节点的负载（千分比）超过这个值就算“不够用”，会员改用免费节点。默认 900。
+    #[serde(default = "default_paid_load_limit")]
+    pub paid_load_limit_permille: u16,
+    /// 本节点中继的带宽（Mbps），用来算负载；0 表示按会话数算（每 100 个会话算满）。
+    #[serde(default)]
+    pub relay_capacity_mbps: u64,
+    /// 记账间隔（毫秒），默认 10000：中继用量每隔这么久写进账本、报告给其他节点，
+    /// 进程崩溃最多丢这么久的用量。
+    #[serde(default = "default_bill_every")]
+    pub bill_every_ms: u64,
     /// 加密配置。
     #[serde(default)]
     pub crypto: CryptoConfig,
+}
+
+const fn default_free_window() -> u64 {
+    600
+}
+const fn default_free_device_mb() -> u64 {
+    200
+}
+const fn default_free_ip_mb() -> u64 {
+    600
+}
+const fn default_bill_every() -> u64 {
+    10_000
+}
+const fn default_paid_load_limit() -> u16 {
+    900
 }
 
 /// 解析好的信令配置。
@@ -222,6 +274,25 @@ impl ServerConfig {
         }))
     }
 
+    /// 签发会员令牌和中继票据用的密钥：billing_secret，没有时用 cluster_secret。
+    #[must_use]
+    pub fn billing_key(&self) -> Option<&[u8]> {
+        self.billing_secret
+            .as_deref()
+            .or(self.cluster_secret.as_deref())
+            .map(str::as_bytes)
+    }
+
+    /// 免费通道的额度。
+    #[must_use]
+    pub fn free_policy(&self) -> crate::relay::FreePolicy {
+        crate::relay::FreePolicy {
+            window_us: self.free_window_secs.saturating_mul(1_000_000),
+            device_bytes: self.free_device_mb.saturating_mul(1_000_000),
+            ip_bytes: self.free_ip_mb.saturating_mul(1_000_000),
+        }
+    }
+
     /// 解析并校验。
     pub fn from_toml(text: &str) -> Result<Self, Error> {
         let cfg: Self = toml::from_str(text).map_err(|e| Error::Config(e.to_string()))?;
@@ -238,6 +309,21 @@ impl ServerConfig {
             check_region("region_fallback", region)?;
         }
         check_addr("http_listen", &self.http_listen)?;
+        if let Some(a) = &self.signal_advertise {
+            check_addr("signal_advertise", a)?;
+        }
+        if self.billing_secret.as_ref().is_some_and(|s| s.len() < 16) {
+            return Err(Error::Config("billing_secret 至少 16 个字符".into()));
+        }
+        if self.admin_token.as_ref().is_some_and(|s| s.len() < 16) {
+            return Err(Error::Config("admin_token 至少 16 个字符".into()));
+        }
+        if self.bill_every_ms == 0 {
+            return Err(Error::Config("bill_every_ms 不能为 0".into()));
+        }
+        if self.free_window_secs == 0 {
+            return Err(Error::Config("free_window_secs 不能为 0".into()));
+        }
         check_addr("cluster_listen", &self.cluster_listen)?;
         check_addr("advertise", &self.advertise)?;
         for peer in &self.peers {

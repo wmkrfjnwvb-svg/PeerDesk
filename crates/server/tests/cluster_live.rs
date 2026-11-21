@@ -214,6 +214,10 @@ fn only_nodes_with_the_shared_secret_can_join() {
             addr: "127.0.0.1:1".into(),
             load_permille: 0,
             sessions: 0,
+            signal: String::new(),
+            fingerprint: [0; 32],
+            role: peerdesk_core::cluster::Role::Free,
+            relay: String::new(),
         },
         known: vec![],
     }

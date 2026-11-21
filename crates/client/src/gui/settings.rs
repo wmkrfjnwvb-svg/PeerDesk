@@ -1,6 +1,6 @@
 //! 服务器设置：填一次，存在数据目录里。本机用它登记、拿设备码，连别人时也用它按设备码查找。
 //!
-//! 文件两行：第一行服务器 `地址:端口`，第二行服务器指纹（可以空着）。
+//! 文件三行：服务器 `地址:端口`、服务器指纹（可以空着）、会员令牌（可以空着）。
 
 use std::path::{Path, PathBuf};
 
@@ -19,6 +19,8 @@ pub struct ServerSettings {
     pub addr: String,
     /// 服务器指纹，空着表示不核对。
     pub pin: String,
+    /// 会员令牌，空着表示免费用户。
+    pub account: String,
 }
 
 impl ServerSettings {
@@ -30,6 +32,7 @@ impl ServerSettings {
         Self {
             addr: lines.next().unwrap_or_default().to_owned(),
             pin: lines.next().unwrap_or_default().to_owned(),
+            account: lines.next().unwrap_or_default().to_owned(),
         }
     }
 
@@ -38,7 +41,12 @@ impl ServerSettings {
         std::fs::create_dir_all(dir)?;
         std::fs::write(
             path(dir),
-            format!("{}\n{}\n", self.addr.trim(), self.pin.trim()),
+            format!(
+                "{}\n{}\n{}\n",
+                self.addr.trim(),
+                self.pin.trim(),
+                self.account.trim()
+            ),
         )
     }
 
@@ -81,22 +89,25 @@ mod tests {
         let set = ServerSettings {
             addr: " 203.0.113.5:4433 ".into(),
             pin: fp.clone(),
+            account: "pdk1-token".into(),
         };
         set.save(&dir).unwrap();
         let back = ServerSettings::load(&dir);
         assert_eq!(back.addr, "203.0.113.5:4433");
+        assert_eq!(back.account, "pdk1-token");
         let server = back.server(&ZH).unwrap().unwrap();
         assert_eq!(server.addr, "203.0.113.5:4433".parse().unwrap());
         assert_eq!(server.pin, Some([0xab; 32]));
 
         let bad = ServerSettings {
             addr: "nope".into(),
-            pin: String::new(),
+            ..ServerSettings::default()
         };
         assert_eq!(bad.server(&ZH), Err(ZH.err_bad_server.to_owned()));
         let bad_pin = ServerSettings {
             addr: "1.2.3.4".into(),
             pin: "zz".into(),
+            ..ServerSettings::default()
         };
         assert_eq!(bad_pin.server(&ZH), Err(ZH.err_bad_pin.to_owned()));
         let _ = std::fs::remove_dir_all(&dir);

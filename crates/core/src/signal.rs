@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use crate::paths::{Candidate, PathKind};
-use crate::relay::SessionId;
+use crate::relay::{SessionId, TICKET_LEN};
 use crate::wire::{Reader, Writer};
 use crate::Error;
 
@@ -24,6 +24,8 @@ pub struct RelayGrant {
     pub session: SessionId,
     /// 本端在这条通道里的方向（0 或 1）。
     pub side: u8,
+    /// 中继票据（见 [`crate::relay::Ticket`]），转发器在第一个包里交给中继。
+    pub ticket: [u8; TICKET_LEN],
 }
 
 /// 信令消息。
@@ -56,6 +58,8 @@ pub enum SignalMsg {
         target: DeviceId,
         /// 控制端的候选地址，转给被控端，两端同时互相探测。
         locals: Vec<Candidate>,
+        /// 会员账户令牌（空表示免费用户）。
+        account: String,
     },
     /// 控制端 → 服务器：我要连设备码是 `code` 的设备。
     ConnectCode {
@@ -63,6 +67,8 @@ pub enum SignalMsg {
         code: u32,
         /// 控制端的候选地址。
         locals: Vec<Candidate>,
+        /// 会员账户令牌（空表示免费用户）。
+        account: String,
     },
     /// 服务器 → 控制端：对方的身份和地址，以及备用的中继通道。
     Peer {
@@ -78,6 +84,8 @@ pub enum SignalMsg {
         punch: PunchInfo,
         /// 中继通道。
         relay: Option<RelayGrant>,
+        /// 中继的说明（走会员通道还是免费通道，或者为什么没有中继），给用户看。
+        note: String,
     },
     /// 服务器 → 被控端：有人要连你，请向这个地址打洞。
     Incoming {
@@ -94,6 +102,13 @@ pub enum SignalMsg {
     },
     /// 服务器 → 控制端：目标设备不在线。
     NotFound,
+    /// 设备 → 服务器：集群里有哪些节点（用于故障切换）。
+    Nodes,
+    /// 服务器 → 设备：集群里存活的节点：（信令地址，证书指纹，是否付费节点）。
+    NodeList {
+        /// 节点。
+        nodes: Vec<(SocketAddr, DeviceId, bool)>,
+    },
     /// 设备 → 服务器：网络体检，问服务器看到的本机地址。
     Check,
     /// 服务器 → 设备：体检结果。
@@ -284,6 +299,29 @@ pub fn parse_probe(packet: &[u8], nonce: &[u8; 16]) -> Option<u16> {
     Some(u16::from_be_bytes(<[u8; 2]>::try_from(port).ok()?))
 }
 
+/// 节点列表最多这么多个节点。
+pub const MAX_NODES: usize = 64;
+/// 文本字段（账户令牌、说明）的最大长度。
+const MAX_TEXT: usize = 256;
+
+fn put_text(w: &mut Writer, text: &str) {
+    // 截断时不切开一个字符。
+    let n = (0..=text.len().min(MAX_TEXT))
+        .rev()
+        .find(|i| text.is_char_boundary(*i))
+        .unwrap_or(0);
+    let bytes = text.as_bytes().get(..n).unwrap_or_default();
+    w.u16(u16::try_from(n).unwrap_or(0)).bytes(bytes);
+}
+
+fn get_text(r: &mut Reader<'_>) -> Result<String, Error> {
+    let n = usize::from(r.u16()?);
+    if n > MAX_TEXT {
+        return Err(Error::Inconsistent("文本太长"));
+    }
+    String::from_utf8(r.take(n)?.to_vec()).map_err(|_| Error::BadUtf8)
+}
+
 /// 一台设备最多报告这么多个候选地址。
 pub const MAX_LOCALS: usize = 12;
 
@@ -321,7 +359,7 @@ fn put_grant(w: &mut Writer, grant: Option<&RelayGrant>) {
         Some(g) => {
             w.u8(1);
             put_addr(w, &g.addr);
-            w.bytes(&g.session).u8(g.side);
+            w.bytes(&g.session).u8(g.side).bytes(&g.ticket);
         }
     }
 }
@@ -337,10 +375,13 @@ fn get_grant(r: &mut Reader<'_>) -> Result<Option<RelayGrant>, Error> {
             if side > 1 {
                 return Err(Error::Inconsistent("中继方向只能是 0 或 1"));
             }
+            let mut ticket = [0u8; TICKET_LEN];
+            ticket.copy_from_slice(r.take(TICKET_LEN)?);
             Ok(Some(RelayGrant {
                 addr,
                 session,
                 side,
+                ticket,
             }))
         }
         _ => Err(Error::Inconsistent("中继凭据标志不合法")),
@@ -366,6 +407,8 @@ impl SignalMsg {
             | SignalMsg::ConnectCode { .. }
             | SignalMsg::NotFound
             | SignalMsg::Check
+            | SignalMsg::Nodes
+            | SignalMsg::NodeList { .. }
             | SignalMsg::Checked { .. } => None,
         }
     }
@@ -383,6 +426,8 @@ impl SignalMsg {
             SignalMsg::Probe { .. } => "Probe",
             SignalMsg::NotFound => "NotFound",
             SignalMsg::Check => "Check",
+            SignalMsg::Nodes => "Nodes",
+            SignalMsg::NodeList { .. } => "NodeList",
             SignalMsg::Checked { .. } => "Checked",
         }
     }
@@ -410,9 +455,25 @@ impl SignalMsg {
                 w.u8(8);
                 put_addr(&mut w, relay);
             }
-            SignalMsg::Connect { target, locals } => {
+            SignalMsg::Connect {
+                target,
+                locals,
+                account,
+            } => {
                 w.u8(3).bytes(target);
                 put_addrs(&mut w, locals);
+                put_text(&mut w, account);
+            }
+            SignalMsg::Nodes => {
+                w.u8(11);
+            }
+            SignalMsg::NodeList { nodes } => {
+                let n = nodes.len().min(MAX_NODES);
+                w.u8(12).u8(u8::try_from(n).unwrap_or(0));
+                for (addr, fp, paid) in nodes.iter().take(n) {
+                    put_addr(&mut w, addr);
+                    w.bytes(fp).u8(u8::from(*paid));
+                }
             }
             SignalMsg::Peer {
                 device,
@@ -421,6 +482,7 @@ impl SignalMsg {
                 you,
                 punch,
                 relay,
+                note,
             } => {
                 w.u8(4).bytes(device);
                 put_addr(&mut w, addr);
@@ -428,6 +490,7 @@ impl SignalMsg {
                 put_addr(&mut w, you);
                 punch.put(&mut w);
                 put_grant(&mut w, relay.as_ref());
+                put_text(&mut w, note);
             }
             SignalMsg::Incoming {
                 peer,
@@ -458,9 +521,14 @@ impl SignalMsg {
                 put_opt_addr(&mut w, probe.as_ref());
                 put_opt_addr(&mut w, seen.as_ref());
             }
-            SignalMsg::ConnectCode { code, locals } => {
+            SignalMsg::ConnectCode {
+                code,
+                locals,
+                account,
+            } => {
                 w.u8(7).u32(*code);
                 put_addrs(&mut w, locals);
+                put_text(&mut w, account);
             }
         }
         w.into_vec()
@@ -484,7 +552,22 @@ impl SignalMsg {
             3 => SignalMsg::Connect {
                 target: get_id(&mut r)?,
                 locals: get_addrs(&mut r)?,
+                account: get_text(&mut r)?,
             },
+            11 => SignalMsg::Nodes,
+            12 => {
+                let n = usize::from(r.u8()?);
+                if n > MAX_NODES {
+                    return Err(Error::Inconsistent("节点太多"));
+                }
+                let mut nodes = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let addr = get_addr(&mut r)?;
+                    let fp = get_id(&mut r)?;
+                    nodes.push((addr, fp, r.u8()? == 1));
+                }
+                SignalMsg::NodeList { nodes }
+            }
             4 => SignalMsg::Peer {
                 device: get_id(&mut r)?,
                 addr: get_addr(&mut r)?,
@@ -492,6 +575,7 @@ impl SignalMsg {
                 you: get_addr(&mut r)?,
                 punch: PunchInfo::get(&mut r)?,
                 relay: get_grant(&mut r)?,
+                note: get_text(&mut r)?,
             },
             5 => SignalMsg::Incoming {
                 peer: get_id(&mut r)?,
@@ -510,6 +594,7 @@ impl SignalMsg {
             7 => SignalMsg::ConnectCode {
                 code: r.u32()?,
                 locals: get_addrs(&mut r)?,
+                account: get_text(&mut r)?,
             },
             other => return Err(Error::UnknownMessage(other)),
         };
@@ -723,7 +808,7 @@ impl Registry {
         &self,
         caller: &Caller,
         target: &DeviceId,
-        relay: Option<(SocketAddr, SessionId)>,
+        relay: Option<(SocketAddr, SessionId, [u8; TICKET_LEN])>,
         nonce: [u8; 16],
         probe_of: &dyn Fn(&DeviceId) -> Option<SocketAddr>,
     ) -> Introduction {
@@ -734,10 +819,11 @@ impl Registry {
             };
         };
         let grant = |side| {
-            relay.map(|(addr, session)| RelayGrant {
+            relay.map(|(addr, session, ticket)| RelayGrant {
                 addr,
                 session,
                 side,
+                ticket,
             })
         };
         let (controller, controller_addr) = (caller.device, caller.addr);
@@ -755,6 +841,7 @@ impl Registry {
                     peer: host_nat,
                 },
                 relay: grant(0),
+                note: String::new(),
             },
             to_host: Some((
                 host.conn,
@@ -821,6 +908,7 @@ mod tests {
             addr: addr("[2001:db8::1]:3478"),
             session: [5; 16],
             side,
+            ticket: [4; TICKET_LEN],
         }
     }
 
@@ -845,6 +933,10 @@ mod tests {
                 relay: addr("203.0.113.1:3478"),
             },
             SignalMsg::Check,
+            SignalMsg::Nodes,
+            SignalMsg::NodeList {
+                nodes: vec![(addr("203.0.113.1:4433"), [1; 32], true)],
+            },
             SignalMsg::Checked {
                 observed: addr("203.0.113.9:4000"),
                 probe: Some(addr("203.0.113.1:3478")),
@@ -853,10 +945,12 @@ mod tests {
             SignalMsg::Connect {
                 target: [1; 32],
                 locals: vec![lan("10.0.0.3:9")],
+                account: "pdk1-token".into(),
             },
             SignalMsg::ConnectCode {
                 code: 987_654_321,
                 locals: vec![],
+                account: String::new(),
             },
             SignalMsg::Peer {
                 device: [3; 32],
@@ -869,6 +963,7 @@ mod tests {
                     peer: Nat::Hard,
                 },
                 relay: Some(grant(0)),
+                note: "免费通道".into(),
             },
             SignalMsg::Peer {
                 device: [4; 32],
@@ -881,6 +976,7 @@ mod tests {
                     peer: Nat::Hard,
                 },
                 relay: None,
+                note: "免费通道".into(),
             },
             SignalMsg::Incoming {
                 peer: [2; 32],
@@ -909,6 +1005,8 @@ mod tests {
                 "Registered",
                 "Probe",
                 "Check",
+                "Nodes",
+                "NodeList",
                 "Checked",
                 "Connect",
                 "ConnectCode",
@@ -917,6 +1015,36 @@ mod tests {
                 "Incoming",
                 "NotFound"
             ]
+        );
+    }
+
+    #[test]
+    fn text_fields_are_bounded_and_utf8() {
+        let long = "中".repeat(200);
+        let msg = SignalMsg::ConnectCode {
+            code: 1,
+            locals: vec![],
+            account: long,
+        };
+        let SignalMsg::ConnectCode { account, .. } = SignalMsg::decode(&msg.encode()).unwrap()
+        else {
+            panic!("应为 ConnectCode")
+        };
+        assert_eq!(account.chars().count(), MAX_TEXT / 3, "截断时不切开字符");
+        // 长度超过上限、内容不是 UTF-8 都拒绝
+        let mut too_long = vec![7u8, 0, 0, 0, 1, 0];
+        too_long.extend_from_slice(&(u16::try_from(MAX_TEXT).unwrap() + 1).to_be_bytes());
+        assert_eq!(
+            SignalMsg::decode(&too_long),
+            Err(Error::Inconsistent("文本太长"))
+        );
+        assert_eq!(
+            SignalMsg::decode(&[7, 0, 0, 0, 1, 0, 0, 1, 0xff]),
+            Err(Error::BadUtf8)
+        );
+        assert_eq!(
+            SignalMsg::decode(&[12, u8::try_from(MAX_NODES).unwrap() + 1]),
+            Err(Error::Inconsistent("节点太多"))
         );
     }
 
@@ -965,9 +1093,12 @@ mod tests {
                 peer: Nat::Hard,
             },
             relay: None,
+            note: String::new(),
         }
         .encode();
-        *bad_flag.last_mut().unwrap() = 7;
+        // 最后是说明的长度（2 字节），前面一个字节是中继凭据标志
+        let flag = bad_flag.len() - 3;
+        bad_flag[flag] = 7;
         assert_eq!(
             SignalMsg::decode(&bad_flag),
             Err(Error::Inconsistent("中继凭据标志不合法"))
@@ -983,9 +1114,12 @@ mod tests {
                 peer: Nat::Hard,
             },
             relay: Some(grant(0)),
+            note: String::new(),
         }
         .encode();
-        *bad_side.last_mut().unwrap() = 2;
+        // 方向后面是票据（65 字节）和说明的长度（2 字节）
+        let side = bad_side.len() - 3 - TICKET_LEN;
+        bad_side[side] = 2;
         assert_eq!(
             SignalMsg::decode(&bad_side),
             Err(Error::Inconsistent("中继方向只能是 0 或 1"))
@@ -1033,7 +1167,7 @@ mod tests {
         );
         assert_eq!(reg.online(), 1);
 
-        let relay = Some((addr("203.0.113.1:3478"), [8; 16]));
+        let relay = Some((addr("203.0.113.1:3478"), [8; 16], [4; TICKET_LEN]));
         let intro = reg.connect(
             &caller(ctrl, addr("192.0.2.7:6000")),
             &host,
@@ -1050,6 +1184,7 @@ mod tests {
                     you,
                     punch,
                     relay: Some(c),
+                    ..
                 },
                 Some((
                     10,

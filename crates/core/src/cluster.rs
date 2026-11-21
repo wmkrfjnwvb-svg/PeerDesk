@@ -76,6 +76,43 @@ pub fn open<'a>(
     Ok((stamp, body))
 }
 
+/// 节点在集群里的角色。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    /// 免费集群：所有人都能用，中继流量有时间窗口限额。
+    #[default]
+    Free,
+    /// 付费集群：会员（有账户令牌）优先走这里。
+    Paid,
+}
+
+impl Role {
+    /// 名字（配置文件和管理接口里的写法）。
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Role::Free => "free",
+            Role::Paid => "paid",
+        }
+    }
+
+    const fn code(self) -> u8 {
+        match self {
+            Role::Free => 0,
+            Role::Paid => 1,
+        }
+    }
+
+    fn from_code(code: u8) -> Result<Self, Error> {
+        match code {
+            0 => Ok(Role::Free),
+            1 => Ok(Role::Paid),
+            _ => Err(Error::Inconsistent("未知的节点角色")),
+        }
+    }
+}
+
 /// 节点对外公布的信息。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeInfo {
@@ -89,6 +126,14 @@ pub struct NodeInfo {
     pub load_permille: u16,
     /// 当前会话数。
     pub sessions: u32,
+    /// 客户端连接这个节点信令的地址（公网地址）；没有开信令时为空。
+    pub signal: String,
+    /// 这个节点的证书指纹（客户端连接时核对）；没有开信令时全为 0。
+    pub fingerprint: [u8; 32],
+    /// 角色。
+    pub role: Role,
+    /// 中继地址（客户端用）；没有开中继时为空。
+    pub relay: String,
 }
 
 impl NodeInfo {
@@ -97,6 +142,10 @@ impl NodeInfo {
         w.string(&self.region, MAX_REGION_LEN)?;
         w.string(&self.addr, MAX_ADDR_LEN)?;
         w.u16(self.load_permille).u32(self.sessions);
+        w.string(&self.signal, MAX_ADDR_LEN)?;
+        w.bytes(&self.fingerprint);
+        w.u8(self.role.code());
+        w.string(&self.relay, MAX_ADDR_LEN)?;
         Ok(())
     }
 
@@ -107,6 +156,14 @@ impl NodeInfo {
             addr: r.string(MAX_ADDR_LEN)?,
             load_permille: r.u16()?,
             sessions: r.u32()?,
+            signal: r.string(MAX_ADDR_LEN)?,
+            fingerprint: {
+                let mut fp = [0u8; 32];
+                fp.copy_from_slice(r.take(32)?);
+                fp
+            },
+            role: Role::from_code(r.u8()?)?,
+            relay: r.string(MAX_ADDR_LEN)?,
         })
     }
 }
@@ -120,6 +177,14 @@ pub enum ClusterMsg {
         from: NodeInfo,
         /// 发送者知道的其他存活节点。
         known: Vec<NodeInfo>,
+    },
+    /// 中继用量：发送者本月各账户的中继字节数（见 `billing::encode_totals`），
+    /// 收到的节点据此按全集群的合计检查额度。
+    Usage {
+        /// 发送者。
+        from: NodeId,
+        /// 编码后的汇总。
+        totals: Vec<u8>,
     },
 }
 
@@ -143,6 +208,11 @@ impl ClusterMsg {
                     node.encode(&mut w)?;
                 }
             }
+            ClusterMsg::Usage { from, totals } => {
+                w.u8(2).u64(from.0);
+                w.u32(u32::try_from(totals.len()).unwrap_or(u32::MAX));
+                w.bytes(totals);
+            }
         }
         Ok(w.into_vec())
     }
@@ -165,6 +235,14 @@ impl ClusterMsg {
                     known.push(NodeInfo::decode(&mut r)?);
                 }
                 ClusterMsg::Heartbeat { from, known }
+            }
+            2 => {
+                let from = NodeId(r.u64()?);
+                let len = usize::try_from(r.u32()?).unwrap_or(usize::MAX);
+                ClusterMsg::Usage {
+                    from,
+                    totals: r.take(len)?.to_vec(),
+                }
             }
             other => return Err(Error::UnknownMessage(other)),
         };
@@ -328,6 +406,8 @@ impl Cluster {
     pub fn on_message(&mut self, now: Time, msg: &ClusterMsg) -> Vec<ClusterEvent> {
         let mut events = Vec::new();
         match msg {
+            // 用量汇总由节点自己交给账本处理，不影响成员表。
+            ClusterMsg::Usage { .. } => {}
             ClusterMsg::Heartbeat { from, known } => {
                 if from.id == self.me.id {
                     // 自己的回声，或者配置里有重复的节点标识：忽略。
@@ -455,6 +535,50 @@ impl Cluster {
             .collect()
     }
 
+    /// 修改本节点公布的信息（启动后填上信令地址、指纹、中继地址）。
+    pub fn update_me(&mut self, f: impl FnOnce(&mut NodeInfo)) {
+        f(&mut self.me);
+    }
+
+    /// 加入一个种子节点地址（管理中心“加入节点”）：之后向它发心跳，它回应后成为成员。
+    pub fn add_seed(&mut self, addr: String) {
+        if !self.seeds.contains(&addr) {
+            self.seeds.push(addr);
+        }
+    }
+
+    /// 所有成员（不含自己）和它们的状态。
+    pub fn members_with_state(&self) -> impl Iterator<Item = (&NodeInfo, NodeState)> {
+        self.members.values().map(|m| (&m.info, m.state))
+    }
+
+    /// 存活的节点（包括自己）。
+    pub fn alive(&self) -> impl Iterator<Item = &NodeInfo> {
+        std::iter::once(&self.me).chain(
+            self.members
+                .values()
+                .filter(|m| m.state == NodeState::Alive)
+                .map(|m| &m.info),
+        )
+    }
+
+    /// 为一次连接选中继节点：会员优先付费节点（负载低于 `paid_limit` 的里面选最空的），
+    /// 付费节点都满了或没有付费节点时用免费节点；免费用户只用免费节点。
+    /// 返回节点和是否走会员通道（选中的是付费节点）。
+    #[must_use]
+    pub fn pick_relay(&self, vip: bool, paid_limit: u16) -> Option<(NodeInfo, bool)> {
+        let with_relay = |role: Role| {
+            self.alive()
+                .filter(move |n| n.role == role && !n.relay.is_empty())
+                .min_by_key(|n| (n.load_permille, n.id))
+        };
+        let paid = with_relay(Role::Paid).filter(|n| vip && n.load_permille < paid_limit);
+        match paid {
+            Some(node) => Some((node.clone(), true)),
+            None => with_relay(Role::Free).map(|n| (n.clone(), false)),
+        }
+    }
+
     /// 为某个区域的客户端选一个节点：同区域优先，过载时溢出到回退区域。
     #[must_use]
     pub fn route(&self, client_region: &str, fallback: &[String]) -> Option<NodeInfo> {
@@ -477,7 +601,102 @@ mod tests {
             addr: format!("n{id}"),
             load_permille: 0,
             sessions: 0,
+            signal: String::new(),
+            fingerprint: [0; 32],
+            role: Role::Free,
+            relay: String::new(),
         }
+    }
+
+    /// 会员优先付费节点里最空的；付费节点都满了退到免费节点；免费用户只用免费节点；
+    /// 没开中继的、离线的节点不选。
+    #[test]
+    fn relay_choice_follows_roles_and_load() {
+        let node = |id, role, load, relay: &str| NodeInfo {
+            role,
+            load_permille: load,
+            relay: relay.into(),
+            ..info(id, "cn")
+        };
+        let mut c = Cluster::new(
+            node(1, Role::Free, 100, "f1:1"),
+            ClusterConfig::default(),
+            vec![],
+        );
+        assert_eq!(
+            c.pick_relay(true, 900).map(|(n, vip)| (n.id.0, vip)),
+            Some((1, false))
+        );
+        for (id, role, load, relay) in [
+            (2, Role::Paid, 500, "p2:1"),
+            (3, Role::Paid, 300, "p3:1"),
+            (4, Role::Paid, 0, ""),
+            (5, Role::Free, 50, "f5:1"),
+        ] {
+            let _ = c.on_message(Time(0), &beat(node(id, role, load, relay), vec![]));
+        }
+        let pick = |c: &Cluster, vip| c.pick_relay(vip, 900).map(|(n, v)| (n.id.0, v));
+        assert_eq!(
+            pick(&c, true),
+            Some((3, true)),
+            "最空的付费节点；没开中继的 4 不选"
+        );
+        assert_eq!(
+            pick(&c, false),
+            Some((5, false)),
+            "免费用户只用免费节点里最空的"
+        );
+        assert_eq!(
+            c.pick_relay(true, 300).map(|(n, v)| (n.id.0, v)),
+            Some((5, false)),
+            "付费都满了"
+        );
+        assert_eq!(c.alive().count(), 5);
+        let mut lonely = Cluster::new(
+            node(9, Role::Paid, 0, "p9:1"),
+            ClusterConfig::default(),
+            vec![],
+        );
+        assert_eq!(
+            lonely.pick_relay(false, 900),
+            None,
+            "免费用户没有免费节点可用"
+        );
+        lonely.set_load(10, 1);
+        lonely.update_me(|me| me.signal = "1.2.3.4:4433".into());
+        assert_eq!(lonely.me().signal, "1.2.3.4:4433");
+        lonely.add_seed("n7".into());
+        lonely.add_seed("n7".into());
+        let (_, out) = lonely.tick(Time(10_000_000));
+        assert_eq!(out.iter().filter(|o| o.to_addr == "n7").count(), 1);
+        assert_eq!(c.members_with_state().count(), 4);
+    }
+
+    #[test]
+    fn signal_endpoints_and_usage_round_trip() {
+        let mut node = info(4, "cn");
+        node.signal = "203.0.113.4:4433".into();
+        node.fingerprint = [9; 32];
+        node.role = Role::Paid;
+        node.relay = "203.0.113.4:3478".into();
+        assert_eq!(Role::Paid.name(), "paid");
+        assert_eq!(
+            Role::from_code(7),
+            Err(Error::Inconsistent("未知的节点角色"))
+        );
+        let msg = beat(node.clone(), vec![info(5, "cn")]);
+        assert_eq!(ClusterMsg::decode(&msg.encode().unwrap()).unwrap(), msg);
+        let usage = ClusterMsg::Usage {
+            from: NodeId(4),
+            totals: vec![1, 2, 3],
+        };
+        let bytes = usage.encode().unwrap();
+        assert_eq!(ClusterMsg::decode(&bytes).unwrap(), usage);
+        assert!(ClusterMsg::decode(&bytes[..bytes.len() - 1]).is_err());
+        // 用量不影响成员表
+        let mut c = Cluster::new(info(1, "cn"), ClusterConfig::default(), vec![]);
+        assert!(c.on_message(Time(0), &usage).is_empty());
+        assert_eq!(c.alive_count(), 1);
     }
 
     fn beat(from: NodeInfo, known: Vec<NodeInfo>) -> ClusterMsg {
@@ -583,6 +802,7 @@ mod tests {
             ClusterMsg::Heartbeat { known, .. } => {
                 assert_eq!(known.iter().map(|k| k.id.0).collect::<Vec<_>>(), vec![2]);
             }
+            ClusterMsg::Usage { .. } => panic!("心跳里不该是用量"),
         }
 
         // 节点 3 直接发来心跳：恢复为存活

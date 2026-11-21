@@ -399,6 +399,7 @@ async fn a_lying_server_cannot_misdirect_us() {
         you: other_addr,
         punch: plain(),
         relay: None,
+        note: String::new(),
     });
     assert!(matches!(
         dial(&me, &server, &Lookup::Device(target), PathPolicy::Auto).await,
@@ -412,6 +413,7 @@ async fn a_lying_server_cannot_misdirect_us() {
         you: other_addr,
         punch: plain(),
         relay: None,
+        note: String::new(),
     });
     assert!(matches!(
         dial(&me, &server, &Lookup::Device(target), PathPolicy::Auto).await,
@@ -448,6 +450,7 @@ async fn probing_picks_the_candidate_that_answers() {
         you: "127.0.0.1:5".parse().unwrap(),
         punch: plain(),
         relay: None,
+        note: String::new(),
     });
     let dialed = dial(&me, &server, &Lookup::Device(target), PathPolicy::Auto)
         .await
@@ -465,6 +468,7 @@ async fn probing_picks_the_candidate_that_answers() {
         you: "127.0.0.1:5".parse().unwrap(),
         punch: plain(),
         relay: None,
+        note: String::new(),
     });
     let dialed = dial(&me, &server, &Lookup::Device(target), PathPolicy::Auto)
         .await
@@ -480,6 +484,7 @@ async fn probing_picks_the_candidate_that_answers() {
         you: "127.0.0.1:5".parse().unwrap(),
         punch: plain(),
         relay: None,
+        note: String::new(),
     });
     // （普通打洞没通时还会退到多端口打洞，也不通）
     assert!(matches!(
@@ -500,6 +505,7 @@ async fn probing_picks_the_candidate_that_answers() {
         you: "127.0.0.1:5".parse().unwrap(),
         punch: plain(),
         relay: None,
+        note: String::new(),
     });
     assert!(matches!(
         dial(&me, &server, &Lookup::Device(target), PathPolicy::Auto).await,

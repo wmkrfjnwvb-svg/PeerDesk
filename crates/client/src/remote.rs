@@ -22,8 +22,8 @@ use peerdesk_net::host::{self, HostOptions, InputSink, Permissions};
 use peerdesk_net::identity::{parse_hex, to_hex};
 use peerdesk_net::netcheck::prepare_host;
 use peerdesk_net::rendezvous::{
-    answer, dial, register_with, Incoming, Lookup, Path as PathKind, PathPolicy, Registration,
-    Server,
+    answer, dial_via, fetch_nodes, register_with, Incoming, Lookup, Path as PathKind, PathPolicy,
+    Registration, Server,
 };
 use peerdesk_net::{bench, Fingerprint, Identity, NetError, Node};
 use peerdesk_platform::CaptureOptions;
@@ -208,10 +208,10 @@ async fn next_request(registration: &mut Option<Registration>) -> Option<Incomin
 pub(crate) async fn stay_registered(
     node: Arc<Node>,
     server: Server,
-    registration: Registration,
+    registration: Option<Registration>,
     extra: Vec<Candidate>,
 ) {
-    let mut registration = Some(registration);
+    let mut registration = registration;
     let mut shims = VecDeque::new();
     loop {
         while let Some(request) = next_request(&mut registration).await {
@@ -221,6 +221,73 @@ pub(crate) async fn stay_registered(
         }
         tokio::time::sleep(REREGISTER_EVERY).await;
         registration = register_with(&node, &server, extra.clone()).await.ok();
+    }
+}
+
+/// 隔多久重新问一次集群节点列表（新加入的节点也登记上）。
+const CLUSTER_REFRESH: Duration = Duration::from_secs(60);
+
+/// 集群节点缓存文件：上次从服务器得到的节点列表，服务器崩了也能换到别的节点。
+const NODES_FILE: &str = "cluster-nodes.txt";
+
+/// 读缓存的集群节点（每行 `地址 指纹`），读不懂的行跳过。
+#[must_use]
+pub fn load_nodes(dir: &Path) -> Vec<Server> {
+    std::fs::read_to_string(dir.join(NODES_FILE))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| {
+            let (addr, pin) = line.split_once(' ')?;
+            Some(Server {
+                addr: addr.parse().ok()?,
+                pin: Some(parse_hex(pin.trim()).ok()?),
+            })
+        })
+        .collect()
+}
+
+/// 存集群节点缓存。
+pub fn save_nodes(dir: &Path, nodes: &[Server]) -> std::io::Result<()> {
+    let text: String = nodes
+        .iter()
+        .filter_map(|n| Some(format!("{} {}\n", n.addr, to_hex(n.pin.as_ref()?))))
+        .collect();
+    std::fs::write(dir.join(NODES_FILE), text)
+}
+
+/// 也在集群里其他节点上登记：任何一个节点崩了，设备仍然在线，别的节点照样能找到它。
+/// 节点列表从 `seed` 问来（问不到时用缓存），每隔一段时间再问一次，新加入的节点也登记上。
+pub(crate) async fn join_cluster(
+    node: Arc<Node>,
+    seed: Server,
+    extra: Vec<Candidate>,
+    data_dir: PathBuf,
+) {
+    let mut joined = vec![seed.addr];
+    loop {
+        let nodes = match fetch_nodes(&node, &seed).await {
+            Ok(nodes) => {
+                if !nodes.is_empty() {
+                    let _ = save_nodes(&data_dir, &nodes);
+                }
+                nodes
+            }
+            Err(_) => load_nodes(&data_dir),
+        };
+        for server in nodes {
+            if joined.contains(&server.addr) {
+                continue;
+            }
+            joined.push(server.addr);
+            peerdesk_net::note!(info, "也在集群节点 {} 上登记", server.addr);
+            tokio::spawn(stay_registered(
+                Arc::clone(&node),
+                server,
+                None,
+                extra.clone(),
+            ));
+        }
+        tokio::time::sleep(CLUSTER_REFRESH).await;
     }
 }
 
@@ -265,8 +332,14 @@ async fn host_async(args: HostArgs, out: &mut dyn Write) -> Result<u8, NetError>
         tokio::spawn(stay_registered(
             Arc::clone(&node),
             server,
-            registration,
+            Some(registration),
+            extra.clone(),
+        ));
+        tokio::spawn(join_cluster(
+            Arc::clone(&node),
+            server,
             extra,
+            args.data_dir.clone(),
         ));
     }
     let limiter = Arc::new(Mutex::new(Limiter::default()));
@@ -398,6 +471,8 @@ struct ConnectArgs {
     snapshot: Option<PathBuf>,
     /// 看到第一帧之后输入的一行字（后面自动回车）。
     type_line: Option<String>,
+    /// 会员令牌（空表示免费用户）。
+    account: String,
 }
 
 fn parse_connect(args: &[String]) -> Result<ConnectArgs, String> {
@@ -420,6 +495,7 @@ fn parse_connect(args: &[String]) -> Result<ConnectArgs, String> {
         send: None,
         auth: password_from_env().map_or(Auth::Open, Auth::Password),
         snapshot: None,
+        account: String::new(),
         type_line: None,
     };
     let mut it = rest.iter();
@@ -430,6 +506,7 @@ fn parse_connect(args: &[String]) -> Result<ConnectArgs, String> {
             "--server-pin" => server_pin = Some(parse_fingerprint(flag, it.next())?),
             "--device" => device = Some(parse_device(flag, it.next())?),
             "--relay-only" => relay_only = true,
+            "--account" => parsed.account = it.next().ok_or("--account 需要一个值")?.clone(),
             "--direct-only" => direct_only = true,
             "--data-dir" => parsed.data_dir = it.next().ok_or("--data-dir 需要一个值")?.into(),
             "--seconds" => parsed.seconds = parse_number(flag, it.next())?,
@@ -527,7 +604,29 @@ async fn connect_session(
             policy,
         } => {
             warn_unpinned_server(out, &server);
-            let dialed = dial(node, &server, &device, policy).await?;
+            // 配置的服务器在前，缓存的其他集群节点在后：前面的连不上就换下一个。
+            let mut servers = vec![server];
+            servers.extend(
+                load_nodes(&args.data_dir)
+                    .into_iter()
+                    .filter(|n| n.addr != server.addr),
+            );
+            let dialed = dial_via(node, &servers, &device, policy, &args.account).await?;
+            if let Ok(nodes) = fetch_nodes(node, &server).await {
+                if !nodes.is_empty() {
+                    let _ = save_nodes(&args.data_dir, &nodes);
+                }
+            }
+            let _ = writeln!(
+                out,
+                "信令节点      {}",
+                servers
+                    .iter()
+                    .map(|s| s.addr.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" → ")
+            );
+            let _ = writeln!(out, "中继说明      {}", dialed.relay_note);
             let path = match dialed.path {
                 PathKind::Direct => "直连",
                 PathKind::Relay => "中继",

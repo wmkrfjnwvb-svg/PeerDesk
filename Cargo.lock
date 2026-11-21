@@ -2321,6 +2321,7 @@ dependencies = [
  "log",
  "peerdesk-core",
  "peerdesk-net",
+ "ring",
  "tokio",
 ]
 

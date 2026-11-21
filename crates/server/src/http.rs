@@ -1,6 +1,7 @@
 //! 极小的 HTTP/1.1 处理：只做请求行解析和路由，不做 IO，便于测试。
 //!
-//! 只服务管理页面和几个只读接口。每个连接处理一个请求后关闭。
+//! 服务管理中心页面和接口。写操作（加入节点、签发会员令牌）要带管理令牌。
+//! 每个连接处理一个请求后关闭。
 
 use std::borrow::Cow;
 
@@ -16,6 +17,37 @@ pub struct Request {
     pub path: String,
     /// 查询串，不含问号；没有时为空。
     pub query: String,
+    /// `Authorization: Bearer <令牌>` 里的令牌。
+    pub token: Option<String>,
+    /// 请求体（最多 [`MAX_BODY`] 字节）。
+    pub body: String,
+}
+
+/// 请求体的上限。
+pub const MAX_BODY: usize = 4 * 1024;
+
+/// 请求头里的 `Content-Length`（没有时为 0）。
+#[must_use]
+pub fn content_length(head: &str) -> usize {
+    head.lines()
+        .filter_map(|l| l.split_once(':'))
+        .find(|(k, _)| k.trim().eq_ignore_ascii_case("content-length"))
+        .and_then(|(_, v)| v.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// 从一个很小的 JSON 对象里取一个字段的值（字符串去掉引号；数字原样）。
+/// 只用于管理接口里形如 `{"addr":"1.2.3.4:7946"}`、`{"quota_gb":50}` 的请求体。
+#[must_use]
+pub fn json_field<'a>(body: &'a str, key: &str) -> Option<&'a str> {
+    let needle = format!("\"{key}\"");
+    let after = body.split_once(needle.as_str())?.1;
+    let value = after.trim_start().strip_prefix(':')?.trim_start();
+    if let Some(rest) = value.strip_prefix('"') {
+        return rest.split_once('"').map(|(v, _)| v);
+    }
+    let end = value.find([',', '}']).unwrap_or(value.len());
+    Some(value.get(..end)?.trim())
 }
 
 /// 解析请求行（请求头的第一行）。
@@ -28,10 +60,20 @@ pub fn parse_request(head: &str) -> Option<Request> {
         return None;
     }
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    let (head_part, body) = head.split_once("\r\n\r\n").unwrap_or((head, ""));
+    let token = head_part
+        .lines()
+        .filter_map(|l| l.split_once(':'))
+        .find(|(k, _)| k.trim().eq_ignore_ascii_case("authorization"))
+        .and_then(|(_, v)| v.trim().strip_prefix("Bearer "))
+        .map(|t| t.trim().to_owned());
+    let limit = content_length(head_part).min(MAX_BODY).min(body.len());
     Some(Request {
         method: method.to_owned(),
         path: path.to_owned(),
         query: query.to_owned(),
+        token,
+        body: body.get(..limit).unwrap_or_default().to_owned(),
     })
 }
 
@@ -150,6 +192,41 @@ pub trait Api {
     fn status(&self) -> String;
     /// 为某区域选一个节点，返回它的 JSON；没有可用节点时返回 `None`。
     fn route(&self, region: &str) -> Option<String>;
+    /// `/api/cluster`：全集群的节点。
+    fn cluster(&self) -> String {
+        "{\"nodes\":[]}".into()
+    }
+    /// `/api/usage`：某月（`None` 表示本月）的中继用量和计费。
+    fn usage(&self, _month: Option<u32>) -> String {
+        "{\"accounts\":[]}".into()
+    }
+    /// 管理操作。令牌不对返回 `Err((401, …))`；参数不对返回 `Err((400, …))`。
+    fn admin(&self, _token: Option<&str>, _action: Admin) -> Result<String, (u16, String)> {
+        Err((403, "这个节点不能做管理操作".into()))
+    }
+}
+
+/// 管理操作。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Admin {
+    /// 加入一个集群节点（它的集群地址）。
+    AddPeer(String),
+    /// 签发一个会员令牌，每月中继额度（GB，0 表示不限）。
+    IssueAccount(u64),
+}
+
+fn error_json(message: &str) -> String {
+    format!("{{\"error\":{}}}", crate::json::string(message))
+}
+
+fn admin(api: &dyn Api, request: &Request, action: Result<Admin, &str>) -> Response {
+    match action {
+        Err(why) => Response::json(400, error_json(why)),
+        Ok(action) => match api.admin(request.token.as_deref(), action) {
+            Ok(body) => Response::json(200, body),
+            Err((status, why)) => Response::json(status, error_json(&why)),
+        },
+    }
 }
 
 /// 处理一个请求。
@@ -159,10 +236,37 @@ pub fn respond(
     api: &dyn Api,
     assets: &'static [(&'static str, &'static [u8])],
 ) -> Response {
+    if request.method == "POST" {
+        return match request.path.as_str() {
+            "/api/peers" => {
+                let addr = json_field(&request.body, "addr").filter(|a| !a.is_empty());
+                admin(
+                    api,
+                    request,
+                    addr.map(|a| Admin::AddPeer(a.to_owned()))
+                        .ok_or("缺少 addr"),
+                )
+            }
+            "/api/accounts" => {
+                let quota = json_field(&request.body, "quota_gb").and_then(|q| q.parse().ok());
+                admin(
+                    api,
+                    request,
+                    quota.map(Admin::IssueAccount).ok_or("quota_gb 应为整数"),
+                )
+            }
+            _ => Response::text(405, "method not allowed\n"),
+        };
+    }
     if request.method != "GET" {
         return Response::text(405, "method not allowed\n");
     }
     match request.path.as_str() {
+        "/api/cluster" => Response::json(200, api.cluster()),
+        "/api/usage" => {
+            let month = query_param(&request.query, "month").and_then(|m| m.parse().ok());
+            Response::json(200, api.usage(month))
+        }
         "/healthz" => Response::text(200, "ok\n"),
         "/api/status" => Response::json(200, api.status()),
         "/api/route" => match query_param(&request.query, "region") {

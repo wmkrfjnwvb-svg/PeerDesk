@@ -20,13 +20,13 @@ use peerdesk_net::controller::{self, ControllerOptions, ScreenSink};
 use peerdesk_net::host::{self, HostOptions, ScreenSource, FRAME_DEADLINE_US};
 use peerdesk_net::identity::to_hex;
 use peerdesk_net::netcheck::{prepare_host, NetReport};
-use peerdesk_net::rendezvous::{dial, register_with, Path as Route, Server};
+use peerdesk_net::rendezvous::{dial_via, fetch_nodes, register_with, Path as Route, Server, Shim};
 use peerdesk_net::{Identity, NetError, Node};
 use tokio::sync::watch;
 
 use super::form::Target;
 use crate::local::{check_local, local_input, local_screen, Tap};
-use crate::remote::{runtime, session, stay_registered};
+use crate::remote::{join_cluster, load_nodes, runtime, save_nodes, session, stay_registered};
 
 /// 请求界面重绘。
 pub type Repaint = Arc<dyn Fn() + Send + Sync>;
@@ -323,8 +323,14 @@ async fn host_main(
                     tokio::spawn(stay_registered(
                         Arc::clone(node),
                         server,
-                        registration,
+                        Some(registration),
+                        extra.clone(),
+                    ));
+                    tokio::spawn(join_cluster(
+                        Arc::clone(node),
+                        server,
                         extra,
+                        config.data_dir.clone(),
                     ));
                 }
                 Err(e) => {
@@ -479,6 +485,7 @@ pub fn to_color_image(screen: &Screen) -> ColorImage {
     )
 }
 
+#[derive(Clone)]
 struct GuiSink {
     slot: Arc<FrameSlot>,
     repaint: Repaint,
@@ -522,6 +529,44 @@ pub enum ViewEvent {
     },
     /// 会话结束。
     Ended(Result<Summary, NetError>),
+    /// 网络断了，正在换通道重连（第几次，断开的原因）。
+    Reconnecting {
+        /// 第几次重连。
+        attempt: u32,
+        /// 断开的原因。
+        why: String,
+    },
+    /// 服务器的通知（例如免费额度用完），会话随之结束。
+    Notice(String),
+}
+
+/// 网络断开后最多自动重连几次。
+pub const RECONNECT_TRIES: u32 = 3;
+/// 两次重连之间等多久。
+const RECONNECT_GAP: Duration = Duration::from_secs(1);
+/// 多久看一次中继有没有发来通知。
+const NOTICE_POLL: Duration = Duration::from_millis(500);
+
+/// 会话结束的原因是不是网络断了（应当换通道重连），而不是对方或自己结束的。
+#[must_use]
+pub fn network_lost(end: &str) -> bool {
+    [
+        "timed out",
+        "超时",
+        "connection lost",
+        "reset",
+        "closed by peer: 0",
+    ]
+    .iter()
+    .any(|k| end.contains(k))
+        && !end.contains("对端结束会话")
+}
+
+/// 免费额度用完时给用户看的话。
+#[must_use]
+pub fn free_limit_text(retry_secs: u32) -> String {
+    let minutes = retry_secs.div_ceil(60).max(1);
+    format!("免费服务器拥挤，请约 {minutes} 分钟后重试（免费用户每 10 分钟的中继流量有限额）")
 }
 
 /// 控制端会话的句柄。丢弃时断开。
@@ -635,7 +680,7 @@ async fn view_main(
             elapsed: started.elapsed(),
             ..Summary::default()
         }),
-        r = watch_remote(&node, &identity, &policy, target, auth, sink, input, &ev) => r,
+        r = watch_remote(&node, &identity, &policy, target, auth, sink, input, &ev, &data_dir) => r,
     };
     close_nodes(&[node]).await;
     match &result {
@@ -652,6 +697,25 @@ async fn view_main(
     result
 }
 
+/// 要试的服务器：用户配置的那个在前，然后是缓存的其他节点（去重）。
+#[must_use]
+pub fn server_order(seed: Server, cached: Vec<Server>) -> Vec<Server> {
+    let mut list = vec![seed];
+    for n in cached {
+        if !list.iter().any(|s| s.addr == n.addr) {
+            list.push(n);
+        }
+    }
+    list
+}
+
+/// 一次会话的结果：正常结束、网络断了（可以重连）、服务器通知（例如免费额度用完）。
+enum Outcome {
+    Done(Summary),
+    Lost(String),
+    Notice(String),
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn watch_remote(
     node: &Node,
@@ -662,11 +726,91 @@ async fn watch_remote(
     sink: GuiSink,
     input: tokio::sync::mpsc::Receiver<InputEvent>,
     ev: &Emitter<ViewEvent>,
+    data_dir: &std::path::Path,
 ) -> Result<Summary, NetError> {
+    // 输入事件先进这里，再转给当前这一次会话（重连后转给新会话）。
+    let current: Arc<Mutex<Option<tokio::sync::mpsc::Sender<InputEvent>>>> =
+        Arc::new(Mutex::new(None));
+    let forward = Arc::clone(&current);
+    let mut input = input;
+    let forwarder = tokio::spawn(async move {
+        while let Some(event) = input.recv().await {
+            let tx = forward
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            if let Some(tx) = tx {
+                let _ = tx.send(event).await;
+            }
+        }
+    });
+    let started = Instant::now();
+    let mut attempt = 0u32;
+    let result = loop {
+        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        *current.lock().unwrap_or_else(PoisonError::into_inner) = Some(tx);
+        let outcome = one_session(
+            node,
+            identity,
+            policy,
+            &target,
+            &auth,
+            sink.clone(),
+            rx,
+            ev,
+            data_dir,
+        )
+        .await;
+        match outcome {
+            Ok(Outcome::Done(summary)) => break Ok(summary),
+            Ok(Outcome::Notice(text)) => {
+                ev.send(ViewEvent::Notice(text.clone()));
+                break Ok(Summary {
+                    end: text,
+                    elapsed: started.elapsed(),
+                    ..Summary::default()
+                });
+            }
+            Ok(Outcome::Lost(why)) if attempt < RECONNECT_TRIES => {
+                attempt += 1;
+                peerdesk_net::note!(warn, "控制：网络断开（{why}），第 {attempt} 次重连");
+                ev.send(ViewEvent::Reconnecting { attempt, why });
+                tokio::time::sleep(RECONNECT_GAP).await;
+            }
+            Ok(Outcome::Lost(why)) => break Err(NetError::Closed(why)),
+            // 第一次就连不上：直接报错；重连时连不上：再试，用完次数再报错。
+            Err(e) if attempt > 0 && attempt < RECONNECT_TRIES => {
+                attempt += 1;
+                ev.send(ViewEvent::Reconnecting {
+                    attempt,
+                    why: e.to_string(),
+                });
+                tokio::time::sleep(RECONNECT_GAP).await;
+            }
+            Err(e) => break Err(e),
+        }
+    };
+    forwarder.abort();
+    result
+}
+
+/// 连一次并跑一次会话。
+#[allow(clippy::too_many_arguments)]
+async fn one_session(
+    node: &Node,
+    identity: &Identity,
+    policy: &Policy,
+    target: &Target,
+    auth: &Auth,
+    sink: GuiSink,
+    input: tokio::sync::mpsc::Receiver<InputEvent>,
+    ev: &Emitter<ViewEvent>,
+    data_dir: &std::path::Path,
+) -> Result<Outcome, NetError> {
     // 走中继时的本机转发器要保持到会话结束。
-    let (link, _shim, route, detail) = match target {
+    let (link, shim, route, detail) = match target {
         Target::Addr { addr, pin } => (
-            node.connect(addr, pin.as_ref()).await?,
+            node.connect(*addr, pin.as_ref()).await?,
             None,
             Route::Direct,
             String::new(),
@@ -675,15 +819,28 @@ async fn watch_remote(
             server,
             device,
             policy,
+            account,
         } => {
-            let dialed = dial(node, &server, &device, policy).await?;
+            let servers = server_order(*server, load_nodes(data_dir));
+            let dialed = dial_via(node, &servers, device, *policy, account).await?;
+            // 顺便更新集群节点缓存，下次这个服务器崩了还能换别的节点。
+            if let Ok(nodes) = fetch_nodes(node, server).await {
+                if !nodes.is_empty() {
+                    let _ = save_nodes(data_dir, &nodes);
+                }
+            }
             let rtt = dialed.rtt_us.map_or_else(String::new, |us| {
                 format!(
                     " {:.1} ms",
                     Duration::from_micros(us).as_secs_f64() * 1000.0
                 )
             });
-            let detail = format!("{}{rtt}", dialed.route.label());
+            let note = if dialed.shim.is_some() && !dialed.relay_note.is_empty() {
+                format!("，{}", dialed.relay_note)
+            } else {
+                String::new()
+            };
+            let detail = format!("{}{rtt}{note}", dialed.route.label());
             (dialed.link, dialed.shim, dialed.path, detail)
         }
     };
@@ -702,25 +859,42 @@ async fn watch_remote(
         detail,
     });
     let started = Instant::now();
-    let report = controller::run(
+    let session = controller::run(
         link,
         ControllerOptions {
-            session: session(identity, policy, auth),
+            session: session(identity, policy, auth.clone()),
             deadline_us: FRAME_DEADLINE_US,
             duration: None,
         },
         Box::new(sink),
         input,
         None,
-    )
-    .await?;
-    Ok(Summary {
-        end: report.end,
-        cancelled: false,
-        rtt: Some(report.rtt),
-        video_bytes: report.video_bytes,
-        elapsed: started.elapsed(),
-    })
+    );
+    // 走中继时盯着中继的通知：免费额度用完就结束会话并告诉用户原因。
+    let notice = async {
+        loop {
+            tokio::time::sleep(NOTICE_POLL).await;
+            if let Some((_, retry)) = shim.as_ref().and_then(Shim::notice) {
+                return free_limit_text(retry);
+            }
+        }
+    };
+    tokio::select! {
+        report = session => {
+            let report = report?;
+            if network_lost(&report.end) {
+                return Ok(Outcome::Lost(report.end));
+            }
+            Ok(Outcome::Done(Summary {
+                end: report.end,
+                cancelled: false,
+                rtt: Some(report.rtt),
+                video_bytes: report.video_bytes,
+                elapsed: started.elapsed(),
+            }))
+        }
+        text = notice => Ok(Outcome::Notice(text)),
+    }
 }
 
 #[cfg(test)]

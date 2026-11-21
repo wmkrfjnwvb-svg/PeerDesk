@@ -5,21 +5,25 @@
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use peerdesk_core::billing::{issue, month_of};
 use peerdesk_core::cluster::{self, Cluster, ClusterConfig, ClusterMsg, NodeInfo};
 use peerdesk_core::config::{ServerConfig, SignalConfig};
 use peerdesk_core::crypto::Policy;
 use peerdesk_core::region::NodeId;
+use peerdesk_core::relay::FreePolicy;
 use peerdesk_core::{Error, Time};
 use peerdesk_net::identity::to_hex;
-use peerdesk_net::service::{RelayService, SignalService};
+use peerdesk_net::service::{Directory, LocalDirectory, RelayOptions, RelayService, SignalService};
 use peerdesk_net::{Fingerprint, Identity, NetError};
 
-use crate::http::{self, Api, Response, MAX_REQUEST_HEAD};
+use crate::accounting::{hex, Accounting, ClusterDirectory};
+use crate::http::{self, Admin, Api, Response, MAX_REQUEST_HEAD};
 use crate::status;
 
 /// 线程轮询停止标志和超时的间隔。
@@ -61,7 +65,12 @@ struct Services {
 }
 
 impl Services {
-    fn start(cfg: &SignalConfig, policy: &Policy) -> Result<Self, Error> {
+    fn start(
+        cfg: &SignalConfig,
+        policy: &Policy,
+        options: RelayOptions,
+        directory: Option<ClusterDirectory>,
+    ) -> Result<Self, Error> {
         let fail = |e: NetError| Error::Config(format!("启动信令服务失败：{e}"));
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -72,15 +81,25 @@ impl Services {
         let (signal, relay, addr) = runtime
             .block_on(async {
                 let relay = match cfg.relay {
-                    Some(r) => Some(Arc::new(RelayService::start(r.listen, r.advertise).await?)),
+                    Some(r) => Some(Arc::new(
+                        RelayService::start_with(r.listen, r.advertise, options.clone()).await?,
+                    )),
                     None => None,
                 };
                 let node = Arc::new(peerdesk_net::Node::bind(cfg.listen, &identity, policy)?);
                 let addr = node.local_addr()?;
+                let directory: Arc<dyn Directory> = match directory {
+                    Some(d) => Arc::new(d),
+                    None => Arc::new(LocalDirectory::new(
+                        relay.clone(),
+                        Some(options.key.clone()),
+                    )),
+                };
                 Ok::<_, NetError>((
-                    SignalService::start_with_codes(
+                    SignalService::start_with_directory(
                         node,
                         relay.clone(),
+                        directory,
                         Some(cfg.data_dir.join("device-codes.txt")),
                     ),
                     relay,
@@ -104,7 +123,23 @@ impl Services {
 struct Shared {
     /// 集群共享密钥；`None` 表示心跳不带认证。
     secret: Option<Vec<u8>>,
-    cluster: Mutex<Cluster>,
+    cluster: Arc<Mutex<Cluster>>,
+    /// 中继账本。
+    accounting: Arc<Accounting>,
+    /// 计费密钥（签发会员令牌）。
+    billing_key: Vec<u8>,
+    /// 管理令牌；`None` 表示不能做写操作。
+    admin_token: Option<String>,
+    /// 中继单价（分/GB）。
+    price: u64,
+    /// 免费通道额度（管理中心显示）。
+    free: FreePolicy,
+    /// 中继带宽（Mbps），算负载用；0 表示按会话数算。
+    capacity_mbps: u64,
+    /// 上次算负载时的转发总字节数。
+    last_bytes: Mutex<u64>,
+    /// 记账间隔。
+    bill_every: Duration,
     policy: Policy,
     fallback: Vec<String>,
     started: Instant,
@@ -145,11 +180,17 @@ impl Shared {
         let Ok(msg) = ClusterMsg::decode(body) else {
             return;
         };
-        let ClusterMsg::Heartbeat { from, .. } = &msg;
+        let from = match &msg {
+            ClusterMsg::Heartbeat { from, .. } => from.id,
+            ClusterMsg::Usage { from, .. } => *from,
+        };
         let now = self.now();
         let mut cluster = self.cluster();
-        if stamp.is_some_and(|stamp| !cluster.fresh(from.id, stamp)) {
+        if stamp.is_some_and(|stamp| !cluster.fresh(from, stamp)) {
             return;
+        }
+        if let ClusterMsg::Usage { totals, .. } = &msg {
+            self.accounting.merge(from.0, totals);
         }
         cluster.on_message(now, &msg);
     }
@@ -171,15 +212,152 @@ impl Api for Shared {
             .route(region, &self.fallback)
             .map(|node| status::node_json(&node))
     }
+
+    fn cluster(&self) -> String {
+        status::cluster_json(&self.cluster(), wall_ms())
+    }
+
+    fn usage(&self, month: Option<u32>) -> String {
+        let now = wall_ms();
+        let month = month.unwrap_or_else(|| month_of(now));
+        let limited = self
+            .services
+            .as_ref()
+            .and_then(|s| s.relay.as_ref())
+            .map_or(0, |r| r.limited().0);
+        let free = format!(
+            "{{\"window_secs\":{},\"limit_bytes\":{},\"limited_now\":{limited}}}",
+            self.free.window_us / 1_000_000,
+            self.free.device_bytes
+        );
+        self.accounting.usage_json(month, self.price, &free)
+    }
+
+    fn admin(&self, token: Option<&str>, action: Admin) -> Result<String, (u16, String)> {
+        let Some(expected) = &self.admin_token else {
+            return Err((403, "这个节点没有配置 admin_token，不能做管理操作".into()));
+        };
+        // 逐字节比较全部内容，不在第一个不同处提前返回。
+        let given = token.unwrap_or_default().as_bytes();
+        let same = given.len() == expected.len()
+            && given
+                .iter()
+                .zip(expected.as_bytes())
+                .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+                == 0;
+        if !same {
+            return Err((401, "管理令牌不对".into()));
+        }
+        match action {
+            Admin::AddPeer(addr) => {
+                if addr.parse::<SocketAddr>().is_err() {
+                    return Err((400, format!("节点地址应为 IP:端口：{addr}")));
+                }
+                peerdesk_net::note!(info, "管理中心：加入节点 {addr}");
+                self.cluster().add_seed(addr);
+                Ok("{\"ok\":true}".into())
+            }
+            Admin::IssueAccount(quota_gb) => {
+                let mut id = [0u8; 8];
+                {
+                    use ring::rand::SecureRandom;
+                    ring::rand::SystemRandom::new()
+                        .fill(&mut id)
+                        .map_err(|_| (500, "取随机数失败".to_owned()))?;
+                }
+                let token = issue(&self.billing_key, id, quota_gb);
+                peerdesk_net::note!(
+                    info,
+                    "管理中心：签发会员账户 {}，额度 {quota_gb} GB/月",
+                    hex(&id)
+                );
+                Ok(format!(
+                    "{{\"account\":\"{}\",\"token\":{}}}",
+                    hex(&id),
+                    crate::json::string(&token)
+                ))
+            }
+        }
+    }
+}
+
+/// 随机的 32 字节密钥。
+fn random_key() -> Vec<u8> {
+    use ring::rand::SecureRandom;
+    let mut key = vec![0u8; 32];
+    // 取随机数失败极少见；那样密钥全 0，只是本机签发的东西可以被猜到，单机部署仍然能用。
+    let _ = ring::rand::SystemRandom::new().fill(&mut key);
+    key
 }
 
 fn io_error(what: &str, e: &std::io::Error) -> Error {
     Error::Config(format!("{what}：{e}"))
 }
 
+/// 记账、报告用量、更新负载：每个记账间隔一次。
+fn bookkeeping(shared: &Shared, socket: &UdpSocket) {
+    let now_ms = wall_ms();
+    let Some(relay) = shared.services.as_ref().and_then(|s| s.relay.as_ref()) else {
+        return;
+    };
+    let records = relay.take_records();
+    if let Err(e) = shared.accounting.record(&records, now_ms) {
+        peerdesk_net::note!(error, "{e}");
+    }
+    let (total, sessions, _) = relay.totals();
+    let load = load_permille(shared.capacity_mbps, sessions, total.bytes, shared);
+    shared
+        .cluster()
+        .set_load(load, u32::try_from(sessions).unwrap_or(u32::MAX));
+    let msg = ClusterMsg::Usage {
+        from: NodeId(shared.cluster().me().id.0),
+        totals: shared.accounting.payload(now_ms),
+    };
+    let Ok(body) = msg.encode() else { return };
+    let bytes = match &shared.secret {
+        Some(secret) => cluster::seal(secret, now_ms, &body),
+        None => body,
+    };
+    let peers: Vec<String> = shared
+        .cluster()
+        .members_with_state()
+        .map(|(info, _)| info.addr.clone())
+        .collect();
+    for addr in peers {
+        if let Ok(addr) = addr.parse::<SocketAddr>() {
+            let _ = socket.send_to(&bytes, addr);
+        }
+    }
+}
+
+/// 负载（千分比）：配置了带宽时按最近一段的转发速率算，否则每 100 个会话算满。
+fn load_permille(capacity_mbps: u64, sessions: usize, total_bytes: u64, shared: &Shared) -> u16 {
+    let by_sessions = u16::try_from(sessions.saturating_mul(10).min(1000)).unwrap_or(1000);
+    if capacity_mbps == 0 {
+        return by_sessions;
+    }
+    let mut last = shared
+        .last_bytes
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let delta = total_bytes.saturating_sub(*last);
+    *last = total_bytes;
+    let millis = u64::try_from(shared.bill_every.as_millis())
+        .unwrap_or(u64::MAX)
+        .max(1);
+    let bits_per_sec = delta.saturating_mul(8_000) / millis;
+    let capacity = capacity_mbps.saturating_mul(1_000_000).max(1);
+    u16::try_from((bits_per_sec.saturating_mul(1000) / capacity).min(1000)).unwrap_or(1000)
+}
+
 fn cluster_loop(shared: &Shared, socket: &UdpSocket) {
     let mut buf = [0u8; 2048];
+    let mut last_bill = Instant::now();
     while !shared.stop.load(Ordering::Relaxed) {
+        if last_bill.elapsed() >= shared.bill_every {
+            last_bill = Instant::now();
+            bookkeeping(shared, socket);
+        }
         // 超时或瞬时错误都只是“这一轮没有收到包”。
         if let Ok((len, _)) = socket.recv_from(&mut buf) {
             shared.on_packet(buf.get(..len).unwrap_or_default());
@@ -208,8 +386,13 @@ fn read_head(stream: &mut TcpStream) -> Option<String> {
             break;
         }
         head.extend_from_slice(chunk.get(..n)?);
-        if head.windows(4).any(|w| w == b"\r\n\r\n") {
-            break;
+        if let Some(end) = head.windows(4).position(|w| w == b"\r\n\r\n") {
+            // 头读完了：按 Content-Length 再读请求体（有上限）。
+            let text = String::from_utf8_lossy(head.get(..end).unwrap_or_default()).into_owned();
+            let want = end + 4 + http::content_length(&text).min(http::MAX_BODY);
+            if head.len() >= want {
+                break;
+            }
         }
         if head.len() > MAX_REQUEST_HEAD {
             return None;
@@ -293,21 +476,66 @@ impl Node {
         let http_addr = listener
             .local_addr()
             .map_err(|e| io_error("读取管理端口失败", &e))?;
-        let services = cfg
-            .signal()?
-            .map(|signal| Services::start(&signal, &policy))
-            .transpose()?;
-
         let me = NodeInfo {
             id: NodeId(cfg.node_id),
             region: cfg.region.clone(),
             addr: cfg.advertise.clone(),
             load_permille: 0,
             sessions: 0,
+            signal: String::new(),
+            fingerprint: [0; 32],
+            role: cfg.role,
+            relay: String::new(),
         };
+        let cluster = Arc::new(Mutex::new(Cluster::new(me, timing, cfg.peers.clone())));
+        let usage_dir = cfg
+            .data_dir
+            .as_ref()
+            .map(|d| PathBuf::from(d).join("usage"));
+        let accounting = Arc::new(Accounting::open(cfg.node_id, usage_dir, wall_ms()));
+        // 计费密钥：集群共用（billing_secret 或 cluster_secret）；单机没配时用随机密钥，
+        // 只有本机签发的会员令牌和中继票据有效，重启后失效。
+        let billing_key = cfg.billing_key().map_or_else(random_key, <[u8]>::to_vec);
+        let bill_every = Duration::from_millis(cfg.bill_every_ms);
+        let options = RelayOptions {
+            key: billing_key.clone(),
+            free: cfg.free_policy(),
+            bill_every,
+        };
+        let directory = ClusterDirectory {
+            cluster: Arc::clone(&cluster),
+            accounting: Arc::clone(&accounting),
+            key: billing_key.clone(),
+            paid_limit: cfg.paid_load_limit_permille,
+        };
+        let services = cfg
+            .signal()?
+            .map(|signal| Services::start(&signal, &policy, options, Some(directory)))
+            .transpose()?;
+        if let Some(services) = &services {
+            let info = services.info;
+            let advertised = cfg
+                .signal_advertise
+                .clone()
+                .or_else(|| (!info.addr.ip().is_unspecified()).then(|| info.addr.to_string()));
+            let mut c = cluster.lock().unwrap_or_else(PoisonError::into_inner);
+            c.update_me(|me| {
+                me.signal = advertised.unwrap_or_default();
+                me.fingerprint = info.fingerprint;
+                me.relay = info.relay.map(|r| r.to_string()).unwrap_or_default();
+            });
+        }
         let shared = Arc::new(Shared {
             secret: cfg.cluster_secret.as_ref().map(|s| s.as_bytes().to_vec()),
-            cluster: Mutex::new(Cluster::new(me, timing, cfg.peers.clone())),
+            cluster,
+            accounting,
+            billing_key,
+            admin_token: cfg.admin_token.clone(),
+            price: cfg.relay_price_cents_per_gb,
+            free: cfg.free_policy(),
+            capacity_mbps: cfg.relay_capacity_mbps,
+            last_bytes: Mutex::new(0),
+            bill_every,
             policy,
             fallback: cfg.region_fallback.clone(),
             started: Instant::now(),

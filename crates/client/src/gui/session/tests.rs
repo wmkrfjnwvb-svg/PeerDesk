@@ -97,7 +97,9 @@ use peerdesk_net::Fingerprint;
 fn ended(v: &ViewHandle, seen: &mut Log<ViewEvent>) -> Result<Summary, NetError> {
     match wait_for(|| v.poll(), seen, |e| matches!(e, ViewEvent::Ended(_))) {
         ViewEvent::Ended(r) => r,
-        ViewEvent::Connected { .. } => panic!("不是 Ended"),
+        ViewEvent::Connected { .. } | ViewEvent::Reconnecting { .. } | ViewEvent::Notice(_) => {
+            panic!("不是 Ended")
+        }
     }
 }
 
@@ -428,6 +430,7 @@ fn connect_through_a_signaling_server() {
             server: server.server(None),
             device,
             policy: peerdesk_net::rendezvous::PathPolicy::RelayOnly,
+            account: String::new(),
         },
         "secret-pw",
         ctrl_dir.clone(),
@@ -488,6 +491,7 @@ fn pixels_are_converted() {
         },
         device: peerdesk_net::rendezvous::Lookup::Device([0; 32]),
         policy: peerdesk_net::rendezvous::PathPolicy::Auto,
+        account: String::new(),
     })
     .is_ipv6());
     let v4 = Target::Addr {

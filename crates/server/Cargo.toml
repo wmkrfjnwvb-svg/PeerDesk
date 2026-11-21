@@ -10,8 +10,12 @@ build = "build.rs"
 [dependencies]
 log = "0.4"
 peerdesk-core.workspace = true
+ring = "0.17"
 peerdesk-net.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread"] }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net"] }

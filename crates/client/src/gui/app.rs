@@ -189,7 +189,10 @@ impl App {
 
     fn connect_from_form(&mut self) {
         match self.form.target(self.s, self.server.server(self.s)) {
-            Ok(target) => {
+            Ok(mut target) => {
+                if let Target::Device { account, .. } = &mut target {
+                    account.clone_from(&self.server.account);
+                }
                 let pin = match target {
                     Target::Addr { .. } => self.form.pin.clone(),
                     Target::Device { .. } => String::new(),
@@ -461,6 +464,7 @@ impl App {
                 ui.small(s.via_server);
                 let mut save = labeled(ui, s.server_addr, &mut self.server.addr, false);
                 save |= labeled(ui, s.server_pin, &mut self.server.pin, false);
+                save |= labeled(ui, s.account_token, &mut self.server.account, true);
                 ui.horizontal(|ui| {
                     save |= ui.button(s.save).clicked();
                     if ui.button(s.open_logs).clicked() {

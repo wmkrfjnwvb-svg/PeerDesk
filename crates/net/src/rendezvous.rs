@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use peerdesk_core::paths::{Candidate, Limits, PathKind};
-use peerdesk_core::relay::{unwrap, wrap, SessionId, RELAY_HEADER};
+use peerdesk_core::relay::{parse_notice, unwrap, wrap, SessionId, RELAY_HEADER};
 use peerdesk_core::signal::{
     format_code, observe_packet, PunchInfo, PunchPlan, RelayGrant, SignalMsg,
 };
@@ -80,6 +80,7 @@ fn local_ip(v6: bool, loopback: bool) -> std::net::IpAddr {
 pub struct Shim {
     local: SocketAddr,
     task: JoinHandle<()>,
+    notice: Arc<std::sync::Mutex<Option<(u8, u32)>>>,
 }
 
 impl Shim {
@@ -93,8 +94,22 @@ impl Shim {
             .map_err(io)?;
         let port = socket.local_addr().map_err(io)?.port();
         let local = SocketAddr::new(local_ip(v6, true), port);
-        let task = tokio::spawn(run_shim(socket, grant, endpoint));
-        Ok(Self { local, task })
+        let notice = Arc::new(std::sync::Mutex::new(None));
+        let task = tokio::spawn(run_shim(socket, grant, endpoint, Arc::clone(&notice)));
+        Ok(Self {
+            local,
+            task,
+            notice,
+        })
+    }
+
+    /// 中继发来的通知（类别、建议多少秒后重试），例如免费额度用完；没有时为 `None`。
+    #[must_use]
+    pub fn notice(&self) -> Option<(u8, u32)> {
+        *self
+            .notice
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// 本机 QUIC 端点应当把这个地址当作“对端”。
@@ -110,13 +125,19 @@ impl Drop for Shim {
     }
 }
 
-async fn run_shim(socket: UdpSocket, grant: RelayGrant, mut endpoint: Option<SocketAddr>) {
-    let hello = wrap(&grant.session, grant.side, &[]);
+async fn run_shim(
+    socket: UdpSocket,
+    grant: RelayGrant,
+    mut endpoint: Option<SocketAddr>,
+    notice: Arc<std::sync::Mutex<Option<(u8, u32)>>>,
+) {
+    // 登记和保活的包里带着票据：中继凭它开通道（只认集群签发的票据）。
+    let hello = wrap(&grant.session, grant.side, &grant.ticket);
     let mut keepalive = tokio::time::interval(SHIM_KEEPALIVE);
     let mut buf = vec![0u8; 2048];
     loop {
         tokio::select! {
-            // 空载荷的包只用来让中继记住本端的地址。
+            // 带票据的包只用来开通道、让中继记住本端的地址，中继不转发。
             _ = keepalive.tick() => { let _ = socket.send_to(&hello, grant.addr).await; }
             received = socket.recv_from(&mut buf) => {
                 let Ok((len, from)) = received else { continue };
@@ -125,6 +146,11 @@ async fn run_shim(socket: UdpSocket, grant: RelayGrant, mut endpoint: Option<Soc
                     // 中继来的：只接受本会话、对方方向的包。
                     let Some((session, side, payload)) = unwrap(packet) else { continue };
                     if session != grant.session || side == grant.side || payload.is_empty() {
+                        continue;
+                    }
+                    if let Some(n) = parse_notice(payload) {
+                        crate::note!(warn, "中继通知：类别 {}，建议 {} 秒后重试", n.0, n.1);
+                        *notice.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(n);
                         continue;
                     }
                     if let Some(to) = endpoint {
@@ -334,6 +360,8 @@ pub struct Dialed {
     pub rtt_us: Option<u64>,
     /// 探测结果的说明：每条路径通不通、多快。
     pub report: String,
+    /// 服务器对中继的说明：会员通道、免费通道，或者为什么没有中继。
+    pub relay_note: String,
     /// 对方设备的指纹（按设备码连接时由服务器告知，连接本身核对过）。
     pub device: Fingerprint,
     /// 按两端 NAT 类型选的打洞方式。
@@ -384,12 +412,77 @@ pub async fn dial(
     lookup: &Lookup,
     policy: PathPolicy,
 ) -> Result<Dialed, NetError> {
+    dial_via(node, &[*server], lookup, policy, "").await
+}
+
+/// 连信令服务器最多等这么久，超时就换集群里的下一个节点。
+const SERVER_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// 依次试 `servers`（集群里的节点），用第一个连得上的建立连接。某个节点连不上（崩溃、网络不通）
+/// 就换下一个；连上了之后的结果（例如“设备不在线”）不再换节点重试。`account` 是会员令牌
+/// （空表示免费用户），走中继时记在这个账户上。
+pub async fn dial_via(
+    node: &Node,
+    servers: &[Server],
+    lookup: &Lookup,
+    policy: PathPolicy,
+    account: &str,
+) -> Result<Dialed, NetError> {
     let started = Instant::now();
-    let signal = node.connect(server.addr, server.pin.as_ref()).await?;
-    let mut timing = DialTiming {
-        server_connect: started.elapsed(),
-        ..DialTiming::default()
+    let mut last = NetError::Connect("没有配置服务器".into());
+    for server in servers {
+        match node
+            .connect_within(server.addr, server.pin.as_ref(), SERVER_TIMEOUT)
+            .await
+        {
+            Ok(signal) => {
+                let timing = DialTiming {
+                    server_connect: started.elapsed(),
+                    ..DialTiming::default()
+                };
+                return dial_on(node, server, signal, timing, lookup, policy, account).await;
+            }
+            Err(e) => {
+                crate::note!(warn, "服务器 {} 连不上，换下一个：{e}", server.addr);
+                last = e;
+            }
+        }
+    }
+    Err(last)
+}
+
+/// 问一个服务器集群里有哪些节点（用于故障切换）。节点的指纹来自这个已经核对过身份的服务器。
+pub async fn fetch_nodes(node: &Node, server: &Server) -> Result<Vec<Server>, NetError> {
+    let link = node
+        .connect_within(server.addr, server.pin.as_ref(), SERVER_TIMEOUT)
+        .await?;
+    let (mut send, mut recv) = link.open_stream().await?;
+    write_kind(&mut send, StreamKind::Signal).await?;
+    write_signal(&mut send, &SignalMsg::Nodes).await?;
+    let reply = read_signal(&mut recv).await?;
+    link.close("done");
+    let SignalMsg::NodeList { nodes } = reply else {
+        return Err(NetError::Protocol("服务器的节点列表应答不对"));
     };
+    Ok(nodes
+        .into_iter()
+        .map(|(addr, pin, _)| Server {
+            addr,
+            pin: Some(pin),
+        })
+        .collect())
+}
+
+/// 在已经连上的信令连接上完成一次连接。
+async fn dial_on(
+    node: &Node,
+    server: &Server,
+    signal: Link,
+    mut timing: DialTiming,
+    lookup: &Lookup,
+    policy: PathPolicy,
+    account: &str,
+) -> Result<Dialed, NetError> {
     let (mut send, mut recv) = signal.open_stream().await?;
     write_kind(&mut send, StreamKind::Signal).await?;
     let mine = crate::candidates::local_candidates(
@@ -400,10 +493,12 @@ pub async fn dial(
         Lookup::Device(target) => SignalMsg::Connect {
             target: *target,
             locals: mine,
+            account: account.to_owned(),
         },
         Lookup::Code(code) => SignalMsg::ConnectCode {
             code: *code,
             locals: mine,
+            account: account.to_owned(),
         },
     };
     let asked = Instant::now();
@@ -415,7 +510,7 @@ pub async fn dial(
         write_signal(&mut send, &ask).await?;
         reply = read_signal(&mut recv).await?;
     }
-    let (device, addr, locals, you, punch_info, relay) = match reply {
+    let (device, addr, locals, you, punch_info, relay, relay_note) = match reply {
         SignalMsg::Peer {
             device,
             addr,
@@ -423,7 +518,8 @@ pub async fn dial(
             you,
             punch,
             relay,
-        } => (device, addr, locals, you, punch, relay),
+            note,
+        } => (device, addr, locals, you, punch, relay, note),
         SignalMsg::NotFound => {
             return Err(NetError::Connect(match lookup {
                 Lookup::Device(_) => "设备不在线".into(),
@@ -433,6 +529,8 @@ pub async fn dial(
         SignalMsg::Register { .. }
         | SignalMsg::Probe { .. }
         | SignalMsg::Check
+        | SignalMsg::Nodes
+        | SignalMsg::NodeList { .. }
         | SignalMsg::Checked { .. }
         | SignalMsg::Registered { .. }
         | SignalMsg::Connect { .. }
@@ -522,6 +620,7 @@ pub async fn dial(
                     route: m.candidate.kind,
                     rtt_us: Some(m.rtt_us),
                     report,
+                    relay_note: relay_note.clone(),
                     device,
                     plan,
                     timing,
@@ -555,6 +654,7 @@ pub async fn dial(
                     route: PathKind::PeerReflexive,
                     rtt_us: None,
                     report,
+                    relay_note: relay_note.clone(),
                     device,
                     plan,
                     timing,
@@ -598,6 +698,7 @@ pub async fn dial(
         route: PathKind::Relay,
         rtt_us,
         report,
+        relay_note: relay_note.clone(),
         device,
         plan,
         timing,
@@ -690,12 +791,33 @@ mod tests {
             addr: relay.local_addr().unwrap(),
             session: [3; 16],
             side: 0,
+            ticket: [5; peerdesk_core::relay::TICKET_LEN],
         };
         let shim = Shim::start(grant, None).await.unwrap();
         let mut buf = [0u8; 4096];
-        // 第一个包是登记用的空包
+        // 第一个包是登记用的，带着票据
         let (len, shim_addr) = relay.recv_from(&mut buf).await.unwrap();
-        assert_eq!(len, RELAY_HEADER);
+        assert_eq!(len, RELAY_HEADER + peerdesk_core::relay::TICKET_LEN);
+        assert_eq!(
+            &buf[RELAY_HEADER..len],
+            &[5; peerdesk_core::relay::TICKET_LEN]
+        );
+        // 中继的通知（免费额度用完）：记下，不交给端点
+        assert_eq!(shim.notice(), None);
+        relay
+            .send_to(
+                &wrap(&[3; 16], 1, &peerdesk_core::relay::notice(1, 300)),
+                shim_addr,
+            )
+            .await
+            .unwrap();
+        for _ in 0..100 {
+            if shim.notice().is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(shim.notice(), Some((1, 300)));
         // 端点还没出现：中继来的包没处可交
         relay
             .send_to(&wrap(&[3; 16], 1, b"early"), shim_addr)

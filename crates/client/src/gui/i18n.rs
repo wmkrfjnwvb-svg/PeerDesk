@@ -118,6 +118,16 @@ pub struct Strings {
     pub open_logs: &'static str,
     /// 网络体检。
     pub network_check: &'static str,
+    /// 网络重连中。
+    pub reconnecting: &'static str,
+    /// 免费额度用完的弹框标题。
+    pub busy_title: &'static str,
+    /// 升级会员按钮。
+    pub upgrade: &'static str,
+    /// 升级说明。
+    pub upgrade_hint: &'static str,
+    /// 会员令牌。
+    pub account_token: &'static str,
     pub err_port_in_use: &'static str,
     pub err_timeout: &'static str,
     pub err_refused: &'static str,
@@ -199,6 +209,11 @@ pub const ZH: Strings = Strings {
     saved: "服务器设置已保存",
     open_logs: "打开日志文件夹",
     network_check: "网络体检（NAT、路由器、服务器、IPv6、端口映射）",
+    reconnecting: "网络重连中，正在切换到其他通道",
+    busy_title: "免费服务器拥挤",
+    upgrade: "升级会员，走 VIP 通道",
+    upgrade_hint: "会员走付费集群的专用通道，不受免费额度限制。会员购买即将开放；已有会员令牌的，在窗口下方“服务器”里填写“会员令牌”。",
+    account_token: "会员令牌（可选）",
     err_port_in_use: "端口已被占用（也许另一个 PeerDesk 正在运行），换一个端口试试",
     err_timeout: "对方没有响应。请检查地址和端口、防火墙，以及对方是否打开了“允许远程控制”",
     err_refused: "连接失败",
@@ -281,6 +296,11 @@ pub const EN: Strings = Strings {
     saved: "Server settings saved",
     open_logs: "Open log folder",
     network_check: "Network check (NAT, router, server, IPv6, port mapping)",
+    reconnecting: "Network lost, reconnecting through another channel",
+    busy_title: "Free servers are busy",
+    upgrade: "Upgrade to VIP",
+    upgrade_hint: "VIP members use dedicated paid relays without the free-tier limit. Membership is coming soon; if you already have a member token, enter it under Server below.",
+    account_token: "Member token (optional)",
     err_port_in_use:
         "The port is already in use (maybe another PeerDesk is running). Try another port",
     err_timeout: "No response. Check the address, the port, the firewall, and that \
