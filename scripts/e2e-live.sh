@@ -69,13 +69,13 @@ run_case() {
 # 实验（只报告、不判失败）：画面持续大量变化时，QUIC 层不同的拥塞控制让多少画面送到。
 # 一个终端不停地刷随机文字，相当于快速滚动的日志。
 flood_table="$OUT/congestion.md"
-echo "| 网络 | QUIC 拥塞控制 | 送达帧 | 画面数据 KB | 平均 kbps | 被控端结束码率 |" > "$flood_table"
-echo "|---|---|---|---|---|---|" >> "$flood_table"
+echo "| 网络 | QUIC 拥塞控制 | 带宽估计 | 送达帧 | 画面数据 KB | 平均 kbps | 被控端结束码率 |" > "$flood_table"
+echo "|---|---|---|---|---|---|---|" >> "$flood_table"
 run_flood() {
-  local net=$1 cc=$2
-  local w="$OUT/flood-$net-$cc"
+  local net=$1 cc=$2 est=$3
+  local w="$OUT/flood-$net-$cc-$est"
   mkdir -p "$w"
-  PEERDESK_CC=$cc DISPLAY=$DISPLAY_NUM "$BIN" host --listen 127.0.0.1:0 --data-dir "$w/host" --open --once \
+  PEERDESK_CC=$cc PEERDESK_ESTIMATOR=$est DISPLAY=$DISPLAY_NUM "$BIN" host --listen 127.0.0.1:0 --data-dir "$w/host" --open --once \
     >"$w/host.log" 2>&1 & local host=$!
   pids+=($host)
   for _ in $(seq 60); do grep -q '^指纹' "$w/host.log" && break; sleep 0.25; done
@@ -88,7 +88,7 @@ run_flood() {
   frames=$(sed -n 's/^帧 *送达 \([0-9]*\).*/\1/p' "$w/ctrl.log")
   bytes=$(sed -n 's/^画面数据 *\([0-9]*\).*/\1/p' "$w/ctrl.log")
   rate=$(sed -n 's/.*结束时码率 \([0-9]* kbps\).*/\1/p' "$w/host.log")
-  echo "| $net | $cc | ${frames:-?} | $(( ${bytes:-0} / 1024 )) | $(( ${bytes:-0} * 8 / 8000 )) | ${rate:-?} |" >> "$flood_table"
+  echo "| $net | $cc | $est | ${frames:-?} | $(( ${bytes:-0} / 1024 )) | $(( ${bytes:-0} * 8 / 8000 )) | ${rate:-?} |" >> "$flood_table"
 }
 start_flood() {
   DISPLAY=$DISPLAY_NUM xterm -geometry 170x50+0+0 -fa Monospace -fs 10 \
@@ -99,13 +99,16 @@ start_flood() {
 
 run_case loopback
 start_flood
-run_flood loopback cubic
+run_flood loopback bbr legacy
 kill "$FLOOD" 2>/dev/null || true
 if command -v tc >/dev/null && sudo -n tc qdisc add dev lo root netem delay 25ms 5ms loss 2% 2>/dev/null; then
   NETEM=1
   run_case "delay25ms-loss2%"
   start_flood
-  for cc in cubic newreno bbr; do run_flood "delay25ms-loss2%" "$cc"; done
+  # 原来（cubic + legacy）、现在的产品默认（bbr + legacy）、候选（bbr + v1）
+  run_flood "delay25ms-loss2%" cubic legacy
+  run_flood "delay25ms-loss2%" bbr legacy
+  run_flood "delay25ms-loss2%" bbr v1
   kill "$FLOOD" 2>/dev/null || true
   sudo tc qdisc del dev lo root; NETEM=
 else

@@ -7,6 +7,7 @@ use std::time::Duration;
 use peerdesk_core::adaptive::Profile;
 use peerdesk_core::auth::{Auth, Limiter};
 use peerdesk_core::crypto::Suite;
+use peerdesk_core::estimator::EstimatorKind;
 use peerdesk_core::file::FileMsg;
 use peerdesk_core::input::{InputEvent, InputReceiver, KeyState};
 use peerdesk_core::media::{encode_job, FrameJob, MediaSender, SenderConfig};
@@ -293,6 +294,11 @@ pub async fn serve(
             profile: Profile::select(rtt_us, false, false),
             deadline_us: FRAME_DEADLINE_US,
             max_payload: link.max_payload(),
+            // 实验开关：PEERDESK_ESTIMATOR=legacy 或 v1 选估计器，默认用产品默认的那个。
+            estimator: std::env::var("PEERDESK_ESTIMATOR")
+                .ok()
+                .and_then(|name| EstimatorKind::parse(&name))
+                .unwrap_or(EstimatorKind::PRODUCT),
         },
         codec,
     );

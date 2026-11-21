@@ -611,7 +611,12 @@ async fn sources_with_a_change_counter_are_encoded_only_when_it_moves() {
     let (host_link, ctrl_link) = links(&p).await;
     let host_task = tokio::spawn(host::serve(
         host_link,
-        HostOptions::new(session(&p.host_id, &policy), 100, temp_dir("seq")),
+        // 预算给足：第一幅画面一帧发完，帧数只取决于变化计数。
+        HostOptions {
+            start_bps: 50_000_000,
+            max_bps: 50_000_000,
+            ..HostOptions::new(session(&p.host_id, &policy), 100, temp_dir("seq"))
+        },
         Box::new(Counted {
             inner: DemoDesktop::new(320, 240, 1).with_limit(12),
             seq: 0,

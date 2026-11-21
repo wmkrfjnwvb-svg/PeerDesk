@@ -14,6 +14,7 @@ pub mod report;
 
 use peerdesk_core::adaptive::Profile;
 use peerdesk_core::error::Error;
+pub use peerdesk_core::estimator::EstimatorKind;
 use peerdesk_core::media::{MediaReceiver, MediaSender, SenderConfig};
 use peerdesk_core::proto::{decode_datagram, encode_datagram, Channel, Header};
 use peerdesk_core::screen::Screen;
@@ -107,6 +108,8 @@ pub struct Scenario {
     pub max_bps: u64,
     /// 随机种子。
     pub seed: u64,
+    /// 带宽估计器。
+    pub estimator: EstimatorKind,
 }
 
 impl Scenario {
@@ -126,6 +129,7 @@ impl Scenario {
             start_bps: 4_000_000,
             max_bps: 30_000_000,
             seed: 1,
+            estimator: EstimatorKind::PRODUCT,
         }
     }
 }
@@ -180,6 +184,59 @@ pub struct Outcome {
     pub max_wait_ms: f64,
     /// 全程卡顿次数。
     pub freezes: u32,
+    /// 带宽估计器的名字。
+    pub estimator: &'static str,
+    /// 每次反馈一行特征，带着仿真知道的真实情况（以后训练 AI 模型用）。
+    pub features: Vec<FeatureRow>,
+}
+
+/// 一行特征：发送端这一刻看到的，以及仿真知道的真实链路。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FeatureRow {
+    /// 时间（毫秒）。
+    pub t_ms: u64,
+    /// 估计器给出的码率（比特每秒）。
+    pub rate_bps: u64,
+    /// 接收端报告的排队延迟（微秒）。
+    pub queue_us: u32,
+    /// 延迟趋势（0.1 毫秒）。
+    pub trend: i32,
+    /// 包串速率（字节每秒）。
+    pub train: u32,
+    /// 丢包率（千分比）。
+    pub loss: u16,
+    /// 接收速率（字节每秒）。
+    pub recv: u32,
+    /// 发送端在途字节。
+    pub in_flight: u64,
+    /// 真实瓶颈带宽（比特每秒，0 表示不限）。
+    pub true_rate_bps: u64,
+    /// 真实的在途包数（链路里排着的）。
+    pub true_queue_packets: usize,
+}
+
+impl FeatureRow {
+    /// CSV 表头。
+    pub const HEADER: &'static str =
+        "t_ms,rate_bps,queue_us,trend_0.1ms,train_Bps,loss_permille,recv_Bps,in_flight_B,true_rate_bps,true_queue_pkts";
+
+    /// 一行 CSV。
+    #[must_use]
+    pub fn csv(&self) -> String {
+        format!(
+            "{},{},{},{},{},{},{},{},{},{}",
+            self.t_ms,
+            self.rate_bps,
+            self.queue_us,
+            self.trend,
+            self.train,
+            self.loss,
+            self.recv,
+            self.in_flight,
+            self.true_rate_bps,
+            self.true_queue_packets
+        )
+    }
 }
 
 /// 亮度 PSNR（dB）。尺寸不同时返回 0。
@@ -256,6 +313,7 @@ pub fn run(s: &Scenario) -> Result<Outcome, Error> {
         start_bps: s.start_bps,
         max_bps: s.max_bps,
         profile: s.profile,
+        estimator: s.estimator,
         ..SenderConfig::default()
     };
     let mut tx = MediaSender::new(cfg, encoder);
@@ -272,6 +330,7 @@ pub fn run(s: &Scenario) -> Result<Outcome, Error> {
     let mut results = Vec::new();
     let (mut seq, mut fb_seq) = (0u32, 0u32);
     let mut overall_wait = 0u64;
+    let mut features = Vec::new();
     // 源画面变了、控制端还没看到新画面：从哪个时刻开始等的。
     let mut waiting_since: Option<Time> = None;
     let mut first = true;
@@ -372,6 +431,20 @@ pub fn run(s: &Scenario) -> Result<Outcome, Error> {
                                 .saturating_add(u64::try_from(datagram.len()).unwrap_or(u64::MAX));
                             net.send(HOST, VIEWER, datagram.len(), datagram);
                         }
+                        if let Some(obs) = tx.last_observation() {
+                            features.push(FeatureRow {
+                                t_ms: now.micros() / 1000,
+                                rate_bps: tx.rate_bps(),
+                                queue_us: obs.feedback.queue_delay_us,
+                                trend: obs.ext.trend_tenth_ms,
+                                train: obs.ext.train_bytes_per_s,
+                                loss: obs.feedback.loss_permille,
+                                recv: obs.feedback.recv_bytes_per_s,
+                                in_flight: obs.in_flight,
+                                true_rate_bps: link.rate_bps.unwrap_or(0),
+                                true_queue_packets: net.in_flight(),
+                            });
+                        }
                         continue;
                     }
                     let Ok(Some(frame)) =
@@ -446,6 +519,8 @@ pub fn run(s: &Scenario) -> Result<Outcome, Error> {
         net: net.stats(),
         max_wait_ms: ms(overall_wait),
         freezes: overall_freezes,
+        estimator: tx.estimator(),
+        features,
     })
 }
 

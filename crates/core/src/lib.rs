@@ -25,6 +25,7 @@ pub mod connect;
 pub mod crypto;
 pub mod desktop_sim;
 pub mod error;
+pub mod estimator;
 pub mod file;
 pub mod input;
 pub mod media;

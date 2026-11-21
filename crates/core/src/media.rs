@@ -9,8 +9,9 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
-use crate::adaptive::{DelayTracker, DeliveryLog, Feedback, Profile, RateController};
+use crate::adaptive::{DelayTracker, DeliveryLog, Feedback, Profile};
 use crate::error::Error;
+use crate::estimator::{EstimatorKind, Extension, Observation, RateEstimator, ReceiverMetrics};
 use crate::proto::{VideoHeader, MAX_DATAGRAM};
 use crate::screen::Screen;
 use crate::time::Time;
@@ -26,11 +27,12 @@ pub const MAX_NACKS: usize = 48;
 /// 分片缺了多久才请求重传（微秒）：短于这个时间可能只是乱序。
 const NACK_AFTER_US: u64 = 10_000;
 
-/// 反馈数据报：[`Feedback`] 后面跟着重传请求（个数 + 每个的帧号和分片序号）。
+/// 反馈数据报：[`Feedback`]、扩展测量（[`Extension`]），后面跟着重传请求（个数 + 每个的帧号和分片序号）。
 #[must_use]
-pub fn encode_feedback(feedback: &Feedback, nacks: &[(u32, u16)]) -> Vec<u8> {
+pub fn encode_feedback(feedback: &Feedback, ext: &Extension, nacks: &[(u32, u16)]) -> Vec<u8> {
     let mut w = Writer::new();
     w.bytes(&feedback.encode());
+    ext.encode(&mut w);
     let nacks = nacks.get(..MAX_NACKS.min(nacks.len())).unwrap_or_default();
     if !nacks.is_empty() {
         w.u8(u8::try_from(nacks.len()).unwrap_or(u8::MAX));
@@ -41,8 +43,11 @@ pub fn encode_feedback(feedback: &Feedback, nacks: &[(u32, u16)]) -> Vec<u8> {
     w.into_vec()
 }
 
+/// 解析出的反馈数据报：基本反馈、扩展测量、重传请求。
+pub type DecodedFeedback = (Feedback, Extension, Vec<(u32, u16)>);
+
 /// 解析反馈数据报。
-pub fn decode_feedback(buf: &[u8]) -> Result<(Feedback, Vec<(u32, u16)>), Error> {
+pub fn decode_feedback(buf: &[u8]) -> Result<DecodedFeedback, Error> {
     let (head, rest) = buf
         .split_at_checked(Feedback::LEN)
         .ok_or(Error::Truncated {
@@ -50,10 +55,11 @@ pub fn decode_feedback(buf: &[u8]) -> Result<(Feedback, Vec<(u32, u16)>), Error>
             have: buf.len(),
         })?;
     let feedback = Feedback::decode(head)?;
-    if rest.is_empty() {
-        return Ok((feedback, Vec::new()));
-    }
     let mut r = Reader::new(rest);
+    let ext = Extension::decode(&mut r)?;
+    if r.remaining() == 0 {
+        return Ok((feedback, ext, Vec::new()));
+    }
     let count = usize::from(r.u8()?);
     if count == 0 || count > MAX_NACKS {
         return Err(Error::TooManyItems {
@@ -65,7 +71,7 @@ pub fn decode_feedback(buf: &[u8]) -> Result<(Feedback, Vec<(u32, u16)>), Error>
         .map(|_| Ok((r.u32()?, r.u16()?)))
         .collect::<Result<Vec<_>, Error>>()?;
     r.finish()?;
-    Ok((feedback, nacks))
+    Ok((feedback, ext, nacks))
 }
 
 /// 发送端的参数。
@@ -85,6 +91,8 @@ pub struct SenderConfig {
     pub deadline_us: u64,
     /// 一个数据报能装的最大载荷（不含数据报头）。
     pub max_payload: usize,
+    /// 带宽估计器。
+    pub estimator: EstimatorKind,
 }
 
 impl Default for SenderConfig {
@@ -98,6 +106,7 @@ impl Default for SenderConfig {
             // 要留够时间给丢失的分片重传一次（大约一个往返）。
             deadline_us: 250_000,
             max_payload: MAX_DATAGRAM - HEADER_LEN,
+            estimator: EstimatorKind::PRODUCT,
         }
     }
 }
@@ -173,9 +182,9 @@ pub struct MediaSender {
     notes: (Vec<u32>, Option<(u32, u32)>),
     /// 编码器上次报告的“还要不要继续交画面”（编码器在别的线程时用）。
     refine: bool,
-    rate: RateController,
+    rate: Box<dyn RateEstimator>,
     /// 已发出、还没有定论的帧：(帧号, 发出时间)。
-    unacked: VecDeque<(u32, Time)>,
+    unacked: VecDeque<(u32, Time, u64)>,
     last_frame: u32,
     last_key: u32,
     stats: SenderStats,
@@ -184,6 +193,7 @@ pub struct MediaSender {
     /// 每个分片上次重传的时间：一个往返之内不重复重传。
     resent: BTreeMap<(u32, u16), Time>,
     rtt_us: u64,
+    last_obs: Option<Observation>,
 }
 
 impl std::fmt::Debug for MediaSender {
@@ -211,7 +221,9 @@ impl MediaSender {
     #[must_use]
     pub fn detached(cfg: SenderConfig, codec: Codec) -> Self {
         Self {
-            rate: RateController::new(cfg.profile, cfg.start_bps, cfg.min_bps, cfg.max_bps),
+            rate: cfg
+                .estimator
+                .build(cfg.profile, cfg.start_bps, cfg.min_bps, cfg.max_bps),
             cfg,
             encoder: None,
             codec,
@@ -224,6 +236,7 @@ impl MediaSender {
             recent: VecDeque::new(),
             resent: BTreeMap::new(),
             rtt_us: 0,
+            last_obs: None,
         }
     }
 
@@ -235,7 +248,7 @@ impl MediaSender {
 
     /// 当前码率。
     #[must_use]
-    pub const fn rate_bps(&self) -> u64 {
+    pub fn rate_bps(&self) -> u64 {
         self.rate.rate_bps()
     }
 
@@ -257,12 +270,12 @@ impl MediaSender {
 
     /// 网络画像。
     #[must_use]
-    pub const fn profile(&self) -> &Profile {
+    pub fn profile(&self) -> &Profile {
         self.rate.profile()
     }
 
     /// 改网络画像（例如测出了更大的往返时间）。
-    pub const fn set_profile(&mut self, profile: Profile) {
+    pub fn set_profile(&mut self, profile: Profile) {
         self.rate.set_profile(profile);
     }
 
@@ -315,7 +328,7 @@ impl MediaSender {
             .deadline_us
             .saturating_add(rtt_us.saturating_mul(2))
             .saturating_add(60_000);
-        while let Some((id, at)) = self.unacked.front().copied() {
+        while let Some((id, at, _)) = self.unacked.front().copied() {
             if now.since(at) < ack_timeout {
                 break;
             }
@@ -325,7 +338,7 @@ impl MediaSender {
         let (lost, feedback) = std::mem::take(&mut self.notes);
         FrameJob {
             frame_id: self.last_frame.wrapping_add(1).max(1),
-            budget: self.rate.frame_budget(self.cfg.fps),
+            budget: self.frame_budget(),
             lost,
             feedback,
         }
@@ -382,7 +395,9 @@ impl MediaSender {
             self.last_key = frame_id;
             self.stats.keyframes = self.stats.keyframes.saturating_add(1);
         }
-        self.unacked.push_back((frame_id, now));
+        let wire_total: usize = out.iter().map(|o| o.body.len()).sum();
+        self.unacked
+            .push_back((frame_id, now, u64::try_from(wire_total).unwrap_or(u64::MAX)));
         self.stats.frames = self.stats.frames.saturating_add(1);
         self.stats.video_bytes = self
             .stats
@@ -398,8 +413,8 @@ impl MediaSender {
 
     /// 收到一个反馈数据报。返回要重传的分片。
     pub fn on_feedback_datagram(&mut self, now: Time, buf: &[u8]) -> Result<Vec<Outgoing>, Error> {
-        let (feedback, nacks) = decode_feedback(buf)?;
-        self.on_feedback(now, &feedback);
+        let (feedback, ext, nacks) = decode_feedback(buf)?;
+        self.observe(now, &feedback, ext);
         let mut out = Vec::new();
         for (frame, frag) in nacks {
             let again = self
@@ -428,14 +443,55 @@ impl MediaSender {
         Ok(out)
     }
 
-    /// 接收端的反馈。
+    /// 还没确认的字节数。
+    #[must_use]
+    pub fn in_flight(&self) -> u64 {
+        self.unacked.iter().map(|(_, _, bytes)| *bytes).sum()
+    }
+
+    /// 带宽估计器的名字。
+    #[must_use]
+    pub fn estimator(&self) -> &'static str {
+        self.rate.name()
+    }
+
+    /// 最近一次交给估计器的观测（特征记录用）。
+    #[must_use]
+    pub const fn last_observation(&self) -> Option<Observation> {
+        self.last_obs
+    }
+
+    /// 每帧字节预算：码率摊到每帧，打一个折扣给重传和控制消息留余量。
+    fn frame_budget(&self) -> usize {
+        let per_frame = self.rate.rate_bps() / 8 / u64::from(self.cfg.fps.max(1));
+        let budget =
+            per_frame.saturating_mul(u64::from(self.rate.profile().safety_permille)) / 1000;
+        usize::try_from(budget).unwrap_or(usize::MAX)
+    }
+
+    fn observe(&mut self, now: Time, feedback: &Feedback, ext: Extension) {
+        let obs = Observation {
+            feedback: *feedback,
+            ext,
+            rtt_us: self.rtt_us,
+            in_flight: self.in_flight(),
+        };
+        self.rate.on_observation(now, &obs);
+        self.last_obs = Some(obs);
+        self.acknowledge(feedback);
+    }
+
+    /// 接收端的反馈（没有扩展测量时用）。
     pub fn on_feedback(&mut self, now: Time, feedback: &Feedback) {
-        self.rate.on_feedback(now, feedback);
+        self.observe(now, feedback, Extension::default());
+    }
+
+    fn acknowledge(&mut self, feedback: &Feedback) {
         match self.encoder.as_mut() {
             Some(encoder) => encoder.on_feedback(feedback.floor, feedback.delivered),
             None => self.notes.1 = Some((feedback.floor, feedback.delivered)),
         }
-        while let Some((id, _)) = self.unacked.front().copied() {
+        while let Some((id, _, _)) = self.unacked.front().copied() {
             if id > feedback.floor {
                 break;
             }
@@ -537,6 +593,7 @@ pub struct MediaReceiver {
     decoder: Option<Box<dyn VideoDecoder>>,
     reassembler: Reassembler,
     tracker: DelayTracker,
+    metrics: ReceiverMetrics,
     log: DeliveryLog,
     /// 最后交给解码器的帧号；`None` 表示要等关键帧。
     decoded: Option<u32>,
@@ -569,6 +626,7 @@ impl MediaReceiver {
             decoder: None,
             reassembler: Reassembler::new(deadline_us, 16),
             tracker: DelayTracker::new(now),
+            metrics: ReceiverMetrics::new(),
             log: DeliveryLog::new(),
             decoded: None,
             stats: ReceiverStats::default(),
@@ -675,6 +733,8 @@ impl MediaReceiver {
         self.tracker.on_packet(now, send_time, seq, body.len());
         let mut r = Reader::new(body);
         let header = VideoHeader::decode(&mut r)?;
+        self.metrics
+            .on_packet(now, send_time, header.frame_id, body.len());
         let packet = VideoPacket {
             header,
             parity: flags & FLAG_PARITY != 0,
@@ -729,7 +789,7 @@ impl MediaReceiver {
     pub fn feedback_datagram(&mut self, now: Time) -> Vec<u8> {
         let feedback = self.feedback(now);
         let nacks = self.reassembler.missing(now, NACK_AFTER_US, MAX_NACKS);
-        encode_feedback(&feedback, &nacks)
+        encode_feedback(&feedback, &self.metrics.report(), &nacks)
     }
 
     /// 生成一条反馈，同时让超时的帧作废。
@@ -1021,18 +1081,26 @@ mod tests {
             loss_permille: 2,
             recv_bytes_per_s: 9,
         };
+        let ext = Extension {
+            trend_tenth_ms: -5,
+            groups: 3,
+            train_bytes_per_s: 1,
+            processing_us: 2,
+        };
         assert_eq!(
-            decode_feedback(&encode_feedback(&fb, &[])).unwrap(),
-            (fb, vec![])
+            decode_feedback(&encode_feedback(&fb, &ext, &[])).unwrap(),
+            (fb, ext, vec![])
         );
         let nacks: Vec<(u32, u16)> = (0..60).map(|i| (5, i)).collect();
-        let (back, got) = decode_feedback(&encode_feedback(&fb, &nacks)).unwrap();
+        let (back, _, got) = decode_feedback(&encode_feedback(&fb, &ext, &nacks)).unwrap();
         assert_eq!((back, got.len()), (fb, MAX_NACKS), "最多带 {MAX_NACKS} 个");
         assert!(decode_feedback(&[0; 5]).is_err(), "截断");
-        let mut zero = fb.encode();
+        assert!(decode_feedback(&fb.encode()).is_err(), "缺扩展测量");
+        let with_ext = encode_feedback(&fb, &ext, &[]);
+        let mut zero = with_ext.clone();
         zero.push(0);
         assert!(decode_feedback(&zero).is_err(), "个数为 0");
-        let mut short = fb.encode();
+        let mut short = with_ext;
         short.extend([2, 0, 0, 0, 1, 0, 1]);
         assert!(decode_feedback(&short).is_err(), "说有 2 个，只有 1 个");
     }

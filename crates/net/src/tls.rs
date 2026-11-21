@@ -85,13 +85,14 @@ fn transport() -> Arc<quinn::TransportConfig> {
     Arc::new(transport)
 }
 
-/// QUIC 层的拥塞控制。画面和输入的码率由我们自己的实时层决定，这里只是安全网；
-/// 选哪一种由实验决定（`PEERDESK_CC`：cubic、newreno、bbr，默认 cubic），见 scripts/e2e-live.sh。
+/// QUIC 层的拥塞控制。画面和输入的码率由我们自己的实时层决定，这里只是安全网。
+/// 默认 BBR：实验（scripts/e2e-live.sh，25 ms 延迟、2% 丢包、画面大量变化）里 Cubic 和 NewReno
+/// 把随机丢包当拥塞，8 秒一帧都没送到；BBR 不看丢包，送到了。`PEERDESK_CC` 可换成 cubic、newreno 做对照。
 fn congestion(name: Option<&str>) -> Arc<dyn quinn::congestion::ControllerFactory + Send + Sync> {
     match name {
-        Some("bbr") => Arc::new(quinn::congestion::BbrConfig::default()),
+        Some("cubic") => Arc::new(quinn::congestion::CubicConfig::default()),
         Some("newreno") => Arc::new(quinn::congestion::NewRenoConfig::default()),
-        Some(_) | None => Arc::new(quinn::congestion::CubicConfig::default()),
+        Some(_) | None => Arc::new(quinn::congestion::BbrConfig::default()),
     }
 }
 

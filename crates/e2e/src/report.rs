@@ -64,9 +64,10 @@ fn opt(v: Option<f64>) -> String {
 /// 一个阶段的表格行。
 fn row(o: &Outcome, p: &PhaseResult) -> String {
     format!(
-        "| {} | {} | {} | {} | {:.0} / {:.0} | {:.0} | {} | {:.1} | {} |",
+        "| {} | {}/{} | {} | {} | {:.0} / {:.0} | {:.0} | {} | {:.1} | {} |",
         o.name,
         o.codec.name(),
+        o.estimator,
         p.action.name(),
         p.kbps,
         p.latency_ms.0,
@@ -79,7 +80,7 @@ fn row(o: &Outcome, p: &PhaseResult) -> String {
 }
 
 /// 表头。
-pub const TABLE_HEADER: &str = "| 场景 | 编码 | 操作 | 码率 kbps | 延迟 p50/p95 ms | 最长等待 ms | 卡顿次数 | 结束 PSNR dB | 变清晰 ms |\n|---|---|---|---|---|---|---|---|---|\n";
+pub const TABLE_HEADER: &str = "| 场景 | 编码/估计器 | 操作 | 码率 kbps | 延迟 p50/p95 ms | 最长等待 ms | 卡顿次数 | 结束 PSNR dB | 变清晰 ms |\n|---|---|---|---|---|---|---|---|---|\n";
 
 /// 整个场景的 Markdown 表格行（不含表头）。
 #[must_use]
@@ -114,9 +115,10 @@ pub fn json(o: &Outcome) -> String {
         })
         .collect();
     format!(
-        "{{\"name\":\"{}\",\"codec\":\"{}\",\"keyframes\":{},\"recoveries\":{},\"skipped\":{},\"bad\":{},\"net_lost\":{},\"net_queue_dropped\":{},\"max_wait_ms\":{:.1},\"freezes\":{},\"phases\":[{}]}}",
+        "{{\"name\":\"{}\",\"codec\":\"{}\",\"estimator\":\"{}\",\"keyframes\":{},\"recoveries\":{},\"skipped\":{},\"bad\":{},\"net_lost\":{},\"net_queue_dropped\":{},\"max_wait_ms\":{:.1},\"freezes\":{},\"phases\":[{}]}}",
         o.name,
         o.codec.name(),
+        o.estimator,
         o.keyframes,
         o.recoveries,
         o.skipped,
@@ -131,7 +133,7 @@ pub fn json(o: &Outcome) -> String {
 
 /// 把一个场景的截图、JSON 和表格写进 `dir/<场景名>-<编码>/`。
 pub fn save(dir: &Path, o: &Outcome) -> Result<(), Error> {
-    let out = dir.join(format!("{}-{}", o.name, o.codec.name()));
+    let out = dir.join(format!("{}-{}-{}", o.name, o.codec.name(), o.estimator));
     fs::create_dir_all(&out).map_err(|e| io(&e))?;
     for (i, p) in o.phases.iter().enumerate() {
         let (w, h, rgb) = side_by_side(&p.snapshot.0, &p.snapshot.1);
@@ -143,6 +145,12 @@ pub fn save(dir: &Path, o: &Outcome) -> Result<(), Error> {
         )?;
     }
     fs::write(out.join("result.json"), json(o)).map_err(|e| io(&e))?;
+    let mut csv = String::from(crate::FeatureRow::HEADER);
+    for row in &o.features {
+        csv.push('\n');
+        csv.push_str(&row.csv());
+    }
+    fs::write(out.join("features.csv"), csv).map_err(|e| io(&e))?;
     fs::write(
         out.join("result.md"),
         format!("{TABLE_HEADER}{}", markdown(o)),

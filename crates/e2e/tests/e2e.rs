@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use peerdesk_core::adaptive::Profile;
 use peerdesk_core::sim::Link;
 use peerdesk_e2e::report::{markdown, save, TABLE_HEADER};
-use peerdesk_e2e::{run, Action, CodecKind, Outcome, Phase, Scenario};
+use peerdesk_e2e::{run, Action, CodecKind, EstimatorKind, Outcome, Phase, Scenario};
 
 fn out_dir() -> PathBuf {
     std::env::var_os("PEERDESK_E2E_OUT").map_or_else(
@@ -44,11 +44,21 @@ fn office() -> Vec<Phase> {
 /// 仿真是确定性的，同一份代码每次结果相同，所以可以当硬门槛。
 fn gate(o: &Outcome, what: &str, ok: bool, detail: &str) {
     use std::io::Write as _;
+    // 门槛只卡产品默认的估计器；候选的估计器跑同样的场景，只报告，用来对比。
+    let product = EstimatorKind::PRODUCT
+        .build(Profile::STABLE, 1, 1, 1)
+        .name();
+    let hard = o.estimator == product;
+    let verdict = match (ok, hard) {
+        (true, _) => "达标",
+        (false, true) => "**未达标**",
+        (false, false) => "未达标（候选，不卡）",
+    };
     let line = format!(
-        "| {} | {} | {what} | {} | {detail} |\n",
+        "| {} | {}/{} | {what} | {verdict} | {detail} |\n",
         o.name,
         o.codec.name(),
-        if ok { "达标" } else { "**未达标**" }
+        o.estimator,
     );
     print!("{line}");
     std::fs::create_dir_all(out_dir()).unwrap();
@@ -59,7 +69,7 @@ fn gate(o: &Outcome, what: &str, ok: bool, detail: &str) {
         .unwrap();
     f.write_all(line.as_bytes()).unwrap();
     assert!(
-        ok,
+        ok || !hard,
         "{} {}: {what} 未达标（{detail}）",
         o.name,
         o.codec.name()
@@ -104,17 +114,28 @@ fn finish(o: &Outcome) {
     );
 }
 
-/// 局域网上的办公操作：两种编码器对比。
-#[test]
-fn office_on_lan() {
-    for codec in [CodecKind::H264, CodecKind::Tile] {
+/// 用产品默认的估计器（卡门槛）和候选的估计器（只报告）各跑一遍。
+fn compare(s: &Scenario) {
+    for estimator in [EstimatorKind::Legacy, EstimatorKind::ClassicV1] {
         let o = run(&Scenario {
-            codec,
-            ..Scenario::new("office-lan", office())
+            estimator,
+            ..s.clone()
         })
         .unwrap();
         finish(&o);
     }
+}
+
+/// 局域网上的办公操作：两种编码器对比。
+#[test]
+fn office_on_lan() {
+    compare(&Scenario::new("office-lan", office()));
+    let tile = run(&Scenario {
+        codec: CodecKind::Tile,
+        ..Scenario::new("office-lan", office())
+    })
+    .unwrap();
+    finish(&tile);
 }
 
 /// 带宽阶梯：20 → 3 → 20 Mbps（ToDesk 切清晰度时卡几秒的场景）。
@@ -136,8 +157,7 @@ fn bandwidth_steps() {
             ],
         )
     };
-    let o = run(&s).unwrap();
-    finish(&o);
+    compare(&s);
 }
 
 /// 突然掉 90% 的带宽，持续 2 秒，再恢复。
@@ -159,19 +179,16 @@ fn sudden_drop() {
             vec![phase(Action::Dragging, 240), phase(Action::Idle, 45)],
         )
     };
-    let o = run(&s).unwrap();
-    finish(&o);
+    compare(&s);
 }
 
 /// 蜂窝网络上的办公操作。
 #[test]
 fn office_on_cellular() {
-    let o = run(&Scenario {
+    compare(&Scenario {
         network: vec![(0, Link::cellular())],
         profile: Profile::CELLULAR,
         start_bps: 2_000_000,
         ..Scenario::new("office-cellular", office())
-    })
-    .unwrap();
-    finish(&o);
+    });
 }
