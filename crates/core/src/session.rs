@@ -17,7 +17,7 @@
 
 use crate::auth::{Auth, Pake, Proofs, Side};
 use crate::crypto::{negotiate, Policy, Suite};
-use crate::proto::{Caps, Control, RejectReason, VERSION};
+use crate::proto::{Caps, Control, RejectReason, MIN_VERSION, VERSION};
 use crate::trace::{Stage, TraceId, Tracer};
 use crate::{Error, Time};
 
@@ -321,7 +321,8 @@ impl Session {
         }
 
         tracer.record(now, self.trace, Stage::HelloReceived, device_id);
-        if version != VERSION {
+        // 比自己新的版本也接受：新版本对老版本只用双方都有的能力。
+        if version < MIN_VERSION {
             return Ok(vec![self.reject(now, RejectReason::Version, tracer)]);
         }
         let Ok(suite) = negotiate(&self.cfg.policy, suites) else {

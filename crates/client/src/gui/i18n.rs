@@ -24,6 +24,55 @@ pub fn lang_for(locale: Option<&str>) -> Lang {
     }
 }
 
+impl Lang {
+    /// 存盘用的代号。
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Zh => "zh",
+            Self::En => "en",
+        }
+    }
+
+    /// 这种语言的用户是否优先走 IPv6 直连：英文（海外，IPv6 普及、质量好）是；
+    /// 中文（国内跨运营商 IPv6 常常比 IPv4 差）只比延迟。
+    #[must_use]
+    pub const fn prefers_ipv6(self) -> bool {
+        matches!(self, Self::En)
+    }
+}
+
+/// 用户在界面里选的语言存在数据目录的这个文件里（`zh` 或 `en`）；没有时跟随系统。
+pub const LANG_FILE: &str = "lang.txt";
+
+/// 用户选过的语言；没选过（或文件读不懂）时为 `None`。
+#[must_use]
+pub fn saved_lang(dir: &std::path::Path) -> Option<Lang> {
+    match std::fs::read_to_string(dir.join(LANG_FILE)).ok()?.trim() {
+        "zh" => Some(Lang::Zh),
+        "en" => Some(Lang::En),
+        _ => None,
+    }
+}
+
+/// 记住用户选的语言。
+pub fn save_lang(dir: &std::path::Path, lang: Lang) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    std::fs::write(dir.join(LANG_FILE), lang.code())
+}
+
+/// 实际使用的语言：`PEERDESK_LANG` 环境变量优先，其次用户选过的，最后跟随系统。
+#[must_use]
+pub fn effective_lang(dir: &std::path::Path) -> Lang {
+    let forced = std::env::var("PEERDESK_LANG")
+        .ok()
+        .filter(|v| !v.is_empty());
+    match forced {
+        Some(f) => lang_for(Some(&f)),
+        None => saved_lang(dir).unwrap_or_else(system_lang),
+    }
+}
+
 /// 当前系统的界面语言。`PEERDESK_LANG` 可以覆盖（例如 `en`、`zh`）。
 #[must_use]
 pub fn system_lang() -> Lang {
@@ -338,11 +387,30 @@ mod tests {
     #[test]
     fn environment_overrides_the_system() {
         // 只有这个测试改 PEERDESK_LANG。
+        let dir = std::env::temp_dir().join(format!("peerdesk-lang-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         std::env::set_var("PEERDESK_LANG", "zh_CN");
         assert_eq!(system_lang(), Lang::Zh);
+        save_lang(&dir, Lang::En).unwrap();
+        assert_eq!(effective_lang(&dir), Lang::Zh, "环境变量优先于用户选择");
         std::env::set_var("PEERDESK_LANG", "en");
         assert_eq!(system_lang(), Lang::En);
         std::env::remove_var("PEERDESK_LANG");
         let _ = system_lang();
+        // 没有环境变量时用用户选的
+        assert_eq!(effective_lang(&dir), Lang::En);
+        save_lang(&dir, Lang::Zh).unwrap();
+        assert_eq!(effective_lang(&dir), Lang::Zh);
+        std::fs::write(dir.join(LANG_FILE), "fr").unwrap();
+        assert_eq!(saved_lang(&dir), None);
+        let _ = effective_lang(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn language_codes_and_ipv6_preference() {
+        assert_eq!((Lang::Zh.code(), Lang::En.code()), ("zh", "en"));
+        assert!(Lang::En.prefers_ipv6());
+        assert!(!Lang::Zh.prefers_ipv6());
     }
 }

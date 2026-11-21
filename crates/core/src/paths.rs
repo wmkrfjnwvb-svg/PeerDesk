@@ -16,6 +16,9 @@ pub const PING_MAGIC: &[u8; 8] = b"PDPING01";
 pub const PING_LEN: usize = 37;
 /// 中继的额外代价（微秒）：直连只要不比中继慢这么多，就用直连。
 pub const RELAY_PENALTY_US: u64 = 30_000;
+/// 穿过 NAT 的 IPv4 直连（映射端口、打洞、对端反射地址）比 IPv6 直连多算的代价（微秒）。
+/// IPv6 没有 NAT：映射不会过期，路由器不会换端口，长时间会话更稳；海外 IPv6 普及，优先用它。
+pub const NAT_PENALTY_US: u64 = 10_000;
 /// 探测阶段的时间安排（微秒）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
@@ -25,6 +28,8 @@ pub struct Limits {
     pub direct_wait_us: u64,
     /// 总时限：到时还没有任何回应就放弃。
     pub budget_us: u64,
+    /// 穿过 NAT 的 IPv4 直连比 IPv6 多算的代价（微秒），见 [`NAT_PENALTY_US`]；0 表示只比延迟。
+    pub nat_penalty_us: u64,
 }
 
 impl Limits {
@@ -33,6 +38,7 @@ impl Limits {
         settle_us: 300_000,
         direct_wait_us: 1_500_000,
         budget_us: 2_000_000,
+        nat_penalty_us: NAT_PENALTY_US,
     };
     /// 有一端是难打洞的 NAT：公网地址基本不会通，只等局域网、IPv6、端口映射这些快路径，
     /// 早点交给多端口打洞（整个连接仍在 5 秒内）。
@@ -40,6 +46,7 @@ impl Limits {
         settle_us: 200_000,
         direct_wait_us: 1_000_000,
         budget_us: 1_200_000,
+        nat_penalty_us: NAT_PENALTY_US,
     };
 }
 
@@ -215,12 +222,13 @@ pub struct Measured {
     pub first_us: u64,
 }
 
-/// 路径的综合代价：往返时间，中继再加上 [`RELAY_PENALTY_US`]；相同时按种类排（局域网优先）。
-fn score(m: &Measured) -> (u64, PathKind) {
-    let penalty = if m.candidate.kind.direct() {
-        0
-    } else {
-        RELAY_PENALTY_US
+/// 路径的综合代价：往返时间，中继再加上 [`RELAY_PENALTY_US`]，穿过 NAT 的 IPv4 直连加上
+/// [`NAT_PENALTY_US`]；相同时按种类排（局域网优先，其次 IPv6）。
+fn score(m: &Measured, nat_penalty_us: u64) -> (u64, PathKind) {
+    let penalty = match m.candidate.kind {
+        PathKind::Lan | PathKind::Ipv6 => 0,
+        PathKind::Mapped | PathKind::Public | PathKind::PeerReflexive => nat_penalty_us,
+        PathKind::Relay => RELAY_PENALTY_US,
     };
     (m.rtt_us.saturating_add(penalty), m.candidate.kind)
 }
@@ -228,7 +236,16 @@ fn score(m: &Measured) -> (u64, PathKind) {
 /// 已测到的路径里最好的一条。
 #[must_use]
 pub fn best(measured: &[Measured]) -> Option<Measured> {
-    measured.iter().min_by_key(|m| score(m)).copied()
+    best_with(measured, NAT_PENALTY_US)
+}
+
+/// 同 [`best`]，穿过 NAT 的 IPv4 直连多算 `nat_penalty_us`。
+#[must_use]
+pub fn best_with(measured: &[Measured], nat_penalty_us: u64) -> Option<Measured> {
+    measured
+        .iter()
+        .min_by_key(|m| score(m, nat_penalty_us))
+        .copied()
 }
 
 /// 探测进行到 `elapsed_us` 时该怎么办。
@@ -251,7 +268,7 @@ pub fn decide(
     elapsed_us: u64,
     limits: Limits,
 ) -> Decision {
-    let Some(top) = best(measured) else {
+    let Some(top) = best_with(measured, limits.nat_penalty_us) else {
         return if elapsed_us >= limits.budget_us {
             Decision::GiveUp
         } else {
@@ -352,6 +369,16 @@ mod tests {
         assert_eq!(pick.candidate.kind, PathKind::Lan, "一样快时局域网优先");
         let pick = best(&[m(PathKind::Public, 20, 0), m(PathKind::Ipv6, 12, 0)]).unwrap();
         assert_eq!(pick.candidate.kind, PathKind::Ipv6);
+        // IPv6 优先：比打洞的 IPv4 慢 8 ms 仍用 IPv6，慢 15 ms 才用 IPv4
+        let pick = best(&[m(PathKind::Public, 20, 0), m(PathKind::Ipv6, 28, 0)]).unwrap();
+        assert_eq!(pick.candidate.kind, PathKind::Ipv6, "IPv6 只慢 8 ms");
+        let pick = best(&[m(PathKind::Mapped, 20, 0), m(PathKind::Ipv6, 35, 0)]).unwrap();
+        assert_eq!(pick.candidate.kind, PathKind::Mapped, "IPv6 慢 15 ms");
+        let pick = best(&[m(PathKind::Lan, 5, 0), m(PathKind::Ipv6, 5, 0)]).unwrap();
+        assert_eq!(pick.candidate.kind, PathKind::Lan, "局域网仍然最优先");
+        // 不偏向 IPv6 时只比延迟
+        let pick = best_with(&[m(PathKind::Public, 20, 0), m(PathKind::Ipv6, 28, 0)], 0).unwrap();
+        assert_eq!(pick.candidate.kind, PathKind::Public);
     }
 
     #[test]

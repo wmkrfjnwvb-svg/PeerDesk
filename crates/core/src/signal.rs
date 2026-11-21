@@ -598,7 +598,8 @@ impl SignalMsg {
             },
             other => return Err(Error::UnknownMessage(other)),
         };
-        r.finish()?;
+        // 兼容：新版本可以在消息末尾追加字段，老版本读完认识的部分，忽略后面的。
+        let _ = r;
         Ok(msg)
     }
 }
@@ -1069,7 +1070,11 @@ mod tests {
             })
         );
         assert_eq!(SignalMsg::decode(&[0]), Err(Error::UnknownMessage(0)));
-        assert_eq!(SignalMsg::decode(&[1, 0, 0]), Err(Error::TrailingBytes(1)));
+        // 末尾多出来的字节是新版本追加的字段，忽略
+        assert_eq!(
+            SignalMsg::decode(&[1, 0, 0]),
+            Ok(SignalMsg::Register { locals: vec![] })
+        );
         assert_eq!(
             SignalMsg::decode(&[2, 9]),
             Err(Error::Inconsistent("未知的地址族"))

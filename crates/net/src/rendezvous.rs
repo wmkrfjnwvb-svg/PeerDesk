@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use peerdesk_core::paths::{Candidate, Limits, PathKind};
+use peerdesk_core::paths::{Candidate, Limits, PathKind, NAT_PENALTY_US};
 use peerdesk_core::relay::{parse_notice, unwrap, wrap, SessionId, RELAY_HEADER};
 use peerdesk_core::signal::{
     format_code, observe_packet, PunchInfo, PunchPlan, RelayGrant, SignalMsg,
@@ -21,6 +21,21 @@ use crate::{Fingerprint, Link, NetError, Node};
 
 /// 被控端向控制端的候选地址发 ping 的时长（控制端探测加多端口打洞都在这之内）。
 const PINGING_TIME: Duration = Duration::from_millis(5000);
+/// 是否优先 IPv6 直连（见 [`peerdesk_core::paths::NAT_PENALTY_US`]）。默认是（海外优先）。
+static PREFER_IPV6: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// 设置是否优先 IPv6 直连。客户端按界面语言设置：英文（海外）优先 IPv6；中文只比延迟
+/// （国内 IPv6 跨运营商时延迟和丢包常常比 IPv4 差）。
+pub fn set_prefer_ipv6(on: bool) {
+    PREFER_IPV6.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 当前是否优先 IPv6 直连。
+#[must_use]
+pub fn prefer_ipv6() -> bool {
+    PREFER_IPV6.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// 一端难打洞时，先让快路径试这么久再开始多端口打洞（和 `Limits::HARD` 的等待一致）。
 const HARD_HEAD_START: Duration = Duration::from_millis(1000);
 /// 普通打洞时，等这么久控制端还没连上来，被控端就开始多端口打洞（和 `Limits::NORMAL` 的等待一致）。
@@ -592,10 +607,14 @@ async fn dial_on(
         });
     }
     // 有一端难打洞（包括两端都难）时，公网地址基本不会通，只等快路径。
-    let limits = if plan == PunchPlan::Plain {
+    let base = if plan == PunchPlan::Plain {
         Limits::NORMAL
     } else {
         Limits::HARD
+    };
+    let limits = Limits {
+        nat_penalty_us: if prefer_ipv6() { NAT_PENALTY_US } else { 0 },
+        ..base
     };
     let probing = Instant::now();
     let direct_allowed = !matches!(policy, PathPolicy::RelayOnly);
@@ -774,6 +793,14 @@ async fn birthday(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
     use super::*;
+
+    #[test]
+    fn ipv6_preference_defaults_on() {
+        // 其他测试并行运行，这里只写默认值，不改变它们看到的行为。
+        assert!(prefer_ipv6());
+        set_prefer_ipv6(true);
+        assert!(prefer_ipv6());
+    }
 
     #[test]
     fn local_ip_covers_both_families() {

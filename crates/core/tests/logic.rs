@@ -3,7 +3,7 @@
 
 use peerdesk_core::auth::Auth;
 use peerdesk_core::crypto::{Policy, Suite};
-use peerdesk_core::proto::{Caps, Control, RejectReason, VERSION};
+use peerdesk_core::proto::{Caps, Control, RejectReason, MIN_VERSION, VERSION};
 use peerdesk_core::session::{Role, Session, SessionConfig, State};
 use peerdesk_core::trace::{Stage, TraceId, Tracer};
 use peerdesk_core::{Error, Time};
@@ -121,10 +121,32 @@ fn hello_can_be_resent_and_accept_is_idempotent() {
 }
 
 #[test]
-fn host_rejects_wrong_version() {
+fn host_accepts_newer_versions_with_common_caps_only() {
+    // 新版本的控制端连老版本被控端（这里反过来模拟：对方版本更高、能力位更多）：照常建立，
+    // 只用双方都有的能力。
     let (_, mut h, mut t) = pair(Policy::recommended(), Policy::recommended());
     let hello = Control::Hello {
         version: VERSION + 1,
+        device_id: 10,
+        caps: Caps(u32::MAX),
+        region: "us".into(),
+        suites: vec![Suite::Aes256Gcm],
+    };
+    let out = h.on_control(Time(0), &hello, &mut t).unwrap();
+    assert!(
+        matches!(
+            out.as_slice(),
+            [Control::Accept { .. }] | [Control::AuthStart { .. }]
+        ),
+        "{out:?}"
+    );
+}
+
+#[test]
+fn host_rejects_versions_below_the_minimum() {
+    let (_, mut h, mut t) = pair(Policy::recommended(), Policy::recommended());
+    let hello = Control::Hello {
+        version: MIN_VERSION - 1,
         device_id: 10,
         caps: Caps::H264,
         region: "us".into(),

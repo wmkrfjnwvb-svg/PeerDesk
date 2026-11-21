@@ -393,7 +393,7 @@ async fn application_level_rejection_and_protocol_errors() {
     use peerdesk_net::stream::{read_control, write_control, write_kind, StreamKind};
     write_kind(&mut send, StreamKind::Control).await.unwrap();
     let hello = peerdesk_core::proto::Control::Hello {
-        version: 99,
+        version: 0,
         device_id: 1,
         caps: Caps::H264,
         region: "x".into(),

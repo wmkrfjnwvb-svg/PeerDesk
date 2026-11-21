@@ -9,8 +9,14 @@ use crate::{Error, Time};
 
 /// 包头魔数。
 pub const MAGIC: u8 = 0x50;
-/// 协议版本。
+/// 协议版本（包头和握手里的版本号）。
+///
+/// 兼容规则（见 `docs/compat.md`）：新功能一律用 [`Caps`] 里的能力位协商，两端都支持才开启，
+/// 版本号不变，新旧版本照常互通。只有无法兼容的改动才升版本号，这时被控端仍接受
+/// [`MIN_VERSION`] 及以上的所有版本（包括比自己新的），只有低于它才拒绝（要求升级）。
 pub const VERSION: u8 = 1;
+/// 还能连的最老版本。低于它才拒绝连接、提示升级。
+pub const MIN_VERSION: u8 = 1;
 /// 包头长度。
 pub const HEADER_LEN: usize = 20;
 /// 视频分片头长度。
@@ -231,6 +237,15 @@ impl Caps {
     pub const AV1: Caps = Caps(1 << 2);
     /// 4:4:4 色度。
     pub const YUV444: Caps = Caps(1 << 3);
+
+    // 第 16 位起是功能能力位。老版本不发这些位，协商后的交集里也就没有，对应功能自动关闭。
+    /// 剪贴板同步。
+    pub const CLIPBOARD: Caps = Caps(1 << 16);
+    /// 声音。
+    pub const AUDIO: Caps = Caps(1 << 17);
+
+    /// 本版本支持的全部能力。
+    pub const ALL: Caps = Caps(Self::H264.0 | Self::CLIPBOARD.0 | Self::AUDIO.0);
 
     /// 并集。
     #[must_use]
@@ -490,7 +505,11 @@ impl Control {
             }
             other => return Err(Error::UnknownMessage(other)),
         };
-        r.finish()?;
+        // 握手消息可以带扩展字段：老版本读到自己认识的部分就够了，后面的忽略。
+        // 其他消息要求恰好用完全部字节。
+        if !matches!(msg, Control::Hello { .. } | Control::Accept { .. }) {
+            r.finish()?;
+        }
         Ok(msg)
     }
 }

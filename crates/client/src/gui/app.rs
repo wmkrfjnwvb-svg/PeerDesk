@@ -16,7 +16,7 @@ use peerdesk_net::Identity;
 use peerdesk_platform::guide::{guide, Guide, Os};
 
 use super::form::{parse_pin, parse_port, ConnectForm, Target, DEFAULT_PORT};
-use super::i18n::{strings, system_lang, Strings};
+use super::i18n::{effective_lang, save_lang, strings, Lang, Strings};
 use super::netinfo::lan_addresses;
 use super::recent::RecentStore;
 use super::session::{start_host, start_view, HostConfig, HostEvent, HostHandle, Repaint};
@@ -35,7 +35,9 @@ const GUIDE_REFRESH: Duration = Duration::from_secs(1);
 
 /// 打开图形界面，直到窗口关闭。返回进程退出码。
 pub fn run() -> u8 {
-    let s = strings(system_lang());
+    let lang = effective_lang(&default_data_dir());
+    peerdesk_net::rendezvous::set_prefer_ipv6(lang.prefers_ipv6());
+    let s = strings(lang);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(s.app_title)
@@ -89,6 +91,28 @@ struct App {
 }
 
 impl App {
+    /// 中文 / English 切换：立即生效并记住；英文（海外）同时优先走 IPv6 直连。
+    fn language_switch(&mut self, ui: &mut egui::Ui) {
+        let current = if std::ptr::eq(self.s, strings(Lang::Zh)) {
+            Lang::Zh
+        } else {
+            Lang::En
+        };
+        let mut chosen = current;
+        // 从右往左排：先放 English
+        ui.selectable_value(&mut chosen, Lang::En, "English");
+        ui.selectable_value(&mut chosen, Lang::Zh, "中文");
+        if chosen != current {
+            self.s = strings(chosen);
+            peerdesk_net::rendezvous::set_prefer_ipv6(chosen.prefers_ipv6());
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::Title(self.s.app_title.to_owned()));
+            if let Err(e) = save_lang(&self.data_dir, chosen) {
+                self.status = Status::error(e.to_string());
+            }
+        }
+    }
+
     fn new(ctx: &egui::Context, s: &'static Strings) -> Self {
         let (defs, _font) = fonts::definitions();
         ctx.set_fonts(defs);
@@ -565,7 +589,12 @@ impl eframe::App for App {
             } else {
                 ui.visuals().text_color()
             };
-            ui.colored_label(color, &self.status.text);
+            ui.horizontal(|ui| {
+                ui.colored_label(color, &self.status.text);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    self.language_switch(ui);
+                });
+            });
         });
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
