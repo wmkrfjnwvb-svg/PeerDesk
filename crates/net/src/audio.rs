@@ -242,3 +242,66 @@ impl AudioPlayback for Recorder {
             .push(pcm.to_vec());
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    #[test]
+    fn receiver_handles_good_bad_and_missing_packets() {
+        let rec = Arc::new(Recorder::default());
+        let mut rx = Receiver::new(PlaybackHandle(rec.clone())).unwrap();
+        // 还没收到包：播静音等待
+        rx.tick();
+        assert_eq!(rec.frames().len(), 1);
+        assert!(rec.frames()[0].iter().all(|&s| s == 0));
+        // 解不开的数据报计入坏包
+        rx.on_datagram(0, &[1, 2]);
+        assert_eq!(rx.bad(), 1);
+        // 正常的包
+        let mut enc = AudioEncoder::new(DEFAULT_BPS).unwrap();
+        for seq in 0..8u32 {
+            let frame = enc.encode(&[1000; FRAME_SAMPLES]).unwrap();
+            let p = AudioPacket {
+                seq,
+                capture_us: u64::from(seq) * 10_000,
+                frame,
+                redundant: vec![],
+            };
+            rx.on_datagram(u64::from(seq) * 10_000, &p.encode().unwrap());
+        }
+        // Opus 数据是坏的：这一帧放静音并计数
+        let broken = AudioPacket {
+            seq: 8,
+            capture_us: 80_000,
+            frame: vec![0xff; 3],
+            redundant: vec![],
+        };
+        rx.on_datagram(80_000, &broken.encode().unwrap());
+        for _ in 0..12 {
+            rx.tick();
+        }
+        // 9 个包一起到，超过目标的部分加速丢掉，其余正常播放
+        let st = rx.stats();
+        assert!(st.normal + st.accelerated >= 8, "{st:?}");
+        assert!(st.accelerated > 0, "{st:?}");
+        assert_eq!(rx.bad(), 2);
+        assert!(rx.target_ms() >= peerdesk_core::audio::MIN_TARGET_MS);
+        assert!(format!("{rx:?}").contains("Receiver"));
+    }
+
+    #[test]
+    fn handles_are_printable() {
+        let cap = CaptureHandle(Arc::new(ToneCapture));
+        let play = PlaybackHandle(Arc::new(Recorder::default()));
+        let (_tx, on) = tokio::sync::watch::channel(false);
+        let out = AudioOut {
+            playback: play.clone(),
+            on,
+        };
+        assert_eq!(format!("{cap:?}"), "CaptureHandle");
+        assert_eq!(format!("{play:?}"), "PlaybackHandle");
+        assert!(format!("{out:?}").contains("on: false"));
+    }
+}

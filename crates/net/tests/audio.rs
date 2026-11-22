@@ -37,7 +37,10 @@ fn energy(pcm: &[i16]) -> f64 {
 }
 
 /// 跑一次会话：`host_caps` 是被控端声明的能力。返回录音器和开关。
-async fn session_with(host_caps: Caps) -> (Arc<Recorder>, watch::Sender<bool>, impl FnOnce()) {
+async fn session_with(
+    host_caps: Caps,
+    host_has_audio: bool,
+) -> (Arc<Recorder>, watch::Sender<bool>, impl FnOnce()) {
     let any: SocketAddr = ([127, 0, 0, 1], 0).into();
     let (host_id, ctrl_id) = (Identity::generate().unwrap(), Identity::generate().unwrap());
     let policy = Policy::recommended();
@@ -49,7 +52,7 @@ async fn session_with(host_caps: Caps) -> (Arc<Recorder>, watch::Sender<bool>, i
     let (host_link, ctrl_link) = (h.unwrap().unwrap(), c.unwrap());
 
     let mut opts = HostOptions::new(session(&host_id, host_caps), 30, std::env::temp_dir());
-    opts.audio = Some(CaptureHandle(Arc::new(ToneCapture)));
+    opts.audio = host_has_audio.then(|| CaptureHandle(Arc::new(ToneCapture)));
     let host_task = tokio::spawn(host::serve(
         host_link,
         opts,
@@ -87,7 +90,7 @@ async fn session_with(host_caps: Caps) -> (Arc<Recorder>, watch::Sender<bool>, i
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sound_is_off_by_default_then_plays_continuously() {
-    let (recorder, switch, stop) = session_with(Caps::AUDIO).await;
+    let (recorder, switch, stop) = session_with(Caps::AUDIO, true).await;
     // 默认关：什么都不播
     tokio::time::sleep(Duration::from_millis(400)).await;
     assert!(recorder.frames().is_empty());
@@ -119,9 +122,18 @@ async fn sound_is_off_by_default_then_plays_continuously() {
 #[tokio::test(flavor = "multi_thread")]
 async fn old_host_without_sound_support_plays_nothing() {
     // 被控端是不支持声音的老版本：开关无效，会话照常
-    let (recorder, switch, stop) = session_with(Caps(0)).await;
+    let (recorder, switch, stop) = session_with(Caps(0), true).await;
     switch.send(true).unwrap();
     tokio::time::sleep(Duration::from_millis(600)).await;
     assert!(recorder.frames().is_empty());
+    stop();
+    // 被控端声明支持但没有声音来源（例如没有声卡）：拒绝声音流，控制端只播等待的静音
+    let (recorder, switch, stop) = session_with(Caps::AUDIO, false).await;
+    switch.send(true).unwrap();
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(recorder.frames().iter().all(|f| energy(f) < 1.0));
+    // 远程窗口关掉、开关被丢弃：会话照常，不再理会开关
+    drop(switch);
+    tokio::time::sleep(Duration::from_millis(200)).await;
     stop();
 }
