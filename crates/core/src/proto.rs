@@ -667,7 +667,7 @@ mod tests {
         assert!(!Channel::Video.reliable());
         assert!(!Channel::Input.reliable());
         assert!(!Channel::Cursor.reliable());
-        assert_eq!(Channel::from_id(6), Err(Error::UnknownChannel(6)));
+        assert_eq!(Channel::from_id(7), Err(Error::UnknownChannel(7)));
     }
 
     #[test]
