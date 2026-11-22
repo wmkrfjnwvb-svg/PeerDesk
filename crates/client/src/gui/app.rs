@@ -113,6 +113,8 @@ struct App {
     page: Page,
     show_password: bool,
     toast: Option<(String, Instant)>,
+    /// 连接表单的错误（显示在连接按钮下面，改了输入就消失）。
+    form_error: Option<String>,
     status_text: String,
     status_since: Instant,
     perms: peerdesk_platform::PermissionStatus,
@@ -217,6 +219,7 @@ impl App {
             },
             show_password: false,
             toast: None,
+            form_error: None,
             status_text: String::new(),
             status_since: Instant::now(),
             perms,
@@ -296,7 +299,11 @@ impl App {
                 let remember = Some((self.form.remembered(), pin));
                 self.connect(target, remember);
             }
-            Err(e) => self.status = Status::error(e),
+            Err(e) => {
+                // 表单的错误就近显示在连接按钮下面
+                self.form_error = Some(e.clone());
+                self.status = Status::error(e);
+            }
         }
     }
 
@@ -605,6 +612,9 @@ impl App {
         let mut go = false;
         let r = big_input(ui, p, &mut self.form.addr, s.code_hint, false);
         go |= r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        if r.changed() {
+            self.form_error = None;
+        }
         ui.add_space(4.0);
         let r = big_input(ui, p, &mut self.form_password, s.password_input_hint, true);
         go |= r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -629,6 +639,13 @@ impl App {
             || (go && ready)
         {
             self.connect_from_form();
+        }
+        if let Some(e) = &self.form_error {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(icon::WARNING).color(p.danger));
+                ui.label(RichText::new(e).size(12.5).color(p.danger));
+            });
         }
     }
 
@@ -812,7 +829,10 @@ impl App {
                     Err(e) => Status::error(e),
                     Ok(_) => match self.server.save(&self.data_dir) {
                         // 本机正在被控：下次开启时用新服务器登记。
-                        Ok(()) => Status::info(s.saved),
+                        Ok(()) => {
+                            self.toast = Some((s.saved.to_owned(), Instant::now()));
+                            Status::info(s.saved)
+                        }
                         Err(e) => Status::error(e.to_string()),
                     },
                 };
