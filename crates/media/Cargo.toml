@@ -10,6 +10,7 @@ rust-version.workspace = true
 peerdesk-core.workspace = true
 openh264 = { version = "0.9.10", default-features = false }
 openh264-sys2 = { version = "0.9.10", default-features = false }
+opus = "0.4"
 
 [features]
 # 从源码编译 OpenH264（开发、测试、CI）。发布版改为运行时加载 Cisco 官方的二进制（以后加 `libloading`）。

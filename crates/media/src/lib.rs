@@ -16,6 +16,7 @@ use openh264::encoder::{
 };
 use openh264::formats::{YUVSlices, YUVSource};
 
+pub mod audio;
 mod color;
 use openh264::OpenH264API;
 use peerdesk_core::error::Error;

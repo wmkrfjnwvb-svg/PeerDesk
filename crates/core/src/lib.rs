@@ -17,6 +17,7 @@
 //! - [`config`]：客户端与服务端配置。
 
 pub mod adaptive;
+pub mod audio;
 pub mod auth;
 pub mod billing;
 pub mod clipboard;
