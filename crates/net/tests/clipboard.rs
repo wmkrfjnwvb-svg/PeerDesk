@@ -296,3 +296,24 @@ async fn identical_content_on_both_sides_is_not_rewritten() {
     })
     .await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_large_copy_survives_writes_that_take_longer_than_a_poll() {
+    // 15 MB 的图片：写一块要等对方读走（流量控制），比 100 ms 的轮询间隔长。
+    // 原来写到一半被轮询打断后整块重写，流里的数据错位，剪贴板同步断掉（CI 上复现）。
+    session_with(Caps::CLIPBOARD, true, true, |host, ctrl| async move {
+        let big = Clip {
+            kind: ClipKind::Png,
+            data: (0..15u32 << 20)
+                .map(|i| u8::try_from(i % 251).unwrap())
+                .collect(),
+        };
+        ctrl.copy(big.clone());
+        arrives(&host, &big).await;
+        // 之后同步照常
+        let after = Clip::text("after");
+        ctrl.copy(after.clone());
+        arrives(&host, &after).await;
+    })
+    .await;
+}

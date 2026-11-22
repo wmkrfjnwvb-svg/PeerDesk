@@ -180,9 +180,13 @@ pub async fn run(
     let mut tick = tokio::time::interval(POLL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut buf = vec![0u8; 64 * 1024];
+    // 正在写的一条消息（编码后的字节，已写到第几个字节）。一条消息一旦开始写就要写完，
+    // 否则流里的数据就错位了；新的复制只作废还没开始写的消息。
+    let mut outgoing: Option<(Vec<u8>, usize)> = None;
     loop {
-        // 有待发的消息时一条一条地发，每条之间也能读对方的消息、发现新的复制（新的复制会作废旧的）。
-        let next = sender.peek();
+        if outgoing.is_none() {
+            outgoing = sender.next_msg().map(|msg| (msg.frame(), 0));
+        }
         tokio::select! {
             biased;
             read = recv.read(&mut buf) => {
@@ -252,14 +256,22 @@ pub async fn run(
                     }
                 }
             }
+            // 用可以取消的 write（没写进去就是一个字节都没写），记着写到哪里：
+            // 其他分支先就绪时这次写被取消，下一轮接着写。原来用 write_all，被取消时已经写了一部分，
+            // 下一轮又整条重写，流里的数据错位，剪贴板同步就断了（慢网络、大图片、文件时出现）。
             written = async {
-                match &next {
-                    Some(msg) => send.write_all(&msg.frame()).await,
+                match &outgoing {
+                    Some((bytes, at)) => send.write(bytes.get(*at..).unwrap_or_default()).await,
                     None => std::future::pending().await,
                 }
             } => {
-                written.map_err(|e| NetError::Closed(e.to_string()))?;
-                let _ = sender.next_msg();
+                let n = written.map_err(|e| NetError::Closed(e.to_string()))?;
+                if let Some((bytes, at)) = outgoing.as_mut() {
+                    *at += n;
+                    if *at >= bytes.len() {
+                        outgoing = None;
+                    }
+                }
             }
         }
     }
