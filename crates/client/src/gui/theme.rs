@@ -125,6 +125,8 @@ pub fn visuals(p: &Palette) -> Visuals {
     v.widgets.active.weak_bg_fill = p.accent_soft;
     v.widgets.active.bg_stroke = Stroke::new(1.0_f32, p.accent);
     v.text_cursor.stroke = Stroke::new(2.0_f32, p.accent);
+    // 能点的东西都显示手形指针
+    v.interact_cursor = Some(egui::CursorIcon::PointingHand);
     v
 }
 
@@ -372,8 +374,59 @@ pub fn big_input(
     )
 }
 
+/// 程序图标（窗口、任务栏）：品牌蓝圆角方块里一个白色显示器。返回 `size × size` 的 RGBA。
+#[must_use]
+pub fn app_icon(size: u32) -> Vec<u8> {
+    let n = f32::from(u16::try_from(size).unwrap_or(256));
+    let mut out = Vec::with_capacity(usize::try_from(size * size * 4).unwrap_or(0));
+    let radius = n * 0.22;
+    // 显示器：屏幕外框、底座
+    let screen = (n * 0.22, n * 0.26, n * 0.78, n * 0.64);
+    let border = n * 0.06;
+    let stand = (n * 0.44, n * 0.64, n * 0.56, n * 0.74);
+    let base = (n * 0.34, n * 0.73, n * 0.66, n * 0.78);
+    let inside =
+        |r: (f32, f32, f32, f32), x: f32, y: f32| x >= r.0 && x < r.2 && y >= r.1 && y < r.3;
+    for py in 0..size {
+        for px in 0..size {
+            let (x, y) = (
+                f32::from(u16::try_from(px).unwrap_or(0)) + 0.5,
+                f32::from(u16::try_from(py).unwrap_or(0)) + 0.5,
+            );
+            // 圆角方块：到最近角圆心的距离
+            let cx = x.clamp(radius, n - radius);
+            let cy = y.clamp(radius, n - radius);
+            let d = ((x - cx).powi(2) + (y - cy).powi(2)).sqrt();
+            let alpha = (radius + 0.5 - d).clamp(0.0, 1.0);
+            let frame = inside(screen, x, y)
+                && !inside(
+                    (
+                        screen.0 + border,
+                        screen.1 + border,
+                        screen.2 - border,
+                        screen.3 - border,
+                    ),
+                    x,
+                    y,
+                );
+            let white = frame || inside(stand, x, y) || inside(base, x, y);
+            let (r, g, b) = if white {
+                (255, 255, 255)
+            } else {
+                (0x3B, 0x6C, 0xF6)
+            };
+            // 0..=1 乘 255，在 u8 范围内
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let a = (alpha * 255.0).round() as u8;
+            out.extend_from_slice(&[r, g, b, a]);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::indexing_slicing)]
     use super::*;
 
     /// 在无界面的 egui 里跑一帧。
@@ -430,6 +483,17 @@ mod tests {
         assert_eq!(ctx.theme(), Theme::Light);
         Appearance::System.apply(&ctx);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn icon_has_a_transparent_corner_and_white_monitor() {
+        let size = 64;
+        let px = app_icon(size);
+        assert_eq!(px.len(), 64 * 64 * 4);
+        let at = |x: usize, y: usize| &px[(y * 64 + x) * 4..(y * 64 + x) * 4 + 4];
+        assert_eq!(at(0, 0)[3], 0, "圆角外透明");
+        assert_eq!(at(32, 5), [0x3B, 0x6C, 0xF6, 255], "品牌蓝");
+        assert_eq!(at(16, 30), [255, 255, 255, 255], "显示器外框");
     }
 
     #[test]

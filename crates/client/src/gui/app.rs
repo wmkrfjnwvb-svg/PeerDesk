@@ -35,6 +35,14 @@ use crate::{EXIT_FAILED, EXIT_OK};
 
 /// 自测模式：启动后自动开启被控、再连接本机。值为 `host` 时只开启被控。CI 用它截图。
 const SELFTEST_ENV: &str = "PEERDESK_GUI_SELFTEST";
+/// 窗口图标的边长（像素）。
+const ICON_SIZE: u32 = 128;
+/// 首页两张卡片的最小高度（两张一样高）。
+const CARD_HEIGHT: f32 = 250.0;
+/// 复制等操作的轻提示显示多久。
+const TOAST: Duration = Duration::from_millis(1500);
+/// 普通的状态信息显示多久（错误一直显示，直到下一条）。
+const STATUS_FADE: Duration = Duration::from_secs(6);
 /// 启动时打开哪一页（home、devices、settings、permissions），截图用。
 const PAGE_ENV: &str = "PEERDESK_GUI_PAGE";
 /// 预览 macOS 授权引导的环境变量（值是 macOS 主版本号）。
@@ -51,6 +59,11 @@ pub fn run() -> u8 {
         viewport: egui::ViewportBuilder::default()
             .with_title(s.app_title)
             .with_app_id("peerdesk")
+            .with_icon(egui::IconData {
+                rgba: theme::app_icon(ICON_SIZE),
+                width: ICON_SIZE,
+                height: ICON_SIZE,
+            })
             .with_inner_size([1000.0, 680.0])
             .with_min_inner_size([820.0, 560.0]),
         renderer: eframe::Renderer::Glow,
@@ -99,6 +112,9 @@ struct App {
     repaint: Repaint,
     page: Page,
     show_password: bool,
+    toast: Option<(String, Instant)>,
+    status_text: String,
+    status_since: Instant,
     perms: peerdesk_platform::PermissionStatus,
     /// 预览 macOS 引导（在别的系统上截图用）：权限一律当作没有。
     preview_mac: bool,
@@ -200,6 +216,9 @@ impl App {
                 Ok(_) | Err(_) => Page::Home,
             },
             show_password: false,
+            toast: None,
+            status_text: String::new(),
+            status_since: Instant::now(),
             perms,
             preview_mac,
             appearance,
@@ -389,7 +408,40 @@ impl App {
 
     fn copy(&mut self, ui: &egui::Ui, text: &str, shown: &str) {
         ui.ctx().copy_text(text.to_owned());
-        self.status = Status::info(format!("{} {shown}", self.s.copied));
+        let _ = shown;
+        self.toast = Some((self.s.copied.to_owned(), Instant::now()));
+    }
+
+    /// 轻提示（例如“已复制”）：内容区底部居中，一会儿就消失。
+    fn show_toast(&mut self, ctx: &egui::Context, p: &Palette) {
+        let Some((text, at)) = &self.toast else {
+            return;
+        };
+        if at.elapsed() > TOAST {
+            self.toast = None;
+            return;
+        }
+        let text = text.clone();
+        egui::Area::new(egui::Id::new("toast"))
+            .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(100.0, -48.0))
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(if p.dark {
+                        Color32::from_rgb(0x2A, 0x31, 0x3D)
+                    } else {
+                        Color32::from_rgb(0x1B, 0x23, 0x30)
+                    })
+                    .corner_radius(18)
+                    .inner_margin(egui::Margin::symmetric(16, 8))
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new(format!("{}  {text}", icon::CHECK_CIRCLE))
+                                .color(Color32::WHITE),
+                        );
+                    });
+            });
+        ctx.request_repaint_after(Duration::from_millis(100));
     }
 
     fn host_state(&self, p: &Palette) -> (&'static str, Color32) {
@@ -438,30 +490,37 @@ impl App {
 
         // 设备码（登记到服务器后才有）
         let _ = muted(ui, p, s.device_code);
-        ui.horizontal(|ui| match self.device_code {
-            Some(code) => {
-                let shown = format_code(code);
-                ui.label(RichText::new(&shown).monospace().size(30.0).strong());
-                if icon_button(ui, icon::COPY, s.copy).clicked() {
-                    self.copy(ui, &code.to_string(), &shown);
+        ui.horizontal(|ui| {
+            ui.set_min_height(40.0);
+            match self.device_code {
+                Some(code) => {
+                    let shown = format_code(code);
+                    ui.label(RichText::new(&shown).monospace().size(30.0).strong());
+                    if icon_button(ui, icon::COPY, s.copy).clicked() {
+                        self.copy(ui, &code.to_string(), &shown);
+                    }
+                }
+                // 没设服务器就没有设备码：引导去设置（局域网里仍可以用地址直连）
+                None if !self.server.is_set() => {
+                    let link = egui::Button::new(
+                        RichText::new(format!("{}  {}", s.server_unset, icon::ARROW_RIGHT))
+                            .size(14.0)
+                            .color(p.accent),
+                    )
+                    .frame(false);
+                    if ui.add(link).clicked() {
+                        self.page = Page::Settings;
+                    }
+                }
+                None if self.phase.is_on() => {
+                    ui.add(egui::Spinner::new().size(16.0).color(p.muted));
+                    let _ = muted(ui, p, s.code_pending);
+                }
+                None => {
+                    ui.label(RichText::new(s.host_off).size(16.0).color(p.muted));
                 }
             }
-            None => {
-                ui.label(RichText::new("— — —").monospace().size(30.0).color(p.muted));
-            }
         });
-        if self.device_code.is_none() && !self.server.is_set() {
-            // 没设服务器就没有设备码：引导去设置（局域网里仍可以用地址直连）
-            let link = egui::Button::new(
-                RichText::new(format!("{}  {}", s.server_unset, icon::ARROW_RIGHT))
-                    .size(12.5)
-                    .color(p.accent),
-            )
-            .frame(false);
-            if ui.add(link).clicked() {
-                self.page = Page::Settings;
-            }
-        }
         ui.add_space(10.0);
 
         // 密码
@@ -573,48 +632,63 @@ impl App {
         }
     }
 
-    /// 最近连接过的设备（小卡片，点一下填进连接表单）。
+    /// 最近连接过的设备（小卡片）：单击填进连接表单，双击直接连接。
     fn recent_strip(&mut self, ui: &mut egui::Ui, p: &Palette, limit: usize) {
         let s = self.s;
         let items: Vec<_> = self.recent.items().iter().take(limit).cloned().collect();
         if items.is_empty() {
-            let _ = muted(ui, p, s.no_recent);
+            empty_state(ui, p, icon::CLOCK_COUNTER_CLOCKWISE, s.no_recent);
             return;
         }
         let mut pick = None;
-        ui.horizontal_wrapped(|ui| {
+        let mut go = false;
+        // 顶端对齐、放不下就换行
+        let layout = egui::Layout::left_to_right(egui::Align::TOP).with_main_wrap(true);
+        ui.with_layout(layout, |ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
             for item in items {
-                let fp = if item.pin.is_empty() {
-                    String::new()
-                } else {
-                    short_fingerprint(&item.pin)
-                };
+                let (title, is_code) = item.title();
+                let kind = if is_code { s.device_code } else { s.ip_direct };
+                let id = ui.id().with(("recent", &item.addr));
+                let hovered = ui
+                    .ctx()
+                    .memory(|m| m.data.get_temp::<bool>(id))
+                    .unwrap_or(false);
                 let response = egui::Frame::new()
                     .fill(p.card)
-                    .stroke(egui::Stroke::new(1.0_f32, p.border))
+                    .stroke(egui::Stroke::new(
+                        1.0_f32,
+                        if hovered { p.accent } else { p.border },
+                    ))
                     .corner_radius(10)
                     .inner_margin(12)
                     .show(ui, |ui| {
-                        ui.set_width(190.0);
+                        ui.set_width(196.0);
+                        ui.set_height(40.0);
                         ui.horizontal(|ui| {
                             ui.label(
                                 RichText::new(icon::DESKTOP_TOWER)
-                                    .size(22.0)
+                                    .size(24.0)
                                     .color(p.accent),
                             );
                             ui.vertical(|ui| {
-                                ui.label(RichText::new(&item.addr).strong());
-                                if !fp.is_empty() {
-                                    let _ = muted(ui, p, &fp);
-                                }
+                                ui.label(RichText::new(&title).strong());
+                                let _ = muted(ui, p, kind);
                             });
                         });
                     })
                     .response
                     .interact(egui::Sense::click())
-                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .on_hover_text(s.recent_hint);
+                ui.ctx()
+                    .memory_mut(|m| m.data.insert_temp(id, response.hovered()));
                 if response.clicked() {
                     pick = Some(item.clone());
+                }
+                if response.double_clicked() {
+                    pick = Some(item.clone());
+                    go = true;
                 }
             }
         });
@@ -622,6 +696,9 @@ impl App {
             self.form.addr = item.addr;
             self.form.pin = item.pin;
             self.page = Page::Home;
+            if go {
+                self.connect_from_form();
+            }
         }
     }
 
@@ -632,8 +709,14 @@ impl App {
         self.permission_guide(ui, p);
         ui.columns(2, |cols| {
             if let [left, right] = cols {
-                card(left, p, |ui| self.this_device_card(ui, p));
-                card(right, p, |ui| self.remote_card(ui, p));
+                card(left, p, |ui| {
+                    ui.set_min_height(CARD_HEIGHT);
+                    self.this_device_card(ui, p);
+                });
+                card(right, p, |ui| {
+                    ui.set_min_height(CARD_HEIGHT);
+                    self.remote_card(ui, p);
+                });
             }
         });
         ui.add_space(18.0);
@@ -645,10 +728,61 @@ impl App {
     fn devices_page(&mut self, ui: &mut egui::Ui, p: &Palette) {
         let s = self.s;
         ui.label(RichText::new(s.nav_devices).size(22.0).strong());
+        ui.add_space(4.0);
+        let _ = muted(ui, p, s.devices_hint);
         ui.add_space(14.0);
-        ui.label(RichText::new(s.recent).size(15.0).strong());
-        ui.add_space(6.0);
-        self.recent_strip(ui, p, usize::MAX);
+        let items: Vec<_> = self.recent.items().to_vec();
+        if items.is_empty() {
+            empty_state(ui, p, icon::CLOCK_COUNTER_CLOCKWISE, s.no_recent);
+            return;
+        }
+        let mut connect = None;
+        let mut forget = None;
+        card(ui, p, |ui| {
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    ui.separator();
+                }
+                let (title, is_code) = item.title();
+                ui.horizontal(|ui| {
+                    ui.set_min_height(44.0);
+                    ui.label(
+                        RichText::new(icon::DESKTOP_TOWER)
+                            .size(24.0)
+                            .color(p.accent),
+                    );
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new(&title).strong());
+                        let kind = if is_code { s.device_code } else { s.ip_direct };
+                        let detail = if item.pin.is_empty() {
+                            kind.to_owned()
+                        } else {
+                            format!("{kind}  ·  {}", short_fingerprint(&item.pin))
+                        };
+                        let _ = muted(ui, p, &detail);
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if icon_button(ui, icon::TRASH, s.forget).clicked() {
+                            forget = Some(item.addr.clone());
+                        }
+                        if primary_button(ui, p, s.connect_this, 88.0, true).clicked() {
+                            connect = Some(item.clone());
+                        }
+                    });
+                });
+            }
+        });
+        if let Some(addr) = forget {
+            if let Err(e) = self.recent.forget(&addr) {
+                self.status = Status::error(e.to_string());
+            }
+        }
+        if let Some(item) = connect {
+            // 回到首页、填好表单：可能要输入密码
+            self.form.addr = item.addr;
+            self.form.pin = item.pin;
+            self.page = Page::Home;
+        }
     }
 
     fn settings_page(&mut self, ui: &mut egui::Ui, p: &Palette) {
@@ -1014,6 +1148,11 @@ impl App {
                 (s.server_offline, p.warning)
             };
             ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                let _ = muted(ui, p, &format!("v{}", env!("CARGO_PKG_VERSION")));
+            });
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
                 ui.add_space(6.0);
                 let _ = pill(ui, text, color);
             });
@@ -1021,10 +1160,17 @@ impl App {
     }
 
     /// 内容区底部的状态（最近一次操作的结果）。
-    fn status_line(&self, ui: &mut egui::Ui, p: &Palette) {
-        if self.status.text.is_empty() {
+    fn status_line(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        // 新的状态从现在开始计时；普通信息几秒后淡出，错误一直显示
+        if self.status_text != self.status.text {
+            self.status_text.clone_from(&self.status.text);
+            self.status_since = Instant::now();
+        }
+        let faded = !self.status.error && self.status_since.elapsed() > STATUS_FADE;
+        if self.status.text.is_empty() || faded {
             return;
         }
+        ui.ctx().request_repaint_after(STATUS_FADE);
         let (glyph, color) = if self.status.error {
             (icon::WARNING, p.danger)
         } else {
@@ -1088,7 +1234,10 @@ impl eframe::App for App {
                     .fill(p.bg)
                     .inner_margin(egui::Margin::symmetric(28, 8)),
             )
-            .show(ctx, |ui| self.status_line(ui, &p));
+            .show(ctx, |ui| {
+                ui.set_min_height(20.0);
+                self.status_line(ui, &p);
+            });
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
@@ -1104,6 +1253,7 @@ impl eframe::App for App {
                 });
             });
 
+        self.show_toast(ctx, &p);
         let s = self.s;
         let mut remembered = Vec::new();
         self.views.retain_mut(|(viewer, remember)| {
@@ -1126,4 +1276,21 @@ impl eframe::App for App {
         }
         self.stop_hosting();
     }
+}
+
+/// 空列表时的提示：大图标 + 一句话，居中。
+fn empty_state(ui: &mut egui::Ui, p: &Palette, glyph: &str, text: &str) {
+    card(ui, p, |ui| {
+        ui.vertical_centered(|ui| {
+            ui.add_space(12.0);
+            ui.label(
+                RichText::new(glyph)
+                    .size(36.0)
+                    .color(p.muted.gamma_multiply(0.7)),
+            );
+            ui.add_space(6.0);
+            let _ = muted(ui, p, text);
+            ui.add_space(12.0);
+        });
+    });
 }

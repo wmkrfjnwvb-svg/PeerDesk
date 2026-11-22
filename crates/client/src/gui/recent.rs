@@ -9,6 +9,19 @@ pub const MAX: usize = 8;
 /// 文件名。
 pub const FILE: &str = "recent_hosts.txt";
 
+impl Recent {
+    /// 卡片上显示的标题：设备码按“三位一组”显示，地址原样显示；以及是不是设备码。
+    #[must_use]
+    pub fn title(&self) -> (String, bool) {
+        match peerdesk_core::signal::parse_code(&self.addr) {
+            Some(code) if !self.addr.contains(':') => {
+                (peerdesk_core::signal::format_code(code), true)
+            }
+            Some(_) | None => (self.addr.clone(), false),
+        }
+    }
+}
+
 /// 一条记录。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Recent {
@@ -69,6 +82,12 @@ impl RecentStore {
         self.save()
     }
 
+    /// 删掉一条记录。
+    pub fn forget(&mut self, addr: &str) -> std::io::Result<()> {
+        self.items.retain(|r| r.addr != addr);
+        self.save()
+    }
+
     fn save(&self) -> std::io::Result<()> {
         if let Some(dir) = self.path.parent() {
             std::fs::create_dir_all(dir)?;
@@ -85,6 +104,27 @@ impl RecentStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn titles_and_forgetting() {
+        let code = Recent {
+            addr: "339166837".into(),
+            pin: String::new(),
+        };
+        assert_eq!(code.title(), ("339 166 837".into(), true));
+        let ip = Recent {
+            addr: "192.168.1.20:4433".into(),
+            pin: String::new(),
+        };
+        assert_eq!(ip.title(), ("192.168.1.20:4433".into(), false));
+        let dir = temp_dir("forget");
+        let mut store = RecentStore::load(&dir);
+        store.remember("339166837", "").unwrap();
+        store.remember("10.0.0.1:4433", "").unwrap();
+        store.forget("339166837").unwrap();
+        assert_eq!(RecentStore::load(&dir).items().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir =

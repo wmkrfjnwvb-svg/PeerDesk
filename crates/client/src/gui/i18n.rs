@@ -285,6 +285,16 @@ pub struct Strings {
     pub perm_banner: &'static str,
     /// 首页按钮
     pub perm_start: &'static str,
+    /// 设备码获取中
+    pub code_pending: &'static str,
+    /// IP 直连
+    pub ip_direct: &'static str,
+    /// 最近连接提示
+    pub recent_hint: &'static str,
+    /// 设备页说明
+    pub devices_hint: &'static str,
+    /// 删除记录
+    pub forget: &'static str,
     /// 助手：助手。
     pub assistant: &'static str,
     /// 助手：开始菜单。
@@ -460,6 +470,11 @@ pub const ZH: Strings = Strings {
     perm_done: "现在别人可以远程控制这台 Mac 了。",
     perm_banner: "这台 Mac 还需要授权，别人才能远程控制它",
     perm_start: "开始设置",
+    code_pending: "正在获取设备码…",
+    ip_direct: "IP 直连",
+    recent_hint: "单击填入，双击直接连接",
+    devices_hint: "连接过的设备会出现在这里",
+    forget: "删除",
     clip_remote_too_large: "对方复制的内容太大（{mb} MB），没有同步过来；文件超过 20 MB 请用文件传输",
     assistant: "助手",
     sc_start: "开始菜单",
@@ -619,6 +634,11 @@ pub const EN: Strings = Strings {
     perm_done: "Others can now control this Mac remotely.",
     perm_banner: "This Mac needs permission before others can control it",
     perm_start: "Set up",
+    code_pending: "Getting device code…",
+    ip_direct: "Direct IP",
+    recent_hint: "Click to fill in, double-click to connect",
+    devices_hint: "Devices you have connected to",
+    forget: "Remove",
     clip_remote_too_large: "Content copied on the remote ({mb} MB) is too large to sync; use file transfer for files over 20 MB",
     assistant: "Assistant",
     sc_start: "Start menu",
