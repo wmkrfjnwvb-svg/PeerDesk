@@ -12,6 +12,16 @@
 - 顺带修了：Windows 上同一端口能开两个被控端；被控端拒绝文件时控制端偶发报错；
   端口映射测试里只在 Linux 成立的假设。
 
+## 浮动助手（已完成第一版）
+- 12 个常用快捷键按被控端系统自动选键（被控端在 Accept 能力字段第 24–26 位带上系统；老版本显示“未知”）、全屏、统计、断开。
+- 还差：声音开关（等真实声卡接好）、剪贴板开关、文件传输入口、画质/帧率、切换显示器。
+
+## 声音（会话链路已通，真实声卡未接）
+- 已有：Opus 编解码、声音数据报（RED 冗余）、NetEQ 式抖动缓冲 v1（整帧加速/减速）、会话里的声音流和开关（默认关）。
+- 端到端测试：合成声音 → 录音器，连续无静音、开关、老版本兼容。
+- 下一步：控制端 cpal 播放；被控端采集（Windows WASAPI loopback、macOS ScreenCaptureKit、Linux PipeWire/Pulse monitor）；
+  CI 要装 libasound2-dev；助手里加声音开关；之后做 WSOLA 时间伸缩、按丢包自适应冗余。
+
 ## 调研已完成（待据此排期）
 - docs/research/G-unattended.md 无人值守、锁屏、无显示器
 - docs/research/H-audio.md 声音（NetEQ 式抖动缓冲、Opus、RED）
