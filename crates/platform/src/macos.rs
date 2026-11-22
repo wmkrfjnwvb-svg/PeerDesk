@@ -902,3 +902,184 @@ impl InputSink for MacInput {
         }
     }
 }
+
+// ---------------------------------------------------------------- 系统声音（ScreenCaptureKit，macOS 13 起）
+
+/// CoreAudio 的 AudioBuffer（只读其中的数据指针和长度）。
+#[repr(C)]
+struct AudioBufferRaw {
+    channels: u32,
+    bytes: u32,
+    data: *mut c_void,
+}
+
+/// 最多两个缓冲（双声道分开存放时每个声道一个）。
+#[repr(C)]
+struct AudioBufferList2 {
+    count: u32,
+    buffers: [AudioBufferRaw; 2],
+}
+
+#[link(name = "CoreMedia", kind = "framework")]
+extern "C" {
+    fn CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+        sbuf: *const c_void,
+        size_needed: *mut usize,
+        list: *mut AudioBufferList2,
+        list_size: usize,
+        struct_alloc: *const c_void,
+        block_alloc: *const c_void,
+        flags: u32,
+        block_out: *mut *const c_void,
+    ) -> i32;
+}
+
+/// 从声音样本里取出交错的浮点采样（双声道）。格式不是预期的浮点时返回 `None`。
+fn audio_samples(sample: &CMSampleBuffer) -> Option<Vec<f32>> {
+    let mut list = AudioBufferList2 {
+        count: 0,
+        buffers: [
+            AudioBufferRaw {
+                channels: 0,
+                bytes: 0,
+                data: std::ptr::null_mut(),
+            },
+            AudioBufferRaw {
+                channels: 0,
+                bytes: 0,
+                data: std::ptr::null_mut(),
+            },
+        ],
+    };
+    let mut block: *const c_void = std::ptr::null();
+    // SAFETY: 传入有效的样本和足够大的 AudioBufferList（两个缓冲）；系统写入列表并返回 retain 过的块缓冲，
+    // 用完后 CFRelease。标志 1 = 要求 16 字节对齐。
+    let status = unsafe {
+        CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+            std::ptr::from_ref(sample).cast(),
+            std::ptr::null_mut(),
+            &mut list,
+            std::mem::size_of::<AudioBufferList2>(),
+            std::ptr::null(),
+            std::ptr::null(),
+            1,
+            &mut block,
+        )
+    };
+    if status != 0 || block.is_null() {
+        return None;
+    }
+    let slice = |b: &AudioBufferRaw| -> &[f32] {
+        if b.data.is_null() {
+            return &[];
+        }
+        // SAFETY: 系统给出的缓冲在块缓冲释放前有效；ScreenCaptureKit 的声音是 32 位浮点，长度按字节数换算。
+        unsafe {
+            std::slice::from_raw_parts(
+                b.data.cast::<f32>(),
+                usize::try_from(b.bytes).unwrap_or(0) / 4,
+            )
+        }
+    };
+    let out = match list.count {
+        // 两个声道分开存放：交错
+        2 => {
+            let (l, r) = (slice(&list.buffers[0]), slice(&list.buffers[1]));
+            l.iter().zip(r).flat_map(|(a, b)| [*a, *b]).collect()
+        }
+        // 一个缓冲：已经交错（双声道）或单声道
+        1 if list.buffers[0].channels >= 2 => slice(&list.buffers[0]).to_vec(),
+        1 => slice(&list.buffers[0])
+            .iter()
+            .flat_map(|v| [*v, *v])
+            .collect(),
+        _ => Vec::new(),
+    };
+    // SAFETY: 释放上面拿到的块缓冲（retain 过的）。
+    unsafe { CFRelease(block) };
+    Some(out)
+}
+
+/// 系统声音采集：持有它期间一直在采，丢弃时停止。
+pub(crate) struct AudioGrabber {
+    stream: Retained<SCStream>,
+    _output: Retained<StreamOutput>,
+    _queue: DispatchRetained<DispatchQueue>,
+}
+
+impl Drop for AudioGrabber {
+    fn drop(&mut self) {
+        let stream = &self.stream;
+        // SAFETY: 完成回调是有效的 block。
+        let _ =
+            wait_completion(|done| unsafe { stream.stopCaptureWithCompletionHandler(Some(done)) });
+    }
+}
+
+/// 开始采集本机正在播放的声音（不含本程序自己的声音，避免回声）。`on_samples` 收到交错的
+/// 双声道 48 kHz 浮点采样。需要 macOS 13 和“屏幕录制”权限。
+pub(crate) fn open_audio(
+    on_samples: Box<dyn Fn(&[f32]) + Send + Sync>,
+) -> Result<AudioGrabber, String> {
+    if !objc2::available!(macos = 13.0) {
+        return Err("远程声音需要 macOS 13 或更新的系统".into());
+    }
+    require_screen_permission().map_err(|e| e.to_string())?;
+    let d = display(0).map_err(|e| e.to_string())?;
+    let target = shareable_display(d.id).map_err(|e| e.to_string())?;
+    // SAFETY: 新建并填写一个采集配置。画面只要 2×2、每秒 1 帧（不用，只是 ScreenCaptureKit 要求有画面）。
+    let config = unsafe {
+        let c = SCStreamConfiguration::new();
+        c.setWidth(2);
+        c.setHeight(2);
+        c.setMinimumFrameInterval(CMTime::new(1, 1));
+        c.setCapturesAudio(true);
+        c.setSampleRate(48_000);
+        c.setChannelCount(2);
+        c.setExcludesCurrentProcessAudio(true);
+        c
+    };
+    let output = StreamOutput::new(Handlers {
+        on_sample: Box::new(move |sample, kind| {
+            if kind != SCStreamOutputType::Audio {
+                return;
+            }
+            if let Some(samples) = audio_samples(sample) {
+                on_samples(&samples);
+            }
+        }),
+        on_stop: Box::new(|why| peerdesk_net::note!(warn, "声音：系统停止了声音采集：{why}")),
+    });
+    let queue = DispatchQueue::new("com.peerdesk.audio", None);
+    // SAFETY: 用整个显示器、上面的配置和回调对象创建采集流。
+    let stream = unsafe {
+        let filter = SCContentFilter::initWithDisplay_excludingWindows(
+            SCContentFilter::alloc(),
+            &target,
+            &NSArray::new(),
+        );
+        SCStream::initWithFilter_configuration_delegate(
+            SCStream::alloc(),
+            &filter,
+            &config,
+            Some(ProtocolObject::from_ref(&*output)),
+        )
+    };
+    // SAFETY: 回调对象和队列都由 AudioGrabber 持有，生命周期不短于流。
+    unsafe {
+        stream.addStreamOutput_type_sampleHandlerQueue_error(
+            ProtocolObject::from_ref(&*output),
+            SCStreamOutputType::Audio,
+            Some(&queue),
+        )
+    }
+    .map_err(|e| format!("SCStream addStreamOutput 失败：{}", error_code(&e)))?;
+    // SAFETY: 完成回调是有效的 block。
+    wait_completion(|done| unsafe { stream.startCaptureWithCompletionHandler(Some(done)) })
+        .map_err(|e| format!("无法开始声音采集：{e}"))?;
+    Ok(AudioGrabber {
+        stream,
+        _output: output,
+        _queue: queue,
+    })
+}

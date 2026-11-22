@@ -4,8 +4,8 @@
 //! - 采集系统声音：
 //!   - Windows：WASAPI 回环（在默认输出设备上开输入流，cpal 自动用回环模式）；
 //!   - Linux：PulseAudio/PipeWire 的“默认输出的监听源”（`@DEFAULT_MONITOR@`），经 ALSA 的 pulse 插件；
-//!   - macOS：系统不允许普通程序直接录系统声音，要用 ScreenCaptureKit（macOS 13 起），下一步接入；
-//!     现在明确报错，不静默。
+//!   - macOS：系统不允许普通程序直接录系统声音，用 ScreenCaptureKit（macOS 13 起，需要“屏幕录制”权限），
+//!     不录本程序自己的声音（避免回声）。
 //!
 //! 测试构建不会打开声卡（不碰开发者电脑的声卡），在各平台实机上验证。
 
@@ -151,11 +151,6 @@ pub fn system_playback() -> PlaybackHandle {
 #[derive(Debug, Default)]
 pub struct SystemCapture;
 
-#[cfg(target_os = "macos")]
-fn capture_device() -> Result<cpal::Device, String> {
-    Err("macOS 的系统声音采集还在开发中（需要 ScreenCaptureKit），这一版暂不提供远程声音".into())
-}
-
 #[cfg(windows)]
 fn capture_device() -> Result<cpal::Device, String> {
     // 在输出设备上开输入流，cpal 用 WASAPI 回环模式录下正在播放的声音
@@ -180,50 +175,92 @@ fn capture_device() -> Result<cpal::Device, String> {
         })
 }
 
+/// 采集线程：把声卡的采样切成会话用的帧，发到 `tx`。
+#[cfg(not(target_os = "macos"))]
+fn start_capture(tx: mpsc::Sender<Vec<i16>>) -> Result<StreamThread, String> {
+    run_stream("peerdesk-audio-in", move || {
+        let device = capture_device()?;
+        #[cfg(windows)]
+        let config = device.default_output_config();
+        #[cfg(not(windows))]
+        let config = device.default_input_config();
+        let config = config.map_err(|e| format!("读不到声卡格式：{e}"))?;
+        let (rate, channels) = (config.sample_rate().0, config.channels());
+        peerdesk_net::note!(
+            info,
+            "声音：采集 {} {rate} Hz {channels} 声道",
+            device.name().unwrap_or_default()
+        );
+        let mut framer = ToFrames::new(rate, channels);
+        device
+            .build_input_stream(
+                &config.config(),
+                move |data: &[f32], _| {
+                    for frame in framer.push(data) {
+                        // 会话处理不过来时丢帧，不阻塞声卡回调
+                        let _ = tx.try_send(frame);
+                    }
+                },
+                |e| peerdesk_net::note!(warn, "声音：采集出错：{e}"),
+                None,
+            )
+            .map_err(|e| format!("打不开声音采集：{e}"))
+    })
+}
+
+/// macOS：系统不允许普通程序直接录系统声音，用 ScreenCaptureKit（macOS 13 起）。
+#[cfg(target_os = "macos")]
+fn start_capture(tx: mpsc::Sender<Vec<i16>>) -> Result<StreamThread, String> {
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+    std::thread::Builder::new()
+        .name("peerdesk-audio-in".to_owned())
+        .spawn(move || {
+            let framer = Mutex::new(ToFrames::new(48_000, 2));
+            let grabber = crate::macos::open_audio(Box::new(move |samples| {
+                let frames = framer
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(samples);
+                for frame in frames {
+                    let _ = tx.try_send(frame);
+                }
+            }));
+            match grabber {
+                Ok(grabber) => {
+                    let _ = ready_tx.send(Ok(()));
+                    let _ = stop_rx.recv();
+                    drop(grabber);
+                }
+                Err(e) => {
+                    let _ = ready_tx.send(Err(e));
+                }
+            }
+        })
+        .map_err(|e| format!("启动声音线程失败：{e}"))?;
+    ready_rx
+        .recv()
+        .map_err(|_| "声音线程意外退出".to_owned())??;
+    Ok(StreamThread {
+        stop: Some(stop_tx),
+    })
+}
+
 impl AudioCapture for SystemCapture {
     fn start(&self) -> Result<mpsc::Receiver<Vec<i16>>, String> {
-        let (tx, rx) = mpsc::channel(32);
-        let thread = run_stream("peerdesk-audio-in", move || {
-            let device = capture_device()?;
-            #[cfg(windows)]
-            let config = device.default_output_config();
-            #[cfg(not(windows))]
-            let config = device.default_input_config();
-            let config = config.map_err(|e| format!("读不到声卡格式：{e}"))?;
-            let (rate, channels) = (config.sample_rate().0, config.channels());
-            peerdesk_net::note!(
-                info,
-                "声音：采集 {} {rate} Hz {channels} 声道",
-                device.name().unwrap_or_default()
-            );
-            let mut framer = ToFrames::new(rate, channels);
-            device
-                .build_input_stream(
-                    &config.config(),
-                    move |data: &[f32], _| {
-                        for frame in framer.push(data) {
-                            // 会话处理不过来时丢帧，不阻塞声卡回调
-                            let _ = tx.try_send(frame);
-                        }
-                    },
-                    |e| peerdesk_net::note!(warn, "声音：采集出错：{e}"),
-                    None,
-                )
-                .map_err(|e| format!("打不开声音采集：{e}"))
-        })?;
-        // 流跟着接收端走：会话丢掉接收端（停止发送）后，下一次回调发送失败……
-        // cpal 的流要显式停：把线程句柄挂在一个跟随接收端生命周期的任务上。
-        let (guard_tx, guard_rx) = mpsc::channel::<Vec<i16>>(32);
-        let mut rx = rx;
+        let (tx, mut rx) = mpsc::channel(32);
+        let thread = start_capture(tx)?;
+        // 采集线程跟着接收端走：会话丢掉接收端（停止发送）后，转发任务结束，线程句柄随之丢弃，声卡关闭。
+        let (out_tx, out_rx) = mpsc::channel::<Vec<i16>>(32);
         tokio::spawn(async move {
             let _thread = thread;
             while let Some(frame) = rx.recv().await {
-                if guard_tx.send(frame).await.is_err() {
+                if out_tx.send(frame).await.is_err() {
                     break;
                 }
             }
         });
-        Ok(guard_rx)
+        Ok(out_rx)
     }
 }
 
