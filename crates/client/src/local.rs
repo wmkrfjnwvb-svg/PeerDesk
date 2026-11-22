@@ -39,6 +39,14 @@ pub fn check_local() -> Result<(), String> {
     Ok(())
 }
 
+/// Windows 上锁屏、登录界面、管理员权限提示（安全桌面）时普通程序采集不到屏幕。
+const LOCKED_HINT: &str = if cfg!(windows) {
+    "。如果这台电脑已锁屏、在登录界面或弹出了管理员权限提示，当前版本还不能远程这些界面\
+     （需要以系统服务运行，即将支持），请先在本机解锁"
+} else {
+    ""
+};
+
 /// 本机屏幕的画面来源。打不开时返回给用户看的原因。
 pub fn local_screen() -> Result<Box<dyn ScreenSource>, String> {
     opened_screen((SYSTEM.0)(CaptureOptions::default()))
@@ -47,7 +55,7 @@ pub fn local_screen() -> Result<Box<dyn ScreenSource>, String> {
 fn opened_screen(
     opened: Result<Box<dyn ScreenSource>, PlatformError>,
 ) -> Result<Box<dyn ScreenSource>, String> {
-    opened.map_err(|e| format!("无法采集本机屏幕：{e}"))
+    opened.map_err(|e| format!("无法采集本机屏幕：{e}{LOCKED_HINT}"))
 }
 
 /// 本机的输入注入：先交给 `tap` 记录（界面上显示收到了什么），再注入系统。

@@ -147,6 +147,8 @@ pub enum HostEvent {
     Established,
     /// 本机屏幕或键鼠打不开（多半是没有权限）：不提供远程，被控已关闭。带着原因。
     Unavailable(String),
+    /// 有人来连，但这时屏幕打不开（例如锁屏、登录界面）：拒绝这一次，继续等待下一次。带着原因。
+    Refused(String),
     /// 会话结束：结束原因，或者失败原因（例如密码错误）。
     SessionEnded(Result<String, NetError>),
     /// 连接握手失败。
@@ -402,14 +404,16 @@ async fn host_main(
             )
         };
         seed = seed.wrapping_add(1);
-        // 会话开始时屏幕或键鼠打不开了（例如权限被撤销）：拒绝这次连接，停止被控。
+        // 这时屏幕或键鼠打不开（锁屏、登录界面、权限被撤销……）：拒绝这一次连接并告诉对方原因，
+        // 继续等待下一次（原来会直接停止被控，设备从此离线）。
         let opened = local_screen().and_then(|s| Ok((s, local_input(Arc::clone(&shared.tap))?)));
         let (screen, input) = match opened {
             Ok(opened) => opened,
             Err(why) => {
-                link.close("host cannot share its screen");
-                ev.send(HostEvent::Unavailable(why));
-                break;
+                peerdesk_net::note!(warn, "被控：拒绝 {}：{why}", link.remote_addr());
+                link.close(&why);
+                ev.send(HostEvent::Refused(why));
+                continue;
             }
         };
         let source = Watched {

@@ -156,6 +156,8 @@ impl HostPhase {
                 HostPhase::Off,
                 Some(Status::error(format!("{}（{why}）", s.host_unavailable))),
             ),
+            // 只拒绝了这一次，仍在等待连接
+            HostEvent::Refused(why) => (self.clone(), Some(Status::error(why.clone()))),
             HostEvent::SessionEnded(Ok(end)) => (
                 listening(),
                 Some(Status::info(format!("{}：{end}", s.session_ended))),
@@ -478,6 +480,10 @@ mod tests {
             port: 1,
             ipv6: false,
         };
+        // 只拒绝这一次（例如锁屏）：仍在等待连接，状态栏说明原因
+        let (still, why) = listening.apply(&HostEvent::Refused("locked".into()), s);
+        assert_eq!(still, listening);
+        assert!(why.unwrap().error);
         let (phase, status) =
             listening.apply(&HostEvent::Unavailable("screen recording".into()), s);
         assert_eq!(phase, HostPhase::Off, "没有权限：被控关闭");
