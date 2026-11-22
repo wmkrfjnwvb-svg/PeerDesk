@@ -43,17 +43,20 @@ pub enum Channel {
     Clipboard,
     /// 文件。
     File,
+    /// 声音（不可靠，每 10 ms 一个包；只在双方协商出声音能力、控制端打开声音时才有）。
+    Audio,
 }
 
 impl Channel {
     /// 全部通道，按优先级从高到低。
-    pub const ALL: [Channel; 6] = [
+    pub const ALL: [Channel; 7] = [
         Channel::Input,
         Channel::Control,
         Channel::Cursor,
         Channel::Video,
         Channel::Clipboard,
         Channel::File,
+        Channel::Audio,
     ];
 
     /// 线上编号。
@@ -66,6 +69,7 @@ impl Channel {
             Channel::Video => 3,
             Channel::Clipboard => 4,
             Channel::File => 5,
+            Channel::Audio => 6,
         }
     }
 
@@ -78,6 +82,7 @@ impl Channel {
             3 => Ok(Channel::Video),
             4 => Ok(Channel::Clipboard),
             5 => Ok(Channel::File),
+            6 => Ok(Channel::Audio),
             other => Err(Error::UnknownChannel(other)),
         }
     }
@@ -85,7 +90,16 @@ impl Channel {
     /// 调度优先级，0 最高。
     #[must_use]
     pub const fn priority(self) -> u8 {
-        self.id()
+        // 声音排在画面前面：输入 > 控制 > 光标 > 声音 > 画面 > 剪贴板 > 文件
+        match self {
+            Channel::Input => 0,
+            Channel::Control => 1,
+            Channel::Cursor => 2,
+            Channel::Audio => 3,
+            Channel::Video => 4,
+            Channel::Clipboard => 5,
+            Channel::File => 6,
+        }
     }
 
     /// 是否要求可靠有序送达。
@@ -93,7 +107,7 @@ impl Channel {
     pub const fn reliable(self) -> bool {
         match self {
             Channel::Control | Channel::Clipboard | Channel::File => true,
-            Channel::Input | Channel::Cursor | Channel::Video => false,
+            Channel::Input | Channel::Cursor | Channel::Video | Channel::Audio => false,
         }
     }
 }
@@ -641,8 +655,12 @@ mod tests {
     fn channel_properties() {
         for (i, ch) in Channel::ALL.into_iter().enumerate() {
             assert_eq!(Channel::from_id(ch.id()).unwrap(), ch);
-            assert_eq!(usize::from(ch.priority()), i);
+            assert_eq!(usize::from(ch.id()), i);
         }
+        // 声音优先于画面
+        assert!(Channel::Audio.priority() < Channel::Video.priority());
+        assert!(Channel::Input.priority() < Channel::Audio.priority());
+        assert!(!Channel::Audio.reliable());
         assert!(Channel::File.reliable());
         assert!(Channel::Control.reliable());
         assert!(Channel::Clipboard.reliable());

@@ -58,6 +58,8 @@ pub struct ControllerOptions {
     pub clipboard: Option<crate::clipsync::ClipboardHandle>,
     /// 握手完成时调用，参数是被控端 Accept 里的能力（含被控端的系统，见 `Caps::os`）。
     pub on_established: Option<EstablishedHook>,
+    /// 声音：去向和开关；`None` 表示本机不播放声音。对方不支持声音（老版本）时开关无效。
+    pub audio: Option<crate::audio::AudioOut>,
 }
 
 /// 握手完成时的回调。
@@ -224,6 +226,14 @@ pub async fn run(
         None => None,
     };
 
+    // 声音：开关打开时开一条声音流（开着被控端就发），关掉时关流。
+    let mut audio_switch = opts.audio.clone().filter(|_| caps.has(Caps::AUDIO));
+    let mut audio_stream: Option<quinn::SendStream> = None;
+    let mut audio_rx: Option<crate::audio::Receiver> = None;
+    let mut audio_tick = tokio::time::interval(Duration::from_millis(10));
+    audio_tick.set_missed_tick_behavior(MissedTickBehavior::Burst);
+    let mut audio_changed = audio_switch.is_some();
+
     let mut upload_task = upload.map(|u| {
         let link = Arc::clone(&link);
         tokio::spawn(async move { send_files(&link, &u.root, u.files).await })
@@ -291,8 +301,47 @@ pub async fn run(
                 upload_task = None;
                 upload_result = Some(result.unwrap_or_else(|e| Err(NetError::Io(e.to_string()))));
             }
+            changed = async {
+                match audio_switch.as_mut() {
+                    Some(sw) if !audio_changed => sw.on.changed().await.is_ok(),
+                    Some(_) => true,
+                    None => std::future::pending().await,
+                }
+            } => {
+                audio_changed = false;
+                let Some(sw) = audio_switch.as_ref().filter(|_| changed) else {
+                    audio_switch = None;
+                    continue;
+                };
+                let on = *sw.on.borrow();
+                if on && audio_stream.is_none() {
+                    let (mut send, _recv) = link.open_stream().await?;
+                    write_kind(&mut send, StreamKind::Audio).await?;
+                    audio_stream = Some(send);
+                    audio_rx = Some(crate::audio::Receiver::new(sw.playback.clone())?);
+                    // 关着的时候积下的节拍作废：否则一打开就连播几十帧静音，凭空多出几百毫秒延迟
+                    audio_tick.reset();
+                    crate::note!(info, "声音：打开");
+                } else if !on {
+                    if let Some(mut send) = audio_stream.take() {
+                        let _ = send.finish();
+                        crate::note!(info, "声音：关闭");
+                    }
+                    audio_rx = None;
+                }
+            }
+            _ = audio_tick.tick(), if audio_rx.is_some() => {
+                if let Some(rx) = audio_rx.as_mut() {
+                    rx.tick();
+                }
+            }
             datagram = link.recv() => match datagram {
                 Ok((header, payload)) => match header.channel {
+                    Channel::Audio => {
+                        if let Some(rx) = audio_rx.as_mut() {
+                            rx.on_datagram(link.now().micros(), &payload);
+                        }
+                    }
                     Channel::Video => {
                         let now = link.now();
                         video_since_feedback = video_since_feedback.saturating_add(1);

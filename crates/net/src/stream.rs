@@ -18,6 +18,8 @@ pub enum StreamKind {
     Signal,
     /// 剪贴板同步（双方协商出剪贴板能力才有）。
     Clipboard,
+    /// 声音：控制端打开声音时开，开着被控端就发声音（双方协商出声音能力才有）。
+    Audio,
 }
 
 impl StreamKind {
@@ -27,6 +29,7 @@ impl StreamKind {
             StreamKind::File => 2,
             StreamKind::Signal => 3,
             StreamKind::Clipboard => 4,
+            StreamKind::Audio => 5,
         }
     }
 
@@ -36,6 +39,7 @@ impl StreamKind {
             2 => Some(StreamKind::File),
             3 => Some(StreamKind::Signal),
             4 => Some(StreamKind::Clipboard),
+            5 => Some(StreamKind::Audio),
             _ => None,
         }
     }
@@ -141,10 +145,11 @@ mod tests {
             StreamKind::File,
             StreamKind::Signal,
             StreamKind::Clipboard,
+            StreamKind::Audio,
         ] {
             assert_eq!(StreamKind::from_id(kind.id()), Some(kind));
         }
         assert_eq!(StreamKind::from_id(0), None);
-        assert_eq!(StreamKind::from_id(5), None);
+        assert_eq!(StreamKind::from_id(6), None);
     }
 }

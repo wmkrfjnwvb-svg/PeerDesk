@@ -412,7 +412,11 @@ pub fn run(p: &Params) -> Result<Report, Error> {
                         }
                     }
                 }
-                Channel::Input | Channel::Cursor | Channel::Clipboard | Channel::File => {
+                Channel::Input
+                | Channel::Cursor
+                | Channel::Clipboard
+                | Channel::File
+                | Channel::Audio => {
                     bad_datagrams = bad_datagrams.saturating_add(1);
                 }
             }

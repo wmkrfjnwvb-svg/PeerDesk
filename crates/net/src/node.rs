@@ -390,7 +390,7 @@ pub struct Link {
     conn: quinn::Connection,
     peer: Fingerprint,
     /// 每个通道各自的序号：接收端按通道统计丢包，不同通道的包不能共用一个序号。
-    seq: [AtomicU32; 6],
+    seq: [AtomicU32; 7],
     started: Instant,
 }
 

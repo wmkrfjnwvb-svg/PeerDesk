@@ -696,6 +696,7 @@ async fn connect_session(
             duration: Some(Duration::from_secs(args.seconds)),
             clipboard: None,
             on_established: None,
+            audio: None,
         },
         Box::new(sink.clone()),
         input_rx,

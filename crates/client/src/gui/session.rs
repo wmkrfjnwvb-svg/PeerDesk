@@ -897,6 +897,7 @@ async fn one_session(
                     ev.send(ViewEvent::PeerOs(caps.os()));
                 })))
             },
+            audio: None,
         },
         Box::new(sink),
         input,

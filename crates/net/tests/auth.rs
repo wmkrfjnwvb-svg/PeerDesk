@@ -127,6 +127,7 @@ async fn attempt(
             duration: Some(Duration::from_millis(200)),
             clipboard: None,
             on_established: None,
+            audio: None,
         },
         Box::new(Null),
         rx,
@@ -245,6 +246,7 @@ async fn view_only_and_no_files_permissions_are_enforced() {
             input: false,
             files: false,
             clipboard: false,
+            audio: false,
         }
     };
 
@@ -274,6 +276,7 @@ async fn view_only_and_no_files_permissions_are_enforced() {
             input: true,
             files: true,
             clipboard: true,
+            audio: true,
         }
     );
 }

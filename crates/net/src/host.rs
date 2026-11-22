@@ -74,6 +74,8 @@ pub struct Permissions {
     pub files: bool,
     /// 是否同步剪贴板。
     pub clipboard: bool,
+    /// 是否允许控制端听本机的声音。
+    pub audio: bool,
 }
 
 impl Default for Permissions {
@@ -82,6 +84,7 @@ impl Default for Permissions {
             input: true,
             files: true,
             clipboard: true,
+            audio: true,
         }
     }
 }
@@ -107,6 +110,8 @@ pub struct HostOptions {
     pub recv_root: PathBuf,
     /// 本机剪贴板；`None` 表示不同步剪贴板。
     pub clipboard: Option<ClipboardHandle>,
+    /// 本机声音来源；`None` 表示不提供声音。
+    pub audio: Option<crate::audio::CaptureHandle>,
 }
 
 impl HostOptions {
@@ -123,6 +128,7 @@ impl HostOptions {
             fps,
             recv_root,
             clipboard: None,
+            audio: None,
         }
     }
 }
@@ -295,6 +301,10 @@ pub async fn serve(
         .clipboard
         .clone()
         .filter(|_| opts.permissions.clipboard && caps.has(Caps::CLIPBOARD));
+    let audio = opts
+        .audio
+        .clone()
+        .filter(|_| opts.permissions.audio && caps.has(Caps::AUDIO));
     let (mut input_events, mut bad_datagrams) = (0u64, 0u64);
     let mut input_denied = 0u64;
     let rtt_us = u64::try_from(link.rtt().as_micros()).unwrap_or(u64::MAX);
@@ -372,7 +382,7 @@ pub async fn serve(
                         }
                         Err(_) => bad_datagrams = bad_datagrams.saturating_add(1),
                     },
-                    Channel::Cursor | Channel::Video | Channel::Clipboard | Channel::File => {
+                    Channel::Cursor | Channel::Video | Channel::Clipboard | Channel::File | Channel::Audio => {
                         bad_datagrams = bad_datagrams.saturating_add(1);
                     }
                 },
@@ -384,6 +394,8 @@ pub async fn serve(
                     let root = opts.recv_root.clone();
                     let allowed = opts.permissions.files;
                     let clipboard = clipboard.clone();
+                    let audio = audio.clone();
+                    let link = Arc::clone(&link);
                     let mut clip_stopped = clip_stopped.clone();
                     file_tasks.push(tokio::spawn(async move {
                         match read_kind(&mut recv).await? {
@@ -402,6 +414,29 @@ pub async fn serve(
                                     r = crate::clipsync::run(send, recv, clipboard.0, Limits::DEFAULT) => r?,
                                     _ = clip_stopped.wait_for(|stop| *stop) => {}
                                 }
+                                Ok(Vec::new())
+                            }
+                            StreamKind::Audio => {
+                                let Some(audio) = audio else {
+                                    return Err(NetError::Protocol("没有协商声音，或者本机不允许"));
+                                };
+                                // 声音流开着就一直发：控制端关掉声音（流结束）或会话结束时停
+                                let mut recv = recv;
+                                let closed = async move {
+                                    let mut buf = [0u8; 16];
+                                    while let Ok(Some(_)) = recv.read(&mut buf).await {}
+                                };
+                                let stopped = async move {
+                                    let _ = clip_stopped.wait_for(|stop| *stop).await;
+                                };
+                                let stop = async move {
+                                    tokio::select! {
+                                        () = closed => {}
+                                        () = stopped => {}
+                                    }
+                                };
+                                crate::audio::send(&link, audio.0.as_ref(), stop).await?;
+                                drop(send);
                                 Ok(Vec::new())
                             }
                             StreamKind::Control | StreamKind::Signal => {

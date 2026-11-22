@@ -93,6 +93,7 @@ async fn session_with<F, Fut>(
             on_established: Some(controller::EstablishedHook(Arc::new(move |caps: Caps| {
                 *seen_os.lock().unwrap() = Some(caps.os());
             }))),
+            audio: None,
         },
         Box::new(CountSink::new()),
         rx,
