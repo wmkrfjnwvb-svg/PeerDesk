@@ -114,6 +114,65 @@ fn mac_places(major: u32) -> (String, String) {
     (format!("{root} → {screen}"), format!("{root} → {input}"))
 }
 
+/// macOS 系统设置里相关项目的叫法（画示意图用），按系统版本和界面语言给出。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MacSettingsNames {
+    /// 设置程序的名字（“系统设置”，12 及更早是“系统偏好设置”）。
+    pub app: &'static str,
+    /// 隐私那一栏（“隐私与安全性”，12 及更早是“安全性与隐私”）。
+    pub section: &'static str,
+    /// 屏幕录制那一项（15 起叫“录屏与系统录音”）。
+    pub screen: &'static str,
+    /// 辅助功能那一项。
+    pub input: &'static str,
+    /// 改设置前要先点左下角的锁解锁（12 及更早）。
+    pub unlock: bool,
+}
+
+/// macOS `major` 版本的系统设置里各项的叫法；`english` 为真时用英文系统的叫法。
+#[must_use]
+pub const fn mac_settings_names(major: u32, english: bool) -> MacSettingsNames {
+    let old = major <= 12;
+    match (english, old) {
+        (false, true) => MacSettingsNames {
+            app: "系统偏好设置",
+            section: "安全性与隐私",
+            screen: "屏幕录制",
+            input: "辅助功能",
+            unlock: true,
+        },
+        (false, false) => MacSettingsNames {
+            app: "系统设置",
+            section: "隐私与安全性",
+            screen: if major >= 15 {
+                "录屏与系统录音"
+            } else {
+                "屏幕录制"
+            },
+            input: "辅助功能",
+            unlock: false,
+        },
+        (true, true) => MacSettingsNames {
+            app: "System Preferences",
+            section: "Security & Privacy",
+            screen: "Screen Recording",
+            input: "Accessibility",
+            unlock: true,
+        },
+        (true, false) => MacSettingsNames {
+            app: "System Settings",
+            section: "Privacy & Security",
+            screen: if major >= 15 {
+                "Screen & System Audio Recording"
+            } else {
+                "Screen Recording"
+            },
+            input: "Accessibility",
+            unlock: false,
+        },
+    }
+}
+
 /// 向导：在 `os` 上，权限现状是 `status`，这台设备怎样才能被远程控制。
 #[must_use]
 pub fn guide(os: Os, status: PermissionStatus) -> Guide {
@@ -237,6 +296,30 @@ fn mac_guide(major: u32, minor: u32, status: PermissionStatus) -> Guide {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mac_settings_names_follow_the_version_and_language() {
+        let ventura = mac_settings_names(13, false);
+        assert_eq!(
+            (ventura.app, ventura.section, ventura.screen),
+            ("系统设置", "隐私与安全性", "屏幕录制")
+        );
+        assert!(!ventura.unlock);
+        assert_eq!(mac_settings_names(15, false).screen, "录屏与系统录音");
+        let monterey = mac_settings_names(12, false);
+        assert_eq!(
+            (monterey.app, monterey.section),
+            ("系统偏好设置", "安全性与隐私")
+        );
+        assert!(monterey.unlock);
+        assert_eq!(
+            mac_settings_names(15, true).screen,
+            "Screen & System Audio Recording"
+        );
+        assert_eq!(mac_settings_names(14, true).screen, "Screen Recording");
+        assert_eq!(mac_settings_names(11, true).app, "System Preferences");
+        assert_eq!(mac_settings_names(14, true).input, "Accessibility");
+    }
 
     const NONE: PermissionStatus = PermissionStatus {
         screen_capture: false,

@@ -335,6 +335,9 @@ jobs:
           shot zh host main-zh
           shot en host main-en
           shot zh connect viewer-zh
+          # macOS 授权引导（在 Linux 上预览 macOS 15）和设置页
+          PEERDESK_GUI_PAGE=permissions PEERDESK_GUI_PREVIEW_MAC=15 shot zh host guide-zh
+          PEERDESK_GUI_PAGE=settings shot en host settings-en
           ls -l gui-*.png
       - uses: actions/upload-artifact@v4
         if: always()

@@ -183,6 +183,108 @@ pub struct Strings {
     pub clip_remote_too_large: &'static str,
     /// 复制了文件但对方版本不支持。
     pub clip_files_unsupported: &'static str,
+    /// 远程控制
+    pub nav_home: &'static str,
+    /// 设备
+    pub nav_devices: &'static str,
+    /// 设置
+    pub nav_settings: &'static str,
+    /// 远程控制设备
+    pub remote_card: &'static str,
+    /// 把设备码和密码告诉对方，对方就能连接本机
+    pub this_device_hint: &'static str,
+    /// 输入对方设备码或 IP 地址
+    pub code_hint: &'static str,
+    /// 连接密码
+    pub password_input_hint: &'static str,
+    /// 高级选项
+    pub advanced: &'static str,
+    /// 显示密码
+    pub show_password: &'static str,
+    /// 隐藏密码
+    pub hide_password: &'static str,
+    /// 服务器已连接
+    pub server_online: &'static str,
+    /// 服务器未连接
+    pub server_offline: &'static str,
+    /// 未设置服务器
+    pub server_unset: &'static str,
+    /// 服务器
+    pub section_server: &'static str,
+    /// 网络
+    pub section_network: &'static str,
+    /// 通用
+    pub section_general: &'static str,
+    /// 关于
+    pub section_about: &'static str,
+    /// 语言
+    pub language: &'static str,
+    /// 版本
+    pub version: &'static str,
+    /// 还没有连接过的设备。连接一次后会出现在这里。
+    pub no_recent: &'static str,
+    /// 快捷键
+    pub shortcuts: &'static str,
+    /// 收起工具条
+    pub collapse: &'static str,
+    /// 展开工具条
+    pub expand: &'static str,
+    /// 局域网地址
+    pub lan_addresses: &'static str,
+    /// 开启后，别人可以用设备码连接这台电脑
+    pub host_off_hint: &'static str,
+    /// 连接
+    pub connect_this: &'static str,
+    /// 外观
+    pub appearance: &'static str,
+    /// 跟随系统
+    pub appearance_system: &'static str,
+    /// 浅色
+    pub appearance_light: &'static str,
+    /// 深色
+    pub appearance_dark: &'static str,
+    /// 授权页标题
+    pub perm_title: &'static str,
+    /// 授权页说明
+    pub perm_subtitle: &'static str,
+    /// 屏幕录制的作用
+    pub perm_screen_what: &'static str,
+    /// 辅助功能的作用
+    pub perm_input_what: &'static str,
+    /// 已授权
+    pub perm_granted: &'static str,
+    /// 未授权
+    pub perm_missing: &'static str,
+    /// 第几步
+    pub perm_step: &'static str,
+    /// 步骤：打开
+    pub perm_open_hint: &'static str,
+    /// 步骤：打开开关
+    pub perm_toggle_hint: &'static str,
+    /// 步骤：添加
+    pub perm_add_hint: &'static str,
+    /// 步骤：解锁
+    pub perm_unlock_hint: &'static str,
+    /// 步骤：重开
+    pub perm_relaunch_hint: &'static str,
+    /// 示意图提示
+    pub perm_callout: &'static str,
+    /// 示意图解锁
+    pub perm_unlock: &'static str,
+    /// 按钮：请求授权
+    pub perm_request: &'static str,
+    /// 按钮：打开设置
+    pub perm_open_settings: &'static str,
+    /// 按钮：重开
+    pub perm_relaunch: &'static str,
+    /// 完成标题
+    pub perm_done_title: &'static str,
+    /// 完成说明
+    pub perm_done: &'static str,
+    /// 首页提示
+    pub perm_banner: &'static str,
+    /// 首页按钮
+    pub perm_start: &'static str,
     /// 助手：助手。
     pub assistant: &'static str,
     /// 助手：开始菜单。
@@ -307,6 +409,57 @@ pub const ZH: Strings = Strings {
     account_token: "会员令牌（可选）",
     clip_local_too_large: "复制的内容太大（{mb} MB），没有同步到对方；文件超过 20 MB 请用文件传输",
     clip_files_unsupported: "对方的 PeerDesk 版本不支持复制粘贴文件，请升级对方，或用文件传输",
+    nav_home: "远程控制",
+    nav_devices: "设备",
+    nav_settings: "设置",
+    remote_card: "远程控制设备",
+    this_device_hint: "把设备码和密码告诉对方，对方就能连接本机",
+    code_hint: "输入对方设备码或 IP 地址",
+    password_input_hint: "连接密码",
+    advanced: "高级选项",
+    show_password: "显示密码",
+    hide_password: "隐藏密码",
+    server_online: "服务器已连接",
+    server_offline: "服务器未连接",
+    server_unset: "未设置服务器",
+    section_server: "服务器",
+    section_network: "网络",
+    section_general: "通用",
+    section_about: "关于",
+    language: "语言",
+    version: "版本",
+    no_recent: "还没有连接过的设备。连接一次后会出现在这里。",
+    shortcuts: "快捷键",
+    collapse: "收起工具条",
+    expand: "展开工具条",
+    lan_addresses: "局域网地址",
+    host_off_hint: "开启后，别人可以用设备码连接这台电脑",
+    connect_this: "连接",
+    appearance: "外观",
+    appearance_system: "跟随系统",
+    appearance_light: "浅色",
+    appearance_dark: "深色",
+    perm_title: "授权",
+    perm_subtitle: "这台 Mac 需要以下两项权限，别人才能看到屏幕、操作鼠标键盘。只需设置一次。",
+    perm_screen_what: "让对方看到这台电脑的屏幕",
+    perm_input_what: "让对方操作这台电脑的鼠标和键盘",
+    perm_granted: "已授权",
+    perm_missing: "未授权",
+    perm_step: "第 {n} 步",
+    perm_open_hint: "点下面的按钮，系统会弹出授权提示或打开设置",
+    perm_toggle_hint: "在列表里找到 PeerDesk，打开右边的开关",
+    perm_add_hint: "列表里没有 PeerDesk？点列表下面的“+”，在“应用程序”里选择 PeerDesk",
+    perm_unlock_hint: "先点左下角的锁，输入这台电脑的密码",
+    perm_relaunch_hint: "系统提示“退出并重新打开”时点它；也可以点下面的按钮",
+    perm_callout: "打开这个开关",
+    perm_unlock: "点锁解锁",
+    perm_request: "请求授权",
+    perm_open_settings: "打开系统设置",
+    perm_relaunch: "重新打开 PeerDesk",
+    perm_done_title: "全部设置好了",
+    perm_done: "现在别人可以远程控制这台 Mac 了。",
+    perm_banner: "这台 Mac 还需要授权，别人才能远程控制它",
+    perm_start: "开始设置",
     clip_remote_too_large: "对方复制的内容太大（{mb} MB），没有同步过来；文件超过 20 MB 请用文件传输",
     assistant: "助手",
     sc_start: "开始菜单",
@@ -415,6 +568,57 @@ pub const EN: Strings = Strings {
     account_token: "Member token (optional)",
     clip_local_too_large: "Copied content is too large ({mb} MB) to sync; use file transfer for files over 20 MB",
     clip_files_unsupported: "The remote PeerDesk is too old to copy and paste files; update it, or use file transfer",
+    nav_home: "Remote control",
+    nav_devices: "Devices",
+    nav_settings: "Settings",
+    remote_card: "Control a remote device",
+    this_device_hint: "Share this code and password so others can connect",
+    code_hint: "Enter a device code or IP address",
+    password_input_hint: "Password",
+    advanced: "Advanced",
+    show_password: "Show password",
+    hide_password: "Hide password",
+    server_online: "Server connected",
+    server_offline: "Server not connected",
+    server_unset: "No server set",
+    section_server: "Server",
+    section_network: "Network",
+    section_general: "General",
+    section_about: "About",
+    language: "Language",
+    version: "Version",
+    no_recent: "No devices yet. Devices you connect to will appear here.",
+    shortcuts: "Shortcuts",
+    collapse: "Hide toolbar",
+    expand: "Show toolbar",
+    lan_addresses: "LAN addresses",
+    host_off_hint: "Turn on to let others connect to this computer",
+    connect_this: "Connect",
+    appearance: "Appearance",
+    appearance_system: "System",
+    appearance_light: "Light",
+    appearance_dark: "Dark",
+    perm_title: "Permissions",
+    perm_subtitle: "This Mac needs two permissions so others can see the screen and use the mouse and keyboard. You only do this once.",
+    perm_screen_what: "Lets the other side see this screen",
+    perm_input_what: "Lets the other side use the mouse and keyboard",
+    perm_granted: "Granted",
+    perm_missing: "Not granted",
+    perm_step: "Step {n}",
+    perm_open_hint: "Click the button below. macOS will ask, or open Settings",
+    perm_toggle_hint: "Find PeerDesk in the list and turn on its switch",
+    perm_add_hint: "PeerDesk not in the list? Click “+” below the list and choose PeerDesk in Applications",
+    perm_unlock_hint: "First click the lock at the bottom left and enter your password",
+    perm_relaunch_hint: "When macOS asks to “Quit & Reopen”, click it, or use the button below",
+    perm_callout: "Turn this on",
+    perm_unlock: "Unlock",
+    perm_request: "Ask for permission",
+    perm_open_settings: "Open System Settings",
+    perm_relaunch: "Reopen PeerDesk",
+    perm_done_title: "All set",
+    perm_done: "Others can now control this Mac remotely.",
+    perm_banner: "This Mac needs permission before others can control it",
+    perm_start: "Set up",
     clip_remote_too_large: "Content copied on the remote ({mb} MB) is too large to sync; use file transfer for files over 20 MB",
     assistant: "Assistant",
     sc_start: "Start menu",

@@ -104,6 +104,8 @@ pub fn definitions() -> (FontDefinitions, Option<PathBuf>) {
 
 fn definitions_from(found: Option<(Candidate, Vec<u8>)>) -> (FontDefinitions, Option<PathBuf>) {
     let mut defs = FontDefinitions::default();
+    // Phosphor 图标字体（MIT）：图标按钮、导航用
+    egui_phosphor::add_to_fonts(&mut defs, egui_phosphor::Variant::Regular);
     let used = found.map(|(c, bytes)| {
         install(&mut defs, &c, bytes);
         c.path

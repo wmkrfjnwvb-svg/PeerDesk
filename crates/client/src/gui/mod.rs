@@ -9,6 +9,7 @@ pub mod assistant;
 pub mod coords;
 pub mod fonts;
 pub mod form;
+pub mod guide_art;
 pub mod i18n;
 pub mod input;
 pub mod keys;
@@ -19,6 +20,7 @@ pub mod session;
 pub mod settings;
 pub mod state;
 pub mod stats;
+pub mod theme;
 mod viewer;
 
 pub use app::run;

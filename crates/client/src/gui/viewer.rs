@@ -6,10 +6,11 @@ use std::time::{Duration, Instant};
 use peerdesk_core::proto::PeerOs;
 
 use super::assistant::{os_label, Shortcut};
+use super::theme::{icon, icon_button, pill, Palette};
 
 use eframe::egui::{
-    self, pos2, vec2, Align2, Color32, FontId, Frame, Rect, TextureHandle, TextureOptions,
-    ViewportBuilder, ViewportId,
+    self, pos2, vec2, Align2, Color32, FontId, Frame, Rect, RichText, TextureHandle,
+    TextureOptions, ViewportBuilder, ViewportId,
 };
 
 use super::coords::fit;
@@ -130,98 +131,145 @@ impl Viewer {
             .record(now, frames.saturating_sub(self.frames_seen));
         self.frames_seen = frames;
 
-        egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                let live = !self.phase.is_ended();
-                let label = if live { s.disconnect } else { s.close };
-                if ui.button(label).clicked() {
-                    self.stop();
-                    outcome.open = false;
-                }
-                let _ = ui.toggle_value(&mut self.overlay, s.stats);
-                let _ = ui.toggle_value(&mut self.assistant, s.assistant);
-                // 剪贴板提示显示 6 秒
+        let p = Palette::of(ctx);
+        let mut picture = None;
+        let live = matches!(self.phase, ViewPhase::Connected { .. });
+        // 远程画面顶部居中的悬浮工具条（助手）：快捷键、声音、全屏、统计、断开。可以收起成一个小把手。
+        egui::Area::new(egui::Id::new(("assistant", self.id)))
+            .anchor(Align2::CENTER_TOP, vec2(0.0, 8.0))
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                let frame = Frame::new()
+                    .fill(p.card.gamma_multiply(0.96))
+                    .stroke(egui::Stroke::new(1.0_f32, p.border))
+                    .corner_radius(18)
+                    .inner_margin(egui::Margin::symmetric(10, 4))
+                    .shadow(egui::epaint::Shadow {
+                        offset: [0, 4],
+                        blur: 16,
+                        spread: 0,
+                        color: Color32::from_black_alpha(60),
+                    });
+                frame.show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        if !self.assistant {
+                            if icon_button(ui, icon::CARET_DOWN, s.expand).clicked() {
+                                self.assistant = true;
+                            }
+                            return;
+                        }
+                        // 连接状态
+                        let (state, color) = match &self.phase {
+                            ViewPhase::Connecting => (s.connecting.to_owned(), p.warning),
+                            ViewPhase::Reconnecting { .. } => (self.phase.headline(s), p.warning),
+                            ViewPhase::Connected { .. } => (s.connected.to_owned(), p.success),
+                            ViewPhase::Ended { status, .. } => (
+                                status.text.clone(),
+                                if status.error { p.danger } else { p.muted },
+                            ),
+                        };
+                        let _ = pill(ui, &state, color);
+                        ui.separator();
+                        // 快捷键菜单（按被控端系统选键）
+                        ui.add_enabled_ui(live, |ui| {
+                            ui.menu_button(
+                                RichText::new(format!("{}  {}", icon::KEYBOARD, s.shortcuts)),
+                                |ui| {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "{}：{}",
+                                            s.remote_os,
+                                            os_label(self.peer_os, s)
+                                        ))
+                                        .size(12.0)
+                                        .color(p.muted),
+                                    );
+                                    ui.separator();
+                                    for sc in Shortcut::ALL {
+                                        let events = sc.events(self.peer_os);
+                                        let item = ui
+                                            .add_enabled(
+                                                !events.is_empty(),
+                                                egui::Button::new(sc.label(s)).frame(false),
+                                            )
+                                            .on_disabled_hover_text(s.not_on_this_os);
+                                        if item.clicked() {
+                                            for event in events {
+                                                let _ = self.handle.send(event);
+                                            }
+                                            ui.close();
+                                        }
+                                    }
+                                },
+                            );
+                        });
+                        // 声音：默认关
+                        let sound = self.handle.sound();
+                        let (glyph, tip) = if sound {
+                            (icon::SPEAKER_HIGH, s.sound)
+                        } else {
+                            (icon::SPEAKER_SLASH, s.sound)
+                        };
+                        let b = toolbar_toggle(ui, &p, glyph, tip, sound, live);
+                        if b.clicked() {
+                            self.handle.set_sound(!sound);
+                        }
+                        let glyph = if self.fullscreen {
+                            icon::CORNERS_IN
+                        } else {
+                            icon::CORNERS_OUT
+                        };
+                        if toolbar_toggle(ui, &p, glyph, s.fullscreen, self.fullscreen, true)
+                            .clicked()
+                        {
+                            self.fullscreen = !self.fullscreen;
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(
+                                self.fullscreen,
+                            ));
+                        }
+                        if toolbar_toggle(ui, &p, icon::CHART_BAR, s.stats, self.overlay, true)
+                            .clicked()
+                        {
+                            self.overlay = !self.overlay;
+                        }
+                        ui.separator();
+                        let (label, glyph) = if self.phase.is_ended() {
+                            (s.close, icon::X_CIRCLE)
+                        } else {
+                            (s.disconnect, icon::PHONE_DISCONNECT)
+                        };
+                        let stop = egui::Button::new(
+                            RichText::new(format!("{glyph}  {label}")).color(Color32::WHITE),
+                        )
+                        .fill(p.danger)
+                        .corner_radius(12);
+                        if ui.add(stop).clicked() {
+                            self.stop();
+                            outcome.open = false;
+                        }
+                        if icon_button(ui, icon::CARET_UP, s.collapse).clicked() {
+                            self.assistant = false;
+                        }
+                    });
+                });
+                // 剪贴板提示：工具条下方显示 6 秒
                 if let Some((text, at)) = &self.clip_toast {
                     if at.elapsed() < Duration::from_secs(6) {
-                        ui.colored_label(Color32::from_rgb(230, 160, 40), text);
+                        ui.add_space(6.0);
+                        Frame::new()
+                            .fill(p.warning.gamma_multiply(0.9))
+                            .corner_radius(10)
+                            .inner_margin(egui::Margin::symmetric(12, 6))
+                            .show(ui, |ui| {
+                                ui.label(RichText::new(text).color(Color32::BLACK));
+                            });
                         ctx.request_repaint_after(Duration::from_millis(500));
                     } else {
                         self.clip_toast = None;
                     }
                 }
-                match &self.phase {
-                    ViewPhase::Connecting => ui.label(s.connecting),
-                    ViewPhase::Reconnecting { .. } => {
-                        ui.colored_label(Color32::from_rgb(230, 160, 40), self.phase.headline(s))
-                    }
-                    ViewPhase::Connected { remote, .. } => {
-                        ui.label(format!("{} {remote}", s.connected))
-                    }
-                    ViewPhase::Ended { status, .. } => {
-                        let color = if status.error {
-                            Color32::LIGHT_RED
-                        } else {
-                            ui.visuals().text_color()
-                        };
-                        ui.colored_label(color, &status.text)
-                    }
-                };
             });
-        });
-
-        let mut picture = None;
-        if self.assistant && matches!(self.phase, ViewPhase::Connected { .. }) {
-            let mut open = true;
-            egui::Window::new(s.assistant)
-                .open(&mut open)
-                .collapsible(true)
-                .resizable(false)
-                .default_pos([ctx.screen_rect().right() - 260.0, 48.0])
-                .show(ctx, |ui| {
-                    ui.label(format!("{}：{}", s.remote_os, os_label(self.peer_os, s)));
-                    ui.separator();
-                    egui::Grid::new("shortcuts").num_columns(2).show(ui, |ui| {
-                        for (i, sc) in Shortcut::ALL.into_iter().enumerate() {
-                            let events = sc.events(self.peer_os);
-                            let button = ui
-                                .add_enabled(!events.is_empty(), egui::Button::new(sc.label(s)))
-                                .on_disabled_hover_text(s.not_on_this_os);
-                            if button.clicked() {
-                                for event in events {
-                                    let _ = self.handle.send(event);
-                                }
-                            }
-                            if i % 2 == 1 {
-                                ui.end_row();
-                            }
-                        }
-                    });
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        // 远程声音：默认关，打开后才传声音（省流量；对方是老版本时没有声音）
-                        let mut sound = self.handle.sound();
-                        if ui.toggle_value(&mut sound, s.sound).changed() {
-                            self.handle.set_sound(sound);
-                        }
-                        if ui
-                            .toggle_value(&mut self.fullscreen, s.fullscreen)
-                            .changed()
-                        {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(
-                                self.fullscreen,
-                            ));
-                        }
-                        let _ = ui.toggle_value(&mut self.overlay, s.stats);
-                        if ui.button(s.disconnect).clicked() {
-                            self.stop();
-                            outcome.open = false;
-                        }
-                    });
-                });
-            if !open {
-                self.assistant = false;
-            }
-        }
 
         egui::CentralPanel::default()
             .frame(Frame::NONE.fill(Color32::BLACK))
@@ -277,7 +325,7 @@ impl Viewer {
                 .show(ctx, |ui| {
                     ui.label(text);
                     ui.add_space(8.0);
-                    if ui.button(egui::RichText::new(s.upgrade).strong()).clicked() {
+                    if ui.button(RichText::new(s.upgrade).strong()).clicked() {
                         self.show_upgrade = true;
                     }
                     if self.show_upgrade {
@@ -376,4 +424,27 @@ impl Viewer {
             }
         }
     }
+}
+
+/// 工具条上的开关按钮：图标，打开时用品牌色底。
+fn toolbar_toggle(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    glyph: &str,
+    tip: &str,
+    on: bool,
+    enabled: bool,
+) -> egui::Response {
+    let fill = if on {
+        p.accent_soft
+    } else {
+        Color32::TRANSPARENT
+    };
+    let color = if on { p.accent } else { p.text };
+    let button = egui::Button::new(RichText::new(glyph).size(17.0).color(color))
+        .fill(fill)
+        .stroke(egui::Stroke::NONE)
+        .corner_radius(8)
+        .min_size(vec2(32.0, 28.0));
+    ui.add_enabled(enabled, button).on_hover_text(tip)
 }
