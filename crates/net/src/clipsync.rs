@@ -197,7 +197,11 @@ pub async fn run(
                     match receiver.on_msg(msg)? {
                         Some(Received::Clip(clip)) => {
                             let (kind, size) = (clip.kind, len64(&clip));
-                            if sender.is_local(&clip) {
+                            // 和本机剪贴板现在的内容比一下（对方的内容可能比本机这边的轮询先到）
+                            let hash = clip.hash();
+                            let current = blocking(&clipboard, |c| c.read()).await?;
+                            let same_now = matches!(&current, Some(Copied::Clip(c)) if c.hash() == hash);
+                            if same_now || sender.is_local(&clip) {
                                 // 本机已经是这份内容（例如另一个同步工具已经同步过来），不再写
                                 crate::note!(info, "剪贴板：收到 {kind:?} {size} 字节，和本机相同，不再写入");
                                 continue;
