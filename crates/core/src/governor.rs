@@ -15,8 +15,9 @@ use crate::time::Time;
 const STEPS: [u32; 7] = [60, 30, 20, 15, 10, 8, 5];
 /// 连续多少帧出现问题才降一档。
 const DOWN_AFTER: u32 = 3;
-/// 连续多少帧都轻松才升一档。
-const UP_AFTER: u32 = 45;
+/// 连续轻松多久（微秒）才升一档。按时间而不是帧数：远程桌面多数时候画面不动、每秒只有几帧，
+/// 按帧数（原来 45 帧）要十几秒才升一档，降到 5 帧后几分钟都升不回来。
+const UP_AFTER_US: u64 = 1_500_000;
 /// 编码时间超过帧间隔的这个比例（千分比）算 CPU 跟不上。
 const CPU_BUSY_PERMILLE: u64 = 800;
 /// 编码时间低于帧间隔的这个比例算轻松。
@@ -30,7 +31,8 @@ pub struct FpsGovernor {
     max_fps: u32,
     fps: u32,
     strained: u32,
-    easy: u32,
+    /// 从什么时候起一直轻松。
+    calm_since: Option<Time>,
     last_frame: Option<Time>,
 }
 
@@ -43,7 +45,7 @@ impl FpsGovernor {
             max_fps,
             fps: max_fps,
             strained: 0,
-            easy: 0,
+            calm_since: None,
             last_frame: None,
         }
     }
@@ -72,7 +74,7 @@ impl FpsGovernor {
         let easy = encode_us.saturating_mul(1000) < interval.saturating_mul(CPU_EASY_PERMILLE)
             && size <= budget;
         if cpu_busy || over {
-            self.easy = 0;
+            self.calm_since = None;
             self.strained = self.strained.saturating_add(1);
             if self.strained >= DOWN_AFTER {
                 self.strained = 0;
@@ -80,10 +82,14 @@ impl FpsGovernor {
             }
         } else {
             self.strained = 0;
-            self.easy = if easy { self.easy.saturating_add(1) } else { 0 };
-            if self.easy >= UP_AFTER {
-                self.easy = 0;
-                self.fps = self.step(true);
+            if easy {
+                let since = *self.calm_since.get_or_insert(now);
+                if now.since(since) >= UP_AFTER_US {
+                    self.calm_since = Some(now);
+                    self.fps = self.step(true);
+                }
+            } else {
+                self.calm_since = None;
             }
         }
         self.fps
@@ -128,6 +134,25 @@ mod tests {
     }
 
     #[test]
+    fn recovers_by_time_even_when_frames_are_rare() {
+        // 用户日志：降到 5 帧后画面大多静止、每秒只有几帧，按帧数要几分钟才升回来
+        let mut g = FpsGovernor::new(60);
+        let mut t = Time::ZERO;
+        for _ in 0..30 {
+            t = t.plus(100_000);
+            g.on_frame(t, 0, 50_000, 10_000);
+        }
+        assert_eq!(g.fps(), 5);
+        // 之后每秒只有 3 帧，都很轻松：每 1.5 秒升一档，10 秒内回到 60
+        let start = t;
+        while g.fps() < 60 {
+            t = t.plus(333_000);
+            g.on_frame(t, 1_000, 100, 10_000);
+            assert!(t.since(start) < 12_000_000, "{} 帧", g.fps());
+        }
+    }
+
+    #[test]
     fn slows_down_when_frames_do_not_fit_the_budget() {
         let mut g = FpsGovernor::new(30);
         let mut t = Time::ZERO;
@@ -148,9 +173,8 @@ mod tests {
             odd.on_frame(Time::ZERO, 0, 99, 10);
         }
         assert_eq!(odd.fps(), 20);
-        for _ in 0..45 {
-            odd.on_frame(Time::ZERO, 0, 1, 10);
-        }
+        odd.on_frame(Time::ZERO, 0, 1, 10);
+        odd.on_frame(Time::ZERO.plus(UP_AFTER_US), 0, 1, 10);
         assert_eq!(odd.fps(), 24);
         // 预算为 0（不知道）时不算超
         let mut zero = FpsGovernor::new(30);
