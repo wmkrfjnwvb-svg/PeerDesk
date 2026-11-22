@@ -572,12 +572,11 @@ type OpenPlayback = fn() -> peerdesk_net::audio::PlaybackHandle;
 const SYSTEM_AUDIO: (OpenCapture, OpenPlayback) = if cfg!(test) {
     (test_capture, test_playback)
 } else {
-    (system_capture, peerdesk_platform::system_playback)
+    (
+        peerdesk_platform::system_capture,
+        peerdesk_platform::system_playback,
+    )
 };
-
-fn system_capture() -> Option<peerdesk_net::audio::CaptureHandle> {
-    Some(peerdesk_platform::system_capture())
-}
 
 fn test_capture() -> Option<peerdesk_net::audio::CaptureHandle> {
     Some(peerdesk_net::audio::CaptureHandle(Arc::new(

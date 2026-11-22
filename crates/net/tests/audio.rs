@@ -8,7 +8,9 @@ use std::time::Duration;
 use peerdesk_core::crypto::Policy;
 use peerdesk_core::proto::Caps;
 use peerdesk_core::session::SessionConfig;
-use peerdesk_net::audio::{AudioOut, CaptureHandle, PlaybackHandle, Recorder, ToneCapture};
+use peerdesk_net::audio::{
+    AudioCapture, AudioOut, CaptureHandle, PlaybackHandle, Recorder, ToneCapture,
+};
 use peerdesk_net::controller::{self, ControllerOptions};
 use peerdesk_net::demo::{CountSink, DemoDesktop};
 use peerdesk_net::host::{self, HostOptions, InputSink};
@@ -36,10 +38,31 @@ fn energy(pcm: &[i16]) -> f64 {
     pcm.iter().map(|&s| f64::from(s).powi(2)).sum::<f64>() / pcm.len().max(1) as f64
 }
 
-/// 跑一次会话：`host_caps` 是被控端声明的能力。返回录音器和开关。
 async fn session_with(
     host_caps: Caps,
     host_has_audio: bool,
+) -> (Arc<Recorder>, watch::Sender<bool>, impl FnOnce()) {
+    let capture = host_has_audio.then(|| CaptureHandle(Arc::new(ToneCapture)));
+    session_with_capture(host_caps, capture).await
+}
+
+/// 只送 `frames` 帧就结束的声音来源（例如声卡被拔掉）。
+struct Finite(usize);
+
+impl AudioCapture for Finite {
+    fn start(&self) -> Result<mpsc::Receiver<Vec<i16>>, String> {
+        let (tx, rx) = mpsc::channel(self.0.max(1));
+        for _ in 0..self.0 {
+            let _ = tx.try_send(vec![4000; peerdesk_media::audio::FRAME_SAMPLES]);
+        }
+        Ok(rx)
+    }
+}
+
+/// 跑一次会话：`host_caps` 是被控端声明的能力。返回录音器和开关。
+async fn session_with_capture(
+    host_caps: Caps,
+    capture: Option<CaptureHandle>,
 ) -> (Arc<Recorder>, watch::Sender<bool>, impl FnOnce()) {
     let any: SocketAddr = ([127, 0, 0, 1], 0).into();
     let (host_id, ctrl_id) = (Identity::generate().unwrap(), Identity::generate().unwrap());
@@ -52,7 +75,7 @@ async fn session_with(
     let (host_link, ctrl_link) = (h.unwrap().unwrap(), c.unwrap());
 
     let mut opts = HostOptions::new(session(&host_id, host_caps), 30, std::env::temp_dir());
-    opts.audio = host_has_audio.then(|| CaptureHandle(Arc::new(ToneCapture)));
+    opts.audio = capture;
     let host_task = tokio::spawn(host::serve(
         host_link,
         opts,
@@ -135,5 +158,19 @@ async fn old_host_without_sound_support_plays_nothing() {
     // 远程窗口关掉、开关被丢弃：会话照常，不再理会开关
     drop(switch);
     tokio::time::sleep(Duration::from_millis(200)).await;
+    stop();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn capture_that_ends_stops_the_sound_but_not_the_session() {
+    let capture = Some(CaptureHandle(Arc::new(Finite(20))));
+    let (recorder, switch, stop) = session_with_capture(Caps::AUDIO, capture).await;
+    switch.send(true).unwrap();
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let frames = recorder.frames();
+    // 20 帧一下子全到：超过目标的积压被加速丢掉，播出来的是最后几帧；之后只有等待的静音，会话照常
+    let loud = frames.iter().filter(|f| energy(f) > 1e5).count();
+    assert!((1..=20).contains(&loud), "有声音的帧 {loud}");
+    assert!(frames.len() > loud, "来源结束后继续按时播放（静音）");
     stop();
 }

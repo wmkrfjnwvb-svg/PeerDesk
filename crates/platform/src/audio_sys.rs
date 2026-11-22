@@ -264,8 +264,8 @@ impl AudioCapture for SystemCapture {
     }
 }
 
-/// 被控端的声音来源。
+/// 被控端的声音来源（真正打开声卡要等控制端打开声音时）。
 #[must_use]
-pub fn system_capture() -> CaptureHandle {
-    CaptureHandle(Arc::new(SystemCapture))
+pub fn system_capture() -> Option<CaptureHandle> {
+    Some(CaptureHandle(Arc::new(SystemCapture)))
 }

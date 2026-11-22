@@ -657,7 +657,19 @@ mod tests {
             assert_eq!(Channel::from_id(ch.id()).unwrap(), ch);
             assert_eq!(usize::from(ch.id()), i);
         }
-        // 声音优先于画面
+        // 优先级：输入 > 控制 > 光标 > 声音 > 画面 > 剪贴板 > 文件
+        let order = [
+            Channel::Input,
+            Channel::Control,
+            Channel::Cursor,
+            Channel::Audio,
+            Channel::Video,
+            Channel::Clipboard,
+            Channel::File,
+        ];
+        for (i, ch) in order.into_iter().enumerate() {
+            assert_eq!(usize::from(ch.priority()), i, "{ch:?}");
+        }
         assert!(Channel::Audio.priority() < Channel::Video.priority());
         assert!(Channel::Input.priority() < Channel::Audio.priority());
         assert!(!Channel::Audio.reliable());
