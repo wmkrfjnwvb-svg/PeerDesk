@@ -65,7 +65,7 @@ impl Viewer {
             texture: None,
             size: [0, 0],
             input: InputState::new(),
-            overlay: true,
+            overlay: false,
             fps: FpsMeter::default(),
             frames_seen: 0,
             started: Instant::now(),
@@ -163,7 +163,10 @@ impl Viewer {
                         let (state, color) = match &self.phase {
                             ViewPhase::Connecting => (s.connecting.to_owned(), p.warning),
                             ViewPhase::Reconnecting { .. } => (self.phase.headline(s), p.warning),
-                            ViewPhase::Connected { .. } => (s.connected.to_owned(), p.success),
+                            ViewPhase::Connected { route, .. } => (
+                                format!("{} · {}", s.connected, route_name(Some(*route), s)),
+                                p.success,
+                            ),
                             ViewPhase::Ended { status, .. } => (
                                 status.text.clone(),
                                 if status.error { p.danger } else { p.muted },
