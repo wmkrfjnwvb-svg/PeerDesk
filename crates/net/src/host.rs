@@ -421,21 +421,10 @@ pub async fn serve(
                                     return Err(NetError::Protocol("没有协商声音，或者本机不允许"));
                                 };
                                 // 声音流开着就一直发：控制端关掉声音（流结束）或会话结束时停
-                                let mut recv = recv;
-                                let closed = async move {
-                                    let mut buf = [0u8; 16];
-                                    while let Ok(Some(_)) = recv.read(&mut buf).await {}
-                                };
                                 let stopped = async move {
                                     let _ = clip_stopped.wait_for(|stop| *stop).await;
                                 };
-                                let stop = async move {
-                                    tokio::select! {
-                                        () = closed => {}
-                                        () = stopped => {}
-                                    }
-                                };
-                                crate::audio::send(&link, audio.0.as_ref(), stop).await?;
+                                crate::audio::send(&link, audio.0.as_ref(), recv, stopped).await?;
                                 drop(send);
                                 Ok(Vec::new())
                             }

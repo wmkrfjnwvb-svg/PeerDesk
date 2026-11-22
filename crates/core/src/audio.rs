@@ -297,6 +297,63 @@ impl JitterBuffer {
     }
 }
 
+/// 冗余开关：丢包率（千分比）达到 [`RED_ON_PERMILLE`] 就带上前一帧的副本；
+/// 低于 [`RED_OFF_PERMILLE`] 并持续 [`RED_QUIET_MS`] 才关（防止来回切换）。没有丢包时不带，省流量（中继是成本）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Redundancy {
+    on: bool,
+    /// 从什么时候开始一直低于关闭门槛（毫秒）。
+    quiet_since: Option<u64>,
+}
+
+/// 打开冗余的丢包率（千分比，5 = 0.5%）。
+pub const RED_ON_PERMILLE: u16 = 5;
+/// 可以关闭冗余的丢包率（千分比）。
+pub const RED_OFF_PERMILLE: u16 = 2;
+/// 低于关闭门槛要持续多久才关（毫秒）。
+pub const RED_QUIET_MS: u64 = 10_000;
+
+impl Redundancy {
+    /// 当前是否带副本。
+    #[must_use]
+    pub const fn on(&self) -> bool {
+        self.on
+    }
+
+    /// 收到接收端报告的丢包率（千分比），`now_ms` 是本机时刻。返回之后是否带副本。
+    pub fn report(&mut self, loss_permille: u16, now_ms: u64) -> bool {
+        if loss_permille >= RED_ON_PERMILLE {
+            self.on = true;
+            self.quiet_since = None;
+        } else if loss_permille < RED_OFF_PERMILLE {
+            let since = *self.quiet_since.get_or_insert(now_ms);
+            if now_ms.saturating_sub(since) >= RED_QUIET_MS {
+                self.on = false;
+            }
+        } else {
+            // 在两个门槛之间：保持现状，重新计时
+            self.quiet_since = None;
+        }
+        self.on
+    }
+}
+
+/// 两次统计之间的丢包率（千分比）：丢了的帧（不管有没有被副本补回）占应收帧的比例。
+#[must_use]
+pub fn loss_permille(before: &AudioStats, after: &AudioStats) -> u16 {
+    let lost = after.recovered.saturating_sub(before.recovered)
+        + after
+            .concealed
+            .saturating_sub(before.concealed)
+            .saturating_sub(after.underruns.saturating_sub(before.underruns));
+    let played = after.normal.saturating_sub(before.normal)
+        + after.concealed.saturating_sub(before.concealed);
+    if played == 0 {
+        return 0;
+    }
+    u16::try_from((lost * 1000 / played).min(1000)).unwrap_or(1000)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
@@ -312,6 +369,38 @@ mod tests {
                 .map(|k| vec![u8::try_from((seq - u32::try_from(k).unwrap()) % 256).unwrap(); 100])
                 .collect(),
         }
+    }
+
+    #[test]
+    fn redundancy_turns_on_fast_and_off_slowly() {
+        let mut r = Redundancy::default();
+        assert!(!r.on());
+        assert!(!r.report(0, 0));
+        // 0.5% 丢包：马上打开
+        assert!(r.report(5, 100));
+        // 回到 0：10 秒后才关
+        assert!(r.report(0, 200));
+        assert!(r.report(1, 5_000));
+        // 中间夹着一次 0.3%（两个门槛之间）：重新计时
+        assert!(r.report(3, 6_000));
+        assert!(r.report(0, 7_000));
+        assert!(r.report(0, 16_000));
+        assert!(!r.report(0, 17_000));
+    }
+
+    #[test]
+    fn loss_rate_from_stats() {
+        let before = AudioStats::default();
+        let after = AudioStats {
+            normal: 95,
+            concealed: 5,
+            recovered: 5,
+            underruns: 1,
+            ..AudioStats::default()
+        };
+        // 丢了 5 + 4 = 9 帧（见底的那一次不算丢包），应收 100 帧 → 9%
+        assert_eq!(loss_permille(&before, &after), 90);
+        assert_eq!(loss_permille(&after, &after), 0);
     }
 
     #[test]

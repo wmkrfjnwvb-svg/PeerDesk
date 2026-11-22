@@ -233,6 +233,7 @@ pub async fn run(
     let mut audio_tick = tokio::time::interval(Duration::from_millis(10));
     audio_tick.set_missed_tick_behavior(MissedTickBehavior::Burst);
     let mut audio_changed = audio_switch.is_some();
+    let mut audio_ticks = 0u64;
 
     let mut upload_task = upload.map(|u| {
         let link = Arc::clone(&link);
@@ -333,6 +334,14 @@ pub async fn run(
             _ = audio_tick.tick(), if audio_rx.is_some() => {
                 if let Some(rx) = audio_rx.as_mut() {
                     rx.tick();
+                    // 每 500 ms 把丢包率报告给被控端（它据此决定带不带冗余）
+                    audio_ticks = audio_ticks.wrapping_add(1);
+                    if audio_ticks % (crate::audio::REPORT_MS / 10) == 0 {
+                        let loss = rx.loss_report();
+                        if let Some(send) = audio_stream.as_mut() {
+                            let _ = send.write_all(&loss.to_be_bytes()).await;
+                        }
+                    }
                 }
             }
             datagram = link.recv() => match datagram {

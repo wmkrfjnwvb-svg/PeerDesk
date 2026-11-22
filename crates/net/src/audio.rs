@@ -11,7 +11,9 @@
 
 use std::sync::{Arc, Mutex, PoisonError};
 
-use peerdesk_core::audio::{AudioPacket, AudioStats, JitterBuffer, Play};
+use peerdesk_core::audio::{
+    loss_permille, AudioPacket, AudioStats, JitterBuffer, Play, Redundancy,
+};
 use peerdesk_core::proto::Channel;
 use peerdesk_media::audio::{AudioDecoder, AudioEncoder, DEFAULT_BPS, FRAME, FRAME_SAMPLES};
 use tokio::sync::mpsc;
@@ -67,12 +69,21 @@ impl std::fmt::Debug for AudioOut {
     }
 }
 
-/// 被控端：采集、编码并发送，直到 `stop` 完成（声音流关闭或会话结束）。
+/// 控制端多久报告一次丢包率（毫秒）。
+pub const REPORT_MS: u64 = 500;
+
+/// 被控端：采集、编码并发送，直到声音流关闭（控制端关掉声音）或 `stop` 完成（会话结束）。
+/// 控制端在声音流上每 [`REPORT_MS`] 报告一次丢包率（2 字节，千分比），据此决定带不带前一帧的副本。
 pub async fn send(
     link: &Link,
     capture: &dyn AudioCapture,
+    mut reports: quinn::RecvStream,
     stop: impl std::future::Future<Output = ()>,
 ) -> Result<(), NetError> {
+    let started = std::time::Instant::now();
+    let mut redundancy = Redundancy::default();
+    let mut report = Vec::with_capacity(2);
+    let mut buf = [0u8; 64];
     let mut frames = capture.start().map_err(NetError::Io)?;
     let mut encoder = AudioEncoder::new(DEFAULT_BPS).map_err(|e| NetError::Io(e.to_string()))?;
     let mut seq = 0u32;
@@ -82,6 +93,26 @@ pub async fn send(
     loop {
         let pcm = tokio::select! {
             () = &mut stop => break,
+            read = reports.read(&mut buf) => match read {
+                // 控制端的丢包报告：2 字节一个
+                Ok(Some(n)) => {
+                    for &b in buf.get(..n).unwrap_or_default() {
+                        report.push(b);
+                        if let [hi, lo] = report[..] {
+                            let loss = u16::from_be_bytes([hi, lo]);
+                            let now = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                            let was = redundancy.on();
+                            if redundancy.report(loss, now) != was {
+                                crate::note!(info, "声音：丢包 {}.{}%，冗余{}", loss / 10, loss % 10, if was { "关闭" } else { "打开" });
+                            }
+                            report.clear();
+                        }
+                    }
+                    continue;
+                }
+                // 控制端关掉了声音
+                Ok(None) | Err(_) => break,
+            },
             pcm = frames.recv() => match pcm {
                 Some(pcm) => pcm,
                 None => break,
@@ -94,8 +125,12 @@ pub async fn send(
             seq,
             capture_us: u64::from(seq) * 10_000,
             frame: frame.clone(),
-            // 带上前一帧：丢一个包时接收端用副本补回
-            redundant: previous.take().into_iter().collect(),
+            // 有丢包时带上前一帧：丢一个包时接收端用副本补回
+            redundant: previous
+                .take()
+                .filter(|_| redundancy.on())
+                .into_iter()
+                .collect(),
         };
         let bytes = packet.encode()?;
         // 链路断了交给会话处理；声音这里只是不再发
@@ -115,6 +150,8 @@ pub struct Receiver {
     decoder: AudioDecoder,
     out: PlaybackHandle,
     bad: u64,
+    /// 上次报告丢包率时的统计。
+    reported: AudioStats,
 }
 
 impl std::fmt::Debug for Receiver {
@@ -133,6 +170,7 @@ impl Receiver {
             decoder: AudioDecoder::new().map_err(|e| NetError::Io(e.to_string()))?,
             out,
             bad: 0,
+            reported: AudioStats::default(),
         })
     }
 
@@ -165,6 +203,14 @@ impl Receiver {
     #[must_use]
     pub fn stats(&self) -> AudioStats {
         self.jitter.stats()
+    }
+
+    /// 自上次调用以来的丢包率（千分比），发给被控端决定要不要冗余。
+    pub fn loss_report(&mut self) -> u16 {
+        let now = self.jitter.stats();
+        let loss = loss_permille(&self.reported, &now);
+        self.reported = now;
+        loss
     }
 
     /// 解不开的包数。
@@ -289,6 +335,31 @@ mod tests {
         assert_eq!(rx.bad(), 2);
         assert!(rx.target_ms() >= peerdesk_core::audio::MIN_TARGET_MS);
         assert!(format!("{rx:?}").contains("Receiver"));
+    }
+
+    #[test]
+    fn loss_report_counts_missing_frames() {
+        let rec = Arc::new(Recorder::default());
+        let mut rx = Receiver::new(PlaybackHandle(rec)).unwrap();
+        let mut enc = AudioEncoder::new(DEFAULT_BPS).unwrap();
+        // 每 10 ms 到一个包，序号 5 和 15 丢了；按真实节奏一边收一边播
+        for seq in 0..40u32 {
+            if seq % 10 != 5 {
+                let frame = enc.encode(&[1000; FRAME_SAMPLES]).unwrap();
+                let p = AudioPacket {
+                    seq,
+                    capture_us: u64::from(seq) * 10_000,
+                    frame,
+                    redundant: vec![],
+                };
+                rx.on_datagram(u64::from(seq) * 10_000, &p.encode().unwrap());
+            }
+            rx.tick();
+        }
+        let loss = rx.loss_report();
+        assert!(loss > 0, "丢了包却报告 {loss}");
+        // 报告后重新计数
+        assert_eq!(rx.loss_report(), 0);
     }
 
     #[test]
