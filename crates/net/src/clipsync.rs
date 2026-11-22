@@ -67,6 +67,8 @@ impl std::fmt::Debug for ClipboardHandle {
 #[derive(Debug, Default)]
 pub struct MemClipboard {
     state: Mutex<(u64, Option<Clip>, Vec<ClipNote>)>,
+    /// 接下来这么多次写入失败（模拟剪贴板被别的程序占着）。
+    failing: std::sync::atomic::AtomicU32,
 }
 
 impl MemClipboard {
@@ -75,6 +77,11 @@ impl MemClipboard {
         let mut s = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         s.0 = s.0.wrapping_add(1);
         s.1 = Some(clip);
+    }
+
+    /// 接下来 `n` 次写入失败。
+    pub fn fail_next_writes(&self, n: u32) {
+        self.failing.store(n, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// 当前内容。
@@ -106,6 +113,17 @@ impl SystemClipboard for MemClipboard {
         self.get()
     }
     fn write(&self, clip: &Clip) -> Result<(), String> {
+        let failing = &self.failing;
+        if failing
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |n| n.checked_sub(1),
+            )
+            .is_ok()
+        {
+            return Err("剪贴板被占用".into());
+        }
         self.copy(clip.clone());
         Ok(())
     }
@@ -128,7 +146,7 @@ pub async fn run(
     let mut sender = Sender::new(limits);
     let mut receiver = Receiver::new(limits);
     let mut deframer = Deframer::default();
-    let mut seen = clipboard.change_count();
+    let mut seen = blocking(&clipboard, |c| c.change_count()).await?;
     let mut tick = tokio::time::interval(POLL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut buf = vec![0u8; 64 * 1024];
@@ -144,11 +162,25 @@ pub async fn run(
                 for msg in deframer.push(buf.get(..n).unwrap_or_default())? {
                     match receiver.on_msg(msg)? {
                         Some(Received::Clip(clip)) => {
+                            let (kind, size) = (clip.kind, len64(&clip));
+                            if sender.is_local(&clip) {
+                                // 本机已经是这份内容（例如另一个同步工具已经同步过来），不再写
+                                crate::note!(info, "剪贴板：收到 {kind:?} {size} 字节，和本机相同，不再写入");
+                                continue;
+                            }
                             sender.applied_remote(&clip);
-                            clipboard.write(&clip).map_err(|e| NetError::Io(format!("写剪贴板失败：{e}")))?;
-                            seen = clipboard.change_count();
-                            crate::note!(info, "剪贴板：收到 {:?} {} 字节", clip.kind, clip.data.len());
-                            clipboard.note(ClipNote::Received { kind: clip.kind, size: len64(&clip) });
+                            let started = std::time::Instant::now();
+                            let written = blocking(&clipboard, move |c| write_with_retry(c, &clip)).await?;
+                            let took = started.elapsed().as_millis();
+                            match written {
+                                Ok(()) => {
+                                    crate::note!(info, "剪贴板：收到 {kind:?} {size} 字节，写入用时 {took} ms");
+                                    clipboard.note(ClipNote::Received { kind, size });
+                                }
+                                // 写不进去（剪贴板被别的程序占着）：记下原因，继续同步后面的内容
+                                Err(e) => crate::note!(warn, "剪贴板：收到 {kind:?} {size} 字节，写入失败（{took} ms）：{e}"),
+                            }
+                            seen = blocking(&clipboard, |c| c.change_count()).await?;
                         }
                         Some(Received::TooLarge { kind, size }) => {
                             crate::note!(info, "剪贴板：对方复制的 {kind:?} {size} 字节超过上限，没有同步");
@@ -159,13 +191,21 @@ pub async fn run(
                 }
             }
             _ = tick.tick() => {
-                let count = clipboard.change_count();
+                let count = blocking(&clipboard, |c| c.change_count()).await?;
                 if count != seen {
                     seen = count;
-                    if let Some(clip) = clipboard.read() {
-                        if sender.offer(&clip) == Offered::TooLarge {
-                            crate::note!(info, "剪贴板：本机复制的 {:?} {} 字节超过上限，没有同步", clip.kind, clip.data.len());
-                            clipboard.note(ClipNote::LocalTooLarge { kind: clip.kind, size: len64(&clip) });
+                    let started = std::time::Instant::now();
+                    if let Some(clip) = blocking(&clipboard, |c| c.read()).await? {
+                        let took = started.elapsed().as_millis();
+                        match sender.offer(&clip) {
+                            Offered::TooLarge => {
+                                crate::note!(info, "剪贴板：本机复制的 {:?} {} 字节超过上限，没有同步", clip.kind, clip.data.len());
+                                clipboard.note(ClipNote::LocalTooLarge { kind: clip.kind, size: len64(&clip) });
+                            }
+                            Offered::Sending => {
+                                crate::note!(info, "剪贴板：发送 {:?} {} 字节（读取用时 {took} ms）", clip.kind, clip.data.len());
+                            }
+                            Offered::Skip => {}
                         }
                     }
                 }
@@ -181,6 +221,34 @@ pub async fn run(
             }
         }
     }
+}
+
+/// 读写系统剪贴板会阻塞（Windows 上剪贴板被别的程序占着时要等），放到阻塞线程里做，
+/// 不卡住会话（否则画面和输入的反馈被拖住，码率控制误以为网络拥塞）。
+async fn blocking<T: Send + 'static>(
+    clipboard: &Arc<dyn SystemClipboard>,
+    f: impl FnOnce(&dyn SystemClipboard) -> T + Send + 'static,
+) -> Result<T, NetError> {
+    let c = Arc::clone(clipboard);
+    // 只有运行时关闭（会话正在结束）或剪贴板实现崩溃时才失败：结束剪贴板同步
+    tokio::task::spawn_blocking(move || f(c.as_ref()))
+        .await
+        .map_err(|e| NetError::Io(format!("剪贴板线程失败：{e}")))
+}
+
+/// 写剪贴板，被占用时重试几次（每次间隔 50 ms）。
+fn write_with_retry(clipboard: &dyn SystemClipboard, clip: &Clip) -> Result<(), String> {
+    let mut last = String::new();
+    for attempt in 0..5 {
+        match clipboard.write(clip) {
+            Ok(()) => return Ok(()),
+            Err(e) => last = e,
+        }
+        if attempt < 4 {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    Err(last)
 }
 
 fn len64(clip: &Clip) -> u64 {

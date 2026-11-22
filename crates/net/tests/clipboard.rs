@@ -182,3 +182,20 @@ async fn old_peer_or_disabled_permission_means_no_sync() {
         .await;
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_write_does_not_stop_syncing() {
+    session_with(Caps::CLIPBOARD, true, true, |host, ctrl| async move {
+        // 被控端的剪贴板被别的程序占着：第一份内容重试后仍写不进去
+        host.fail_next_writes(5);
+        ctrl.copy(Clip::text("first"));
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert_eq!(host.get(), None);
+        // 之后的复制照常同步（原来写失败会结束整个剪贴板同步）
+        let second = Clip::text("second");
+        ctrl.copy(second.clone());
+        let took = arrives(&host, &second).await;
+        assert!(took < Duration::from_millis(600), "{took:?}");
+    })
+    .await;
+}

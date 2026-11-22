@@ -61,10 +61,20 @@ impl Clip {
 
     /// 内容的哈希（种类也算在内）。
     #[must_use]
+    /// 文本不计换行符的差别（Windows 存 `\r\n`，macOS/Linux 存 `\n`，同一段文字来回同步不算变化）。
     pub fn hash(&self) -> [u8; 32] {
         let mut h = blake3::Hasher::new();
         h.update(&[self.kind.id()]);
-        h.update(&self.data);
+        match self.kind {
+            ClipKind::Text => {
+                for part in self.data.split(|&b| b == b'\r') {
+                    h.update(part);
+                }
+            }
+            ClipKind::Png => {
+                h.update(&self.data);
+            }
+        }
         *h.finalize().as_bytes()
     }
 }
@@ -293,6 +303,14 @@ impl Sender {
         self.echo = Some(clip.hash());
     }
 
+    /// 本机剪贴板里已经是这份内容（刚发出去的，或刚从对方收到的）：不用再写一遍。
+    /// 两套同步工具同时开着（例如另一个远程软件也在同步剪贴板）时，避免来回覆盖。
+    #[must_use]
+    pub fn is_local(&self, clip: &Clip) -> bool {
+        let hash = clip.hash();
+        self.last == Some(hash) || self.echo == Some(hash)
+    }
+
     /// 下一条要发的消息（不取出）。
     #[must_use]
     pub fn peek(&self) -> Option<ClipMsg> {
@@ -469,6 +487,27 @@ mod tests {
         assert_eq!(s.pending(), 1 + 4 + 1);
         let got = deliver(&drain(&mut s), &mut r, 10_000);
         assert_eq!(got, vec![Received::Clip(png)]);
+    }
+
+    #[test]
+    fn line_endings_do_not_count_as_a_change() {
+        let mut s = Sender::new(Limits::DEFAULT);
+        assert_eq!(s.offer(&Clip::text("a\nb")), Offered::Sending);
+        // 对方（Windows）把同一段文字存成 \r\n 又同步回来：已经是本机的内容，不写也不再发
+        let back = Clip::text("a\r\nb");
+        assert!(s.is_local(&back));
+        assert_eq!(s.offer(&back), Offered::Skip);
+        assert!(!s.is_local(&Clip::text("other")));
+        // 图片逐字节比较
+        let png = Clip {
+            kind: ClipKind::Png,
+            data: vec![b'\r', 1],
+        };
+        let png2 = Clip {
+            kind: ClipKind::Png,
+            data: vec![1],
+        };
+        assert_ne!(png.hash(), png2.hash());
     }
 
     #[test]
