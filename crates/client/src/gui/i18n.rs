@@ -181,6 +181,8 @@ pub struct Strings {
     pub clip_local_too_large: &'static str,
     /// 对方复制的内容太大没有同步（`{mb}` 换成大小）。
     pub clip_remote_too_large: &'static str,
+    /// 复制了文件但对方版本不支持。
+    pub clip_files_unsupported: &'static str,
     /// 助手：助手。
     pub assistant: &'static str,
     /// 助手：开始菜单。
@@ -303,8 +305,9 @@ pub const ZH: Strings = Strings {
     upgrade: "升级会员，走 VIP 通道",
     upgrade_hint: "会员走付费集群的专用通道，不受免费额度限制。会员购买即将开放；已有会员令牌的，在窗口下方“服务器”里填写“会员令牌”。",
     account_token: "会员令牌（可选）",
-    clip_local_too_large: "复制的内容太大（{mb} MB），没有同步到对方；大文件请用文件传输",
-    clip_remote_too_large: "对方复制的内容太大（{mb} MB），没有同步过来；大文件请用文件传输",
+    clip_local_too_large: "复制的内容太大（{mb} MB），没有同步到对方；文件超过 20 MB 请用文件传输",
+    clip_files_unsupported: "对方的 PeerDesk 版本不支持复制粘贴文件，请升级对方，或用文件传输",
+    clip_remote_too_large: "对方复制的内容太大（{mb} MB），没有同步过来；文件超过 20 MB 请用文件传输",
     assistant: "助手",
     sc_start: "开始菜单",
     sc_switch_app: "切换程序",
@@ -410,8 +413,9 @@ pub const EN: Strings = Strings {
     upgrade: "Upgrade to VIP",
     upgrade_hint: "VIP members use dedicated paid relays without the free-tier limit. Membership is coming soon; if you already have a member token, enter it under Server below.",
     account_token: "Member token (optional)",
-    clip_local_too_large: "Copied content is too large ({mb} MB) to sync; use file transfer for large files",
-    clip_remote_too_large: "Content copied on the remote ({mb} MB) is too large to sync; use file transfer for large files",
+    clip_local_too_large: "Copied content is too large ({mb} MB) to sync; use file transfer for files over 20 MB",
+    clip_files_unsupported: "The remote PeerDesk is too old to copy and paste files; update it, or use file transfer",
+    clip_remote_too_large: "Content copied on the remote ({mb} MB) is too large to sync; use file transfer for files over 20 MB",
     assistant: "Assistant",
     sc_start: "Start menu",
     sc_switch_app: "Switch app",

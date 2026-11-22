@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use peerdesk_core::clipboard::{Clip, ClipKind, Limits};
+use peerdesk_core::clipboard::{pack_files, Clip, ClipKind, Limits, PackedFile};
 use peerdesk_core::crypto::Policy;
 use peerdesk_core::proto::Caps;
 use peerdesk_core::session::SessionConfig;
@@ -86,7 +86,7 @@ async fn session_with<F, Fut>(
     let ctrl = tokio::spawn(controller::run(
         ctrl_link,
         ControllerOptions {
-            session: session(&ctrl_id, Caps::CLIPBOARD),
+            session: session(&ctrl_id, Caps::CLIPBOARD.with(Caps::CLIPBOARD_FILES)),
             deadline_us: 200_000,
             duration: None,
             clipboard: Some(ClipboardHandle(ctrl_clip.clone())),
@@ -196,6 +196,81 @@ async fn a_failed_write_does_not_stop_syncing() {
         ctrl.copy(second.clone());
         let took = arrives(&host, &second).await;
         assert!(took < Duration::from_millis(600), "{took:?}");
+    })
+    .await;
+}
+
+fn packed(files: &[(&str, usize)]) -> Clip {
+    let files: Vec<PackedFile> = files
+        .iter()
+        .map(|(p, n)| PackedFile {
+            path: (*p).into(),
+            data: vec![7; *n],
+        })
+        .collect();
+    Clip {
+        kind: ClipKind::Files,
+        data: pack_files(&files).unwrap(),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn files_up_to_20_mb_are_copied_and_larger_ones_explained() {
+    session_with(
+        Caps::CLIPBOARD.with(Caps::CLIPBOARD_FILES),
+        true,
+        true,
+        |host, ctrl| async move {
+            // 一个文件夹（两个文件）加一个 5 MB 的文件
+            let files = packed(&[
+                ("报告/a.txt", 10),
+                ("报告/b.bin", 1000),
+                ("视频.mp4", 5 << 20),
+            ]);
+            ctrl.copy(files.clone());
+            let took = arrives(&host, &files).await;
+            assert!(took < Duration::from_secs(2), "5 MB 文件用了 {took:?}");
+            // 超过 20 MB：不发，两端都有提示
+            ctrl.copy_too_large(ClipKind::Files, 25 << 20);
+            let start = Instant::now();
+            while !host.notes().iter().any(|n| {
+                matches!(
+                    n,
+                    ClipNote::RemoteTooLarge {
+                        kind: ClipKind::Files,
+                        ..
+                    }
+                )
+            }) {
+                assert!(start.elapsed() < Duration::from_secs(5), "没有收到超限提示");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(ctrl.notes().iter().any(|n| matches!(
+                n,
+                ClipNote::LocalTooLarge {
+                    kind: ClipKind::Files,
+                    ..
+                }
+            )));
+        },
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn files_are_not_sent_to_an_old_peer() {
+    // 被控端支持剪贴板但不支持文件（老版本）：不发文件，提示对方版本不支持；文字照常同步
+    session_with(Caps::CLIPBOARD, true, true, |host, ctrl| async move {
+        ctrl.copy(packed(&[("a.txt", 3)]));
+        let start = Instant::now();
+        while !ctrl.notes().contains(&ClipNote::FilesUnsupported) {
+            assert!(start.elapsed() < Duration::from_secs(5), "没有提示");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(host.get(), None);
+        let text = Clip::text("still works");
+        ctrl.copy(text.clone());
+        arrives(&host, &text).await;
     })
     .await;
 }

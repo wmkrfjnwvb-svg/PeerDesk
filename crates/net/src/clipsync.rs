@@ -32,6 +32,8 @@ pub enum ClipNote {
         /// 大小（字节）。
         size: u64,
     },
+    /// 本机复制了文件，但对方的版本不支持复制文件。
+    FilesUnsupported,
     /// 收到对方的内容，已写进本机剪贴板。
     Received {
         /// 种类。
@@ -41,12 +43,26 @@ pub enum ClipNote {
     },
 }
 
+/// 读本机剪贴板的结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Copied {
+    /// 内容。
+    Clip(Clip),
+    /// 太大（例如复制了超过 20 MB 的文件），没有读出内容，只有大小。
+    TooLarge {
+        /// 种类。
+        kind: ClipKind,
+        /// 大小（字节，可能只算到超过上限为止）。
+        size: u64,
+    },
+}
+
 /// 本机剪贴板。真实实现在平台层；测试用 [`MemClipboard`]（测试不碰开发者电脑的剪贴板）。
 pub trait SystemClipboard: Send + Sync {
     /// 剪贴板的变化计数：内容一变就不同。
     fn change_count(&self) -> u64;
-    /// 读当前内容（文本或图片）；空的、读不了或是别的格式（例如文件）时为 `None`。
-    fn read(&self) -> Option<Clip>;
+    /// 读当前内容（文件、文本或图片）；空的、读不了或是别的格式时为 `None`。
+    fn read(&self) -> Option<Copied>;
     /// 写入。
     fn write(&self, clip: &Clip) -> Result<(), String>;
     /// 剪贴板事件（给界面提示用）。默认不处理。
@@ -63,10 +79,13 @@ impl std::fmt::Debug for ClipboardHandle {
     }
 }
 
+/// 内存剪贴板的状态：（变化计数，内容，收到的事件，模拟“太大”的复制）。
+type MemState = (u64, Option<Clip>, Vec<ClipNote>, Option<Copied>);
+
 /// 内存里的剪贴板，用于测试和仿真。
 #[derive(Debug, Default)]
 pub struct MemClipboard {
-    state: Mutex<(u64, Option<Clip>, Vec<ClipNote>)>,
+    state: Mutex<MemState>,
     /// 接下来这么多次写入失败（模拟剪贴板被别的程序占着）。
     failing: std::sync::atomic::AtomicU32,
 }
@@ -77,6 +96,14 @@ impl MemClipboard {
         let mut s = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         s.0 = s.0.wrapping_add(1);
         s.1 = Some(clip);
+        s.3 = None;
+    }
+
+    /// 模拟用户复制了太大的内容（例如超过 20 MB 的文件）。
+    pub fn copy_too_large(&self, kind: ClipKind, size: u64) {
+        let mut s = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        s.0 = s.0.wrapping_add(1);
+        s.3 = Some(Copied::TooLarge { kind, size });
     }
 
     /// 接下来 `n` 次写入失败。
@@ -109,8 +136,9 @@ impl SystemClipboard for MemClipboard {
     fn change_count(&self) -> u64 {
         self.state.lock().unwrap_or_else(PoisonError::into_inner).0
     }
-    fn read(&self) -> Option<Clip> {
-        self.get()
+    fn read(&self) -> Option<Copied> {
+        let st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        st.3.clone().or_else(|| st.1.clone().map(Copied::Clip))
     }
     fn write(&self, clip: &Clip) -> Result<(), String> {
         let failing = &self.failing;
@@ -137,11 +165,13 @@ impl SystemClipboard for MemClipboard {
 }
 
 /// 在一条流上双向同步，直到流断开。开始时本机剪贴板里已有的内容不发（只同步之后复制的）。
+/// `files`：对方支持复制文件（[`Caps::CLIPBOARD_FILES`](peerdesk_core::proto::Caps::CLIPBOARD_FILES)）。
 pub async fn run(
     mut send: SendStream,
     mut recv: RecvStream,
     clipboard: Arc<dyn SystemClipboard>,
     limits: Limits,
+    files: bool,
 ) -> Result<(), NetError> {
     let mut sender = Sender::new(limits);
     let mut receiver = Receiver::new(limits);
@@ -195,7 +225,18 @@ pub async fn run(
                 if count != seen {
                     seen = count;
                     let started = std::time::Instant::now();
-                    if let Some(clip) = blocking(&clipboard, |c| c.read()).await? {
+                    match blocking(&clipboard, |c| c.read()).await? {
+                        None => {}
+                        Some(Copied::TooLarge { kind, size }) => {
+                            crate::note!(info, "剪贴板：本机复制的 {kind:?} {size} 字节超过上限，没有同步");
+                            sender.announce_too_large(kind, size);
+                            clipboard.note(ClipNote::LocalTooLarge { kind, size });
+                        }
+                        Some(Copied::Clip(clip)) if clip.kind == ClipKind::Files && !files => {
+                            crate::note!(info, "剪贴板：本机复制了文件，对方版本不支持复制文件");
+                            clipboard.note(ClipNote::FilesUnsupported);
+                        }
+                        Some(Copied::Clip(clip)) => {
                         let took = started.elapsed().as_millis();
                         match sender.offer(&clip) {
                             Offered::TooLarge => {
@@ -206,6 +247,7 @@ pub async fn run(
                                 crate::note!(info, "剪贴板：发送 {:?} {} 字节（读取用时 {took} ms）", clip.kind, clip.data.len());
                             }
                             Offered::Skip => {}
+                        }
                         }
                     }
                 }
@@ -265,7 +307,7 @@ mod tests {
         fn change_count(&self) -> u64 {
             0
         }
-        fn read(&self) -> Option<Clip> {
+        fn read(&self) -> Option<Copied> {
             None
         }
         fn write(&self, _clip: &Clip) -> Result<(), String> {

@@ -221,6 +221,7 @@ pub fn clip_message(note: &peerdesk_net::clipsync::ClipNote, s: &Strings) -> Opt
         ClipNote::RemoteTooLarge { size, .. } => {
             Some(s.clip_remote_too_large.replace("{mb}", &mb(*size)))
         }
+        ClipNote::FilesUnsupported => Some(s.clip_files_unsupported.to_owned()),
         ClipNote::Received { .. } => None,
     }
 }

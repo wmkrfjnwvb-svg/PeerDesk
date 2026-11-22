@@ -221,6 +221,7 @@ pub async fn run(
                 recv,
                 clipboard.0,
                 peerdesk_core::clipboard::Limits::DEFAULT,
+                caps.has(Caps::CLIPBOARD_FILES),
             )))
         }
         None => None,

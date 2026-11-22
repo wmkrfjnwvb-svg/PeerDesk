@@ -257,6 +257,8 @@ impl Caps {
     pub const CLIPBOARD: Caps = Caps(1 << 16);
     /// 声音。
     pub const AUDIO: Caps = Caps(1 << 17);
+    /// 剪贴板里复制粘贴文件（20 MB 以内）。
+    pub const CLIPBOARD_FILES: Caps = Caps(1 << 18);
 
     // 第 24–26 位不是能力，是被控端在 Accept 里告诉控制端自己的系统（见 [`PeerOs`]），
     // 控制端据此把快捷键里的 Ctrl 换成 Cmd 等。老版本只看能力位，会忽略这几位。
@@ -281,7 +283,8 @@ impl Caps {
     }
 
     /// 本版本支持的全部能力。
-    pub const ALL: Caps = Caps(Self::H264.0 | Self::CLIPBOARD.0 | Self::AUDIO.0);
+    pub const ALL: Caps =
+        Caps(Self::H264.0 | Self::CLIPBOARD.0 | Self::AUDIO.0 | Self::CLIPBOARD_FILES.0);
 
     /// 并集。
     #[must_use]

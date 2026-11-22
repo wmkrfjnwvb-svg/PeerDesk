@@ -21,6 +21,9 @@ pub enum ClipKind {
     Text,
     /// PNG 图片。
     Png,
+    /// 文件（复制了文件或文件夹）：打包后的内容，见 [`pack_files`]。只发给声明了
+    /// [`Caps::CLIPBOARD_FILES`](crate::proto::Caps::CLIPBOARD_FILES) 的对端。
+    Files,
 }
 
 impl ClipKind {
@@ -28,6 +31,7 @@ impl ClipKind {
         match self {
             Self::Text => 1,
             Self::Png => 2,
+            Self::Files => 3,
         }
     }
 
@@ -35,6 +39,7 @@ impl ClipKind {
         match id {
             1 => Ok(Self::Text),
             2 => Ok(Self::Png),
+            3 => Ok(Self::Files),
             other => Err(Error::UnknownMessage(other)),
         }
     }
@@ -71,7 +76,7 @@ impl Clip {
                     h.update(part);
                 }
             }
-            ClipKind::Png => {
+            ClipKind::Png | ClipKind::Files => {
                 h.update(&self.data);
             }
         }
@@ -86,13 +91,16 @@ pub struct Limits {
     pub text: u64,
     /// 图片（PNG 编码后）。
     pub image: u64,
+    /// 文件（全部文件内容合计）。
+    pub files: u64,
 }
 
 impl Limits {
-    /// 默认：文本 4 MB，图片 16 MB。
+    /// 默认：文本 4 MB，图片 16 MB，文件 20 MB。
     pub const DEFAULT: Self = Self {
         text: 4 * 1024 * 1024,
         image: 16 * 1024 * 1024,
+        files: FILES_LIMIT,
     };
 
     /// 这种内容的上限。
@@ -101,8 +109,73 @@ impl Limits {
         match kind {
             ClipKind::Text => self.text,
             ClipKind::Png => self.image,
+            // 打包后比文件内容多出路径和长度，留出余量
+            ClipKind::Files => self.files + PACK_OVERHEAD,
         }
     }
+}
+
+/// 复制文件的总大小上限（20 MB）。超过的提示用文件传输。
+pub const FILES_LIMIT: u64 = 20 * 1024 * 1024;
+/// 最多多少个文件（防止复制了一个有几十万个小文件的文件夹）。
+pub const MAX_FILES: usize = 1000;
+/// 打包时路径和长度占的额外空间上限。
+const PACK_OVERHEAD: u64 = (MAX_FILES as u64) * (crate::file::MAX_PATH_LEN as u64 + 16);
+
+/// 打包的一个文件：相对路径（用 `/` 分隔，例如 `报告/图1.png`）和内容。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackedFile {
+    /// 相对路径。
+    pub path: String,
+    /// 内容。
+    pub data: Vec<u8>,
+}
+
+/// 把文件打包成剪贴板内容：`u16` 个数，每个文件 `u16` 路径长度 + 路径 + `u64` 长度 + 内容。
+pub fn pack_files(files: &[PackedFile]) -> Result<Vec<u8>, Error> {
+    if files.len() > MAX_FILES {
+        return Err(Error::TooManyItems {
+            len: files.len(),
+            max: MAX_FILES,
+        });
+    }
+    let mut w = Writer::new();
+    w.u16(u16::try_from(files.len()).unwrap_or(u16::MAX));
+    for f in files {
+        crate::file::check_path(&f.path)?;
+        w.u16(u16::try_from(f.path.len()).unwrap_or(u16::MAX))
+            .bytes(f.path.as_bytes())
+            .u64(u64::try_from(f.data.len()).unwrap_or(u64::MAX))
+            .bytes(&f.data);
+    }
+    Ok(w.into_vec())
+}
+
+/// 解包。路径不安全（绝对路径、`..` 等）时报错：不能让对方把文件写到临时目录以外。
+pub fn unpack_files(data: &[u8]) -> Result<Vec<PackedFile>, Error> {
+    let mut r = Reader::new(data);
+    let n = usize::from(r.u16()?);
+    if n > MAX_FILES {
+        return Err(Error::TooManyItems {
+            len: n,
+            max: MAX_FILES,
+        });
+    }
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        let len = usize::from(r.u16()?);
+        let path = std::str::from_utf8(r.take(len)?)
+            .map_err(|_| Error::Inconsistent("文件路径不是 UTF-8"))?
+            .to_owned();
+        crate::file::check_path(&path)?;
+        let size = usize::try_from(r.u64()?).map_err(|_| Error::Inconsistent("文件太大"))?;
+        out.push(PackedFile {
+            path,
+            data: r.take(size)?.to_vec(),
+        });
+    }
+    r.finish()?;
+    Ok(out)
 }
 
 /// 剪贴板流上的消息。
@@ -298,6 +371,17 @@ impl Sender {
         Offered::Sending
     }
 
+    /// 本机复制的内容太大，只通知对方（大小在读取时就知道了，不用读出内容）。
+    pub fn announce_too_large(&mut self, kind: ClipKind, size: u64) {
+        self.seq = self.seq.wrapping_add(1);
+        self.queue.clear();
+        self.queue.push_back(ClipMsg::TooLarge {
+            seq: self.seq,
+            kind,
+            size,
+        });
+    }
+
     /// 刚把对方的内容写进本机剪贴板：之后本机读到同样的内容不再发回去。
     pub fn applied_remote(&mut self, clip: &Clip) {
         self.echo = Some(clip.hash());
@@ -490,6 +574,56 @@ mod tests {
     }
 
     #[test]
+    fn files_pack_round_trip_and_reject_unsafe_paths() {
+        let files = vec![
+            PackedFile {
+                path: "报告/图1.png".into(),
+                data: vec![1, 2, 3],
+            },
+            PackedFile {
+                path: "空文件.txt".into(),
+                data: vec![],
+            },
+        ];
+        let packed = pack_files(&files).unwrap();
+        assert_eq!(unpack_files(&packed).unwrap(), files);
+        // 往上跳出临时目录、绝对路径：拒绝
+        for bad in ["../evil", "/etc/passwd"] {
+            let evil = PackedFile {
+                path: bad.into(),
+                data: vec![],
+            };
+            assert!(pack_files(std::slice::from_ref(&evil)).is_err());
+            let mut w = Writer::new();
+            w.u16(1)
+                .u16(u16::try_from(bad.len()).unwrap())
+                .bytes(bad.as_bytes())
+                .u64(0);
+            assert!(unpack_files(&w.into_vec()).is_err(), "{bad}");
+        }
+        // 太多文件
+        let many = vec![
+            PackedFile {
+                path: "a".into(),
+                data: vec![]
+            };
+            MAX_FILES + 1
+        ];
+        assert!(pack_files(&many).is_err());
+        let mut w = Writer::new();
+        w.u16(u16::try_from(MAX_FILES + 1).unwrap());
+        assert!(unpack_files(&w.into_vec()).is_err());
+        // 截断、路径不是 UTF-8
+        assert!(unpack_files(&packed[..packed.len() - 1]).is_err());
+        let mut w = Writer::new();
+        w.u16(1).u16(1).bytes(&[0xff]).u64(0);
+        assert!(unpack_files(&w.into_vec()).is_err());
+        // 文件的上限按内容算，留出打包余量
+        assert!(Limits::DEFAULT.of(ClipKind::Files) > FILES_LIMIT);
+        assert_eq!(ClipKind::from_id(ClipKind::Files.id()), Ok(ClipKind::Files));
+    }
+
+    #[test]
     fn line_endings_do_not_count_as_a_change() {
         let mut s = Sender::new(Limits::DEFAULT);
         assert_eq!(s.offer(&Clip::text("a\nb")), Offered::Sending);
@@ -570,7 +704,11 @@ mod tests {
 
     #[test]
     fn too_large_is_only_announced() {
-        let limits = Limits { text: 4, image: 8 };
+        let limits = Limits {
+            text: 4,
+            image: 8,
+            files: 8,
+        };
         let mut s = Sender::new(limits);
         let mut r = Receiver::new(limits);
         assert_eq!(s.offer(&Clip::text("12345")), Offered::TooLarge);

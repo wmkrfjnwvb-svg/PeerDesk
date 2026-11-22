@@ -6,10 +6,11 @@
 
 use std::sync::{Mutex, PoisonError};
 
+use peerdesk_core::clipboard::FILES_LIMIT;
 use peerdesk_core::clipboard::{Clip, ClipKind};
-use peerdesk_net::clipsync::{ClipNote, ClipboardHandle, SystemClipboard};
+use peerdesk_net::clipsync::{ClipNote, ClipboardHandle, Copied, SystemClipboard};
 
-use crate::clipboard::{png_to_rgba, rgba_to_png};
+use crate::clipboard::{pack_paths, png_to_rgba, rgba_to_png, unpack_to};
 
 /// 剪贴板事件的回调（界面提示用）。
 pub type OnNote = Box<dyn Fn(ClipNote) + Send + Sync>;
@@ -110,26 +111,42 @@ impl SystemClipboard for SystemClip {
         }
     }
 
-    fn read(&self) -> Option<Clip> {
+    fn read(&self) -> Option<Copied> {
         if concealed() {
             peerdesk_net::note!(info, "剪贴板：内容被标为敏感（密码管理器），不同步");
             return None;
         }
         let mut board = self.clipboard();
+        // 复制了文件：先看文件（同时还会有文件名文本、图标图片，不用它们）
+        if let Ok(paths) = board.get().file_list() {
+            if !paths.is_empty() {
+                drop(board);
+                return Some(match pack_paths(&paths, FILES_LIMIT) {
+                    Ok(data) => Copied::Clip(Clip {
+                        kind: ClipKind::Files,
+                        data,
+                    }),
+                    Err(size) => Copied::TooLarge {
+                        kind: ClipKind::Files,
+                        size,
+                    },
+                });
+            }
+        }
         // 同时有文本和图片时（例如从网页复制）用文本
         if let Ok(text) = board.get_text() {
             if !text.is_empty() {
-                return Some(Clip::text(&text));
+                return Some(Copied::Clip(Clip::text(&text)));
             }
         }
         let img = board.get_image().ok()?;
         let width = u32::try_from(img.width).ok()?;
         let height = u32::try_from(img.height).ok()?;
         match rgba_to_png(width, height, &img.bytes) {
-            Ok(data) => Some(Clip {
+            Ok(data) => Some(Copied::Clip(Clip {
                 kind: ClipKind::Png,
                 data,
-            }),
+            })),
             Err(e) => {
                 peerdesk_net::note!(warn, "剪贴板：图片转 PNG 失败：{e}");
                 None
@@ -152,6 +169,19 @@ impl SystemClipboard for SystemClip {
                     bytes: rgba.into(),
                 };
                 board.set_image(image).map_err(|e| e.to_string())
+            }
+            ClipKind::Files => {
+                // 解到临时目录里新建的子目录（每次一个，不覆盖之前粘贴的），剪贴板里放这些文件
+                let dir = std::env::temp_dir()
+                    .join("PeerDesk-clipboard")
+                    .join(format!(
+                        "{}",
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_or(0, |d| d.as_millis())
+                    ));
+                let top = unpack_to(&clip.data, &dir)?;
+                board.set().file_list(&top).map_err(|e| e.to_string())
             }
         }
     }

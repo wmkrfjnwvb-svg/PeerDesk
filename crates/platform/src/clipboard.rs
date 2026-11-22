@@ -79,6 +79,61 @@ fn png_to_rgba_within(data: &[u8], max_pixels: u64) -> Result<(u32, u32, Vec<u8>
     Ok((width, height, rgba))
 }
 
+/// 把复制的文件和文件夹打包（[`peerdesk_core::clipboard::pack_files`]）。
+/// 总大小超过 `limit` 或文件太多时停止读取，返回 `Err(已经统计到的大小)`；读不了的文件跳过。
+pub fn pack_paths(paths: &[std::path::PathBuf], limit: u64) -> Result<Vec<u8>, u64> {
+    use peerdesk_core::clipboard::{pack_files, PackedFile, MAX_FILES};
+    let mut files = Vec::new();
+    let mut total = 0u64;
+    let mut stack: Vec<(std::path::PathBuf, String)> = paths
+        .iter()
+        .filter_map(|p| Some((p.clone(), p.file_name()?.to_string_lossy().into_owned())))
+        .collect();
+    while let Some((path, rel)) = stack.pop() {
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.is_dir() {
+            let Ok(entries) = std::fs::read_dir(&path) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                stack.push((entry.path(), format!("{rel}/{name}")));
+            }
+        } else if meta.is_file() {
+            total = total.saturating_add(meta.len());
+            if total > limit || files.len() >= MAX_FILES {
+                return Err(total.max(limit.saturating_add(1)));
+            }
+            if let Ok(data) = std::fs::read(&path) {
+                files.push(PackedFile { path: rel, data });
+            }
+        }
+        // 符号链接等跳过（不跟随，避免打包到复制范围以外的东西）
+    }
+    pack_files(&files).map_err(|_| total)
+}
+
+/// 把收到的文件解包到 `dir` 下，返回最上层的路径（放进剪贴板，粘贴时就是这些文件和文件夹）。
+pub fn unpack_to(data: &[u8], dir: &std::path::Path) -> Result<Vec<std::path::PathBuf>, String> {
+    let files = peerdesk_core::clipboard::unpack_files(data).map_err(|e| e.to_string())?;
+    let mut top: Vec<std::path::PathBuf> = Vec::new();
+    for f in files {
+        let target = dir.join(&f.path);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("建目录失败：{e}"))?;
+        }
+        std::fs::write(&target, &f.data).map_err(|e| format!("写文件失败：{e}"))?;
+        let first = f.path.split('/').next().unwrap_or_default();
+        let first = dir.join(first);
+        if !top.contains(&first) {
+            top.push(first);
+        }
+    }
+    Ok(top)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -91,6 +146,46 @@ mod tests {
         e.set_depth(png::BitDepth::Eight);
         e.write_header().unwrap().write_image_data(data).unwrap();
         out
+    }
+
+    fn temp(tag: &str) -> std::path::PathBuf {
+        let d =
+            std::env::temp_dir().join(format!("peerdesk-clipfiles-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn files_and_folders_round_trip_through_the_clipboard() {
+        let src = temp("src");
+        std::fs::write(src.join("a.txt"), b"hello").unwrap();
+        std::fs::create_dir_all(src.join("folder/sub")).unwrap();
+        std::fs::write(src.join("folder/sub/b.bin"), [1u8, 2, 3]).unwrap();
+        std::fs::write(src.join("folder/c.txt"), b"").unwrap();
+        let packed = pack_paths(
+            &[src.join("a.txt"), src.join("folder"), src.join("missing")],
+            1024,
+        )
+        .unwrap();
+        let dst = temp("dst");
+        let mut top = unpack_to(&packed, &dst).unwrap();
+        top.sort();
+        assert_eq!(top, vec![dst.join("a.txt"), dst.join("folder")]);
+        assert_eq!(std::fs::read(dst.join("a.txt")).unwrap(), b"hello");
+        assert_eq!(
+            std::fs::read(dst.join("folder/sub/b.bin")).unwrap(),
+            [1, 2, 3]
+        );
+        assert!(dst.join("folder/c.txt").exists());
+        // 超过上限：不读完，返回大小
+        let over = pack_paths(&[src.join("a.txt"), src.join("folder")], 4).unwrap_err();
+        assert!(over > 4);
+        // 坏数据
+        assert!(unpack_to(&[1, 2, 3], &dst).is_err());
+        for d in [src, dst] {
+            let _ = std::fs::remove_dir_all(d);
+        }
     }
 
     #[test]
