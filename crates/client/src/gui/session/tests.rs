@@ -500,7 +500,8 @@ fn locked_screen_refuses_one_connection_and_keeps_hosting() {
     let (host_dir, ctrl_dir) = (temp_dir("h7"), temp_dir("c7"));
     let (h, port, mut host_seen) = host(&host_dir, "pw", None);
     // 屏幕暂时采集不到（例如锁屏）：拒绝这一次，原因告诉控制端
-    crate::local::TEST_SCREEN_LOCKED.store(true, Ordering::Relaxed);
+    let lock = host_dir.join(crate::local::TEST_LOCK_FILE);
+    std::fs::write(&lock, b"").unwrap();
     let (repaint, _) = counter();
     let v = start_view(local(port, None), "pw", ctrl_dir.clone(), repaint);
     let err = ended(&v, &mut Log::new()).unwrap_err();
@@ -512,7 +513,7 @@ fn locked_screen_refuses_one_connection_and_keeps_hosting() {
     );
     assert!(matches!(refused, HostEvent::Refused(ref why) if why.contains("屏幕已锁定")));
     // 解锁后，同一个被控端接受下一次连接（原来会停止被控，设备离线）
-    crate::local::TEST_SCREEN_LOCKED.store(false, Ordering::Relaxed);
+    std::fs::remove_file(&lock).unwrap();
     let (repaint, _) = counter();
     let v = start_view(local(port, None), "pw", ctrl_dir.clone(), repaint);
     wait_for(

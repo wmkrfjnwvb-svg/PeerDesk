@@ -24,15 +24,23 @@ const SYSTEM: (OpenScreen, OpenInput) = if cfg!(test) {
     )
 };
 
-/// 测试用：置位后合成桌面打不开（模拟锁屏等屏幕暂时采集不到的情况）。
-pub static TEST_SCREEN_LOCKED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
 fn test_screen(_: CaptureOptions) -> Result<Box<dyn ScreenSource>, PlatformError> {
-    if TEST_SCREEN_LOCKED.load(Ordering::Relaxed) {
-        return Err(PlatformError::Os("屏幕已锁定（测试）".into()));
-    }
     Ok(Box::new(peerdesk_net::demo::DemoDesktop::new(1280, 720, 1)))
+}
+
+/// 测试用：数据目录里有这个文件时，这个被控端的屏幕打不开（模拟锁屏）。按数据目录区分，
+/// 并行的其他测试不受影响（原来用全局开关，其他测试的被控端也被当成锁屏）。
+#[cfg(test)]
+pub const TEST_LOCK_FILE: &str = "test-screen-locked";
+
+/// 被控端用的屏幕：`data_dir` 是被控端的数据目录（测试用来模拟锁屏）。
+pub fn local_screen_in(data_dir: &std::path::Path) -> Result<Box<dyn ScreenSource>, String> {
+    #[cfg(test)]
+    if data_dir.join(TEST_LOCK_FILE).exists() {
+        return opened_screen(Err(PlatformError::Os("屏幕已锁定（测试）".into())));
+    }
+    let _ = data_dir;
+    local_screen()
 }
 
 fn test_input() -> Result<Box<dyn InputSink>, PlatformError> {

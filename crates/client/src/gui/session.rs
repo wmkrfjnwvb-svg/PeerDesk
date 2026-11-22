@@ -27,7 +27,7 @@ use peerdesk_net::{Identity, NetError, Node};
 use tokio::sync::watch;
 
 use super::form::Target;
-use crate::local::{check_local, local_input, local_screen, Tap};
+use crate::local::{check_local, local_input, local_screen_in, Tap};
 use crate::remote::{join_cluster, load_nodes, runtime, save_nodes, session, stay_registered};
 
 /// 请求界面重绘。
@@ -406,7 +406,8 @@ async fn host_main(
         seed = seed.wrapping_add(1);
         // 这时屏幕或键鼠打不开（锁屏、登录界面、权限被撤销……）：拒绝这一次连接并告诉对方原因，
         // 继续等待下一次（原来会直接停止被控，设备从此离线）。
-        let opened = local_screen().and_then(|s| Ok((s, local_input(Arc::clone(&shared.tap))?)));
+        let opened = local_screen_in(&config.data_dir)
+            .and_then(|s| Ok((s, local_input(Arc::clone(&shared.tap))?)));
         let (screen, input) = match opened {
             Ok(opened) => opened,
             Err(why) => {
