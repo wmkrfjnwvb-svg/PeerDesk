@@ -109,6 +109,62 @@ impl AudioDecoder {
     }
 }
 
+/// 交叉淡化的长度（每声道采样数，2.5 ms）。
+const OVERLAP: usize = 120;
+/// 找拼接点时的步长（每声道采样数）。
+const SEARCH_STEP: usize = 4;
+
+/// 加速：把连续的两帧 `a`、`b`（各 10 ms）压成一帧（10 ms），听不出接缝。
+///
+/// 输出 = `a` 的前 p 个采样 + `a[p..]` 与 `b[p..]` 交叉淡化 + `b` 的剩余部分，正好跳过 10 ms。
+/// p 选在两段波形最相似的地方（WSOLA 的简化版），这样淡化时两段的相位对得上，不会出现咔哒声。
+#[must_use]
+pub fn merge_drop(a: &[i16], b: &[i16]) -> Vec<i16> {
+    if a.len() != FRAME_SAMPLES || b.len() != FRAME_SAMPLES {
+        return b.to_vec();
+    }
+    let mono = |pcm: &[i16], at: usize| -> i64 {
+        let l = pcm.get(at * 2).copied().unwrap_or(0);
+        let r = pcm.get(at * 2 + 1).copied().unwrap_or(0);
+        i64::from(l) + i64::from(r)
+    };
+    // 归一化互相关最大的位置
+    let mut best = (0usize, i128::MIN);
+    for p in (0..=FRAME - OVERLAP).step_by(SEARCH_STEP) {
+        let (mut dot, mut ea, mut eb) = (0i128, 0i128, 0i128);
+        for k in 0..OVERLAP {
+            let (x, y) = (i128::from(mono(a, p + k)), i128::from(mono(b, p + k)));
+            dot += x * y;
+            ea += x * x;
+            eb += y * y;
+        }
+        // 比较 dot / sqrt(ea·eb)：用 dot·|dot| / (ea·eb) 避免开方，保留符号
+        let score = if ea == 0 || eb == 0 {
+            0
+        } else {
+            dot.saturating_mul(dot.abs()).saturating_mul(1_000_000) / ea.saturating_mul(eb).max(1)
+        };
+        if score > best.1 {
+            best = (p, score);
+        }
+    }
+    let p = best.0;
+    let mut out = Vec::with_capacity(FRAME_SAMPLES);
+    out.extend_from_slice(a.get(..p * 2).unwrap_or_default());
+    for k in 0..OVERLAP {
+        let w = i64::try_from(k).unwrap_or(0);
+        let n = i64::try_from(OVERLAP).unwrap_or(1);
+        for ch in 0..2 {
+            let x = i64::from(a.get((p + k) * 2 + ch).copied().unwrap_or(0));
+            let y = i64::from(b.get((p + k) * 2 + ch).copied().unwrap_or(0));
+            let v = (x * (n - w) + y * w) / n;
+            out.push(i16::try_from(v).unwrap_or(0));
+        }
+    }
+    out.extend_from_slice(b.get((p + OVERLAP) * 2..).unwrap_or_default());
+    out
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::cast_possible_truncation)]
@@ -153,6 +209,43 @@ mod tests {
         let plc = dec.decode(None).unwrap();
         assert_eq!(plc.len(), FRAME_SAMPLES);
         assert!(energy(&plc) > 0.1 * energy(&last));
+    }
+
+    /// 相邻采样之间最大的跳变（同一声道）。
+    fn max_jump(pcm: &[i16]) -> i32 {
+        pcm.windows(4)
+            .step_by(2)
+            .map(|w| (i32::from(w[2]) - i32::from(w[0])).abs())
+            .max()
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn merging_two_frames_has_no_click() {
+        let (a, b) = (tone(0), tone(FRAME));
+        let merged = merge_drop(&a, &b);
+        assert_eq!(merged.len(), FRAME_SAMPLES);
+        // 原始正弦里相邻采样的最大跳变
+        let smooth = max_jump(&a);
+        // 直接丢掉一帧时：前一帧的结尾接下下一帧的开头（再下一帧），相位错开会有跳变
+        let naive: Vec<i16> = a.iter().chain(tone(2 * FRAME).iter()).copied().collect();
+        let seam = max_jump(&naive);
+        assert!(
+            seam > smooth * 3,
+            "直接丢帧的接缝跳变 {seam}，原始 {smooth}"
+        );
+        // 拼接后的跳变不超过原始波形的两倍（没有咔哒声）
+        assert!(
+            max_jump(&merged) <= smooth * 2,
+            "{} vs {}",
+            max_jump(&merged),
+            smooth
+        );
+        // 长度不对时原样返回后一帧
+        assert_eq!(merge_drop(&a[..10], &b), b);
+        // 静音也能拼
+        let silent = vec![0; FRAME_SAMPLES];
+        assert_eq!(merge_drop(&silent, &silent), silent);
     }
 
     #[test]

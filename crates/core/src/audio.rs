@@ -100,6 +100,8 @@ pub enum Play {
     Normal(Vec<u8>),
     /// 这一帧没到：用补偿生成一帧（Opus PLC）。
     Expand,
+    /// 缓冲太多：把这两帧解码后压成一帧（交叉淡化，听不出接缝）。
+    Accelerate(Vec<u8>, Vec<u8>),
     /// 缓冲还没攒够（刚开始，或者见底后在等水位回到目标）：播放静音。
     Wait,
 }
@@ -266,11 +268,16 @@ impl JitterBuffer {
             return Play::Wait;
         };
         // 缓冲比目标多出两帧以上：丢掉最老的一帧追上（加速）
-        if self.level_ms() > self.target_ms + 2 * FRAME_MS && self.frames.contains_key(&next) {
-            let _ = self.frames.remove(&next);
-            self.stats.accelerated = self.stats.accelerated.saturating_add(1);
-            self.next = Some(next.wrapping_add(1));
-            return self.pop();
+        if self.level_ms() > self.target_ms + 2 * FRAME_MS {
+            let second = next.wrapping_add(1);
+            if let (Some(a), Some(b)) = (self.frames.get(&next), self.frames.get(&second)) {
+                let pair = (a.clone(), b.clone());
+                let _ = self.frames.remove(&next);
+                let _ = self.frames.remove(&second);
+                self.stats.accelerated = self.stats.accelerated.saturating_add(1);
+                self.next = Some(second.wrapping_add(1));
+                return Play::Accelerate(pair.0, pair.1);
+            }
         }
         // 缓冲比目标少一帧以上（目标刚涨上去）：多播一帧补偿、时间线不前进，把缓冲攒起来（减速）
         if !self.decelerated_last

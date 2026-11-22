@@ -15,7 +15,9 @@ use peerdesk_core::audio::{
     loss_permille, AudioPacket, AudioStats, JitterBuffer, Play, Redundancy,
 };
 use peerdesk_core::proto::Channel;
-use peerdesk_media::audio::{AudioDecoder, AudioEncoder, DEFAULT_BPS, FRAME, FRAME_SAMPLES};
+use peerdesk_media::audio::{
+    merge_drop, AudioDecoder, AudioEncoder, DEFAULT_BPS, FRAME, FRAME_SAMPLES,
+};
 use tokio::sync::mpsc;
 
 use crate::{Link, NetError};
@@ -186,6 +188,11 @@ impl Receiver {
     pub fn tick(&mut self) {
         let pcm = match self.jitter.pop() {
             Play::Normal(frame) => self.decoder.decode(Some(&frame)),
+            // 两帧都解码（解码器状态连续），再压成一帧
+            Play::Accelerate(a, b) => self
+                .decoder
+                .decode(Some(&a))
+                .and_then(|pa| Ok(merge_drop(&pa, &self.decoder.decode(Some(&b))?))),
             Play::Expand => self.decoder.decode(None),
             Play::Wait => Ok(vec![0; FRAME_SAMPLES]),
         };
@@ -330,7 +337,8 @@ mod tests {
         }
         // 9 个包一起到，超过目标的部分加速丢掉，其余正常播放
         let st = rx.stats();
-        assert!(st.normal + st.accelerated >= 8, "{st:?}");
+        // 每次加速把两帧压成一帧
+        assert!(st.normal + 2 * st.accelerated >= 8, "{st:?}");
         assert!(st.accelerated > 0, "{st:?}");
         assert_eq!(rx.bad(), 2);
         assert!(rx.target_ms() >= peerdesk_core::audio::MIN_TARGET_MS);
