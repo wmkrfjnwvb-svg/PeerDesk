@@ -79,6 +79,8 @@ async fn session_with<F, Fut>(
         Box::new(NoInput),
     ));
     let os_report = Arc::new(std::sync::Mutex::new(None));
+    let probe = controller::EstablishedHook(Arc::new(|_| {}));
+    assert_eq!(format!("{probe:?}"), "EstablishedHook");
     let seen_os = Arc::clone(&os_report);
     let (tx, rx) = mpsc::channel(4);
     let ctrl = tokio::spawn(controller::run(

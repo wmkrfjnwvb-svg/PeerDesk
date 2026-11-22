@@ -288,6 +288,16 @@ impl Caps {
     }
 }
 
+/// 本机的系统（编译时确定）。
+#[cfg(windows)]
+const CURRENT_OS: PeerOs = PeerOs::Windows;
+#[cfg(target_os = "macos")]
+const CURRENT_OS: PeerOs = PeerOs::Mac;
+#[cfg(target_os = "linux")]
+const CURRENT_OS: PeerOs = PeerOs::Linux;
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+const CURRENT_OS: PeerOs = PeerOs::Unknown;
+
 /// 被控端的操作系统。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerOs {
@@ -305,15 +315,7 @@ impl PeerOs {
     /// 本机的系统。
     #[must_use]
     pub const fn current() -> Self {
-        if cfg!(windows) {
-            Self::Windows
-        } else if cfg!(target_os = "macos") {
-            Self::Mac
-        } else if cfg!(target_os = "linux") {
-            Self::Linux
-        } else {
-            Self::Unknown
-        }
+        CURRENT_OS
     }
 }
 

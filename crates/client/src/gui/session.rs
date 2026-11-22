@@ -548,15 +548,18 @@ pub enum ViewEvent {
 }
 
 /// 打开本机系统剪贴板。测试构建里没有（测试不碰开发者电脑的剪贴板）。
-#[cfg(not(test))]
-fn system_clipboard(on_note: peerdesk_platform::OnNote) -> Option<ClipboardHandle> {
-    peerdesk_platform::open_clipboard(on_note)
+const SYSTEM_CLIPBOARD: fn(peerdesk_platform::OnNote) -> Option<ClipboardHandle> = if cfg!(test) {
+    no_clipboard
+} else {
+    peerdesk_platform::open_clipboard
+};
+
+fn no_clipboard(_on_note: peerdesk_platform::OnNote) -> Option<ClipboardHandle> {
+    None
 }
 
-#[cfg(test)]
-#[allow(clippy::unnecessary_wraps, clippy::needless_pass_by_value)]
-fn system_clipboard(_on_note: Box<dyn Fn(ClipNote) + Send + Sync>) -> Option<ClipboardHandle> {
-    None
+fn system_clipboard(on_note: peerdesk_platform::OnNote) -> Option<ClipboardHandle> {
+    SYSTEM_CLIPBOARD(on_note)
 }
 
 /// 网络断开后最多自动重连几次。

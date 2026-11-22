@@ -232,9 +232,8 @@ impl JitterBuffer {
     }
 
     fn update_target(&mut self) {
-        let Some(fastest) = self.arrivals.iter().map(|(_, d)| *d).min() else {
-            return;
-        };
+        // push 之后才调用，窗口里至少有一个包
+        let fastest = self.arrivals.iter().map(|(_, d)| *d).min().unwrap_or(0);
         let mut delays: Vec<u64> = self
             .arrivals
             .iter()
