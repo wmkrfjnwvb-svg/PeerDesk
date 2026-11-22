@@ -198,6 +198,11 @@ impl Viewer {
                     });
                     ui.separator();
                     ui.horizontal(|ui| {
+                        // 远程声音：默认关，打开后才传声音（省流量；对方是老版本时没有声音）
+                        let mut sound = self.handle.sound();
+                        if ui.toggle_value(&mut sound, s.sound).changed() {
+                            self.handle.set_sound(sound);
+                        }
                         if ui
                             .toggle_value(&mut self.fullscreen, s.fullscreen)
                             .changed()

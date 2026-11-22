@@ -394,6 +394,7 @@ async fn host_main(
         let opts = HostOptions {
             limiter: Arc::clone(&limiter),
             clipboard: system_clipboard(Box::new(|_| {})),
+            audio: SYSTEM_AUDIO.0(),
             ..HostOptions::new(
                 session(&identity, &policy, Auth::Password(password)),
                 config.fps,
@@ -492,6 +493,8 @@ pub fn to_color_image(screen: &Screen) -> ColorImage {
 struct GuiSink {
     slot: Arc<FrameSlot>,
     repaint: Repaint,
+    /// 声音开关（助手里切换，默认关）；重连后的新会话也看同一个开关。
+    sound: watch::Receiver<bool>,
 }
 
 impl ScreenSink for GuiSink {
@@ -562,6 +565,30 @@ fn system_clipboard(on_note: peerdesk_platform::OnNote) -> Option<ClipboardHandl
     SYSTEM_CLIPBOARD(on_note)
 }
 
+type OpenCapture = fn() -> Option<peerdesk_net::audio::CaptureHandle>;
+type OpenPlayback = fn() -> peerdesk_net::audio::PlaybackHandle;
+
+/// 本机声卡：被控端的声音来源、控制端的声音去向。测试构建里换成合成声音和录音器（不碰开发者的声卡）。
+const SYSTEM_AUDIO: (OpenCapture, OpenPlayback) = if cfg!(test) {
+    (test_capture, test_playback)
+} else {
+    (system_capture, peerdesk_platform::system_playback)
+};
+
+fn system_capture() -> Option<peerdesk_net::audio::CaptureHandle> {
+    Some(peerdesk_platform::system_capture())
+}
+
+fn test_capture() -> Option<peerdesk_net::audio::CaptureHandle> {
+    Some(peerdesk_net::audio::CaptureHandle(Arc::new(
+        peerdesk_net::audio::ToneCapture,
+    )))
+}
+
+fn test_playback() -> peerdesk_net::audio::PlaybackHandle {
+    peerdesk_net::audio::PlaybackHandle(Arc::new(peerdesk_net::audio::Recorder::default()))
+}
+
 /// 网络断开后最多自动重连几次。
 pub const RECONNECT_TRIES: u32 = 3;
 /// 两次重连之间等多久。
@@ -598,9 +625,21 @@ pub struct ViewHandle {
     input: tokio::sync::mpsc::Sender<InputEvent>,
     stop: watch::Sender<bool>,
     slot: Arc<FrameSlot>,
+    sound: watch::Sender<bool>,
 }
 
 impl ViewHandle {
+    /// 打开或关闭远程声音（默认关）。
+    pub fn set_sound(&self, on: bool) {
+        let _ = self.sound.send(on);
+    }
+
+    /// 远程声音是否打开。
+    #[must_use]
+    pub fn sound(&self) -> bool {
+        *self.sound.borrow()
+    }
+
     /// 取走到目前为止的事件。
     pub fn poll(&self) -> Vec<ViewEvent> {
         self.events.try_iter().collect()
@@ -646,9 +685,11 @@ pub fn start_view(
         Auth::Password(password.to_owned())
     };
     let emitter = Emitter { tx, repaint };
+    let (sound, sound_rx) = watch::channel(false);
     let sink = GuiSink {
         slot: Arc::clone(&slot),
         repaint: Arc::clone(&emitter.repaint),
+        sound: sound_rx,
     };
     let task = view_main(
         target,
@@ -665,6 +706,7 @@ pub fn start_view(
         input,
         stop,
         slot,
+        sound,
     }
 }
 
@@ -897,7 +939,10 @@ async fn one_session(
                     ev.send(ViewEvent::PeerOs(caps.os()));
                 })))
             },
-            audio: None,
+            audio: Some(peerdesk_net::audio::AudioOut {
+                playback: SYSTEM_AUDIO.1(),
+                on: sink.sound.clone(),
+            }),
         },
         Box::new(sink),
         input,

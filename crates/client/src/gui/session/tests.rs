@@ -130,6 +130,18 @@ fn view_a_host_send_input_and_get_kicked() {
     assert!(
         matches!(connected, ViewEvent::Connected { route: Route::Direct, ref peer, .. } if *peer == to_hex(&host_fp))
     );
+    // 远程声音默认关，可以打开、关闭（测试构建里是合成声音和录音器，不碰声卡）；握手后得知对方系统
+    assert!(!v.sound());
+    v.set_sound(true);
+    assert!(v.sound());
+    let os = wait_for(
+        || v.poll(),
+        &mut seen,
+        |e| matches!(e, ViewEvent::PeerOs(_)),
+    );
+    assert_eq!(os, ViewEvent::PeerOs(PeerOs::current()));
+    std::thread::sleep(Duration::from_millis(300));
+    v.set_sound(false);
 
     let mut host_seen = Log::new();
     wait_for(

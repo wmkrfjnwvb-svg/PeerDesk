@@ -9,10 +9,13 @@ rust-version.workspace = true
 [dependencies]
 peerdesk-core.workspace = true
 peerdesk-net = { workspace = true, features = ["media"] }
+peerdesk-media.workspace = true
 # 剪贴板读写（文本、图片）和 PNG 编解码
 arboard = "3.7"
 png = "0.18"
 log = "0.4"
+tokio = { version = "1", features = ["sync", "rt"] }
+cpal = "0.15"
 
 # Linux：X11（MIT-SHM 采集、DAMAGE 变化检测、XTEST 注入）。x11rb 是纯 Rust 的 X11 协议实现，
 # 不依赖 libX11/libxcb；libc 只用于共享内存（memfd + mmap）和等待连接可读（poll）。

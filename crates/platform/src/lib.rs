@@ -15,7 +15,10 @@
 //!
 //! Wayland 不在支持范围内：会返回明确的错误（见 [`PlatformError::Unsupported`]）。
 
+pub mod audio;
+mod audio_sys;
 pub mod capture;
+pub use audio_sys::{system_capture, system_playback};
 pub mod clipboard;
 mod clipboard_sys;
 pub use clipboard_sys::{open_clipboard, OnNote, SystemClip};
