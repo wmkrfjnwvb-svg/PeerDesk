@@ -266,6 +266,40 @@ async fn controller_handles_bad_handshake_answers_and_vanishing_host() {
         Err(NetError::Protocol("握手应答不是 Accept 或 Reject"))
     );
 
+    // 被控端说我们的版本太旧（或它支持的最低版本比我们新）：用户看到要升级的说明
+    for (reason, expect) in [
+        (peerdesk_core::proto::RejectReason::Version, "版本太旧"),
+        (
+            peerdesk_core::proto::RejectReason::Busy,
+            "正在被其他设备控制",
+        ),
+        (
+            peerdesk_core::proto::RejectReason::NoCommonSuite,
+            "NoCommonSuite",
+        ),
+    ] {
+        let (_n, raw, ctrl_link) = links().await;
+        let (_tx, rx) = mpsc::channel(1);
+        let task = tokio::spawn(controller::run(
+            ctrl_link,
+            ControllerOptions {
+                session: cfg(),
+                deadline_us: 1,
+                duration: None,
+                clipboard: None,
+                on_established: None,
+            },
+            Box::new(Null),
+            rx,
+            None,
+        ));
+        let _streams = raw_host_handshake(&raw, &Control::Reject { reason }).await;
+        match task.await.unwrap() {
+            Err(NetError::Connect(why)) => assert!(why.contains(expect), "{why}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
     // 握手后对端直接消失
     let (_n2, raw, ctrl_link) = links().await;
     let (_tx, rx) = mpsc::channel(1);

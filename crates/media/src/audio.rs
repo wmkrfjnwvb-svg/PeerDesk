@@ -168,7 +168,11 @@ mod tests {
             small / 20
         );
         assert!(enc.encode(&[0; 10]).is_err());
-        let dec = AudioDecoder::new().unwrap();
+        // 非法码率、坏数据都明确报错
+        assert!(AudioEncoder::new(-5).is_err());
+        assert!(AudioEncoder::new(0).is_err());
+        let mut dec = AudioDecoder::new().unwrap();
+        assert!(dec.decode(Some(&[0xff; 3])).is_err());
         let e = AudioError("x".into());
         assert!(e.to_string().contains('x'));
         assert!(format!("{enc:?}{dec:?}").contains("AudioEncoder"));
