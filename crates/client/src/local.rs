@@ -24,7 +24,14 @@ const SYSTEM: (OpenScreen, OpenInput) = if cfg!(test) {
     )
 };
 
+/// 测试用：置位后合成桌面打不开（模拟锁屏等屏幕暂时采集不到的情况）。
+pub static TEST_SCREEN_LOCKED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 fn test_screen(_: CaptureOptions) -> Result<Box<dyn ScreenSource>, PlatformError> {
+    if TEST_SCREEN_LOCKED.load(Ordering::Relaxed) {
+        return Err(PlatformError::Os("屏幕已锁定（测试）".into()));
+    }
     Ok(Box::new(peerdesk_net::demo::DemoDesktop::new(1280, 720, 1)))
 }
 

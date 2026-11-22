@@ -555,6 +555,25 @@ impl Link {
         self.conn.stats().udp_rx.datagrams
     }
 
+    /// 对端主动关闭连接时给的原因（例如被控端屏幕暂时打不开、拒绝了这次连接）；没有原因时为 `None`。
+    #[must_use]
+    pub fn refused_reason(&self) -> Option<String> {
+        use quinn::ConnectionError as E;
+        match self.conn.close_reason()? {
+            E::ApplicationClosed(close) if !close.reason.is_empty() => {
+                Some(String::from_utf8_lossy(&close.reason).into_owned())
+            }
+            E::ApplicationClosed(_)
+            | E::VersionMismatch
+            | E::TransportError(_)
+            | E::ConnectionClosed(_)
+            | E::Reset
+            | E::TimedOut
+            | E::LocallyClosed
+            | E::CidsExhausted => None,
+        }
+    }
+
     /// 连接是不是因为网络原因断了（超时、被重置、传输层出错），是的话返回原因。
     /// 对端或本端正常关闭、连接还开着时为 `None`。
     #[must_use]

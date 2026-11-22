@@ -341,6 +341,9 @@ mod tests {
             size: 5 * 1_048_576,
         };
         assert!(clip_message(&remote, s).unwrap().contains("对方"));
+        assert!(clip_message(&ClipNote::FilesUnsupported, s)
+            .unwrap()
+            .contains("升级"));
         let ok = ClipNote::Received {
             kind: ClipKind::Text,
             size: 1,

@@ -165,14 +165,25 @@ pub async fn run(
     config.binding = link.channel_binding()?;
     let mut session = Session::controller(config, trace);
 
-    let (mut ctrl_send, mut ctrl_recv) = link.open_stream().await?;
-    write_kind(&mut ctrl_send, StreamKind::Control).await?;
+    // 握手阶段对端拒绝时（例如屏幕暂时打不开）会带着原因关闭连接；流上的错误只有“连接断了”，
+    // 换成对端给的原因（也不算网络断开，不用重连）。
+    let refused = |e: NetError| match link.refused_reason() {
+        Some(why) => NetError::Connect(format!("对方拒绝了连接：{why}")),
+        None => e,
+    };
+    let (mut ctrl_send, mut ctrl_recv) = link.open_stream().await.map_err(refused)?;
+    write_kind(&mut ctrl_send, StreamKind::Control)
+        .await
+        .map_err(refused)?;
     let hello = session.hello(link.now(), &mut tracer)?;
-    write_control(&mut ctrl_send, &hello).await?;
+    write_control(&mut ctrl_send, &hello)
+        .await
+        .map_err(refused)?;
     let (suite, caps) = loop {
         let msg = tokio::time::timeout(HELLO_TIMEOUT, read_control(&mut ctrl_recv))
             .await
-            .map_err(|_| NetError::Timeout("等待握手应答"))??;
+            .map_err(|_| NetError::Timeout("等待握手应答"))?
+            .map_err(refused)?;
         let replies = match session.on_control(link.now(), &msg, &mut tracer) {
             Ok(replies) => replies,
             Err(e) => {

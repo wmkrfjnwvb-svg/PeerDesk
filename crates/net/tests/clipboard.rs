@@ -274,3 +274,25 @@ async fn files_are_not_sent_to_an_old_peer() {
     })
     .await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn identical_content_on_both_sides_is_not_rewritten() {
+    // 另一个远程软件（例如 ToDesk）也在同步剪贴板：两边几乎同时有了同样的内容。
+    // 各自收到对方发来的同一份内容时不再写一遍（原来会来回覆盖）。
+    session_with(Caps::CLIPBOARD, true, true, |host, ctrl| async move {
+        let same = Clip::text("同一段文字");
+        host.copy(same.clone());
+        ctrl.copy(same.clone());
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(host.get(), Some(same.clone()));
+        assert_eq!(ctrl.get(), Some(same));
+        let rewrites = |c: &MemClipboard| {
+            c.notes()
+                .iter()
+                .filter(|n| matches!(n, ClipNote::Received { .. }))
+                .count()
+        };
+        assert_eq!((rewrites(&host), rewrites(&ctrl)), (0, 0));
+    })
+    .await;
+}

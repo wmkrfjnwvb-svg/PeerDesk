@@ -2,7 +2,7 @@
 
 use super::*;
 use peerdesk_net::service::{RelayService, SignalService};
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn temp_dir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("peerdesk-gui-{}-{tag}", std::process::id()));
@@ -492,6 +492,43 @@ fn connect_through_a_signaling_server() {
     drop(server);
     for dir in [server_dir, host_dir, ctrl_dir] {
         let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[test]
+fn locked_screen_refuses_one_connection_and_keeps_hosting() {
+    let (host_dir, ctrl_dir) = (temp_dir("h7"), temp_dir("c7"));
+    let (h, port, mut host_seen) = host(&host_dir, "pw", None);
+    // 屏幕暂时采集不到（例如锁屏）：拒绝这一次，原因告诉控制端
+    crate::local::TEST_SCREEN_LOCKED.store(true, Ordering::Relaxed);
+    let (repaint, _) = counter();
+    let v = start_view(local(port, None), "pw", ctrl_dir.clone(), repaint);
+    let err = ended(&v, &mut Log::new()).unwrap_err();
+    assert!(err.to_string().contains("屏幕已锁定"), "{err}");
+    let refused = wait_for(
+        || h.poll(),
+        &mut host_seen,
+        |e| matches!(e, HostEvent::Refused(_)),
+    );
+    assert!(matches!(refused, HostEvent::Refused(ref why) if why.contains("屏幕已锁定")));
+    // 解锁后，同一个被控端接受下一次连接（原来会停止被控，设备离线）
+    crate::local::TEST_SCREEN_LOCKED.store(false, Ordering::Relaxed);
+    let (repaint, _) = counter();
+    let v = start_view(local(port, None), "pw", ctrl_dir.clone(), repaint);
+    wait_for(
+        || v.poll(),
+        &mut Log::new(),
+        |e| matches!(e, ViewEvent::Connected { .. }),
+    );
+    wait_for(
+        || h.poll(),
+        &mut host_seen,
+        |e| *e == HostEvent::Established,
+    );
+    drop(v);
+    drop(h);
+    for d in [host_dir, ctrl_dir] {
+        let _ = std::fs::remove_dir_all(d);
     }
 }
 
