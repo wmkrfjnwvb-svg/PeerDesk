@@ -959,7 +959,7 @@ fn audio_samples(sample: &CMSampleBuffer) -> Option<Vec<f32>> {
             std::ptr::from_ref(sample).cast(),
             std::ptr::null_mut(),
             &mut list,
-            std::mem::size_of::<AudioBufferList2>(),
+            size_of::<AudioBufferList2>(),
             std::ptr::null(),
             std::ptr::null(),
             1,
