@@ -316,6 +316,11 @@ pub async fn run(
     };
     let mut media = MediaReceiver::detached(link.now(), opts.deadline_us);
     media.set_keyframe_grace(caps.common(Caps::H264) == Caps::H264);
+    media.set_fec(if caps.has(Caps::FEC_RS) {
+        peerdesk_core::transport::Fec::Rs
+    } else {
+        peerdesk_core::transport::Fec::Xor
+    });
     let (decode_jobs, mut decoded_rx) = spawn_decoder(decoder);
     let mut last_screen: Option<Screen> = None;
     // 反馈只在有新情况时发；什么都没发生时每秒一次，证明自己还在。
@@ -588,5 +593,7 @@ mod tests {
     fn reaction_summary_is_median_and_max_in_ms() {
         assert_eq!(reaction_summary(&[]), (0, 0));
         assert_eq!(reaction_summary(&[90_000, 30_000, 250_000]), (90, 250));
+        let hook = super::QualityHook(std::sync::Arc::new(|_| {}));
+        assert_eq!(format!("{hook:?}"), "QualityHook");
     }
 }

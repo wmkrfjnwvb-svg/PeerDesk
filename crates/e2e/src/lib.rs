@@ -74,6 +74,15 @@ impl CodecKind {
     }
 }
 
+/// 纠错方式的环境变量：`xor` 用异或（对照），其他用 RS。
+fn fec_from(value: Option<&std::ffi::OsStr>) -> peerdesk_core::transport::Fec {
+    if value.is_some_and(|v| v == "xor") {
+        peerdesk_core::transport::Fec::Xor
+    } else {
+        peerdesk_core::transport::Fec::Rs
+    }
+}
+
 /// 一个阶段：做什么，做多少帧。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Phase {
@@ -112,6 +121,8 @@ pub struct Scenario {
     pub estimator: EstimatorKind,
     /// 发送节奏（实验，见 [`peerdesk_core::pacer`]）。默认按环境变量 `PEERDESK_PACE`。
     pub pacing: bool,
+    /// 纠错方式。默认 RS（新版本之间）；`PEERDESK_FEC=xor` 对照。
+    pub fec: peerdesk_core::transport::Fec,
 }
 
 impl Scenario {
@@ -133,6 +144,7 @@ impl Scenario {
             seed: 1,
             estimator: EstimatorKind::PRODUCT,
             pacing: peerdesk_core::pacer::enabled(),
+            fec: fec_from(std::env::var_os("PEERDESK_FEC").as_deref()),
         }
     }
 }
@@ -324,6 +336,8 @@ pub fn run(s: &Scenario) -> Result<Outcome, Error> {
     let mut tx = MediaSender::new(cfg, encoder);
     let mut rx = MediaReceiver::new(Time::ZERO, cfg.deadline_us, decoder);
     rx.set_keyframe_grace(s.codec == CodecKind::H264);
+    rx.set_fec(s.fec);
+    tx.set_fec(s.fec);
     let mut net: Net<Vec<u8>> = Net::new(s.seed);
     let mut network = s.network.clone();
     network.sort_by_key(|(t, _)| *t);
@@ -610,6 +624,14 @@ mod tests {
         assert!((luma_psnr(&a, &a) - 99.0).abs() < 1e-9);
         assert!(luma_psnr(&a, &Screen::new(2, 2, 0)).abs() < 1e-9);
         assert_eq!(CodecKind::Tile.name(), "tile");
+    }
+
+    #[test]
+    fn fec_choice_from_the_environment() {
+        use peerdesk_core::transport::Fec;
+        assert_eq!(fec_from(Some(std::ffi::OsStr::new("xor"))), Fec::Xor);
+        assert_eq!(fec_from(Some(std::ffi::OsStr::new("rs"))), Fec::Rs);
+        assert_eq!(fec_from(None), Fec::Rs);
     }
 
     #[test]

@@ -16,7 +16,9 @@ use crate::governor::FpsGovernor;
 use crate::proto::{VideoHeader, MAX_DATAGRAM};
 use crate::screen::Screen;
 use crate::time::Time;
-use crate::transport::{fragment, parity_for, Reassembler, VideoPacket, PARITY_PREFIX};
+use crate::transport::{
+    fragment, parity_for, rs_parity_for, Fec, Reassembler, VideoPacket, RS_PARITY_PREFIX,
+};
 use crate::video::{Codec, EncodedFrame, FrameHeader, VideoDecoder, VideoEncoder};
 use crate::wire::{Reader, Writer};
 
@@ -218,6 +220,8 @@ pub struct MediaSender {
     last_obs: Option<Observation>,
     /// 连续有丢包的反馈次数（决定要不要换成“无线”画像）。
     lossy_feedbacks: u32,
+    /// 纠错方式（握手协商）。
+    fec: Fec,
     governor: FpsGovernor,
     /// 下一次 [`Self::finish_frame`] 用的编码时间（微秒），由编码线程报告。
     encode_us: u64,
@@ -265,6 +269,7 @@ impl MediaSender {
             rtt_us: 0,
             last_obs: None,
             lossy_feedbacks: 0,
+            fec: Fec::Xor,
             governor: FpsGovernor::new(cfg.fps),
             encode_us: 0,
         }
@@ -354,6 +359,11 @@ impl MediaSender {
         if max_payload > 0 {
             self.cfg.max_payload = max_payload;
         }
+    }
+
+    /// 设置纠错方式（握手后按双方能力：都支持 RS 时用 RS）。
+    pub fn set_fec(&mut self, fec: Fec) {
+        self.fec = fec;
     }
 
     /// 现在用的画像名（日志用）。
@@ -466,10 +476,14 @@ impl MediaSender {
             .cfg
             .max_payload
             .saturating_sub(VIDEO_HEADER_LEN)
-            .saturating_sub(PARITY_PREFIX);
+            // 按较长的 RS 校验分片头留出空间（异或的短 2 字节，不另算）
+            .saturating_sub(RS_PARITY_PREFIX);
         let mut packets = fragment(frame_id, ref_frame, &encoded.payload, max)?;
         let data_count = packets.len();
-        let parity = parity_for(&packets, self.fec_permille());
+        let parity = match self.fec {
+            Fec::Xor => parity_for(&packets, self.fec_permille()),
+            Fec::Rs => rs_parity_for(&packets, self.fec_permille()),
+        };
         packets.extend(parity);
         let out: Vec<Outgoing> = packets
             .into_iter()
@@ -807,6 +821,11 @@ impl MediaReceiver {
     #[must_use]
     pub fn screen(&self) -> Option<&Screen> {
         self.decoder.as_ref().and_then(|d| d.screen())
+    }
+
+    /// 设置纠错方式（和发送端一致，按握手协商）。
+    pub fn set_fec(&mut self, fec: Fec) {
+        self.reassembler.set_fec(fec);
     }
 
     /// 打开或关闭关键帧宽限（解码器是 H.264 时打开，见 [`crate::transport::Reassembler::set_keyframe_grace`]）。

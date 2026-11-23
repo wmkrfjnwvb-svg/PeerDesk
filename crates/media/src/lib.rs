@@ -95,6 +95,11 @@ impl HardwareEncoder for mf::MfEncoder {
     }
 }
 
+/// `PEERDESK_HW=0` 关掉硬件编码（对照测试用）。
+fn hardware_disabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|v| v == "0")
+}
+
 /// 打开硬件编码器的函数：（宽, 高, 帧率, 码率）。
 pub type HardwareOpener = fn(u32, u32, u32, u64) -> Result<Box<dyn HardwareEncoder>, String>;
 
@@ -108,7 +113,7 @@ pub fn open_system_hardware(
     fps: u32,
     bps: u64,
 ) -> Result<Box<dyn HardwareEncoder>, String> {
-    if std::env::var_os("PEERDESK_HW").is_some_and(|v| v == "0") {
+    if hardware_disabled(std::env::var_os("PEERDESK_HW").as_deref()) {
         return Err("已用 PEERDESK_HW=0 关掉".into());
     }
     #[cfg(windows)]
@@ -673,6 +678,8 @@ mod tests {
         assert_eq!(enc.backend(), "软件 OpenH264");
         // 这个系统的硬件编码入口：Linux 上没有
         assert!(open_system_hardware(64, 64, 30, 1_000_000).is_err());
+        assert!(hardware_disabled(Some(std::ffi::OsStr::new("0"))));
+        assert!(!hardware_disabled(Some(std::ffi::OsStr::new("1"))) && !hardware_disabled(None));
     }
 
     /// Windows 实机：真的调 Media Foundation。有硬件编码器就编几帧并用 OpenH264 解出来（验证是 Baseline、

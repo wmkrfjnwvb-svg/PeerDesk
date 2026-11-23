@@ -40,6 +40,7 @@ pub mod probe;
 pub mod proto;
 pub mod region;
 pub mod relay;
+pub mod rs;
 pub mod scenario;
 pub mod screen;
 pub mod session;

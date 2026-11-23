@@ -125,3 +125,42 @@ fn microsoft_traces() {
         }
     }
 }
+
+/// 回归门槛（每次 CI 都跑）：三条有代表性的真实轨迹，指标不许比 2026-11-23 的结果差（留两成余量）。
+/// 数字只升不降：改进之后把门槛收紧。
+#[test]
+fn microsoft_traces_do_not_regress() {
+    // (轨迹, 冻结次数上限, 最长等待上限 ms, 首帧上限 ms)
+    let gates = [
+        ("ms-09401", 4, 4000.0, 2600.0), // 0.5–1.5 Mbps 变化：实测 3 次 / 3382 ms / 2148 ms
+        ("ms-02560", 20, 470.0, 160.0),  // 8 Mbps、12% 丢包：实测 16 次 / 385 ms / 123 ms
+        ("ms-05729", 16, 4100.0, 2600.0), // 1 Mbps、20% 丢包：实测 13 次 / 3404 ms / 2161 ms
+    ];
+    for (name, freezes, max_wait, first) in gates {
+        let csv = TRACES.iter().find(|(n, _)| *n == name).unwrap().1;
+        let o = run(&Scenario {
+            network: network(csv),
+            profile: Profile::WIRELESS,
+            estimator: EstimatorKind::ClassicV1,
+            start_bps: 1_000_000,
+            ..Scenario::new(name, workload())
+        })
+        .unwrap();
+        println!("{}", row(name, &o));
+        let first_ms = o.first_picture_ms.unwrap_or(f64::INFINITY);
+        assert!(
+            o.freezes <= freezes,
+            "{name}：冻结 {} 次，门槛 {freezes}",
+            o.freezes
+        );
+        assert!(
+            o.max_wait_ms <= max_wait,
+            "{name}：最长等待 {:.0} ms，门槛 {max_wait}",
+            o.max_wait_ms
+        );
+        assert!(
+            first_ms <= first,
+            "{name}：首帧 {first_ms:.0} ms，门槛 {first}"
+        );
+    }
+}

@@ -115,6 +115,53 @@ pub fn parity_for(packets: &[VideoPacket], permille: u16) -> Vec<VideoPacket> {
         .collect()
 }
 
+/// 用 RS 码为一帧的数据分片生成校验分片：`permille` 是冗余比例，校验分片数向上取整，
+/// 至多等于数据分片数且 k + m ≤ 256。数据区开头：数据分片总数(2) + 分片长度(2) + 最后一片长度(2)。
+#[must_use]
+pub fn rs_parity_for(packets: &[VideoPacket], permille: u16) -> Vec<VideoPacket> {
+    let data: Vec<&VideoPacket> = packets.iter().filter(|p| !p.parity).collect();
+    let Some(first) = data.first() else {
+        return Vec::new();
+    };
+    let k = data.len();
+    let m = k
+        .saturating_mul(usize::from(permille))
+        .div_ceil(1000)
+        .min(k)
+        .min(256usize.saturating_sub(k));
+    let refs: Vec<&[u8]> = data.iter().map(|p| p.data.as_slice()).collect();
+    let (Ok(k16), Ok(m16), Ok(parity)) = (
+        u16::try_from(k),
+        u16::try_from(m),
+        crate::rs::encode(&refs, m),
+    ) else {
+        return Vec::new();
+    };
+    let len = len16(&first.data);
+    let last_len = data.last().map_or(0, |p| len16(&p.data));
+    parity
+        .into_iter()
+        .zip(0u16..)
+        .map(|(bytes, j)| {
+            let mut w = Writer::new();
+            w.u16(k16).u16(len).u16(last_len).bytes(&bytes);
+            VideoPacket {
+                header: VideoHeader {
+                    frame_id: first.header.frame_id,
+                    frag_index: j,
+                    frag_count: m16,
+                    ref_frame: first.header.ref_frame,
+                },
+                parity: true,
+                data: w.into_vec(),
+            }
+        })
+        .collect()
+}
+
+/// RS 校验分片数据区开头的固定长度：数据分片总数(2) + 分片长度(2) + 最后一片长度(2)。
+pub const RS_PARITY_PREFIX: usize = 6;
+
 /// 重组完成的一帧。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
@@ -145,10 +192,27 @@ pub struct ReassemblyStats {
     pub recovered: u64,
 }
 
+/// 纠错方式（会话里双方协商：都支持 RS 时用 RS，否则用异或）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Fec {
+    /// 分组异或：每组补一个丢包（老版本只认这个）。
+    #[default]
+    Xor,
+    /// Reed-Solomon：收到任意 k 个分片就能还原（见 [`crate::rs`]）。
+    Rs,
+}
+
 #[derive(Debug, Clone)]
-struct Parity {
-    len_xor: u16,
-    xor: Vec<u8>,
+enum Parity {
+    Xor {
+        len_xor: u16,
+        xor: Vec<u8>,
+    },
+    Rs {
+        len: u16,
+        last_len: u16,
+        data: Vec<u8>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -166,14 +230,72 @@ struct Partial {
 impl Partial {
     /// 用已有的校验分片尽量恢复缺失的数据分片，返回恢复的个数。
     fn recover(&mut self) -> u64 {
+        if self
+            .parity
+            .iter()
+            .flatten()
+            .any(|p| matches!(p, Parity::Rs { .. }))
+        {
+            return self.recover_rs();
+        }
+        self.recover_xor()
+    }
+
+    /// RS：缺的分片数不超过收到的校验分片数时一次全部还原。
+    fn recover_rs(&mut self) -> u64 {
+        let m = self.parity.len();
+        let k = self.parts.len();
+        let mut shape = None;
+        let parity: Vec<Option<&[u8]>> = self
+            .parity
+            .iter()
+            .map(|p| match p {
+                Some(Parity::Rs {
+                    len,
+                    last_len,
+                    data,
+                }) => {
+                    shape = Some((*len, *last_len));
+                    Some(data.as_slice())
+                }
+                Some(Parity::Xor { .. }) | None => None,
+            })
+            .collect();
+        let Some((len, last_len)) = shape else {
+            return 0;
+        };
+        let data: Vec<Option<&[u8]>> = self.parts.iter().map(Option::as_deref).collect();
+        let Some(rebuilt) = crate::rs::reconstruct(&data, &parity, m) else {
+            return 0;
+        };
+        let mut recovered = 0u64;
+        for (index, mut bytes) in rebuilt {
+            let want = usize::from(if index + 1 == k { last_len } else { len });
+            // 长度对不上说明校验分片与数据不匹配（损坏或伪造）：放弃这一片
+            if want > bytes.len() {
+                continue;
+            }
+            bytes.truncate(want);
+            if let Some(slot) = self.parts.get_mut(index) {
+                *slot = Some(bytes);
+                self.have = self.have.saturating_add(1);
+                recovered = recovered.saturating_add(1);
+            }
+        }
+        recovered
+    }
+
+    fn recover_xor(&mut self) -> u64 {
         let groups = self.parity.len();
         let mut recovered = 0u64;
         for (group, parity) in self.parity.iter().enumerate() {
-            let Some(parity) = parity else { continue };
+            let Some(Parity::Xor { len_xor, xor }) = parity else {
+                continue;
+            };
             let mut missing = None;
             let mut missing_count = 0usize;
-            let mut xor = parity.xor.clone();
-            let mut len = parity.len_xor;
+            let mut xor = xor.clone();
+            let mut len = *len_xor;
             for (index, part) in self.parts.iter().enumerate().skip(group).step_by(groups) {
                 match part {
                     Some(data) => {
@@ -214,6 +336,8 @@ pub struct Reassembler {
     /// 小于等于这个帧号的帧不再接受。
     floor: Option<u32>,
     stats: ReassemblyStats,
+    /// 纠错方式（会话协商的结果）。
+    fec: Fec,
     /// 参考自己的帧当作关键帧，给更长的时间（见 [`Reassembler::expire`]）。只对 H.264 打开：
     /// 块编码的每一帧都参考自己、都很小，丢了靠重发块恢复，给长时间反而拖慢恢复。
     keyframe_grace: bool,
@@ -231,7 +355,13 @@ impl Reassembler {
             floor: None,
             stats: ReassemblyStats::default(),
             keyframe_grace: false,
+            fec: Fec::Xor,
         }
+    }
+
+    /// 设置纠错方式（握手协商之后）。
+    pub fn set_fec(&mut self, fec: Fec) {
+        self.fec = fec;
     }
 
     /// 打开或关闭关键帧宽限（H.264 打开）。
@@ -289,12 +419,33 @@ impl Reassembler {
         let (data_count, parity) = if packet.parity {
             let mut r = Reader::new(&packet.data);
             let count = r.u16()?;
-            let len_xor = r.u16()?;
-            if count == 0 || header.frag_count > count {
-                return Err(Error::Inconsistent("校验分片的分组数不合法"));
+            match self.fec {
+                Fec::Xor => {
+                    let len_xor = r.u16()?;
+                    if count == 0 || header.frag_count > count {
+                        return Err(Error::Inconsistent("校验分片的分组数不合法"));
+                    }
+                    let xor = r.rest().to_vec();
+                    (count, Some(Parity::Xor { len_xor, xor }))
+                }
+                Fec::Rs => {
+                    let len = r.u16()?;
+                    let last_len = r.u16()?;
+                    let total = usize::from(count).saturating_add(usize::from(header.frag_count));
+                    if count == 0 || total > 256 || last_len > len {
+                        return Err(Error::Inconsistent("RS 校验分片的参数不合法"));
+                    }
+                    let data = r.rest().to_vec();
+                    (
+                        count,
+                        Some(Parity::Rs {
+                            len,
+                            last_len,
+                            data,
+                        }),
+                    )
+                }
             }
-            let xor = r.rest().to_vec();
-            (count, Some(Parity { len_xor, xor }))
         } else {
             (header.frag_count, None)
         };
@@ -672,6 +823,55 @@ mod tests {
         r.push(Time(0), parity[0].clone()).unwrap();
         r.push(Time(0), parity[0].clone()).unwrap();
         assert_eq!(r.stats().duplicates, 1);
+    }
+
+    #[test]
+    fn rs_parity_rebuilds_several_losses_in_one_frame() {
+        // 10 个数据分片（最后一片短），30% 冗余 → 3 个校验分片；丢 3 个数据分片照样收齐
+        let data = packets(7, 950, 100);
+        assert_eq!(data.len(), 10);
+        let parity = rs_parity_for(&data, 300);
+        assert_eq!(parity.len(), 3);
+        let mut r = Reassembler::new(1_000_000, 4);
+        r.set_fec(Fec::Rs);
+        let mut done = None;
+        for (i, p) in data.iter().enumerate() {
+            if [1, 4, 9].contains(&i) {
+                continue;
+            }
+            assert!(r.push(Time(1), p.clone()).unwrap().is_none());
+        }
+        for p in &parity {
+            if let Some(f) = r.push(Time(2), p.clone()).unwrap() {
+                done = Some(f);
+            }
+        }
+        let frame = done.unwrap();
+        let expected: Vec<u8> = data.iter().flat_map(|p| p.data.clone()).collect();
+        assert_eq!(frame.data, expected);
+        assert_eq!(r.stats().recovered, 3);
+        // 丢 4 个、只有 3 个校验分片：收不齐（等重传）
+        let mut r = Reassembler::new(1_000_000, 4);
+        r.set_fec(Fec::Rs);
+        for (i, p) in data.iter().enumerate() {
+            if ![0, 1, 2, 3].contains(&i) {
+                r.push(Time(1), p.clone()).unwrap();
+            }
+        }
+        for p in &parity {
+            assert!(r.push(Time(2), p.clone()).unwrap().is_none());
+        }
+        // 不合法的 RS 校验分片：报错
+        let mut bad = parity[0].clone();
+        bad.data[4] = 0xff; // 最后一片长度 > 分片长度
+        bad.data[5] = 0xff;
+        let mut r = Reassembler::new(1_000_000, 4);
+        r.set_fec(Fec::Rs);
+        assert!(r.push(Time(1), bad).is_err());
+        // 没有数据分片 / 比例为 0 / 一帧超过 256 个分片：不生成
+        assert!(rs_parity_for(&[], 300).is_empty());
+        assert!(rs_parity_for(&packets(8, 3000, 10), 300).is_empty());
+        assert!(rs_parity_for(&data, 0).is_empty());
     }
 
     #[test]

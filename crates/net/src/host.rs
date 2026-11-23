@@ -15,6 +15,7 @@ use peerdesk_core::proto::{Caps, Channel, Control, RejectReason};
 use peerdesk_core::screen::Screen;
 use peerdesk_core::session::{Session, SessionConfig, State};
 use peerdesk_core::trace::{Stage, TraceId, Tracer};
+use peerdesk_core::transport::Fec;
 use peerdesk_core::video::{EncodedFrame, TileEncoder, VideoEncoder};
 use peerdesk_media::H264Encoder;
 use tokio::sync::mpsc;
@@ -353,6 +354,12 @@ pub async fn serve(
         },
         codec,
     );
+    // 双方都支持 RS 纠错时用它（老版本只认异或）
+    media.set_fec(if caps.has(Caps::FEC_RS) {
+        Fec::Rs
+    } else {
+        Fec::Xor
+    });
     let mut encoded_rx = encoded_rx;
     // 判断画面变没变：来源会报告变化计数时用它；否则和上一幅比较。
     let mut last_seq: Option<u64> = None;

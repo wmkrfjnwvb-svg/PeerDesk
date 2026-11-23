@@ -2552,10 +2552,12 @@ dependencies = [
 name = "peerdesk-media"
 version = "0.1.0"
 dependencies = [
+ "log",
  "openh264",
  "openh264-sys2",
  "opus",
  "peerdesk-core",
+ "windows 0.62.2",
 ]
 
 [[package]]
