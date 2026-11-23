@@ -433,7 +433,7 @@ pub async fn serve(
                                 drop(send);
                                 Ok(Vec::new())
                             }
-                            StreamKind::Control | StreamKind::Signal => {
+                            StreamKind::Control | StreamKind::Signal | StreamKind::Crash => {
                                 Err(NetError::Protocol("会话里不该出现这种流"))
                             }
                         }

@@ -253,10 +253,12 @@ jobs:
         run: npm ci --no-audit --no-fund && npm run build
         working-directory: web
       - name: Package
-        run: scripts/package-server-linux.sh dist
+        run: |
+          echo "SHORT=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_ENV"
+          scripts/package-server-linux.sh dist
       - uses: actions/upload-artifact@v4
         with:
-          name: peerdesk-${{ github.sha }}-linux-server
+          name: peerdesk-${{ env.SHORT }}-linux-server
           path: dist/*
           if-no-files-found: error
           retention-days: 7
@@ -274,10 +276,12 @@ jobs:
         with:
           key: package-linux
       - name: Package
-        run: scripts/package-linux.sh dist
+        run: |
+          echo "SHORT=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_ENV"
+          scripts/package-linux.sh dist
       - uses: actions/upload-artifact@v4
         with:
-          name: peerdesk-${{ github.sha }}-linux-x64
+          name: peerdesk-${{ env.SHORT }}-linux-x64
           path: dist/*
           if-no-files-found: error
           retention-days: 7

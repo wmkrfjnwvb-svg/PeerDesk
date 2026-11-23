@@ -10,7 +10,10 @@ use num_traits::ToPrimitive;
 /// （1920×1080 像素 = 960×540 点）。同类产品默认都是“适应窗口”。
 /// `pixels_per_point` 是本地屏幕的缩放比例；只在画面为空时有意义，留着参数便于以后加“原始大小”。
 #[must_use]
-pub fn fit(avail: Rect, image: [u16; 2], pixels_per_point: f32) -> Rect {
+///
+/// `original` 为真时按原始大小显示（一个远程像素对应一个屏幕物理像素，最清楚），
+/// 放不下时才缩小。
+pub fn fit(avail: Rect, image: [u16; 2], pixels_per_point: f32, original: bool) -> Rect {
     let ppp = if pixels_per_point > 0.0 {
         pixels_per_point
     } else {
@@ -20,9 +23,10 @@ pub fn fit(avail: Rect, image: [u16; 2], pixels_per_point: f32) -> Rect {
     if native.x <= 0.0 || native.y <= 0.0 {
         return Rect::from_center_size(avail.center(), vec2(0.0, 0.0));
     }
-    let scale = (avail.width() / native.x)
+    let fill = (avail.width() / native.x)
         .min(avail.height() / native.y)
         .max(0.0);
+    let scale = if original { fill.min(1.0) } else { fill };
     Rect::from_center_size(avail.center(), native * scale)
 }
 
@@ -63,31 +67,41 @@ mod tests {
     #[test]
     fn scales_up_to_fill_the_window() {
         // 窗口比画面大：放大到碰到一边（这里是高度），左右留边
-        let r = fit(rect(0.0, 0.0, 2000.0, 1000.0), [1280, 720], 1.0);
+        let r = fit(rect(0.0, 0.0, 2000.0, 1000.0), [1280, 720], 1.0, false);
         assert!((r.height() - 1000.0).abs() < 0.01 && r.center() == pos2(1000.0, 500.0));
         // Retina（2 倍）全屏：1920×1080 的画面铺满 1512×850 点的屏幕宽度，不是只占中间一块
         // （屏幕比 16:9 略宽，所以高度铺满、左右各留不到 1 个点）
-        let r = fit(rect(0.0, 0.0, 1512.0, 850.0), [1920, 1080], 2.0);
+        let r = fit(rect(0.0, 0.0, 1512.0, 850.0), [1920, 1080], 2.0, false);
         assert!(
             (r.height() - 850.0).abs() < 0.01 && r.width() > 1510.0,
             "{r:?}"
         );
         // 缩放比例不合法时按 1 处理，结果一样
-        let r = fit(rect(0.0, 0.0, 1512.0, 850.0), [1920, 1080], 0.0);
+        let r = fit(rect(0.0, 0.0, 1512.0, 850.0), [1920, 1080], 0.0, false);
         assert!((r.height() - 850.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn original_size_is_one_to_one_until_it_does_not_fit() {
+        // Retina（2 倍）：1920×1080 原始大小是 960×540 个点
+        let r = fit(rect(0.0, 0.0, 1512.0, 850.0), [1920, 1080], 2.0, true);
+        assert_eq!(r.size(), vec2(960.0, 540.0));
+        // 放不下时照样缩小
+        let r = fit(rect(0.0, 0.0, 640.0, 1000.0), [1280, 720], 1.0, true);
+        assert_eq!(r.size(), vec2(640.0, 360.0));
     }
 
     #[test]
     fn scales_down_keeping_the_aspect_ratio() {
         // 太宽：按宽度缩小，上下留黑边
-        let r = fit(rect(0.0, 0.0, 640.0, 1000.0), [1280, 720], 1.0);
+        let r = fit(rect(0.0, 0.0, 640.0, 1000.0), [1280, 720], 1.0, false);
         assert_eq!(r, rect(0.0, 320.0, 640.0, 360.0));
         // 太高：按高度缩小，左右留黑边
-        let r = fit(rect(10.0, 10.0, 2000.0, 360.0), [1280, 720], 1.0);
+        let r = fit(rect(10.0, 10.0, 2000.0, 360.0), [1280, 720], 1.0, false);
         assert_eq!(r, rect(690.0, 10.0, 640.0, 360.0));
         // 空画面
         assert_eq!(
-            fit(rect(0.0, 0.0, 10.0, 10.0), [0, 720], 1.0).size(),
+            fit(rect(0.0, 0.0, 10.0, 10.0), [0, 720], 1.0, false).size(),
             vec2(0.0, 0.0)
         );
     }

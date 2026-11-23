@@ -17,6 +17,14 @@ fn main() -> ExitCode {
         .collect();
     // 日志写到数据目录的 logs 里，出问题时把它发出来。
     peerdesk::logfile::init(&peerdesk::data_dir().join("logs"), false);
+    // 发布版遇到 panic 直接退出（panic = "abort"），退出前把原因写进日志，用户发日志就能排查。
+    let default_hook = std::panic::take_hook();
+    let logs = peerdesk::data_dir().join("logs");
+    std::panic::set_hook(Box::new(move |info| {
+        log::error!("程序崩溃：{info}");
+        peerdesk::crashreport::record(&logs, &info.to_string());
+        default_hook(info);
+    }));
     if args.is_empty() {
         return ExitCode::from(peerdesk::gui::run());
     }

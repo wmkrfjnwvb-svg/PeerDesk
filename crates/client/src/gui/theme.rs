@@ -222,11 +222,17 @@ pub fn card<R>(ui: &mut Ui, p: &Palette, add: impl FnOnce(&mut Ui) -> R) -> R {
 }
 
 /// 卡片标题：图标 + 标题，右侧可以放东西。
+/// 先放右侧的东西，标题用剩下的宽度、放不下时截断加省略号（电脑名很长时不压住右侧的状态）。
 pub fn card_title(ui: &mut Ui, p: &Palette, glyph: &str, title: &str, right: impl FnOnce(&mut Ui)) {
     ui.horizontal(|ui| {
         ui.label(RichText::new(glyph).size(18.0).color(p.accent));
-        ui.label(RichText::new(title).size(16.0).strong());
-        ui.with_layout(Layout::right_to_left(Align::Center), right);
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            right(ui);
+            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                ui.add(egui::Label::new(RichText::new(title).size(16.0).strong()).truncate())
+                    .on_hover_text(title);
+            });
+        });
     });
     ui.add_space(6.0);
 }
@@ -330,13 +336,18 @@ pub fn primary_button(ui: &mut Ui, p: &Palette, text: &str, width: f32, enabled:
     .fill(if enabled {
         p.accent
     } else {
-        p.accent.gamma_multiply(0.45)
+        p.accent.gamma_multiply(0.55)
     })
     .stroke(Stroke::NONE)
-    .corner_radius(CornerRadius::same(10));
+    .corner_radius(CornerRadius::same(10))
+    // 不能点时不响应点击，但不用 add_enabled_ui：它会把白字也淡化到几乎看不见
+    .sense(if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    });
     // add_sized 让文字居中
-    ui.add_enabled_ui(enabled, |ui| ui.add_sized(Vec2::new(width, 40.0), button))
-        .inner
+    ui.add_sized(Vec2::new(width, 40.0), button)
 }
 
 /// 侧边栏的导航项。

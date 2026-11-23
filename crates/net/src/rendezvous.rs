@@ -218,6 +218,20 @@ impl Drop for Registration {
 }
 
 /// 被控端：向服务器登记在线。
+/// 把崩溃报告传给服务器，等它确认保存。
+pub async fn upload_crash(
+    node: &Node,
+    server: &Server,
+    report: &peerdesk_core::crash::Report,
+) -> Result<(), NetError> {
+    let link = node.connect(server.addr, server.pin.as_ref()).await?;
+    let (mut send, mut recv) = link.open_stream().await?;
+    write_kind(&mut send, StreamKind::Crash).await?;
+    let result = crate::stream::write_crash(&mut send, &mut recv, report).await;
+    link.close("done");
+    result
+}
+
 pub async fn register(node: &Node, server: &Server) -> Result<Registration, NetError> {
     register_with(node, server, Vec::new()).await
 }

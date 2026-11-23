@@ -55,6 +55,12 @@ const GUIDE_REFRESH: Duration = Duration::from_secs(1);
 
 /// 打开图形界面，直到窗口关闭。返回进程退出码。
 pub fn run() -> u8 {
+    #[cfg(target_os = "linux")]
+    if let Some(why) = crate::libcheck::check() {
+        log::error!("{why}");
+        let _ = writeln!(std::io::stderr(), "{why}");
+        return EXIT_FAILED;
+    }
     let lang = effective_lang(&default_data_dir());
     peerdesk_net::rendezvous::set_prefer_ipv6(lang.prefers_ipv6());
     let s = strings(lang);
@@ -179,6 +185,9 @@ impl App {
             Ok(p) => (p, Status::info(s.ready)),
             Err(e) => (String::new(), Status::error(e)),
         };
+        // 上次崩溃了：后台把日志传给服务器（配置了服务器就传给它，否则传给测试版默认服务器）
+        let server = ServerSettings::load(&data_dir);
+        crate::crashreport::upload_in_background(&data_dir, server.server(s).ok().flatten());
         let ctx2 = ctx.clone();
         let auto_host = !data_dir.join(HOST_OFF_FILE).exists();
         // PEERDESK_GUI_PREVIEW_MAC=15：在任何系统上预览 macOS 15 的授权引导（截图、设计评审用）
@@ -610,11 +619,7 @@ impl App {
                     ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(icon::HAND_EYE).color(p.accent));
-                        ui.label(format!(
-                            "{}  {addr}  {}",
-                            s.controller,
-                            short_fingerprint(&peer)
-                        ));
+                        // 先放右侧的断开按钮，地址和指纹用剩下的宽度（放不下截断）
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             let stop = egui::Button::new(
                                 RichText::new(format!(
@@ -630,6 +635,12 @@ impl App {
                                     host.kick();
                                 }
                             }
+                            let who =
+                                format!("{}  {addr}  {}", s.controller, short_fingerprint(&peer));
+                            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                                ui.add(egui::Label::new(&who).truncate())
+                                    .on_hover_text(&who);
+                            });
                         });
                     });
                 });
@@ -1222,7 +1233,15 @@ impl App {
             };
             ui.horizontal(|ui| {
                 ui.add_space(8.0);
-                let _ = muted(ui, p, &format!("v{}", env!("CARGO_PKG_VERSION")));
+                let _ = muted(
+                    ui,
+                    p,
+                    &format!(
+                        "v{} · {}",
+                        env!("CARGO_PKG_VERSION"),
+                        env!("PEERDESK_COMMIT")
+                    ),
+                );
             });
             ui.add_space(4.0);
             ui.horizontal(|ui| {

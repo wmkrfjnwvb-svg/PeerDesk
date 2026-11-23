@@ -268,6 +268,69 @@ struct SignalState {
     next_conn: AtomicU64,
     /// 设备码簿的存盘位置；`None` 表示只在内存里（测试用）。
     codes: Option<PathBuf>,
+    /// 每台设备上一次传崩溃报告的时间（限频）。
+    crash_seen: Mutex<BTreeMap<[u8; 32], Instant>>,
+}
+
+/// 同一台设备两次崩溃报告至少隔这么久。
+const CRASH_INTERVAL: Duration = Duration::from_secs(60);
+/// 服务器最多保存这么多份崩溃报告（每份不超过 260 KB，总共约 500 MB）。
+const MAX_CRASH_FILES: usize = 2000;
+
+/// 收一份崩溃报告，存到设备码簿旁边的 `crashes/` 里。没有数据目录（测试）时只记日志。
+async fn serve_crash(
+    state: &SignalState,
+    link: &Link,
+    mut send: quinn::SendStream,
+    mut recv: quinn::RecvStream,
+) -> Result<(), NetError> {
+    let device = *link.peer_fingerprint();
+    let now = Instant::now();
+    {
+        let mut seen = lock(&state.crash_seen);
+        if seen
+            .get(&device)
+            .is_some_and(|t| now.duration_since(*t) < CRASH_INTERVAL)
+        {
+            return Err(NetError::Protocol("崩溃报告太频繁"));
+        }
+        let _ = seen.insert(device, now);
+    }
+    let report = crate::stream::read_crash(&mut recv).await?;
+    crate::note!(
+        warn,
+        "收到崩溃报告：{}（{}，日志 {} 字节）",
+        link.remote_addr(),
+        report.summary.lines().next().unwrap_or_default(),
+        report.log.len()
+    );
+    if let Some(dir) = state
+        .codes
+        .as_ref()
+        .and_then(|p| p.parent())
+        .map(|d| d.join("crashes"))
+    {
+        let count = std::fs::read_dir(&dir).map_or(0, Iterator::count);
+        if count >= MAX_CRASH_FILES {
+            return Err(NetError::Protocol("崩溃报告已存满"));
+        }
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let path = dir.join(peerdesk_core::crash::file_name(secs, &device));
+        let mut text = format!("{}\n来自 {}\n\n", report.summary, link.remote_addr()).into_bytes();
+        text.extend_from_slice(&report.log);
+        std::fs::create_dir_all(&dir)
+            .and_then(|()| std::fs::write(&path, text))
+            .map_err(|e| NetError::Io(format!("保存崩溃报告 {}：{e}", path.display())))?;
+    }
+    send.write_all(&[1])
+        .await
+        .map_err(|e| NetError::Closed(e.to_string()))?;
+    let _ = send.finish();
+    // 等确认送到再返回：返回后连接随之关闭，没送到的确认会被丢掉
+    let _ = tokio::time::timeout(Duration::from_secs(5), send.stopped()).await;
+    Ok(())
 }
 
 /// 一次连接的中继安排。
@@ -499,8 +562,12 @@ async fn introduce(
 async fn serve_device(state: Arc<SignalState>, link: Link) -> Result<(), NetError> {
     let conn = state.next_conn.fetch_add(1, Ordering::Relaxed);
     let (mut send, mut recv) = link.accept_stream().await?;
-    if read_kind(&mut recv).await? != StreamKind::Signal {
-        return Err(NetError::Protocol("信令端口只接受信令流"));
+    match read_kind(&mut recv).await? {
+        StreamKind::Signal => {}
+        StreamKind::Crash => return serve_crash(&state, &link, send, recv).await,
+        StreamKind::Control | StreamKind::File | StreamKind::Clipboard | StreamKind::Audio => {
+            return Err(NetError::Protocol("信令端口只接受信令流和崩溃报告"));
+        }
     }
     let (tx, mut outbox) = mpsc::channel::<SignalMsg>(16);
     let mut probed = false;
@@ -635,6 +702,7 @@ impl SignalService {
             directory,
             next_conn: AtomicU64::new(1),
             codes,
+            crash_seen: Mutex::new(BTreeMap::new()),
         });
         let accept_state = Arc::clone(&state);
         let task = tokio::spawn(async move {

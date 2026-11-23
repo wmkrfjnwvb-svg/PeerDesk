@@ -25,6 +25,7 @@ pub mod cluster;
 pub mod codec;
 pub mod config;
 pub mod connect;
+pub mod crash;
 pub mod crypto;
 pub mod desktop_sim;
 pub mod error;

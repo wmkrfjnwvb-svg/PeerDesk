@@ -432,6 +432,31 @@ async fn host_async(args: HostArgs, out: &mut dyn Write) -> Result<u8, NetError>
     Ok(EXIT_OK)
 }
 
+/// 把崩溃报告传给服务器（用本机身份连接，服务器按身份限频）。
+pub(crate) fn upload_crash(
+    data_dir: &Path,
+    server: &Server,
+    report: &peerdesk_core::crash::Report,
+) -> Result<(), NetError> {
+    let identity = Identity::load_or_create(data_dir)?;
+    runtime()?.block_on(async {
+        let bind: SocketAddr = if server.addr.is_ipv6() {
+            ([0u16; 8], 0).into()
+        } else {
+            ([0, 0, 0, 0], 0).into()
+        };
+        let node = Node::bind(bind, &identity, &Policy::recommended())?;
+        let result = tokio::time::timeout(
+            Duration::from_secs(20),
+            peerdesk_net::rendezvous::upload_crash(&node, server, report),
+        )
+        .await
+        .unwrap_or(Err(NetError::Timeout("上传崩溃报告")));
+        node.close();
+        result
+    })
+}
+
 /// `peerdesk host`。
 pub fn host(args: &[String], out: &mut dyn Write) -> u8 {
     let parsed = match parse_host(args) {

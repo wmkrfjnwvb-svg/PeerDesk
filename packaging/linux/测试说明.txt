@@ -9,8 +9,9 @@ PeerDesk Linux 客户端（测试版）
 - 被别人控制需要 X11 会话。Ubuntu 22.04+ 和 Debian 12 的 GNOME、新版 KDE 默认是 Wayland，
   此时本机不能被控制（程序会明确提示）：登录界面右下角齿轮里选 “Ubuntu on Xorg” / “GNOME on Xorg” /
   “Plasma (X11)”。Xfce、Cinnamon、MATE、LXQt 默认就是 X11。
-- 运行库（大多数桌面发行版自带）：libasound2（声音）、libxkbcommon、libGL、libX11、libXext、libXfixes、libXdamage、libXtst。
-  缺库时 Ubuntu/Debian：sudo apt install libasound2 libxkbcommon0 libgl1 libxtst6 libxdamage1
+- 运行库：用 .deb 安装会自动装好。用 tar.gz 时缺库程序会直接告诉你缺哪个、怎么装，例如：
+  sudo apt install libxkbcommon-x11-0 libx11-xcb1 libxcursor1 libxrandr2 libxi6 libgl1 libegl1 libasound2 libxtst6 libxdamage1
+- 不要用 sudo 运行：root 连不上你的桌面（会报 Authorization required）。
 - 中文显示需要中文字体（Noto Sans CJK 或文泉驿），没有时中文显示为方框：sudo apt install fonts-noto-cjk
 
 出问题时把数据目录里的 logs/peerdesk.log 发过来（~/.config/peerdesk/logs/）。

@@ -20,6 +20,8 @@ pub enum StreamKind {
     Clipboard,
     /// 声音：控制端打开声音时开，开着被控端就发声音（双方协商出声音能力才有）。
     Audio,
+    /// 客户端 → 服务器：崩溃报告（见 [`peerdesk_core::crash`]）。
+    Crash,
 }
 
 impl StreamKind {
@@ -30,6 +32,7 @@ impl StreamKind {
             StreamKind::Signal => 3,
             StreamKind::Clipboard => 4,
             StreamKind::Audio => 5,
+            StreamKind::Crash => 6,
         }
     }
 
@@ -40,6 +43,7 @@ impl StreamKind {
             3 => Some(StreamKind::Signal),
             4 => Some(StreamKind::Clipboard),
             5 => Some(StreamKind::Audio),
+            6 => Some(StreamKind::Crash),
             _ => None,
         }
     }
@@ -134,6 +138,29 @@ pub async fn read_file_msgs(
     }
 }
 
+/// 发一份崩溃报告，等服务器确认已保存（回一个字节）。
+pub async fn write_crash(
+    send: &mut SendStream,
+    recv: &mut RecvStream,
+    report: &peerdesk_core::crash::Report,
+) -> Result<(), NetError> {
+    let bytes = report.encode().map_err(NetError::Core)?;
+    send.write_all(&bytes).await.map_err(closed)?;
+    send.finish().map_err(closed)?;
+    let mut ack = [0u8; 1];
+    recv.read_exact(&mut ack).await.map_err(closed)?;
+    Ok(())
+}
+
+/// 读一份崩溃报告（不可信输入，限长）。
+pub async fn read_crash(recv: &mut RecvStream) -> Result<peerdesk_core::crash::Report, NetError> {
+    let bytes = recv
+        .read_to_end(peerdesk_core::crash::MAX_REPORT)
+        .await
+        .map_err(closed)?;
+    peerdesk_core::crash::Report::decode(&bytes).map_err(NetError::Core)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,10 +173,11 @@ mod tests {
             StreamKind::Signal,
             StreamKind::Clipboard,
             StreamKind::Audio,
+            StreamKind::Crash,
         ] {
             assert_eq!(StreamKind::from_id(kind.id()), Some(kind));
         }
         assert_eq!(StreamKind::from_id(0), None);
-        assert_eq!(StreamKind::from_id(6), None);
+        assert_eq!(StreamKind::from_id(7), None);
     }
 }

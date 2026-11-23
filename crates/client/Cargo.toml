@@ -27,5 +27,10 @@ win32console = "0.1"
 [dev-dependencies]
 peerdesk-server = { path = "../server" }
 
+[features]
+default = ["crash-upload"]
+# 崩溃后下次启动时把日志的最后一段传给服务器（测试版默认打开）。正式版打包时用 --no-default-features 关掉。
+crash-upload = []
+
 [lints]
 workspace = true

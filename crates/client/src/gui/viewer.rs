@@ -56,6 +56,8 @@ pub struct Viewer {
     assistant: bool,
     /// 是否全屏。
     fullscreen: bool,
+    /// 按原始大小显示（最清楚）；默认放大铺满窗口。
+    original: bool,
 }
 
 impl Viewer {
@@ -79,6 +81,7 @@ impl Viewer {
             peer_name: String::new(),
             assistant: true,
             fullscreen: false,
+            original: false,
         }
     }
 
@@ -239,6 +242,19 @@ impl Viewer {
                                 self.fullscreen,
                             ));
                         }
+                        // 原始大小：一个远程像素对应一个屏幕像素，字最清楚；铺满窗口时放大会变软
+                        if toolbar_toggle(
+                            ui,
+                            &p,
+                            icon::NUMBER_SQUARE_ONE,
+                            s.original_size,
+                            self.original,
+                            true,
+                        )
+                        .clicked()
+                        {
+                            self.original = !self.original;
+                        }
                         if toolbar_toggle(ui, &p, icon::CHART_BAR, s.stats, self.overlay, true)
                             .clicked()
                         {
@@ -288,7 +304,7 @@ impl Viewer {
                 let avail = ui.max_rect();
                 let painter = ui.painter();
                 if let Some(texture) = &self.texture {
-                    let rect = fit(avail, self.size, ctx.pixels_per_point());
+                    let rect = fit(avail, self.size, ctx.pixels_per_point(), self.original);
                     let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
                     painter.image(texture.id(), rect, uv, Color32::WHITE);
                     picture = Some(rect);

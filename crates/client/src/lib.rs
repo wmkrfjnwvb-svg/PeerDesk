@@ -5,7 +5,9 @@
 
 use std::io::Write;
 
+pub mod crashreport;
 pub mod gui;
+pub mod libcheck;
 pub mod logfile;
 
 /// 默认的数据目录（身份、设置、日志都在这里）。

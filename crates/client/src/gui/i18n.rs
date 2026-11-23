@@ -331,6 +331,8 @@ pub struct Strings {
     pub clipboard_sync: &'static str,
     /// 助手：全屏。
     pub fullscreen: &'static str,
+    /// 原始大小（1:1）的提示。
+    pub original_size: &'static str,
     /// 助手：对方系统没有这个操作。
     pub not_on_this_os: &'static str,
     pub err_port_in_use: &'static str,
@@ -496,6 +498,7 @@ pub const ZH: Strings = Strings {
     sound: "声音",
     clipboard_sync: "剪贴板同步",
     fullscreen: "全屏",
+    original_size: "原始大小（1:1，最清楚）；再点一下铺满窗口",
     not_on_this_os: "对方系统没有这个操作",
     err_port_in_use: "端口已被占用（也许另一个 PeerDesk 正在运行），换一个端口试试",
     err_timeout: "对方没有响应。请检查地址和端口、防火墙，以及对方是否打开了“允许远程控制”",
@@ -661,6 +664,7 @@ pub const EN: Strings = Strings {
     sound: "Sound",
     clipboard_sync: "Clipboard sync",
     fullscreen: "Full screen",
+    original_size: "Original size (1:1, sharpest); click again to fill the window",
     not_on_this_os: "Not available on the remote system",
     err_port_in_use:
         "The port is already in use (maybe another PeerDesk is running). Try another port",
