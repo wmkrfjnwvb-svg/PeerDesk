@@ -497,11 +497,18 @@ impl Link {
     pub fn send_raw(&self, datagram: Vec<u8>) -> Result<(), NetError> {
         self.conn
             .send_datagram(Bytes::from(datagram))
-            .map_err(|e| match e {
-                quinn::SendDatagramError::ConnectionLost(why) => NetError::Closed(why.to_string()),
+            .or_else(|e| match e {
+                quinn::SendDatagramError::ConnectionLost(why) => {
+                    Err(NetError::Closed(why.to_string()))
+                }
+                // 路径 MTU 变小了（丢包严重时 QUIC 的黑洞检测会调小）：这个包当作丢了，由重传和下一帧补；
+                // 发送方每帧按新的大小切片。原来当成致命错误，窄带宽上会话直接断开。
+                quinn::SendDatagramError::TooLarge => {
+                    log::debug!("数据报超过当前路径 MTU，丢弃这一片");
+                    Ok(())
+                }
                 quinn::SendDatagramError::UnsupportedByPeer
-                | quinn::SendDatagramError::Disabled
-                | quinn::SendDatagramError::TooLarge => NetError::Protocol("数据报无法发送"),
+                | quinn::SendDatagramError::Disabled => Err(NetError::Protocol("对方不支持数据报")),
             })
     }
 

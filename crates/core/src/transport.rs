@@ -202,7 +202,7 @@ impl Partial {
     }
 }
 
-/// 一帧从第一个分片算起最多等这么多个截止时间。
+/// 一帧从第一个分片算起最多等这么多个截止时间（关键帧除外，见 [`Reassembler::expire`]）。
 const MAX_FRAME_LIFETIME_FACTOR: u64 = 8;
 
 /// 按截止时间重组视频帧。
@@ -214,6 +214,9 @@ pub struct Reassembler {
     /// 小于等于这个帧号的帧不再接受。
     floor: Option<u32>,
     stats: ReassemblyStats,
+    /// 参考自己的帧当作关键帧，给更长的时间（见 [`Reassembler::expire`]）。只对 H.264 打开：
+    /// 块编码的每一帧都参考自己、都很小，丢了靠重发块恢复，给长时间反而拖慢恢复。
+    keyframe_grace: bool,
 }
 
 impl Reassembler {
@@ -227,7 +230,13 @@ impl Reassembler {
             pending: BTreeMap::new(),
             floor: None,
             stats: ReassemblyStats::default(),
+            keyframe_grace: false,
         }
+    }
+
+    /// 打开或关闭关键帧宽限（H.264 打开）。
+    pub fn set_keyframe_grace(&mut self, on: bool) {
+        self.keyframe_grace = on;
     }
 
     /// 计数。
@@ -400,7 +409,16 @@ impl Reassembler {
         let late: Vec<u32> = self
             .pending
             .iter()
-            .filter(|(_, p)| now.since(p.last_seen) >= deadline || now.since(p.first_seen) >= hard)
+            // 关键帧（参考自己）不受总寿命限制，只要还在陆续收到分片就继续等：它是恢复画面的唯一途径，
+            // 窄带宽上一个关键帧本来就要传一两秒（400 kbps 传 96 KB 约 2 秒）。按总寿命作废的话
+            // 永远收不齐，发送端又重发新的关键帧，画面始终出不来。没有进展时照常作废。
+            // 关键帧“没有进展”的判定也放宽到总寿命上限：排队严重时 QUIC 的拥塞窗口要等确认，
+            // 分片会成批到达、中间停顿几百毫秒（400 kbps、排队 1 秒时实测如此）。
+            .filter(|(id, p)| {
+                let key = self.keyframe_grace && p.ref_frame == **id;
+                let stalled = now.since(p.last_seen) >= if key { hard } else { deadline };
+                stalled || (!key && now.since(p.first_seen) >= hard)
+            })
             .map(|(id, _)| *id)
             .collect();
         for id in &late {
@@ -500,6 +518,46 @@ mod tests {
         assert_eq!(r.expire(Time(1600)), vec![2]);
         assert_eq!(r.stats().expired, 2);
         assert_eq!(r.pending(), 0);
+    }
+
+    #[test]
+    fn slow_keyframes_survive_while_they_keep_arriving() {
+        // 截止时间 1 ms，总寿命上限 8 ms；分片每 0.5 ms 到一个，一共 20 个，要 10 ms
+        let key = fragment(5, 5, &[7u8; 2000], 100).unwrap();
+        // 更旧的增量帧（发送端在关键帧送达前不发更新的帧）
+        let delta = fragment(4, 3, &[7u8; 2000], 100).unwrap();
+        let mut r = Reassembler::new(1000, 4);
+        r.set_keyframe_grace(true);
+        let mut done = None;
+        for (i, (k, d)) in key.into_iter().zip(delta).enumerate() {
+            let t = Time(u64::try_from(i).unwrap() * 500);
+            let _ = r.expire(t);
+            if let Some(f) = r.push(t, k).unwrap() {
+                done = Some(f);
+            }
+            let _ = r.push(t, d);
+        }
+        // 关键帧收齐了；同样慢的增量帧超过总寿命被作废
+        assert!(done.is_some_and(|f| f.frame_id == 5));
+        assert!(r.stats().expired >= 1);
+        // 关键帧长时间（总寿命上限）没有进展时照常作废
+        let mut r = Reassembler::new(1000, 4);
+        r.set_keyframe_grace(true);
+        r.push(
+            Time(0),
+            fragment(3, 3, &[1u8; 300], 100).unwrap()[0].clone(),
+        )
+        .unwrap();
+        assert!(r.expire(Time(7999)).is_empty());
+        assert_eq!(r.expire(Time(8000)), vec![3]);
+        // 不打开宽限（块编码）：参考自己的帧也按普通帧作废
+        let mut r = Reassembler::new(1000, 4);
+        r.push(
+            Time(0),
+            fragment(3, 3, &[1u8; 300], 100).unwrap()[0].clone(),
+        )
+        .unwrap();
+        assert_eq!(r.expire(Time(1000)), vec![3]);
     }
 
     #[test]

@@ -110,6 +110,8 @@ pub struct Scenario {
     pub seed: u64,
     /// 带宽估计器。
     pub estimator: EstimatorKind,
+    /// 发送节奏（实验，见 [`peerdesk_core::pacer`]）。默认按环境变量 `PEERDESK_PACE`。
+    pub pacing: bool,
 }
 
 impl Scenario {
@@ -130,6 +132,7 @@ impl Scenario {
             max_bps: 30_000_000,
             seed: 1,
             estimator: EstimatorKind::PRODUCT,
+            pacing: peerdesk_core::pacer::enabled(),
         }
     }
 }
@@ -320,6 +323,7 @@ pub fn run(s: &Scenario) -> Result<Outcome, Error> {
     };
     let mut tx = MediaSender::new(cfg, encoder);
     let mut rx = MediaReceiver::new(Time::ZERO, cfg.deadline_us, decoder);
+    rx.set_keyframe_grace(s.codec == CodecKind::H264);
     let mut net: Net<Vec<u8>> = Net::new(s.seed);
     let mut network = s.network.clone();
     network.sort_by_key(|(t, _)| *t);
@@ -344,6 +348,8 @@ pub fn run(s: &Scenario) -> Result<Outcome, Error> {
 
     let mut now = Time::ZERO;
     let mut next_feedback = Time(FEEDBACK_US);
+    let mut pacer = peerdesk_core::pacer::Pacer::new(Time(0));
+    let pacing = s.pacing;
     for phase in &s.phases {
         let mut acc = PhaseAcc::new(now);
         // 阶段开始时画面已经清晰（例如上一阶段停下来之后补清晰了）。
@@ -369,15 +375,26 @@ pub fn run(s: &Scenario) -> Result<Outcome, Error> {
                 waiting_since = Some(now);
             }
             pending |= changed;
-            // 在途数据超过上限：这一帧不编，变化攒着，等确认之后编最新的画面。
-            if (pending || tx.wants_frame()) && !tx.in_flight_full(now) && tx.due(now) {
+            // 在途数据超过上限，或上一帧还没发完（发送队列最多放一帧）：这一帧不编，
+            // 变化攒着，等发完、确认之后编最新的画面。
+            if (pending || tx.wants_frame())
+                && !tx.in_flight_full(now)
+                && !pacer.busy(
+                    peerdesk_core::pacer::rate_for(pacing, tx.rate_bps()),
+                    1_000_000 / u64::from(s.fps.max(1)),
+                )
+                && tx.due(now)
+            {
                 let rtt = link.delay_us.saturating_mul(2).saturating_add(1_000);
                 let before = tx.stats().frames;
                 let out = tx.on_frame(now, desk.screen(), std::mem::take(&mut pending), rtt)?;
                 if tx.stats().frames != before {
                     captured.push(now);
                 }
-                for o in out {
+                // 和产品一样经发送节奏控制发出（见 peerdesk_core::pacer）
+                pacer.push(out);
+                for o in pacer.pop_ready(now, peerdesk_core::pacer::rate_for(pacing, tx.rate_bps()))
+                {
                     let header = Header {
                         channel: Channel::Video,
                         flags: o.flags,
@@ -395,14 +412,34 @@ pub fn run(s: &Scenario) -> Result<Outcome, Error> {
             }
             // 这一帧的时间内：投递数据报、发反馈。
             loop {
-                let next = [net.peek_time(), Some(next_feedback)]
-                    .into_iter()
-                    .flatten()
-                    .min()
-                    .filter(|t| *t < tick_end);
+                let next = [
+                    net.peek_time(),
+                    Some(next_feedback),
+                    pacer.next_due(now, peerdesk_core::pacer::rate_for(pacing, tx.rate_bps())),
+                ]
+                .into_iter()
+                .flatten()
+                .min()
+                .filter(|t| *t < tick_end);
                 let Some(when) = next else { break };
                 net.advance_to(when);
                 now = when;
+                for o in pacer.pop_ready(now, peerdesk_core::pacer::rate_for(pacing, tx.rate_bps()))
+                {
+                    let header = Header {
+                        channel: Channel::Video,
+                        flags: o.flags,
+                        conn_id: 0,
+                        seq,
+                        send_time: now,
+                    };
+                    seq = seq.wrapping_add(1);
+                    let datagram = encode_datagram(&header, &o.body)?;
+                    acc.bytes = acc
+                        .bytes
+                        .saturating_add(u64::try_from(datagram.len()).unwrap_or(u64::MAX));
+                    net.send(HOST, VIEWER, datagram.len(), datagram);
+                }
                 if next_feedback <= now {
                     let fb = rx.feedback_datagram(now);
                     let header = Header {
@@ -424,7 +461,10 @@ pub fn run(s: &Scenario) -> Result<Outcome, Error> {
                     };
                     if d.to == HOST {
                         // 反馈；顺便按请求重传丢了的分片。
-                        for o in tx.on_feedback_datagram(now, body).unwrap_or_default() {
+                        pacer.push_front(tx.on_feedback_datagram(now, body).unwrap_or_default());
+                        for o in pacer
+                            .pop_ready(now, peerdesk_core::pacer::rate_for(pacing, tx.rate_bps()))
+                        {
                             let header = Header {
                                 channel: Channel::Video,
                                 flags: o.flags,
@@ -570,6 +610,61 @@ mod tests {
         assert!((luma_psnr(&a, &a) - 99.0).abs() < 1e-9);
         assert!(luma_psnr(&a, &Screen::new(2, 2, 0)).abs() < 1e-9);
         assert_eq!(CodecKind::Tile.name(), "tile");
+    }
+
+    #[test]
+    fn paced_run_on_a_narrow_link() {
+        let mut s = Scenario::new(
+            "paced",
+            vec![
+                Phase {
+                    action: Action::Switching,
+                    frames: 10,
+                },
+                Phase {
+                    action: Action::Idle,
+                    frames: 20,
+                },
+            ],
+        );
+        s.pacing = true;
+        s.start_bps = 300_000;
+        s.network = vec![(
+            0,
+            Link {
+                rate_bps: Some(400_000),
+                delay_us: 20_000,
+                ..Link::lan()
+            },
+        )];
+        let o = run(&s).unwrap();
+        assert!(o.first_picture_ms.is_some());
+    }
+
+    #[test]
+    fn a_short_outage_counts_as_a_freeze() {
+        let mut s = Scenario::new(
+            "outage",
+            vec![Phase {
+                action: Action::Typing,
+                frames: 40,
+            }],
+        );
+        // 第 200 ms 起断开 500 ms 再恢复：中间画面停住，算一次超过 200 ms 的冻结
+        s.network = vec![
+            (0, Link::lan()),
+            (
+                200_000,
+                Link {
+                    up: false,
+                    ..Link::lan()
+                },
+            ),
+            (700_000, Link::lan()),
+        ];
+        let o = run(&s).unwrap();
+        assert!(o.freezes >= 1, "{}", o.freezes);
+        assert!(o.max_wait_ms >= 400.0, "{}", o.max_wait_ms);
     }
 
     #[test]

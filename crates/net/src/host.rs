@@ -114,6 +114,8 @@ pub struct HostOptions {
     pub audio: Option<crate::audio::CaptureHandle>,
     /// 本机电脑名：握手时告诉控制端，显示在对方的设备列表里。空表示不发。
     pub name: String,
+    /// 发送节奏（实验，见 [`peerdesk_core::pacer`]）。默认按环境变量 `PEERDESK_PACE`。
+    pub pacing: bool,
 }
 
 impl HostOptions {
@@ -132,8 +134,22 @@ impl HostOptions {
             clipboard: None,
             audio: None,
             name: String::new(),
+            pacing: peerdesk_core::pacer::enabled(),
         }
     }
+}
+
+/// 把发送队列里现在可以发的视频分片发出去（关闭发送节奏时一次发空）。
+fn send_paced(
+    link: &Link,
+    pacer: &mut peerdesk_core::pacer::Pacer,
+    pacing: bool,
+    rate_bps: u64,
+) -> Result<(), NetError> {
+    pacer
+        .pop_ready(link.now(), peerdesk_core::pacer::rate_for(pacing, rate_bps))
+        .iter()
+        .try_for_each(|o| link.send_flags(Channel::Video, o.flags, &o.body))
 }
 
 /// 被控端会话的结果。
@@ -347,6 +363,11 @@ pub async fn serve(
 
     // 每秒一行统计写进日志，用户发日志就能看到真实效果。
     let mut stats_tick = tokio::time::interval(STATS_EVERY);
+    // 发送节奏（实验，默认关闭：关闭时队列每次一下发空，和原来一样）。见 peerdesk_core::pacer。
+    let pacing = opts.pacing;
+    let mut pacer = peerdesk_core::pacer::Pacer::new(link.now());
+    let mut pace_tick = tokio::time::interval(Duration::from_millis(2));
+    pace_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     stats_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut last_stats = media.stats();
     let mut last_encode_us = 0u64;
@@ -379,10 +400,8 @@ pub async fn serve(
                     // 控制通道的数据报是观看端的反馈：哪些帧到了、链路有没有积压。
                     Channel::Control => match media.on_feedback_datagram(link.now(), &payload) {
                         Ok(again) => {
-                            let sent = again
-                                .iter()
-                                .try_for_each(|o| link.send_flags(Channel::Video, o.flags, &o.body));
-                            if let Err(e) = sent { break e.to_string(); }
+                            pacer.push_front(again);
+                            if let Err(e) = send_paced(&link, &mut pacer, pacing, media.rate_bps()) { break e.to_string(); }
                         }
                         Err(_) => bad_datagrams = bad_datagrams.saturating_add(1),
                     },
@@ -467,6 +486,7 @@ pub async fn serve(
                 };
                 media.set_encode_time(took);
                 last_encode_us = took;
+                media.set_max_payload(link.max_payload());
                 let out = match result.and_then(|(encoded, refine)| media.finish_frame(link.now(), &job, encoded, refine)) {
                     Ok(out) => out,
                     Err(e) => break e.to_string(),
@@ -474,11 +494,12 @@ pub async fn serve(
                 if out.is_empty() {
                     continue;
                 }
-                let sent = out
-                    .iter()
-                    .try_for_each(|o| link.send_flags(Channel::Video, o.flags, &o.body));
-                if let Err(e) = sent { break e.to_string(); }
+                pacer.push(out);
+                if let Err(e) = send_paced(&link, &mut pacer, pacing, media.rate_bps()) { break e.to_string(); }
                 tracer.record(link.now(), trace, Stage::FrameSent, u64::from(media.stats().frames));
+            }
+            _ = pace_tick.tick(), if !pacer.is_empty() => {
+                if let Err(e) = send_paced(&link, &mut pacer, pacing, media.rate_bps()) { break e.to_string(); }
             }
             _ = stats_tick.tick() => {
                 let now = media.stats();
@@ -506,6 +527,7 @@ pub async fn serve(
                     // 画面来源结束：正在编的那一帧编完发出去再结束。
                     let last = if encoding { encoded_rx.recv().await } else { None };
                     let last = last.and_then(|(job, r, _)| r.ok().map(|(e, f)| (job, e, f)));
+                    media.set_max_payload(link.max_payload());
                     let out = last.map(|(job, e, f)| media.finish_frame(link.now(), &job, e, f).unwrap_or_default());
                     out.unwrap_or_default().iter().for_each(|o| drop(link.send_flags(Channel::Video, o.flags, &o.body)));
                     break "画面来源结束".to_owned();
@@ -522,7 +544,7 @@ pub async fn serve(
                 };
                 pending_change |= changed;
                 // 在途数据超过上限：这一帧不编，变化攒着，等确认之后编最新的画面。
-                if encoding || media.in_flight_full(link.now()) || !media.due(link.now()) || (!pending_change && !media.wants_frame()) {
+                if encoding || pacer.busy(peerdesk_core::pacer::rate_for(pacing, media.rate_bps()), 1_000_000 / u64::from(opts.fps.max(1))) || media.in_flight_full(link.now()) || !media.due(link.now()) || (!pending_change && !media.wants_frame()) {
                     continue;
                 }
                 let rtt = u64::try_from(link.rtt().as_micros()).unwrap_or(u64::MAX);

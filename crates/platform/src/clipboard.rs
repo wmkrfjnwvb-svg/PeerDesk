@@ -139,6 +139,23 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
 
+    #[test]
+    fn unpack_reports_a_folder_it_cannot_create() {
+        let dir = std::env::temp_dir().join(format!("peerdesk-unpack-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // “a” 已经是一个文件：建不了 a/ 目录
+        std::fs::write(dir.join("a"), b"x").unwrap();
+        let packed =
+            peerdesk_core::clipboard::pack_files(&[peerdesk_core::clipboard::PackedFile {
+                path: "a/b.txt".into(),
+                data: b"hi".to_vec(),
+            }])
+            .unwrap();
+        assert!(unpack_to(&packed, &dir).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn encode(width: u32, height: u32, color: png::ColorType, data: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
         let mut e = png::Encoder::new(&mut out, width, height);

@@ -124,11 +124,9 @@ async fn host_survives_a_hostile_controller() {
     raw.send_raw(vec![0u8; 30]).unwrap(); // 魔数不对
     raw.send(Channel::Control, b"not a feedback message")
         .unwrap();
-    // 超过连接允许的数据报长度：本地就被拒绝
-    assert_eq!(
-        raw.send_raw(vec![0u8; 60_000]),
-        Err(NetError::Protocol("数据报无法发送"))
-    );
+    // 超过当前路径允许的数据报长度：本地丢掉这一片（相当于丢包），不当作错误、不断开会话
+    // （窄带宽上路径 MTU 会被 QUIC 调小，原来当错误处理时会话直接断开）
+    assert_eq!(raw.send_raw(vec![0u8; 60_000]), Ok(()));
 
     // 第二条控制流：被拒绝但不影响会话
     let (mut dup, _dup_recv) = raw.open_stream().await.unwrap();
@@ -556,4 +554,54 @@ async fn file_stream_edge_cases() {
     assert!(!dst.parent().unwrap().join("escape").exists());
     let _ = std::fs::remove_dir_all(src);
     let _ = std::fs::remove_dir_all(dst);
+}
+
+/// 控制端打开控制流后没发 Hello 就说再见：被控端报告“握手阶段结束”，不卡住。
+#[tokio::test(flavor = "multi_thread")]
+async fn controller_leaving_during_handshake_is_reported() {
+    let (_nodes, host_link, raw) = links().await;
+    let host_task = tokio::spawn(host::serve(
+        host_link,
+        HostOptions::new(cfg(), 30, temp_dir("bye")),
+        Box::new(DemoDesktop::new(64, 64, 1)),
+        Box::new(Null),
+    ));
+    let (mut send, _recv) = raw.open_stream().await.unwrap();
+    write_kind(&mut send, StreamKind::Control).await.unwrap();
+    write_control(&mut send, &Control::Bye).await.unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(10), host_task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(&result, Err(NetError::Connect(why)) if why.contains("握手")),
+        "{result:?}"
+    );
+}
+
+/// 被控端在握手时回了不该出现的消息：控制端断开并报告协议错误，不卡住。
+#[tokio::test(flavor = "multi_thread")]
+async fn host_answering_hello_with_nonsense_is_a_protocol_error() {
+    let (_nodes, raw, ctrl_link) = links().await;
+    let (_tx, rx) = mpsc::channel(1);
+    let ctrl_task = tokio::spawn(controller::run(
+        ctrl_link,
+        ControllerOptions {
+            session: cfg(),
+            deadline_us: 30_000,
+            duration: None,
+            clipboard: None,
+            on_established: None,
+            audio: None,
+        },
+        Box::new(Null),
+        rx,
+        None,
+    ));
+    let (_send, _recv) = raw_host_handshake(&raw, &Control::Pong { nonce: 1 }).await;
+    let result = tokio::time::timeout(Duration::from_secs(10), ctrl_task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(result.is_err(), "{result:?}");
 }

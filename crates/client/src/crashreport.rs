@@ -26,11 +26,20 @@ pub fn build_info() -> String {
 
 /// 测试版的默认服务器（不核对证书指纹）。
 #[must_use]
-pub fn default_server() -> Option<peerdesk_net::rendezvous::Server> {
-    DEFAULT_SERVER
-        .parse()
-        .ok()
-        .map(|addr| peerdesk_net::rendezvous::Server { addr, pin: None })
+pub fn default_server() -> peerdesk_net::rendezvous::Server {
+    let addr = std::net::SocketAddr::from(([47, 95, 203, 214], 4433));
+    peerdesk_net::rendezvous::Server { addr, pin: None }
+}
+
+/// 发布版遇到 panic 直接退出（`panic = "abort"`）：退出前把原因写进日志、留下崩溃标记，
+/// 下次启动时上报。原来的处理（打印到标准错误）照常执行。
+pub fn install_panic_hook(logs: std::path::PathBuf) {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        log::error!("程序崩溃：{info}");
+        record(&logs, &info.to_string());
+        default_hook(info);
+    }));
 }
 
 /// 崩溃时调用：留下标记。写不成也不要紧（只是这次不上报）。
@@ -65,16 +74,11 @@ pub fn finish(logs: &Path, attempts: u32, ok: bool) {
 /// 在后台线程里把待上报的崩溃传给 `server`（没有配置服务器时传给 [`DEFAULT_SERVER`]）。
 /// 关掉 `crash-upload` 特性时什么都不做。
 pub fn upload_in_background(data_dir: &Path, server: Option<peerdesk_net::rendezvous::Server>) {
-    if !cfg!(feature = "crash-upload") {
-        return;
-    }
     let logs = data_dir.join("logs");
-    let Some((attempts, report)) = pending(&logs) else {
+    let Some((attempts, report)) = pending(&logs).filter(|_| cfg!(feature = "crash-upload")) else {
         return;
     };
-    let Some(server) = server.or_else(default_server) else {
-        return;
-    };
+    let server = server.unwrap_or_else(default_server);
     let data_dir = data_dir.to_path_buf();
     let _ = std::thread::Builder::new()
         .name("peerdesk-crash-upload".into())
@@ -179,12 +183,27 @@ mod tests {
     }
 
     #[test]
+    fn panic_hook_leaves_a_marker() {
+        let dir = std::env::temp_dir().join(format!("peerdesk-hook-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        install_panic_hook(dir.clone());
+        let caught = std::panic::catch_unwind(|| std::panic::panic_any("测试用的崩溃"));
+        // 换回默认处理，免得影响别的测试
+        let _ = std::panic::take_hook();
+        assert!(caught.is_err());
+        let (_, report) = pending(&dir).unwrap();
+        assert!(
+            report.summary.contains("测试用的崩溃"),
+            "{}",
+            report.summary
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn build_info_has_commit() {
         assert!(build_info().contains(env!("PEERDESK_COMMIT")));
-        assert_eq!(
-            default_server().map(|s| s.addr.to_string()).as_deref(),
-            Some(DEFAULT_SERVER)
-        );
+        assert_eq!(default_server().addr.to_string(), DEFAULT_SERVER);
         // 没有待上报的崩溃时直接返回
         upload_in_background(&std::env::temp_dir().join("peerdesk-no-such-dir"), None);
     }

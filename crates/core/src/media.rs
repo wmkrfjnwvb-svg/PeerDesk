@@ -86,6 +86,9 @@ pub fn decode_feedback(buf: &[u8]) -> Result<DecodedFeedback, Error> {
     Ok((feedback, ext, nacks))
 }
 
+/// 估计一帧传完要多久时用的最低速率，防止速率估计异常低时一帧永远不判丢失。
+const MIN_DRAIN_BPS: u64 = 50_000;
+
 /// 发送端的参数。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SenderConfig {
@@ -195,7 +198,7 @@ pub struct MediaSender {
     /// 编码器上次报告的“还要不要继续交画面”（编码器在别的线程时用）。
     refine: bool,
     rate: Box<dyn RateEstimator>,
-    /// 已发出、还没有定论的帧：(帧号, 发出时间)。
+    /// 已发出、还没有定论的帧：(帧号, 发出时间, 线上字节数)。
     unacked: VecDeque<(u32, Time, u64)>,
     last_frame: u32,
     last_key: u32,
@@ -336,6 +339,13 @@ impl MediaSender {
     }
 
     /// 改网络画像（例如测出了更大的往返时间）。
+    /// 更新一个数据报能放的字节数（路径 MTU 会变：丢包严重时 QUIC 会把它调小）。0 忽略。
+    pub fn set_max_payload(&mut self, max_payload: usize) {
+        if max_payload > 0 {
+            self.cfg.max_payload = max_payload;
+        }
+    }
+
     pub fn set_profile(&mut self, profile: Profile) {
         self.rate.set_profile(profile);
     }
@@ -383,14 +393,22 @@ impl MediaSender {
                 self.resent.retain(|(frame, _), _| *frame != id);
             }
         }
-        // 迟迟等不到反馈的帧按丢失处理。
+        // 迟迟等不到反馈的帧按丢失处理。时限里加上这一帧按接收端实际收的速度传完要多久：
+        // 窄带宽上一个大关键帧要传一两秒，按固定时限判丢会重发新的关键帧，越堵越多，画面始终出不来。
         let ack_timeout = self
             .cfg
             .deadline_us
             .saturating_add(rtt_us.saturating_mul(2))
             .saturating_add(60_000);
-        while let Some((id, at, _)) = self.unacked.front().copied() {
-            if now.since(at) < ack_timeout {
+        let drain_bps = self
+            .last_obs
+            .map(|o| u64::from(o.feedback.recv_bytes_per_s).saturating_mul(8))
+            .filter(|bps| *bps > 0)
+            .unwrap_or_else(|| self.rate.rate_bps())
+            .max(MIN_DRAIN_BPS);
+        while let Some((id, at, bytes)) = self.unacked.front().copied() {
+            let transfer_us = bytes.saturating_mul(8_000_000) / drain_bps;
+            if now.since(at) < ack_timeout.saturating_add(transfer_us) {
                 break;
             }
             self.unacked.pop_front();
@@ -729,6 +747,11 @@ impl MediaReceiver {
     #[must_use]
     pub fn screen(&self) -> Option<&Screen> {
         self.decoder.as_ref().and_then(|d| d.screen())
+    }
+
+    /// 打开或关闭关键帧宽限（解码器是 H.264 时打开，见 [`crate::transport::Reassembler::set_keyframe_grace`]）。
+    pub fn set_keyframe_grace(&mut self, on: bool) {
+        self.reassembler.set_keyframe_grace(on);
     }
 
     /// 分片重组的计数（例如超时作废了多少帧）。

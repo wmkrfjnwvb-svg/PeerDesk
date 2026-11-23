@@ -432,6 +432,15 @@ async fn host_async(args: HostArgs, out: &mut dyn Write) -> Result<u8, NetError>
     Ok(EXIT_OK)
 }
 
+/// 连 `addr` 时本机绑定的地址：同一地址族的任意地址、任意端口。
+fn any_for(addr: SocketAddr) -> SocketAddr {
+    if addr.is_ipv6() {
+        ([0u16; 8], 0).into()
+    } else {
+        ([0, 0, 0, 0], 0).into()
+    }
+}
+
 /// 把崩溃报告传给服务器（用本机身份连接，服务器按身份限频）。
 pub(crate) fn upload_crash(
     data_dir: &Path,
@@ -440,12 +449,7 @@ pub(crate) fn upload_crash(
 ) -> Result<(), NetError> {
     let identity = Identity::load_or_create(data_dir)?;
     runtime()?.block_on(async {
-        let bind: SocketAddr = if server.addr.is_ipv6() {
-            ([0u16; 8], 0).into()
-        } else {
-            ([0, 0, 0, 0], 0).into()
-        };
-        let node = Node::bind(bind, &identity, &Policy::recommended())?;
+        let node = Node::bind(any_for(server.addr), &identity, &Policy::recommended())?;
         let result = tokio::time::timeout(
             Duration::from_secs(20),
             peerdesk_net::rendezvous::upload_crash(&node, server, report),
@@ -882,6 +886,12 @@ pub fn bench(args: &[String], out: &mut dyn Write) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn binds_the_same_address_family() {
+        assert!(any_for("[::1]:4433".parse().unwrap()).is_ipv6());
+        assert!(any_for("1.2.3.4:4433".parse().unwrap()).is_ipv4());
+    }
 
     #[test]
     fn netcheck_command() {

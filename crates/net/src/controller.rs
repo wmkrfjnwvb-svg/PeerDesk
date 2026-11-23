@@ -274,6 +274,7 @@ pub async fn run(
         Box::new(TileDecoder::new())
     };
     let mut media = MediaReceiver::detached(link.now(), opts.deadline_us);
+    media.set_keyframe_grace(caps.common(Caps::H264) == Caps::H264);
     let (decode_jobs, mut decoded_rx) = spawn_decoder(decoder);
     let mut last_screen: Option<Screen> = None;
     // 反馈只在有新情况时发；什么都没发生时每秒一次，证明自己还在。

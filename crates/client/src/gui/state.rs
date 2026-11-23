@@ -449,6 +449,14 @@ mod tests {
             HostPhase::Stopping
         );
 
+        // 网络体检结果不改变状态、不出提示
+        assert_eq!(
+            listening.apply(
+                &HostEvent::Network(peerdesk_net::netcheck::NetReport::default()),
+                s
+            ),
+            (listening.clone(), None)
+        );
         let (same, status) = listening.apply(
             &HostEvent::Registered {
                 observed: addr(),

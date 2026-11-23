@@ -322,6 +322,45 @@ async fn host_ending_first_is_reported_to_controller() {
     assert!(report.files.is_empty());
 }
 
+/// 打开发送节奏（实验开关）：会话照常建立、画面送达。
+#[tokio::test(flavor = "multi_thread")]
+async fn paced_session_delivers_frames() {
+    let policy = Policy::recommended();
+    let p = pair(&policy, &policy);
+    let (host_link, ctrl_link) = links(&p).await;
+    let mut opts = HostOptions::new(session_h264(&p.host_id, &policy), 30, temp_dir("paced"));
+    opts.pacing = true;
+    // 起步码率很低：大帧要靠发送节奏分几次发出
+    opts.start_bps = 100_000;
+    opts.max_bps = 150_000;
+    let host_task = tokio::spawn(host::serve(
+        host_link,
+        opts,
+        Box::new(DemoDesktop::new(1280, 720, 1).with_limit(40)),
+        Box::new(Recorder::default()),
+    ));
+    let (_tx, rx) = mpsc::channel(1);
+    let report = controller::run(
+        ctrl_link,
+        ControllerOptions {
+            session: session_h264(&p.ctrl_id, &policy),
+            deadline_us: 100_000,
+            duration: Some(Duration::from_secs(4)),
+            clipboard: None,
+            on_established: None,
+            audio: None,
+        },
+        Box::new(CountSink::new()),
+        rx,
+        None,
+    )
+    .await
+    .unwrap();
+    let host_report = host_task.await.unwrap().unwrap();
+    assert!(host_report.frames_sent > 0);
+    assert!(report.frames_delivered > 0, "{report:?}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn wrong_fingerprint_is_refused() {
     let policy = Policy::recommended();

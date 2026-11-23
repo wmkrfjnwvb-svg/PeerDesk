@@ -39,5 +39,18 @@ async fn crash_reports_are_saved_and_rate_limited() {
     // 同一台设备马上再传：被拒绝，不存
     assert!(upload_crash(&client, &server, &report).await.is_err());
     assert_eq!(std::fs::read_dir(dir.join("crashes")).unwrap().count(), 1);
+
+    // 存满了（2000 份）：另一台设备也传不上
+    for i in 0..2000 {
+        std::fs::write(dir.join("crashes").join(format!("fill-{i}")), b"").unwrap();
+    }
+    let other = Node::bind(any, &Identity::generate().unwrap(), &policy).unwrap();
+    assert!(upload_crash(&other, &server, &report).await.is_err());
+
+    // 存不了（crashes 是个文件）：报告失败，服务器照常运行
+    std::fs::remove_dir_all(dir.join("crashes")).unwrap();
+    std::fs::write(dir.join("crashes"), b"not a dir").unwrap();
+    let third = Node::bind(any, &Identity::generate().unwrap(), &policy).unwrap();
+    assert!(upload_crash(&third, &server, &report).await.is_err());
     let _ = std::fs::remove_dir_all(&dir);
 }

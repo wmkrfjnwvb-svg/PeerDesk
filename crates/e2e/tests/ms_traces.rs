@@ -117,5 +117,11 @@ fn microsoft_traces() {
         })
         .unwrap();
         println!("{}", row(name, &o));
+        if std::env::var_os("PEERDESK_DETAIL").is_some() {
+            println!(
+                "  网络丢 {}，排队丢 {}，跳过 {}，坏帧 {}，恢复 {}",
+                o.net.lost, o.net.queue_dropped, o.skipped, o.bad, o.recoveries
+            );
+        }
     }
 }
