@@ -105,9 +105,13 @@ pub fn visuals(p: &Palette) -> Visuals {
     v.hyperlink_color = p.accent;
     v.selection.bg_fill = p.accent;
     v.selection.stroke = Stroke::new(1.0_f32, Color32::WHITE);
-    v.override_text_color = Some(p.text);
+    // 不用 override_text_color：它会盖过选中项的白字（蓝底黑字）。文字颜色按控件状态给。
     v.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, p.border);
     v.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, p.text);
+    v.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, p.text);
+    v.widgets.hovered.fg_stroke = Stroke::new(1.5_f32, p.text);
+    v.widgets.active.fg_stroke = Stroke::new(2.0_f32, p.text);
+    v.widgets.open.fg_stroke = Stroke::new(1.0_f32, p.text);
     for w in [
         &mut v.widgets.inactive,
         &mut v.widgets.hovered,

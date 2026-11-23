@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use ab_glyph::{Font as _, FontRef, ScaleFont as _};
 use eframe::egui::{FontData, FontDefinitions, FontFamily};
 
 /// 一个候选字体文件，`index` 是字体集（.ttc）里的第几个字体。
@@ -110,7 +111,63 @@ fn definitions_from(found: Option<(Candidate, Vec<u8>)>) -> (FontDefinitions, Op
         install(&mut defs, &c, bytes);
         c.path
     });
+    align(&mut defs);
     (defs, used)
+}
+
+/// 量字形用的字号：大一些，取整误差可以忽略。
+const MEASURE_PX: f32 = 1000.0;
+
+/// 后备字体和它的参照字形：图标用圆圈（Phosphor 的图标都画在同一个方框中心），中文用“中”。
+const REFERENCES: [(&str, char); 2] = [("phosphor", '\u{E18A}'), ("system-cjk", '中')];
+
+/// 一个字形在一行里的竖直中心，从行顶往下量，单位是字号。
+///
+/// 照 egui 的排版规则算：后备字体的基线 = 它的 ascent + ½ ×（主字体行高 − 它的行高），
+/// 再加上字形实际轮廓的上下边界。`row` 是主字体的行高（同一单位）。
+fn glyph_center(data: &FontData, c: char, row: Option<f32>) -> Option<(f32, f32)> {
+    let font = FontRef::try_from_slice_and_index(&data.font, data.index).ok()?;
+    let scaled = font.as_scaled(MEASURE_PX);
+    let height = (scaled.ascent() - scaled.descent() + scaled.line_gap()) / MEASURE_PX;
+    let baseline = scaled.ascent() / MEASURE_PX + 0.5 * (row.unwrap_or(height) - height);
+    // 字体里没有这个字时 ab_glyph 给的是 .notdef（方框），不能拿来量
+    if font.glyph_id(c).0 == 0 {
+        return None;
+    }
+    let glyph = scaled.scaled_glyph(c);
+    let bounds = scaled.outline_glyph(glyph)?.px_bounds();
+    Some((
+        baseline + 0.5 * (bounds.min.y + bounds.max.y) / MEASURE_PX,
+        height,
+    ))
+}
+
+/// 让中文和图标与拉丁字母在一行里竖直居中。
+///
+/// 根因：egui 按字体的 ascent/descent 摆放后备字体，不看字形实际画在哪里。各系统中文字体
+/// （macOS 苹方、Windows 雅黑、Linux Noto）和图标字体的度量差别很大，于是在按钮、标签里
+/// 中文和图标整体偏下或偏上。这里在启动时量出每个后备字体参照字形的实际中心，
+/// 用 `y_offset_factor` 把它移到主字体“H”的中心上，和系统、字体文件无关。
+pub fn align(defs: &mut FontDefinitions) {
+    let Some(primary) = defs
+        .families
+        .get(&FontFamily::Proportional)
+        .and_then(|f| f.first())
+        .and_then(|name| defs.font_data.get(name))
+    else {
+        return;
+    };
+    let Some((target, row)) = glyph_center(primary, 'H', None) else {
+        return;
+    };
+    for (name, c) in REFERENCES {
+        let Some(data) = defs.font_data.get_mut(name) else {
+            continue;
+        };
+        if let Some((center, _)) = glyph_center(data, c, Some(row)) {
+            Arc::make_mut(data).tweak.y_offset_factor = target - center;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -153,6 +210,26 @@ mod tests {
         assert!(defs.font_data.contains_key("system-cjk"));
         let (defs, used) = definitions_from(None);
         assert!(used.is_none() && !defs.font_data.contains_key("system-cjk"));
+    }
+
+    #[test]
+    fn icons_and_cjk_are_centered_on_latin_text() {
+        let (mut defs, _) = definitions_from(None);
+        // 用主字体自己冒充一个中文后备字体：对齐后偏移应为 0
+        let primary = defs.families[&FontFamily::Proportional][0].clone();
+        let copy = defs.font_data[&primary].clone();
+        let _ = defs.font_data.insert("system-cjk".into(), copy);
+        // 参照字形不存在的字体不改（主字体里没有“中”）
+        align(&mut defs);
+        assert!(defs.font_data["system-cjk"].tweak.y_offset_factor.abs() < 1e-6);
+        let (target, row) = glyph_center(&defs.font_data[&primary], 'H', None).unwrap();
+        let icons = &defs.font_data["phosphor"];
+        let (center, _) = glyph_center(icons, '\u{E18A}', Some(row)).unwrap();
+        let shifted = center + icons.tweak.y_offset_factor;
+        assert!((shifted - target).abs() < 1e-4, "{shifted} vs {target}");
+        // 没有主字体时什么都不做
+        let mut empty = FontDefinitions::empty();
+        align(&mut empty);
     }
 
     #[test]

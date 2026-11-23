@@ -18,6 +18,7 @@ sys-locale = "0.3"
 getrandom = "0.2"
 num-traits = "0.2"
 egui-phosphor = "=0.10.0"
+ab_glyph = "0.2.32"
 
 [target.'cfg(windows)'.dependencies]
 # 图形界面的 exe 没有控制台；命令行子命令运行时挂到启动它的终端上（AttachConsole 的安全封装）。

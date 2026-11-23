@@ -2510,6 +2510,7 @@ dependencies = [
 name = "peerdesk"
 version = "0.1.0"
 dependencies = [
+ "ab_glyph",
  "eframe",
  "egui-phosphor",
  "getrandom 0.2.17",

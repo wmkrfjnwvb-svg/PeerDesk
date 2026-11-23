@@ -30,8 +30,14 @@ cp "$universal/peerdesk" "$app/Contents/MacOS/peerdesk"
 sed -e "s/@VERSION@/$version/" -e "s/@BUILD@/$build/" packaging/macos/Info.plist > "$app/Contents/Info.plist"
 plutil -lint "$app/Contents/Info.plist"
 printf 'APPL????' > "$app/Contents/PkgInfo"
-# 本机（ad-hoc）签名：屏幕录制和辅助功能的授权记在这个程序包上。
-codesign --force --deep -s - --identifier org.peerdesk.client "$app"
+# 本机（ad-hoc）签名。屏幕录制和辅助功能的授权按“指定要求”（designated requirement）认程序：
+# ad-hoc 签名默认的要求是代码哈希，每个新版本都不同，于是覆盖安装后系统里那一条授权对不上新程序，
+# 用户得先删掉旧的 PeerDesk 再重新授权。这里把要求改成只认程序标识，升级后授权保留。
+# 代价：同标识的其他 ad-hoc 程序也能满足这条要求。这是没有 Apple 开发者证书时的过渡做法，
+# 拿到 Developer ID 后换成证书签名（要求变成“标识 + Apple 签发的团队证书”），见 docs/research/I-release.md。
+codesign --force --deep -s - --identifier org.peerdesk.client \
+  -r='designated => identifier "org.peerdesk.client"' "$app"
+codesign -d -r- "$app"
 codesign --verify --verbose "$app"
 cp "$universal/peerdesk-server" "$stage/peerdesk-server"
 codesign --force -s - "$stage/peerdesk-server"

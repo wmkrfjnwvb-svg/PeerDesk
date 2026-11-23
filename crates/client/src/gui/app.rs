@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use eframe::egui::{self, Color32, RichText, TextEdit};
+use eframe::egui::{self, Align, Color32, Layout, RichText, TextEdit};
 use peerdesk_core::signal::format_code;
 use peerdesk_net::identity::to_hex;
 use peerdesk_net::netcheck::NetReport;
@@ -121,7 +121,12 @@ struct App {
     /// 预览 macOS 引导（在别的系统上截图用）：权限一律当作没有。
     preview_mac: bool,
     appearance: Appearance,
+    /// 打开程序后自动开启被控（默认开；用户手动关过就记住，下次不自动开）。权限齐了才真正开启。
+    auto_host: bool,
 }
+
+/// 用户手动关闭被控后留下的标记文件。
+const HOST_OFF_FILE: &str = "host-off";
 
 /// 主窗口的页面。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -170,6 +175,7 @@ impl App {
             Err(e) => (String::new(), Status::error(e)),
         };
         let ctx2 = ctx.clone();
+        let auto_host = !data_dir.join(HOST_OFF_FILE).exists();
         // PEERDESK_GUI_PREVIEW_MAC=15：在任何系统上预览 macOS 15 的授权引导（截图、设计评审用）
         let preview = std::env::var(PREVIEW_MAC_ENV)
             .ok()
@@ -225,6 +231,7 @@ impl App {
             perms,
             preview_mac,
             appearance,
+            auto_host,
         }
     }
 
@@ -364,7 +371,7 @@ impl App {
                                 .color(p.warning),
                         );
                         ui.label(RichText::new(self.s.perm_banner).strong());
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if primary_button(ui, p, self.s.perm_start, 110.0, true).clicked() {
                                 self.page = Page::Permissions;
                             }
@@ -483,10 +490,24 @@ impl App {
             let _ = pill(ui, state, color);
         });
         if toggled {
-            if on {
+            // 记住用户的选择：手动关了，下次打开不再自动开启
+            let marker = self.data_dir.join(HOST_OFF_FILE);
+            let saved = if on {
                 self.start_hosting();
+                std::fs::remove_file(&marker).or_else(|e| {
+                    if e.kind() == std::io::ErrorKind::NotFound {
+                        Ok(())
+                    } else {
+                        Err(e)
+                    }
+                })
             } else {
+                self.auto_host = false;
                 self.stop_hosting();
+                std::fs::write(&marker, b"")
+            };
+            if let Err(e) = saved {
+                log::warn!("记住被控开关失败：{e}");
             }
         }
         ui.add_space(4.0);
@@ -583,7 +604,7 @@ impl App {
                             s.controller,
                             short_fingerprint(&peer)
                         ));
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             let stop = egui::Button::new(
                                 RichText::new(format!(
                                     "{}  {}",
@@ -660,7 +681,7 @@ impl App {
         let mut pick = None;
         let mut go = false;
         // 顶端对齐、放不下就换行
-        let layout = egui::Layout::left_to_right(egui::Align::TOP).with_main_wrap(true);
+        let layout = Layout::left_to_right(Align::TOP).with_main_wrap(true);
         ui.with_layout(layout, |ui| {
             ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
             for item in items {
@@ -778,7 +799,7 @@ impl App {
                         };
                         let _ = muted(ui, p, &detail);
                     });
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if icon_button(ui, icon::TRASH, s.forget).clicked() {
                             forget = Some(item.addr.clone());
                         }
@@ -846,14 +867,19 @@ impl App {
                     self.addrs = lan_addresses();
                 }
             });
-            ui.horizontal(|ui| {
-                ui.label(format!("{}:", s.port));
-                let editable = self.phase == HostPhase::Off;
-                let _ = ui.add_enabled(
-                    editable,
-                    TextEdit::singleline(&mut self.port).desired_width(80.0),
-                );
-            });
+            // 和其他输入框同一种样式：小字标签在上，输入框在下
+            let _ = muted(ui, p, s.port);
+            let editable = self.phase == HostPhase::Off;
+            let field = ui.add_enabled(
+                editable,
+                TextEdit::singleline(&mut self.port)
+                    .margin(egui::Margin::symmetric(10, 8))
+                    .desired_width(120.0),
+            );
+            if !editable {
+                let _ = field.on_disabled_hover_text(s.port_locked);
+            }
+            ui.add_space(6.0);
             let port = self.phase.port();
             let shown_port = port.map_or_else(
                 || parse_port(&self.port, s).unwrap_or(DEFAULT_PORT),
@@ -980,27 +1006,12 @@ impl App {
         ctx.request_repaint_after(GUIDE_REFRESH);
     }
 
-    fn perm_button(
-        &mut self,
-        ui: &mut egui::Ui,
-        p: &Palette,
-        text: &str,
-        action: Action,
-        primary: bool,
-    ) {
-        let clicked = if primary {
-            primary_button(ui, p, text, 150.0, true).clicked()
-        } else {
-            ui.add(egui::Button::new(text).min_size(egui::vec2(0.0, 40.0)))
-                .clicked()
-        };
-        if clicked {
-            if let Err(e) = peerdesk_platform::perform(action) {
-                self.status = Status::error(e);
-            }
-            // 授权对话框关掉后马上重新检查
-            self.guide_checked = Instant::now() - GUIDE_REFRESH;
+    fn perform(&mut self, action: Action) {
+        if let Err(e) = peerdesk_platform::perform(action) {
+            self.status = Status::error(e);
         }
+        // 授权对话框关掉后马上重新检查
+        self.guide_checked = Instant::now() - GUIDE_REFRESH;
     }
 
     /// macOS 授权引导：两项权限的状态，当前这一项的示意图和分步操作。
@@ -1033,26 +1044,72 @@ impl App {
                 icon::CURSOR_CLICK,
             ),
         ];
+        // 每张卡片里直接放授权按钮：用户不用往下翻就能操作
+        let screen_first = !self.perms.screen_capture;
+        let mut clicked = None;
         ui.columns(2, |cols| {
-            for (col, (name, what, ok, glyph)) in cols.iter_mut().zip(items) {
+            for (i, (col, (name, what, ok, glyph))) in cols.iter_mut().zip(items).enumerate() {
+                let screen = i == 0;
                 card(col, p, |ui| {
+                    ui.set_min_height(120.0);
+                    // 标题一行，状态单独一行：英文标题很长，放同一行会和状态标签重叠
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(glyph).size(22.0).color(p.accent));
-                        ui.vertical(|ui| {
-                            ui.horizontal(|ui| {
-                                ui.label(RichText::new(name).strong());
-                                if ok {
-                                    let _ = pill(ui, s.perm_granted, p.success);
-                                } else {
-                                    let _ = pill(ui, s.perm_missing, p.warning);
-                                }
-                            });
-                            let _ = muted(ui, p, what);
-                        });
+                        ui.add(egui::Label::new(RichText::new(name).size(15.0).strong()).wrap());
+                    });
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ok {
+                            let _ = pill(ui, s.perm_granted, p.success);
+                        } else {
+                            let _ = pill(ui, s.perm_missing, p.warning);
+                        }
+                    });
+                    ui.add_space(6.0);
+                    let _ = muted(ui, p, what);
+                    if ok {
+                        return;
+                    }
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        // 先做的那一项用主按钮，另一项用普通按钮，引导用户按顺序来
+                        let request = if screen {
+                            Action::RequestScreen
+                        } else {
+                            Action::RequestInput
+                        };
+                        let settings = if screen {
+                            Action::OpenScreenSettings
+                        } else {
+                            Action::OpenInputSettings
+                        };
+                        let primary = screen == screen_first;
+                        let r = if primary {
+                            primary_button(ui, p, s.perm_request, 120.0, true)
+                        } else {
+                            ui.add(
+                                egui::Button::new(s.perm_request).min_size(egui::vec2(120.0, 40.0)),
+                            )
+                        };
+                        if r.clicked() {
+                            clicked = Some(request);
+                        }
+                        if ui
+                            .add(
+                                egui::Button::new(s.perm_open_settings)
+                                    .min_size(egui::vec2(0.0, 40.0)),
+                            )
+                            .clicked()
+                        {
+                            clicked = Some(settings);
+                        }
                     });
                 });
             }
         });
+        if let Some(action) = clicked {
+            self.perform(action);
+        }
         ui.add_space(14.0);
 
         if self.perms.screen_capture && self.perms.input_injection {
@@ -1112,29 +1169,16 @@ impl App {
                 });
                 ui.add_space(4.0);
             }
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                if screen {
-                    self.perm_button(ui, p, s.perm_request, Action::RequestScreen, true);
-                    self.perm_button(
-                        ui,
-                        p,
-                        s.perm_open_settings,
-                        Action::OpenScreenSettings,
-                        false,
-                    );
-                    self.perm_button(ui, p, s.perm_relaunch, Action::Relaunch, false);
-                } else {
-                    self.perm_button(ui, p, s.perm_request, Action::RequestInput, true);
-                    self.perm_button(
-                        ui,
-                        p,
-                        s.perm_open_settings,
-                        Action::OpenInputSettings,
-                        false,
-                    );
+            if screen {
+                // 屏幕录制授权后要重新打开程序才生效
+                ui.add_space(6.0);
+                if ui
+                    .add(egui::Button::new(s.perm_relaunch).min_size(egui::vec2(0.0, 40.0)))
+                    .clicked()
+                {
+                    self.perform(Action::Relaunch);
                 }
-            });
+            }
         });
     }
 
@@ -1158,7 +1202,7 @@ impl App {
             }
             ui.add_space(2.0);
         }
-        ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+        ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
             ui.add_space(14.0);
             let (text, color) = if !self.server.is_set() {
                 (s.server_unset, p.muted)
@@ -1223,6 +1267,11 @@ fn open_folder(dir: &std::path::Path) -> Result<(), String> {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if self.selftest && self.host.is_none() && self.phase == HostPhase::Off {
+            self.start_hosting();
+        }
+        // 默认本机可以被控制：权限齐了就自动开启（只自动开一次，之后听用户的）
+        if self.auto_host && !self.preview_mac && self.guide.ready && self.phase == HostPhase::Off {
+            self.auto_host = false;
             self.start_hosting();
         }
         self.poll_host();
