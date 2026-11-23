@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=PeerDesk
+Comment=Remote desktop / 远程桌面
+Exec=peerdesk
+Icon=peerdesk
+Terminal=false
+Categories=Network;RemoteAccess;

@@ -261,6 +261,27 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # Linux 客户端：在 22.04 上构建，较老的发行版（glibc 2.35）也能运行。和 package 同样只在 [pkg] 时跑。
+  package-linux:
+    name: package (linux-x64)
+    if: ${{ (github.event_name == 'workflow_dispatch' && (inputs.scope == 'packages' || inputs.scope == 'full')) || contains(github.event.head_commit.message, '[pkg]') }}
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq libasound2-dev
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: package-linux
+      - name: Package
+        run: scripts/package-linux.sh dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: peerdesk-${{ github.sha }}-linux-x64
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
   # Docker 镜像：只验证能构建（不推送）。和打包一样只在 [pkg] 时跑。
   docker-build:
     name: docker build (server)
