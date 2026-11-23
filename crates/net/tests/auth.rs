@@ -127,6 +127,7 @@ async fn attempt(
             duration: Some(Duration::from_millis(200)),
             clipboard: None,
             on_established: None,
+            on_quality: None,
             audio: None,
         },
         Box::new(Null),

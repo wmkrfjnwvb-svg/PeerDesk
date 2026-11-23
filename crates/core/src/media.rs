@@ -702,6 +702,7 @@ pub struct MediaReceiver {
     /// 最后交给解码器的帧号；`None` 表示要等关键帧。
     decoded: Option<u32>,
     stats: ReceiverStats,
+    last_feedback: Option<Feedback>,
 }
 
 impl std::fmt::Debug for MediaReceiver {
@@ -734,6 +735,7 @@ impl MediaReceiver {
             log: DeliveryLog::new(),
             decoded: None,
             stats: ReceiverStats::default(),
+            last_feedback: None,
         }
     }
 
@@ -906,13 +908,21 @@ impl MediaReceiver {
         self.settle(now);
         let sample = self.tracker.report(now);
         let (floor, delivered) = self.log.snapshot();
-        Feedback {
+        let feedback = Feedback {
             floor,
             delivered,
             queue_delay_us: sample.queue_delay_us,
             loss_permille: sample.loss_permille,
             recv_bytes_per_s: sample.recv_bytes_per_s,
-        }
+        };
+        self.last_feedback = Some(feedback);
+        feedback
+    }
+
+    /// 最近一次反馈（丢包率、排队延迟等，界面显示网络质量用）。
+    #[must_use]
+    pub const fn last_feedback(&self) -> Option<Feedback> {
+        self.last_feedback
     }
 }
 

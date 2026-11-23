@@ -136,6 +136,18 @@ pub struct Strings {
     pub ready: &'static str,
     pub connecting: &'static str,
     pub connected: &'static str,
+    /// 网络状况：丢包（{n} 是百分数）。
+    pub net_loss: &'static str,
+    /// 丢包多时的建议。
+    pub net_loss_hint: &'static str,
+    /// 网络状况：延迟高（{n} 是毫秒）。
+    pub net_latency: &'static str,
+    /// 延迟高时的建议。
+    pub net_latency_hint: &'static str,
+    /// 网络状况：带宽不够。
+    pub net_bandwidth: &'static str,
+    /// 带宽不够时的说明。
+    pub net_bandwidth_hint: &'static str,
     pub session_ended: &'static str,
     pub you_disconnected: &'static str,
     pub stats: &'static str,
@@ -390,6 +402,12 @@ pub const ZH: Strings = Strings {
     ready: "就绪",
     connecting: "正在连接…",
     connected: "已连接",
+    net_loss: "丢包 {n}%",
+    net_loss_hint: "网络丢包较多，画面可能卡顿。多半是 Wi-Fi 信号弱或有干扰：靠近路由器、改用 5 GHz Wi-Fi 或网线。",
+    net_latency: "延迟 {n} ms",
+    net_latency_hint: "网络延迟较高，操作会慢半拍。对方离得远、网络拥堵，或者没能直连（走中继）。",
+    net_bandwidth: "带宽不足",
+    net_bandwidth_hint: "网络带宽不够，画面已自动降低清晰度和帧率。关掉占用网络的下载、视频可以改善。",
     session_ended: "会话已结束",
     you_disconnected: "你断开了连接",
     stats: "统计 (F12)",
@@ -556,6 +574,12 @@ pub const EN: Strings = Strings {
     ready: "Ready",
     connecting: "Connecting…",
     connected: "Connected",
+    net_loss: "{n}% loss",
+    net_loss_hint: "The network is dropping packets, so the picture may stutter. Usually weak or noisy Wi-Fi: move closer to the router, or use 5 GHz Wi-Fi or a cable.",
+    net_latency: "{n} ms delay",
+    net_latency_hint: "High network delay, so actions lag a little. The other computer is far away, the network is congested, or the connection is relayed.",
+    net_bandwidth: "Low bandwidth",
+    net_bandwidth_hint: "Not enough bandwidth: picture quality and frame rate were lowered automatically. Pausing downloads or videos helps.",
     session_ended: "Session ended",
     you_disconnected: "You disconnected",
     stats: "Stats (F12)",

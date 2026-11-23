@@ -17,7 +17,7 @@ use super::coords::fit;
 use super::i18n::Strings;
 use super::input::InputState;
 use super::session::ViewHandle;
-use super::state::{route_name, ViewPhase};
+use super::state::{net_texts, route_name, NetLevel, NetMeter, ViewPhase};
 use super::stats::{average_bps, bitrate, millis, FpsMeter};
 
 /// 一次 [`Viewer::show`] 的结果。
@@ -52,6 +52,8 @@ pub struct Viewer {
     peer_os: PeerOs,
     /// 被控端的电脑名（老版本为空）。
     peer_name: String,
+    /// 网络状况（工具条上的提示）。
+    net: NetMeter,
     /// 浮动助手是否展开。
     assistant: bool,
     /// 是否全屏。
@@ -79,6 +81,7 @@ impl Viewer {
             clip_toast: None,
             peer_os: PeerOs::Unknown,
             peer_name: String::new(),
+            net: NetMeter::default(),
             assistant: true,
             fullscreen: false,
             original: false,
@@ -113,6 +116,9 @@ impl Viewer {
                 if let Some(text) = super::state::clip_message(note, s) {
                     self.clip_toast = Some((text, Instant::now()));
                 }
+            }
+            if let super::session::ViewEvent::Quality(q) = &event {
+                self.net.push(q);
             }
             if let super::session::ViewEvent::Peer(os, name) = &event {
                 self.peer_os = *os;
@@ -171,19 +177,37 @@ impl Viewer {
                             return;
                         }
                         // 连接状态
+                        let mut net_hint: Option<String> = None;
                         let (state, color) = match &self.phase {
                             ViewPhase::Connecting => (s.connecting.to_owned(), p.warning),
                             ViewPhase::Reconnecting { .. } => (self.phase.headline(s), p.warning),
-                            ViewPhase::Connected { route, .. } => (
-                                format!("{} · {}", s.connected, route_name(Some(*route), s)),
-                                p.success,
-                            ),
+                            ViewPhase::Connected { route, .. } => {
+                                let base =
+                                    format!("{} · {}", s.connected, route_name(Some(*route), s));
+                                // 网络差时标签变色，并写上主要原因（例如“丢包 6%”）
+                                match self.net.shown() {
+                                    (NetLevel::Good, _) | (_, None) => (base, p.success),
+                                    (level, Some(cause)) => {
+                                        let (short, hint) = net_texts(cause, s);
+                                        net_hint = Some(hint);
+                                        let color = if level == NetLevel::Poor {
+                                            p.danger
+                                        } else {
+                                            p.warning
+                                        };
+                                        (format!("{base} · {short}"), color)
+                                    }
+                                }
+                            }
                             ViewPhase::Ended { status, .. } => (
                                 status.text.clone(),
                                 if status.error { p.danger } else { p.muted },
                             ),
                         };
-                        let _ = pill(ui, &state, color);
+                        let shown = pill(ui, &state, color);
+                        if let Some(hint) = net_hint {
+                            let _ = shown.on_hover_text(hint);
+                        }
                         ui.separator();
                         // 快捷键菜单（按被控端系统选键）
                         ui.add_enabled_ui(live, |ui| {

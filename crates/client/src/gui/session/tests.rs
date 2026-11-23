@@ -101,6 +101,7 @@ fn ended(v: &ViewHandle, seen: &mut Log<ViewEvent>) -> Result<Summary, NetError>
         | ViewEvent::Reconnecting { .. }
         | ViewEvent::Notice(_)
         | ViewEvent::Clipboard(_)
+        | ViewEvent::Quality(_)
         | ViewEvent::Peer(..) => {
             panic!("不是 Ended")
         }
@@ -623,6 +624,7 @@ fn server_crash_shows_reconnecting_then_gives_up() {
             other @ (ViewEvent::Connected { .. }
             | ViewEvent::Notice(_)
             | ViewEvent::Clipboard(_)
+            | ViewEvent::Quality(_)
             | ViewEvent::Peer(..)) => panic!("{other:?}"),
         }
     };

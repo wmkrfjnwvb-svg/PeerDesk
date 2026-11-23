@@ -61,6 +61,33 @@ pub struct ControllerOptions {
     pub on_established: Option<EstablishedHook>,
     /// 声音：去向和开关；`None` 表示本机不播放声音。对方不支持声音（老版本）时开关无效。
     pub audio: Option<crate::audio::AudioOut>,
+    /// 每秒报告一次链路质量（界面显示网络状况用）。
+    pub on_quality: Option<QualityHook>,
+}
+
+/// 每秒报告一次的链路质量。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LinkQuality {
+    /// 往返时间（毫秒）。
+    pub rtt_ms: u32,
+    /// 接收端测得的丢包率（千分比）。
+    pub loss_permille: u16,
+    /// 排队延迟（毫秒）：链路被占满时变大。
+    pub queue_ms: u32,
+    /// 这一秒显示的帧数。
+    pub fps: u32,
+    /// 这一秒“按键或点击到下一幅画面”的中位数（毫秒）；没有操作时为 `None`。
+    pub reaction_ms: Option<u32>,
+}
+
+/// 链路质量的回调。
+#[derive(Clone)]
+pub struct QualityHook(pub Arc<dyn Fn(LinkQuality) + Send + Sync>);
+
+impl std::fmt::Debug for QualityHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("QualityHook")
+    }
 }
 
 /// 握手完成时的回调。
@@ -79,12 +106,26 @@ impl std::fmt::Debug for EstablishedHook {
 /// 统计日志的一个窗口：上一次写日志时的累计值，以及这一秒里的帧数和最长间隔。
 #[derive(Debug, Default)]
 struct StatsWindow {
+    /// 这一秒里“按键或点击之后到下一幅画面”的时间（微秒）：用户感觉到的操作延迟（上限）。
+    reactions: Vec<u64>,
     frames: u32,
     max_gap_us: u64,
     bytes: u64,
     expired: u64,
     recovered: u64,
     bad: u32,
+}
+
+/// 按键或点击之后这么久还没有新画面，就不算这一次（多半是操作没有改变画面）。
+const REACTION_LIMIT_US: u64 = 2_000_000;
+
+/// 一组操作延迟的中位数和最大值（毫秒）。
+fn reaction_summary(v: &[u64]) -> (u64, u64) {
+    let mut v = v.to_vec();
+    v.sort_unstable();
+    let median = v.get(v.len() / 2).copied().unwrap_or(0);
+    let max = v.last().copied().unwrap_or(0);
+    (median / 1000, max / 1000)
 }
 
 /// 统计日志的间隔。
@@ -286,6 +327,7 @@ pub async fn run(
     let mut stats_tick = tokio::time::interval(STATS_EVERY);
     stats_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut window = StatsWindow::default();
+    let mut waiting_input: Option<peerdesk_core::time::Time> = None;
     let mut last_shown = link.now();
 
     let end = loop {
@@ -302,6 +344,12 @@ pub async fn run(
                     window.frames = window.frames.saturating_add(1);
                     window.max_gap_us = window.max_gap_us.max(now.since(last_shown));
                     last_shown = now;
+                    if let Some(at) = waiting_input.take() {
+                        let took = now.since(at);
+                        if took <= REACTION_LIMIT_US {
+                            window.reactions.push(took);
+                        }
+                    }
                     tracer.record(link.now(), trace, Stage::FrameDelivered, u64::from(frame_id));
                     sink.present(&screen);
                     last_screen = Some(screen);
@@ -392,6 +440,14 @@ pub async fn run(
             },
             event = input.recv(), if input_open => match event {
                 Some(event) => {
+                    // 按下键或鼠标键：记下时间，等下一幅画面
+                    let press = matches!(
+                        event,
+                        InputEvent::Key { down: true, .. } | InputEvent::MouseButton { down: true, .. }
+                    );
+                    if press && waiting_input.is_none() {
+                        waiting_input = Some(link.now());
+                    }
                     sender.push(event);
                     input_sent = input_sent.saturating_add(1);
                     let failed = sender.packet()?.and_then(|p| link.send(Channel::Input, &p).err());
@@ -406,7 +462,7 @@ pub async fn run(
                 let reassembly = media.reassembly();
                 let stats = media.stats();
                 crate::note!(info, target: "peerdesk::stats",
-                    "接收 帧 {} 画面 {} kbps 最长间隔 {} ms 作废 {} 纠错恢复 {} 坏帧 {} RTT {} ms 输入未确认 {}",
+                    "接收 帧 {} 画面 {} kbps 最长间隔 {} ms 作废 {} 纠错恢复 {} 坏帧 {} RTT {} ms 输入未确认 {} 操作到画面 {} 次 中位 {} ms 最大 {} ms",
                     window.frames,
                     stats.video_bytes.saturating_sub(window.bytes) * 8 / 1000,
                     gap / 1000,
@@ -415,7 +471,21 @@ pub async fn run(
                     stats.bad.saturating_sub(window.bad),
                     link.rtt().as_millis(),
                     sender.pending(),
+                    window.reactions.len(),
+                    reaction_summary(&window.reactions).0,
+                    reaction_summary(&window.reactions).1,
                 );
+                if let Some(hook) = &opts.on_quality {
+                    let fb = media.last_feedback().unwrap_or_default();
+                    (hook.0)(LinkQuality {
+                        rtt_ms: u32::try_from(link.rtt().as_millis()).unwrap_or(u32::MAX),
+                        loss_permille: fb.loss_permille,
+                        queue_ms: fb.queue_delay_us / 1000,
+                        fps: window.frames,
+                        reaction_ms: (!window.reactions.is_empty())
+                            .then(|| u32::try_from(reaction_summary(&window.reactions).0).unwrap_or(u32::MAX)),
+                    });
+                }
                 window = StatsWindow {
                     bytes: stats.video_bytes,
                     expired: reassembly.expired,
@@ -508,4 +578,15 @@ pub async fn run(
         end,
         trace: tracer.dump(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reaction_summary;
+
+    #[test]
+    fn reaction_summary_is_median_and_max_in_ms() {
+        assert_eq!(reaction_summary(&[]), (0, 0));
+        assert_eq!(reaction_summary(&[90_000, 30_000, 250_000]), (90, 250));
+    }
 }

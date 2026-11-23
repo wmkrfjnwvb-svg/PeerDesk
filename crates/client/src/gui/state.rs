@@ -278,7 +278,7 @@ impl ViewPhase {
                 attempt: *attempt,
                 why: why.clone(),
             },
-            ViewEvent::Clipboard(_) | ViewEvent::Peer(..) => self.clone(),
+            ViewEvent::Clipboard(_) | ViewEvent::Peer(..) | ViewEvent::Quality(_) => self.clone(),
             ViewEvent::Notice(text) => ViewPhase::Ended {
                 status: Status::error(text.clone()),
                 summary: None,
@@ -322,9 +322,163 @@ pub const fn route_name(route: Option<Route>, s: &Strings) -> &'static str {
     }
 }
 
+/// 网络状况的等级。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum NetLevel {
+    /// 正常。
+    Good,
+    /// 一般：能用，但会有些卡或延迟。
+    Fair,
+    /// 差。
+    Poor,
+}
+
+/// 主要原因（给用户看建议用）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetCause {
+    /// 丢包多（多半是 Wi-Fi 信号或干扰）。
+    Loss(u16),
+    /// 往返延迟高（距离远或走中继）。
+    Latency(u32),
+    /// 带宽不够（排队延迟高）。
+    Bandwidth(u32),
+}
+
+/// 一秒的链路质量分级。门槛：丢包 1% / 5%，往返 100 / 200 ms，排队 60 / 150 ms。
+#[must_use]
+pub fn classify(q: &peerdesk_net::controller::LinkQuality) -> (NetLevel, Option<NetCause>) {
+    let level = |v: u32, fair: u32, poor: u32| {
+        if v >= poor {
+            NetLevel::Poor
+        } else if v >= fair {
+            NetLevel::Fair
+        } else {
+            NetLevel::Good
+        }
+    };
+    let candidates = [
+        (
+            level(u32::from(q.loss_permille), 10, 50),
+            NetCause::Loss(q.loss_permille),
+        ),
+        (level(q.rtt_ms, 100, 200), NetCause::Latency(q.rtt_ms)),
+        (level(q.queue_ms, 60, 150), NetCause::Bandwidth(q.queue_ms)),
+    ];
+    // 取最差的一项；一样差时按上面的顺序（丢包最常见、最好解释）
+    let worst = candidates
+        .iter()
+        .map(|(l, _)| *l)
+        .max()
+        .unwrap_or(NetLevel::Good);
+    let cause = candidates
+        .iter()
+        .find(|(l, _)| *l == worst && worst != NetLevel::Good)
+        .map(|(_, c)| *c);
+    (worst, cause)
+}
+
+/// 网络状况的显示：变差立刻显示，变好要连续 [`NetMeter::RECOVER`] 秒才恢复，免得标签来回跳。
+#[derive(Debug, Clone, Default)]
+pub struct NetMeter {
+    recent: std::collections::VecDeque<(NetLevel, Option<NetCause>)>,
+}
+
+impl NetMeter {
+    /// 恢复要连续好这么多秒。
+    pub const RECOVER: usize = 5;
+
+    /// 收到一秒的质量。
+    pub fn push(&mut self, q: &peerdesk_net::controller::LinkQuality) {
+        self.recent.push_back(classify(q));
+        while self.recent.len() > Self::RECOVER {
+            self.recent.pop_front();
+        }
+    }
+
+    /// 现在显示的等级和原因：最近几秒里最差的那一秒。
+    #[must_use]
+    pub fn shown(&self) -> (NetLevel, Option<NetCause>) {
+        self.recent
+            .iter()
+            .copied()
+            .max_by_key(|(l, _)| *l)
+            .unwrap_or((NetLevel::Good, None))
+    }
+}
+
+/// 标签上的短说明（例如“丢包 6%”）和鼠标移上去的建议。
+#[must_use]
+pub fn net_texts(cause: NetCause, s: &Strings) -> (String, String) {
+    match cause {
+        NetCause::Loss(p) => (
+            s.net_loss
+                .replace("{n}", &format!("{:.0}", f64::from(p) / 10.0)),
+            s.net_loss_hint.to_owned(),
+        ),
+        NetCause::Latency(ms) => (
+            s.net_latency.replace("{n}", &ms.to_string()),
+            s.net_latency_hint.to_owned(),
+        ),
+        NetCause::Bandwidth(_) => (s.net_bandwidth.to_owned(), s.net_bandwidth_hint.to_owned()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn network_quality_levels_and_hysteresis() {
+        use peerdesk_net::controller::LinkQuality;
+        let good = LinkQuality {
+            rtt_ms: 20,
+            ..LinkQuality::default()
+        };
+        assert_eq!(classify(&good), (NetLevel::Good, None));
+        let lossy = LinkQuality {
+            loss_permille: 60,
+            rtt_ms: 120,
+            ..good
+        };
+        assert_eq!(classify(&lossy), (NetLevel::Poor, Some(NetCause::Loss(60))));
+        let far = LinkQuality {
+            rtt_ms: 150,
+            ..good
+        };
+        assert_eq!(
+            classify(&far),
+            (NetLevel::Fair, Some(NetCause::Latency(150)))
+        );
+        let full = LinkQuality {
+            queue_ms: 200,
+            ..good
+        };
+        assert_eq!(classify(&full).1, Some(NetCause::Bandwidth(200)));
+        // 变差立刻显示，变好要连续 5 秒
+        let mut m = NetMeter::default();
+        assert_eq!(m.shown().0, NetLevel::Good);
+        m.push(&good);
+        m.push(&lossy);
+        assert_eq!(m.shown().0, NetLevel::Poor);
+        for _ in 0..NetMeter::RECOVER - 1 {
+            m.push(&good);
+            assert_eq!(m.shown().0, NetLevel::Poor);
+        }
+        m.push(&good);
+        assert_eq!(m.shown().0, NetLevel::Good);
+        // 文字
+        for s in [&EN, crate::gui::i18n::strings(crate::gui::i18n::Lang::Zh)] {
+            for c in [
+                NetCause::Loss(60),
+                NetCause::Latency(150),
+                NetCause::Bandwidth(200),
+            ] {
+                let (short, hint) = net_texts(c, s);
+                assert!(!short.is_empty() && !hint.is_empty() && !short.contains("{n}"));
+            }
+        }
+        assert!(net_texts(NetCause::Loss(60), &EN).0.contains('6'));
+    }
 
     #[test]
     fn clipboard_notes() {
