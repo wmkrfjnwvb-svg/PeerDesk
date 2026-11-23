@@ -114,3 +114,13 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
+
+## Microsoft MMSys 2024 带宽估计挑战赛数据集（CC BY 4.0）
+
+`crates/e2e/traces/ms-*.csv` 是从该数据集的仿真通话中摘取的真实带宽和丢包轨迹（由 `scripts/ms-traces.py` 转换，
+只保留变化最多的 40 秒、只记变化时刻）。来源：Microsoft，
+https://github.com/microsoft/RL4BandwidthEstimationChallenge ，
+数据集说明 https://www.microsoft.com/en-us/research/academic-program/bandwidth-estimation-challenge/data/ ，
+许可 Creative Commons Attribution 4.0（https://creativecommons.org/licenses/by/4.0/）。
+论文：Khairy et al., "ACM MMSys 2024 Bandwidth Estimation in Real Time Communications Challenge", arXiv:2403.06324。
+已做的改动：截取窗口、百分数换成千分比、缺失值沿用上一步。
