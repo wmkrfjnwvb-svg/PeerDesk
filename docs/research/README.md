@@ -1,6 +1,6 @@
 # PeerDesk 调研结论与方案（2026-11）
 
-本目录是写代码之前的调研。五份原始报告各有来源链接，没核实的结论在报告里都有标注：
+本目录是写代码之前的调研。各份原始报告各有来源链接，没核实的结论在报告里都有标注：
 
 | 报告 | 内容 |
 | --- | --- |
@@ -10,6 +10,138 @@
 | [D-rdp.md](D-rdp.md) | 接入系统自带的远程桌面（RDP、VNC、macOS 屏幕共享、Linux） |
 | [E-e2e.md](E-e2e.md) | 端到端仿真与实测：网络模拟、轨迹数据集、画质与卡顿指标、延迟测量 |
 | [F-nat.md](F-nat.md) | NAT 穿透（打洞）：业界做法与成功率、中国网络现状、失败模式与“哪一侧的问题”的判定、决策树、分段延迟、NAT 仿真、路线与成本。和传输算法同等优先 |
+| [G-unattended.md](G-unattended.md) | 无人值守：系统服务、锁屏和登录界面、Ctrl+Alt+Del、无显示器主机、隐私屏、安全模型 |
+| [H-audio.md](H-audio.md) | 声音：WebRTC NetEQ 抖动缓冲、Opus 配置、RED 冗余、音画同步 |
+| [I-release.md](I-release.md) | 发布：硬件编码、代码签名和公证、自动更新 |
+| [J-keyboard.md](J-keyboard.md) | 远程键盘：跨系统快捷键映射、输入法、键盘布局、系统快捷键捕获 |
+
+## 实现状态总表（2026-11-23）
+
+图例：✅ 已完成并有测试（进 CI）；🟡 部分完成；⬜ 未做。“代码”列是主要文件，测试在各 crate 的 `tests/` 目录。
+传输算法的逐项细节见第 3.8 节。
+
+### 传输与码率控制（报告 A，本文第 3 节）
+
+| 算法 / 模块 | 状态 | 代码 | 说明 |
+| --- | --- | --- | --- |
+| QUIC 连接、数据报、可靠流 | ✅ | `net/node.rs`、`net/stream.rs` | quinn 0.11；QUIC 层用 BBR 兜底 |
+| 分片、重组、新帧优先、截止时间作废 | ✅ | `core/transport.rs` | |
+| 前向纠错（分组异或校验） | ✅ | `core/transport.rs` | 比例按网络画像固定 |
+| NACK 重传（一轮限量） | ✅ | `core/adaptive.rs`、`core/media.rs` | |
+| 接收端测量与反馈（排队延迟、丢包、速率） | ✅ | `core/adaptive.rs` | |
+| 延迟趋势线（WebRTC trendline，自适应门限） | ✅ | `core/estimator.rs` | |
+| 包串测瓶颈带宽（大帧当探测） | ✅ | `core/estimator.rs` | |
+| 区分随机丢包和拥塞丢包 | ✅ | `core/estimator.rs` | |
+| 每帧字节预算、在途上限、跳到最新帧 | ✅ | `core/media.rs` | |
+| 帧率调节（按时间恢复） | ✅ | `core/governor.rs` | |
+| 输入走数据报加冗余，丢多了先释放按键 | ✅ | `core/input.rs` | 通道优先级：输入 > 控制 > 光标 > 声音 > 画面 |
+| 链路满度（Pudica 式）单独信号 | ⬜ | | |
+| 空闲后先探测带宽 | ⬜ | | 现在靠第一个大帧的包串重新测 |
+| 降分辨率（先接后断） | ⬜ | | |
+| 长期参考帧恢复 | ⬜ | | 等硬件编码器；现在丢帧发关键帧 |
+| 按预测调纠错比例 | ⬜ | | |
+| 视频区域抖动缓冲 | ⬜ | | |
+
+### 编解码（本文第 2 节，报告 I）
+
+| 算法 / 模块 | 状态 | 代码 | 说明 |
+| --- | --- | --- | --- |
+| H.264 软件编码（OpenH264，屏幕内容模式） | ✅ | `media/lib.rs` | 1080p 每帧 45–60 ms，是帧率低的根因 |
+| 整数系数的 RGB→YUV 转换 | ✅ | `media/color.rs` | 与 openh264 逐字节一致 |
+| 静止后补清晰（最多约 8 帧残差） | ✅ | `media/lib.rs` | |
+| 块编码（对照组，渐进无损） | ✅ | `core/codec.rs` | 只在仿真里做对照 |
+| 硬件能力探测与档位 | 🟡 | `core/probe.rs` | 只有判定规则，没有接硬件编码器 |
+| 硬件编码（Media Foundation、VideoToolbox、VA-API） | ⬜ | | **下一项** |
+| 编解码挪到独立线程 | ⬜ | | |
+| AV1、HEVC、4:4:4 文字清晰度、4K/8K | ⬜ | | |
+| 发布版运行时下载 Cisco OpenH264 二进制 | ⬜ | | |
+
+### 打洞、中继与服务端（报告 F）
+
+| 算法 / 模块 | 状态 | 代码 | 说明 |
+| --- | --- | --- | --- |
+| 信令：登记在线、按设备码查找 | ✅ | `core/signal.rs`、`net/service.rs` | |
+| 网络体检（NAT 类型、到路由器和服务器的延迟、IPv6） | ✅ | `net/netcheck.rs`、`net/gateway.rs` | |
+| 局域网地址直连 | ✅ | `net/candidates.rs` | |
+| 候选路径并行探测、按往返时间选路 | ✅ | `core/paths.rs`、`net/ice.rs` | 中继要快 `RELAY_PENALTY_US` 以上才选 |
+| IPv6 优先（按界面语言，英文开） | ✅ | `core/paths.rs` | `NAT_PENALTY_US` 10 ms |
+| 对称型 NAT 生日攻击打洞 | ✅ | `net/punch.rs` | |
+| 端口映射（PCP、NAT-PMP、UPnP） | ✅ | `net/portmap.rs` | |
+| 中继转发（端到端加密，中继只见密文） | ✅ | `core/relay.rs`、`net/service.rs` | |
+| 中继票据、免费额度 | ✅ | `core/relay.rs` | |
+| 服务端集群（无主，心跳发现，死节点自动退出和回归） | ✅ | `core/cluster.rs`、`server/node.rs` | |
+| 按地区选节点 | ✅ | `core/region.rs` | |
+| 中继计费账本（账户令牌、按月汇总） | ✅ | `core/billing.rs`、`server/accounting.rs` | 令牌由服务端签发，还没接账户系统 |
+| NAT 实验室（真实二进制，各种 NAT 组合，CI 门槛） | ✅ | `scripts/nat-lab.sh` | |
+| 会话中从中继升级到直连 | ⬜ | | |
+
+### 安全与会话
+
+| 算法 / 模块 | 状态 | 代码 | 说明 |
+| --- | --- | --- | --- |
+| 设备身份（自签证书，按指纹信任） | ✅ | `net/identity.rs`、`net/tls*.rs` | |
+| 可选加密套件，防降级 | ✅ | `core/crypto.rs` | |
+| 密码认证（SPAKE2 + 通道绑定，失败限次） | ✅ | `core/auth.rs` | |
+| 握手、能力位、新旧版本兼容（快照测试） | ✅ | `core/session.rs`、`core/proto.rs`、`docs/compat.md` | |
+| 双因素、审计日志、访问控制列表 | ⬜ | | 见报告 G 第 5 节 |
+
+### 采集、输入、声音、剪贴板、文件
+
+| 算法 / 模块 | 状态 | 代码 | 说明 |
+| --- | --- | --- | --- |
+| 屏幕采集：Windows DXGI（GDI 兜底） | ✅ | `platform/windows.rs` | |
+| 屏幕采集：macOS ScreenCaptureKit | ✅ | `platform/macos.rs` | |
+| 屏幕采集：Linux X11（MIT-SHM、DAMAGE） | ✅ | `platform/x11.rs` | |
+| 屏幕采集：Linux Wayland | ⬜ | | 现在给出明确错误 |
+| 键鼠注入（SendInput、CGEvent、XTEST），HID 键位表 | ✅ | `platform/*`、`platform/keymap.rs` | |
+| 浮动助手：12 个快捷键（按对端系统选键）、声音、全屏、统计、断开 | ✅ | `client/gui/assistant.rs`、`viewer.rs` | |
+| 浮动助手：剪贴板开关、文件传输入口、画质和帧率、切换显示器 | ⬜ | | |
+| 键盘原生捕获（Win 键、Alt+Tab）、跨系统映射、输入法 | ⬜ | | 报告 J，排在最后 |
+| 声音：Opus 编解码、RED 自适应冗余 | ✅ | `media/audio.rs`、`core/audio.rs` | 报告 H |
+| 声音：NetEQ 式抖动缓冲（目标 20–200 ms、补帧、合并加速） | ✅ | `core/audio.rs` | |
+| 声音采集：WASAPI 回环、PulseAudio 监听源、ScreenCaptureKit；cpal 播放 | ✅ | `platform/audio_sys.rs`、`platform/macos.rs` | 实机听感待测 |
+| 声音：口到耳延迟门槛、音画同步微调 | ⬜ | | |
+| 剪贴板：文本、图片、20 MB 以内的文件（含文件夹），防回声 | ✅ | `core/clipboard.rs`、`net/clipsync.rs` | `docs/clipboard.md` |
+| 文件传输协议（断点续传、哈希校验、路径防逃逸） | ✅ | `core/file.rs`、`net/files.rs` | 命令行可用 |
+| 文件传输界面（拖放、进度、取消） | ⬜ | | |
+
+### 无人值守（报告 G）
+
+| 算法 / 模块 | 状态 | 说明 |
+| --- | --- | --- |
+| 锁屏时拒绝本次连接并说明原因，继续被控 | ✅ | `client/local.rs` |
+| 系统服务（Windows 服务、macOS LaunchDaemon、Linux systemd） | ⬜ | |
+| 锁屏和登录界面的采集与控制，服务发送 Ctrl+Alt+Del（SAS） | ⬜ | |
+| 无显示器主机的虚拟显示器 | ⬜ | |
+| 隐私屏（黑掉被控端屏幕）、锁定被控端键鼠 | ⬜ | |
+
+### 客户端界面与产品
+
+| 模块 | 状态 | 说明 |
+| --- | --- | --- |
+| 主窗口（首页、设备、设置），浅色、深色、跟随系统 | ✅ | `client/gui/app.rs`、`theme.rs` |
+| 中英文切换（跟随系统或手动） | ✅ | `client/gui/i18n.rs` |
+| macOS 授权引导（示意图按系统版本和语言绘制） | ✅ | `client/gui/guide_art.rs`、`platform/guide.rs` |
+| 安装包（Windows、macOS、Linux 服务端、Docker） | ✅ | `scripts/package-*.sh` |
+| 代码签名、公证、自动更新 | ⬜ | 报告 I；需要公司主体和 Apple 开发者账号 |
+| 账户、Stripe 收费（Supabase） | ⬜ | 服务端已有计费账本 |
+| 英文官网（中英切换） | ⬜ | |
+| 被控端有人连入时通知，可接受或拒绝 | ⬜ | |
+
+### 测试平台（报告 E，本文第 5 节）
+
+| 模块 | 状态 | 说明 |
+| --- | --- | --- |
+| L1 进程内确定性仿真，真实编码器，8 个场景，硬门槛 | ✅ | `crates/e2e` |
+| L2 真实二进制闭环（虚拟桌面、真实 QUIC） | ✅ | `scripts/e2e-live.sh` |
+| AI 特征记录（每次反馈一行，带仿真真值） | ✅ | `e2e/lib.rs` |
+| 帧号条码测端到端延迟、输入到显示延迟 | ⬜ | |
+| 真实网络轨迹回放、L3 跨机器每晚测试、性能趋势记录 | ⬜ | |
+
+### 尚未开始的大块
+
+- **AI 网络预估**（报告 C，第 4 节）：只铺了特征记录，模型、训练、对照都没做。
+- **接入系统远程桌面**（报告 D，第 7 节）：端口转发和 IronRDP 嵌入都没做。
 
 下面是汇总后的方案，带“决定”字样的条目需要产品负责人确认。
 
