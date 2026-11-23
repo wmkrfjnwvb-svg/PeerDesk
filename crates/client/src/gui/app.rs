@@ -40,6 +40,8 @@ const ICON_SIZE: u32 = 128;
 /// 首页两张卡片的最小高度（两张一样高）。
 const CARD_HEIGHT: f32 = 250.0;
 /// 复制等操作的轻提示显示多久。
+/// 首页卡片并排时每张的最小宽度。
+const CARD_MIN_WIDTH: f32 = 340.0;
 const TOAST: Duration = Duration::from_millis(1500);
 /// 普通的状态信息显示多久（错误一直显示，直到下一条）。
 const STATUS_FADE: Duration = Duration::from_secs(6);
@@ -745,18 +747,26 @@ impl App {
         ui.label(RichText::new(s.nav_home).size(22.0).strong());
         ui.add_space(14.0);
         self.permission_guide(ui, p);
-        ui.columns(2, |cols| {
-            if let [left, right] = cols {
-                card(left, p, |ui| {
-                    ui.set_min_height(CARD_HEIGHT);
-                    self.this_device_card(ui, p);
-                });
-                card(right, p, |ui| {
-                    ui.set_min_height(CARD_HEIGHT);
-                    self.remote_card(ui, p);
-                });
-            }
-        });
+        // 窗口够宽时两张卡片并排，否则上下排：并排时每张卡片至少要 CARD_MIN_WIDTH，
+        // 不够时内容会溢出到旁边那张卡片上（Windows 高缩放比例下窗口逻辑宽度更小）。
+        if ui.available_width() >= 2.0 * CARD_MIN_WIDTH + 8.0 {
+            ui.columns(2, |cols| {
+                if let [left, right] = cols {
+                    card(left, p, |ui| {
+                        ui.set_min_height(CARD_HEIGHT);
+                        self.this_device_card(ui, p);
+                    });
+                    card(right, p, |ui| {
+                        ui.set_min_height(CARD_HEIGHT);
+                        self.remote_card(ui, p);
+                    });
+                }
+            });
+        } else {
+            card(ui, p, |ui| self.this_device_card(ui, p));
+            ui.add_space(12.0);
+            card(ui, p, |ui| self.remote_card(ui, p));
+        }
         ui.add_space(18.0);
         ui.label(RichText::new(s.recent).size(15.0).strong());
         ui.add_space(6.0);
