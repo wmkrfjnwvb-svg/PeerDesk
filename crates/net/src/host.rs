@@ -112,6 +112,8 @@ pub struct HostOptions {
     pub clipboard: Option<ClipboardHandle>,
     /// 本机声音来源；`None` 表示不提供声音。
     pub audio: Option<crate::audio::CaptureHandle>,
+    /// 本机电脑名：握手时告诉控制端，显示在对方的设备列表里。空表示不发。
+    pub name: String,
 }
 
 impl HostOptions {
@@ -129,6 +131,7 @@ impl HostOptions {
             recv_root,
             clipboard: None,
             audio: None,
+            name: String::new(),
         }
     }
 }
@@ -229,6 +232,7 @@ pub async fn serve(
     }
     let needs_password = matches!(config.auth, Auth::Password(_));
     let mut session = Session::host(config, trace);
+    session.set_name(&opts.name);
 
     // 应用层握手：对端先打开控制流并发 Hello。
     let (mut ctrl_send, mut ctrl_recv) = tokio::time::timeout(HELLO_TIMEOUT, link.accept_stream())

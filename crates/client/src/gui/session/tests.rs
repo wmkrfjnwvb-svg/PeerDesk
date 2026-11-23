@@ -101,7 +101,7 @@ fn ended(v: &ViewHandle, seen: &mut Log<ViewEvent>) -> Result<Summary, NetError>
         | ViewEvent::Reconnecting { .. }
         | ViewEvent::Notice(_)
         | ViewEvent::Clipboard(_)
-        | ViewEvent::PeerOs(_) => {
+        | ViewEvent::Peer(..) => {
             panic!("不是 Ended")
         }
     }
@@ -134,12 +134,11 @@ fn view_a_host_send_input_and_get_kicked() {
     assert!(!v.sound());
     v.set_sound(true);
     assert!(v.sound());
-    let os = wait_for(
-        || v.poll(),
-        &mut seen,
-        |e| matches!(e, ViewEvent::PeerOs(_)),
+    let os = wait_for(|| v.poll(), &mut seen, |e| matches!(e, ViewEvent::Peer(..)));
+    assert_eq!(
+        os,
+        ViewEvent::Peer(PeerOs::current(), crate::local::device_name())
     );
-    assert_eq!(os, ViewEvent::PeerOs(PeerOs::current()));
     std::thread::sleep(Duration::from_millis(300));
     v.set_sound(false);
 
@@ -624,7 +623,7 @@ fn server_crash_shows_reconnecting_then_gives_up() {
             other @ (ViewEvent::Connected { .. }
             | ViewEvent::Notice(_)
             | ViewEvent::Clipboard(_)
-            | ViewEvent::PeerOs(_)) => panic!("{other:?}"),
+            | ViewEvent::Peer(..)) => panic!("{other:?}"),
         }
     };
     assert_eq!(

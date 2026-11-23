@@ -56,7 +56,8 @@ pub struct ControllerOptions {
     pub duration: Option<Duration>,
     /// 本机剪贴板；`None` 表示不同步剪贴板。双方都协商出剪贴板能力时才同步。
     pub clipboard: Option<crate::clipsync::ClipboardHandle>,
-    /// 握手完成时调用，参数是被控端 Accept 里的能力（含被控端的系统，见 `Caps::os`）。
+    /// 握手完成时调用，参数是被控端 Accept 里的能力（含被控端的系统，见 `Caps::os`）
+    /// 和被控端的电脑名（老版本为空）。
     pub on_established: Option<EstablishedHook>,
     /// 声音：去向和开关；`None` 表示本机不播放声音。对方不支持声音（老版本）时开关无效。
     pub audio: Option<crate::audio::AudioOut>,
@@ -64,7 +65,10 @@ pub struct ControllerOptions {
 
 /// 握手完成时的回调。
 #[derive(Clone)]
-pub struct EstablishedHook(pub Arc<dyn Fn(Caps) + Send + Sync>);
+pub struct EstablishedHook(pub Arc<OnEstablished>);
+
+/// 握手完成回调的签名：被控端的能力和电脑名。
+pub type OnEstablished = dyn Fn(Caps, &str) + Send + Sync;
 
 impl std::fmt::Debug for EstablishedHook {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -219,7 +223,7 @@ pub async fn run(
     };
     let mut ctrl_rx = control_reader(ctrl_recv);
     if let Some(hook) = &opts.on_established {
-        (hook.0)(caps);
+        (hook.0)(caps, session.peer_name());
     }
 
     // 剪贴板同步：由控制端打开专用的流。对方是不支持剪贴板的老版本时不开。

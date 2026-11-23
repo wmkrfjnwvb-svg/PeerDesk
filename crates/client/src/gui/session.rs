@@ -397,6 +397,7 @@ async fn host_main(
             limiter: Arc::clone(&limiter),
             clipboard: system_clipboard(Box::new(|_| {})),
             audio: SYSTEM_AUDIO.0(),
+            name: crate::local::device_name(),
             ..HostOptions::new(
                 session(&identity, &policy, Auth::Password(password)),
                 config.fps,
@@ -551,8 +552,9 @@ pub enum ViewEvent {
     Notice(String),
     /// 剪贴板事件（内容太大没有同步等），界面短暂提示，会话继续。
     Clipboard(ClipNote),
-    /// 握手完成，得知被控端的系统（老版本为未知）。助手据此选 Ctrl 还是 Cmd。
-    PeerOs(PeerOs),
+    /// 握手完成，得知被控端的系统和电脑名（老版本为未知、空）。助手据此选 Ctrl 还是 Cmd，
+    /// 设备列表据此显示电脑名。
+    Peer(PeerOs, String),
 }
 
 /// 打开本机系统剪贴板。测试构建里没有（测试不碰开发者电脑的剪贴板）。
@@ -939,9 +941,11 @@ async fn one_session(
             },
             on_established: {
                 let ev = ev.clone();
-                Some(controller::EstablishedHook(Arc::new(move |caps: Caps| {
-                    ev.send(ViewEvent::PeerOs(caps.os()));
-                })))
+                Some(controller::EstablishedHook(Arc::new(
+                    move |caps: Caps, name: &str| {
+                        ev.send(ViewEvent::Peer(caps.os(), name.to_owned()));
+                    },
+                )))
             },
             audio: Some(peerdesk_net::audio::AudioOut {
                 playback: SYSTEM_AUDIO.1(),

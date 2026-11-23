@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align, Color32, Layout, RichText, TextEdit};
+use peerdesk_core::proto::PeerOs;
 use peerdesk_core::signal::format_code;
 use peerdesk_net::identity::to_hex;
 use peerdesk_net::netcheck::NetReport;
@@ -125,6 +126,8 @@ struct App {
     appearance: Appearance,
     /// 打开程序后自动开启被控（默认开；用户手动关过就记住，下次不自动开）。权限齐了才真正开启。
     auto_host: bool,
+    /// 本机电脑名（首页“本机”卡片上显示）。
+    name: String,
 }
 
 /// 用户手动关闭被控后留下的标记文件。
@@ -234,6 +237,7 @@ impl App {
             preview_mac,
             appearance,
             auto_host,
+            name: crate::local::device_name(),
         }
     }
 
@@ -485,7 +489,12 @@ impl App {
             && (self.guide.ready || self.phase.is_on());
         let (state, color) = self.host_state(p);
         let mut toggled = false;
-        card_title(ui, p, icon::DESKTOP, s.this_device, |ui| {
+        let title = if self.name.is_empty() {
+            s.this_device.to_owned()
+        } else {
+            format!("{} · {}", s.this_device, self.name)
+        };
+        card_title(ui, p, os_icon(PeerOs::current()), &title, |ui| {
             toggled = toggle(ui, p, &mut on, enabled)
                 .on_hover_text(s.allow_control)
                 .changed();
@@ -687,8 +696,7 @@ impl App {
         ui.with_layout(layout, |ui| {
             ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
             for item in items {
-                let (title, is_code) = item.title();
-                let kind = if is_code { s.device_code } else { s.ip_direct };
+                let (title, kind) = item.heading(s.device_code, s.ip_direct);
                 let id = ui.id().with(("recent", &item.addr));
                 let hovered = ui
                     .ctx()
@@ -706,14 +714,10 @@ impl App {
                         ui.set_width(196.0);
                         ui.set_height(40.0);
                         ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(icon::DESKTOP_TOWER)
-                                    .size(24.0)
-                                    .color(p.accent),
-                            );
+                            ui.label(RichText::new(os_icon(item.os)).size(24.0).color(p.accent));
                             ui.vertical(|ui| {
-                                ui.label(RichText::new(&title).strong());
-                                let _ = muted(ui, p, kind);
+                                ui.add(egui::Label::new(RichText::new(&title).strong()).truncate());
+                                let _ = muted(ui, p, &kind);
                             });
                         });
                     })
@@ -791,17 +795,12 @@ impl App {
                 if i > 0 {
                     ui.separator();
                 }
-                let (title, is_code) = item.title();
+                let (title, kind) = item.heading(s.device_code, s.ip_direct);
                 ui.horizontal(|ui| {
                     ui.set_min_height(44.0);
-                    ui.label(
-                        RichText::new(icon::DESKTOP_TOWER)
-                            .size(24.0)
-                            .color(p.accent),
-                    );
+                    ui.label(RichText::new(os_icon(item.os)).size(24.0).color(p.accent));
                     ui.vertical(|ui| {
                         ui.label(RichText::new(&title).strong());
-                        let kind = if is_code { s.device_code } else { s.ip_direct };
                         let detail = if item.pin.is_empty() {
                             kind.to_owned()
                         } else {
@@ -1338,12 +1337,14 @@ impl eframe::App for App {
         self.views.retain_mut(|(viewer, remember)| {
             let outcome = viewer.show(ctx, s);
             if outcome.connected {
-                remembered.extend(remember.take());
+                if let Some((addr, pin)) = remember.take() {
+                    remembered.push((addr, pin, outcome.peer.0, outcome.peer.1));
+                }
             }
             outcome.open
         });
-        for (addr, pin) in remembered {
-            if let Err(e) = self.recent.remember(&addr, &pin) {
+        for (addr, pin, os, name) in remembered {
+            if let Err(e) = self.recent.remember(&addr, &pin, os, &name) {
                 self.status = Status::error(e.to_string());
             }
         }
@@ -1354,6 +1355,16 @@ impl eframe::App for App {
             viewer.stop();
         }
         self.stop_hosting();
+    }
+}
+
+/// 系统的图标：设备列表里一眼分出 Windows、Mac、Linux。
+const fn os_icon(os: PeerOs) -> &'static str {
+    match os {
+        PeerOs::Windows => icon::WINDOWS_LOGO,
+        PeerOs::Mac => icon::APPLE_LOGO,
+        PeerOs::Linux => icon::LINUX_LOGO,
+        PeerOs::Unknown => icon::DESKTOP_TOWER,
     }
 }
 

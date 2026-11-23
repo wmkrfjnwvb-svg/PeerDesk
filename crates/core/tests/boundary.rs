@@ -108,11 +108,13 @@ fn extreme_numeric_values_survive_roundtrip() {
             suite: Suite::None,
             session_id: 0,
             caps: Caps(0),
+            name: String::new(),
         },
         Control::Accept {
             suite: Suite::ChaCha20Poly1305,
             session_id: u32::MAX,
             caps: Caps(u32::MAX),
+            name: String::new(),
         },
     ] {
         assert_eq!(Control::decode(&msg.encode().unwrap()).unwrap(), msg);

@@ -25,6 +25,18 @@ pub const VIDEO_HEADER_LEN: usize = 12;
 pub const MAX_DATAGRAM: usize = 1200;
 /// 区域名的最大长度。
 pub const MAX_REGION_LEN: usize = 32;
+/// 电脑名最长字节数（UTF-8）。更长的在字符边界截断。
+pub const MAX_NAME_LEN: usize = 64;
+
+/// 把电脑名截到 [`MAX_NAME_LEN`] 字节以内，不切断字符。
+#[must_use]
+pub fn clip_name(name: &str) -> String {
+    let mut end = name.len().min(MAX_NAME_LEN);
+    while !name.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    name.get(..end).unwrap_or_default().to_owned()
+}
 /// 一条 Hello 最多携带的套件数。
 pub const MAX_SUITES: usize = 16;
 
@@ -410,6 +422,8 @@ pub enum Control {
         session_id: u32,
         /// 两端共同的编解码能力。
         caps: Caps,
+        /// 被控端的电脑名（扩展字段，老版本不发；控制端用来在设备列表里显示）。空表示没有。
+        name: String,
     },
     /// 被控端拒绝。
     Reject {
@@ -485,8 +499,13 @@ impl Control {
                 suite,
                 session_id,
                 caps,
+                name,
             } => {
                 w.u8(2).u8(suite.id()).u32(*session_id).u32(caps.0);
+                // 没有名字时不写，字节和老版本完全一样
+                if !name.is_empty() {
+                    w.string(&clip_name(name), MAX_NAME_LEN)?;
+                }
             }
             Control::Reject { reason } => {
                 w.u8(3).u8(reason.id());
@@ -549,6 +568,9 @@ impl Control {
                 suite: Suite::from_id(r.u8()?)?,
                 session_id: r.u32()?,
                 caps: Caps(r.u32()?),
+                // 读不成名字（更新版本换了扩展格式、或对方发错）就当没有：名字只用来显示，
+                // 不能因此让握手失败。
+                name: r.string(MAX_NAME_LEN).unwrap_or_default(),
             },
             3 => Control::Reject {
                 reason: RejectReason::from_id(r.u8()?)?,
@@ -588,6 +610,22 @@ impl Control {
 mod tests {
     use super::*;
 
+    #[test]
+    fn long_names_are_clipped_on_char_boundaries() {
+        assert_eq!(clip_name("abc"), "abc");
+        let long = "电脑".repeat(20); // 120 字节
+        let clipped = clip_name(&long);
+        assert!(clipped.len() <= MAX_NAME_LEN && clipped.len() == 63);
+        let wire = Control::Accept {
+            suite: Suite::Aes256Gcm,
+            session_id: 1,
+            caps: Caps(0),
+            name: long,
+        };
+        let back = Control::decode(&wire.encode().unwrap()).unwrap();
+        assert!(matches!(back, Control::Accept { name, .. } if name == clipped));
+    }
+
     fn samples() -> Vec<Control> {
         vec![
             Control::Hello {
@@ -601,6 +639,13 @@ mod tests {
                 suite: Suite::ChaCha20Poly1305,
                 session_id: 7,
                 caps: Caps::H264,
+                name: String::new(),
+            },
+            Control::Accept {
+                suite: Suite::Aes256Gcm,
+                session_id: 8,
+                caps: Caps::H264,
+                name: "张三的 MacBook Pro".into(),
             },
             Control::Reject {
                 reason: RejectReason::Busy,
@@ -626,6 +671,7 @@ mod tests {
             names,
             [
                 "Hello",
+                "Accept",
                 "Accept",
                 "Reject",
                 "Ping",

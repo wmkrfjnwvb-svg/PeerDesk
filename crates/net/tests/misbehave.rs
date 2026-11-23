@@ -102,6 +102,7 @@ const ACCEPT: Control = Control::Accept {
     suite: Suite::Aes256Gcm,
     session_id: 1,
     caps: Caps::H264,
+    name: String::new(),
 };
 
 #[tokio::test(flavor = "multi_thread")]

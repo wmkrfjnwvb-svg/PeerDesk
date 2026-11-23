@@ -210,6 +210,7 @@ fn controller_refuses_a_suite_outside_its_policy() {
         suite: Suite::None,
         session_id: 1,
         caps: Caps::H264,
+        name: String::new(),
     };
     assert_eq!(
         c.on_control(Time(1), &forged, &mut t),
@@ -266,6 +267,7 @@ fn messages_in_the_wrong_direction_or_state_are_errors() {
         suite: Suite::Aes256Gcm,
         session_id: 1,
         caps: Caps::H264,
+        name: String::new(),
     };
     let reject = Control::Reject {
         reason: RejectReason::Busy,
@@ -294,6 +296,7 @@ fn messages_in_the_wrong_direction_or_state_are_errors() {
         suite: Suite::Aes128Gcm,
         session_id: 1,
         caps: Caps::H264,
+        name: String::new(),
     };
     unexpected(c.on_control(Time(5), &different, &mut t));
     unexpected(c.on_control(Time(5), &reject, &mut t));
@@ -466,6 +469,7 @@ fn host_that_skips_its_proof_is_not_trusted() {
         suite: Suite::Aes256Gcm,
         session_id: 1,
         caps: Caps::H264,
+        name: String::new(),
     };
     unexpected(c.on_control(Time(3), &forged, &mut t));
     assert_eq!(*c.state(), State::Rejected(RejectReason::Unauthorized));

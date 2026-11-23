@@ -72,6 +72,7 @@ async fn session_with<F, Fut>(
     let mut opts = HostOptions::new(session(&host_id, host_caps), 30, std::env::temp_dir());
     opts.clipboard = host_has_clipboard.then(|| ClipboardHandle(host_clip.clone()));
     opts.permissions.clipboard = host_allows;
+    opts.name = "测试电脑 01".into();
     let host_task = tokio::spawn(host::serve(
         host_link,
         opts,
@@ -79,7 +80,7 @@ async fn session_with<F, Fut>(
         Box::new(NoInput),
     ));
     let os_report = Arc::new(std::sync::Mutex::new(None));
-    let probe = controller::EstablishedHook(Arc::new(|_| {}));
+    let probe = controller::EstablishedHook(Arc::new(|_, _| {}));
     assert_eq!(format!("{probe:?}"), "EstablishedHook");
     let seen_os = Arc::clone(&os_report);
     let (tx, rx) = mpsc::channel(4);
@@ -90,9 +91,11 @@ async fn session_with<F, Fut>(
             deadline_us: 200_000,
             duration: None,
             clipboard: Some(ClipboardHandle(ctrl_clip.clone())),
-            on_established: Some(controller::EstablishedHook(Arc::new(move |caps: Caps| {
-                *seen_os.lock().unwrap() = Some(caps.os());
-            }))),
+            on_established: Some(controller::EstablishedHook(Arc::new(
+                move |caps: Caps, name: &str| {
+                    *seen_os.lock().unwrap() = Some((caps.os(), name.to_owned()));
+                },
+            ))),
             audio: None,
         },
         Box::new(CountSink::new()),
@@ -101,10 +104,13 @@ async fn session_with<F, Fut>(
     ));
     // 等会话建立、剪贴板流打开
     tokio::time::sleep(Duration::from_millis(300)).await;
-    // 握手完成时控制端得知了被控端的系统（新版本被控端在 Accept 里带上）
+    // 握手完成时控制端得知了被控端的系统和电脑名（新版本被控端在 Accept 里带上）
     assert_eq!(
         *os_report.lock().unwrap(),
-        Some(peerdesk_core::proto::PeerOs::current())
+        Some((
+            peerdesk_core::proto::PeerOs::current(),
+            "测试电脑 01".into()
+        ))
     );
     script(host_clip, ctrl_clip).await;
     drop(tx);

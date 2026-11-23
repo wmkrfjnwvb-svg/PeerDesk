@@ -21,12 +21,14 @@ use super::state::{route_name, ViewPhase};
 use super::stats::{average_bps, bitrate, millis, FpsMeter};
 
 /// 一次 [`Viewer::show`] 的结果。
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone)]
 pub struct Outcome {
     /// 窗口还开着。
     pub open: bool,
     /// 这一帧里连上了。
     pub connected: bool,
+    /// 被控端的系统和电脑名。
+    pub peer: (PeerOs, String),
 }
 
 /// 一个观看窗口。
@@ -48,6 +50,8 @@ pub struct Viewer {
     clip_toast: Option<(String, Instant)>,
     /// 被控端的系统（握手后得知），助手据此选快捷键。
     peer_os: PeerOs,
+    /// 被控端的电脑名（老版本为空）。
+    peer_name: String,
     /// 浮动助手是否展开。
     assistant: bool,
     /// 是否全屏。
@@ -72,6 +76,7 @@ impl Viewer {
             show_upgrade: false,
             clip_toast: None,
             peer_os: PeerOs::Unknown,
+            peer_name: String::new(),
             assistant: true,
             fullscreen: false,
         }
@@ -98,6 +103,7 @@ impl Viewer {
         let mut outcome = Outcome {
             open: true,
             connected: false,
+            peer: (PeerOs::Unknown, String::new()),
         };
         for event in self.handle.poll() {
             if let super::session::ViewEvent::Clipboard(note) = &event {
@@ -105,11 +111,13 @@ impl Viewer {
                     self.clip_toast = Some((text, Instant::now()));
                 }
             }
-            if let super::session::ViewEvent::PeerOs(os) = &event {
+            if let super::session::ViewEvent::Peer(os, name) = &event {
                 self.peer_os = *os;
+                self.peer_name.clone_from(name);
             }
             self.phase = self.phase.apply(&event, s);
             outcome.connected |= matches!(self.phase, ViewPhase::Connected { .. });
+            outcome.peer = (self.peer_os, self.peer_name.clone());
         }
         // 只有新画面到了才上传纹理。
         if let Some(image) = self.handle.frames().take() {

@@ -165,3 +165,47 @@ mod tests {
         assert!(err.contains("无法控制本机键鼠"), "{err}");
     }
 }
+
+/// 本机的电脑名：握手时告诉控制端，界面上也显示，用户一眼认出是哪台电脑。
+/// 取不到时为空（对方就只显示设备码）。
+#[must_use]
+pub fn device_name() -> String {
+    peerdesk_core::proto::clip_name(system_name().trim())
+}
+
+/// Windows：计算机名。
+#[cfg(windows)]
+fn system_name() -> String {
+    std::env::var("COMPUTERNAME").unwrap_or_default()
+}
+
+/// macOS：“系统设置 → 通用 → 关于本机”里的名称（例如“张三的 MacBook Pro”），
+/// 比主机名（Zhangsans-MacBook-Pro.local）好认。
+#[cfg(target_os = "macos")]
+fn system_name() -> String {
+    std::process::Command::new("/usr/sbin/scutil")
+        .args(["--get", "ComputerName"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .unwrap_or_default()
+}
+
+/// Linux 等：主机名。
+#[cfg(not(any(windows, target_os = "macos")))]
+fn system_name() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .or_else(|_| std::fs::read_to_string("/etc/hostname"))
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod name_tests {
+    #[test]
+    fn this_computer_has_a_short_name() {
+        let name = super::device_name();
+        assert!(!name.is_empty() && name.len() <= peerdesk_core::proto::MAX_NAME_LEN);
+        assert_eq!(name, name.trim());
+    }
+}

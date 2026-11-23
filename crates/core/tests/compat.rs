@@ -46,6 +46,7 @@ fn accept() -> Control {
         suite: Suite::Aes256Gcm,
         session_id: 7,
         caps: Caps::H264,
+        name: String::new(),
     }
 }
 
@@ -117,6 +118,20 @@ fn session_handshake_bytes_are_frozen() {
         b.extend_from_slice(&EXTENSION);
         assert_eq!(Control::decode(&b).unwrap(), msg);
     }
+}
+
+/// 带电脑名的 Accept（扩展字段：1 字节长度 + UTF-8）。老版本读到 caps 就停，忽略后面的名字。
+#[test]
+fn accept_name_extension_is_frozen() {
+    let named = Control::Accept {
+        suite: Suite::Aes256Gcm,
+        session_id: 7,
+        caps: Caps::H264,
+        name: "PC".into(),
+    };
+    let bytes = format!("{ACCEPT}025043");
+    assert_eq!(hex(&named.encode().unwrap()), bytes);
+    assert_eq!(Control::decode(&unhex(&bytes)).unwrap(), named);
 }
 
 #[test]

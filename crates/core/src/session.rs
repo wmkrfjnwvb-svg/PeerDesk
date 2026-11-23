@@ -110,6 +110,10 @@ pub struct Session {
     auth_start: Option<Vec<u8>>,
     /// 控制端是否已经核对过被控端的确认码。
     host_verified: bool,
+    /// 本机电脑名：被控端放在 Accept 里发给控制端。
+    name: String,
+    /// 对方的电脑名（控制端从 Accept 里读到；老版本对方为空）。
+    peer_name: String,
 }
 
 impl Session {
@@ -124,7 +128,20 @@ impl Session {
             pending: None,
             auth_start: None,
             host_verified: false,
+            name: String::new(),
+            peer_name: String::new(),
         }
+    }
+
+    /// 设置本机电脑名（被控端在 Accept 里发给控制端）。
+    pub fn set_name(&mut self, name: &str) {
+        self.name = crate::proto::clip_name(name.trim());
+    }
+
+    /// 对方的电脑名；对方是老版本或没有发时为空。
+    #[must_use]
+    pub fn peer_name(&self) -> &str {
+        &self.peer_name
     }
 
     /// 创建控制端。
@@ -225,7 +242,14 @@ impl Session {
                 suite,
                 session_id,
                 caps,
-            } => self.on_accept(now, msg, *suite, *session_id, *caps, tracer),
+                name,
+            } => {
+                let r = self.on_accept(now, msg, *suite, *session_id, *caps, tracer);
+                if r.is_ok() {
+                    self.peer_name = crate::proto::clip_name(name);
+                }
+                r
+            }
             Control::Reject { reason } => self.on_reject(now, msg, *reason, tracer),
             Control::Ping { nonce } => match self.state {
                 State::Established { .. } => Ok(vec![Control::Pong { nonce: *nonce }]),
@@ -269,6 +293,7 @@ impl Session {
             suite: p.suite,
             session_id,
             caps: p.caps.with_os(PeerOs::current()),
+            name: self.name.clone(),
         }
     }
 
@@ -300,6 +325,7 @@ impl Session {
                     suite,
                     session_id,
                     caps: common.with_os(PeerOs::current()),
+                    name: self.name.clone(),
                 }]);
             }
             State::AwaitAuth if self.pending.is_some_and(|p| p.device_id == device_id) => {
