@@ -5,8 +5,10 @@ use num_traits::ToPrimitive;
 
 /// 画面在 `avail` 里显示的位置（单位是 egui 的点）。
 ///
-/// 放得下时按 1:1 显示（一个远程像素对应一个物理像素），否则保持宽高比缩小到正好放下。
-/// 都居中。`pixels_per_point` 是本地屏幕的缩放比例。
+/// 保持宽高比缩放到正好放进窗口（放大或缩小），居中；宽高比不同时只在一个方向留边。
+/// 原来放得下时按 1:1 显示，结果在 Retina 屏上全屏时 1080p 的远程画面只占屏幕中间四分之一
+/// （1920×1080 像素 = 960×540 点）。同类产品默认都是“适应窗口”。
+/// `pixels_per_point` 是本地屏幕的缩放比例；只在画面为空时有意义，留着参数便于以后加“原始大小”。
 #[must_use]
 pub fn fit(avail: Rect, image: [u16; 2], pixels_per_point: f32) -> Rect {
     let ppp = if pixels_per_point > 0.0 {
@@ -20,7 +22,7 @@ pub fn fit(avail: Rect, image: [u16; 2], pixels_per_point: f32) -> Rect {
     }
     let scale = (avail.width() / native.x)
         .min(avail.height() / native.y)
-        .clamp(0.0, 1.0);
+        .max(0.0);
     Rect::from_center_size(avail.center(), native * scale)
 }
 
@@ -59,15 +61,17 @@ mod tests {
     }
 
     #[test]
-    fn draws_one_to_one_when_it_fits() {
+    fn scales_up_to_fill_the_window() {
+        // 窗口比画面大：放大到碰到一边（这里是高度），左右留边
         let r = fit(rect(0.0, 0.0, 2000.0, 1000.0), [1280, 720], 1.0);
-        assert_eq!(r, rect(360.0, 140.0, 1280.0, 720.0));
-        // 2 倍缩放的屏幕上，1:1 是 640×360 个点
-        let r = fit(rect(0.0, 0.0, 2000.0, 1000.0), [1280, 720], 2.0);
-        assert_eq!(r.size(), vec2(640.0, 360.0));
-        // 缩放比例不合法时按 1 处理
-        let r = fit(rect(0.0, 0.0, 2000.0, 1000.0), [1280, 720], 0.0);
-        assert_eq!(r.size(), vec2(1280.0, 720.0));
+        assert!((r.height() - 1000.0).abs() < 0.01 && r.center() == pos2(1000.0, 500.0));
+        // Retina（2 倍）全屏：1920×1080 的画面铺满 1512×850 点的屏幕宽度，不是只占中间一块
+        // （屏幕比 16:9 略宽，所以高度铺满、左右各留不到 1 个点）
+        let r = fit(rect(0.0, 0.0, 1512.0, 850.0), [1920, 1080], 2.0);
+        assert!((r.height() - 850.0).abs() < 0.01 && r.width() > 1510.0, "{r:?}");
+        // 缩放比例不合法时按 1 处理，结果一样
+        let r = fit(rect(0.0, 0.0, 1512.0, 850.0), [1920, 1080], 0.0);
+        assert!((r.height() - 850.0).abs() < 0.01);
     }
 
     #[test]
