@@ -504,7 +504,7 @@ pub async fn serve(
             _ = stats_tick.tick() => {
                 let now = media.stats();
                 crate::note!(info, target: "peerdesk::stats",
-                    "发送 帧 {} 关键帧 {} 画面 {} kbps 线上 {} kbps 目标 {} kbps 帧率上限 {} 编码 {} ms 在途 {} KB 丢失 {} 重传 {} RTT {} ms 估计器 {}",
+                    "发送 帧 {} 关键帧 {} 画面 {} kbps 线上 {} kbps 目标 {} kbps 帧率上限 {} 编码 {} ms 在途 {} KB 丢失 {} 重传 {} RTT {} ms 估计器 {} 纠错 {}‰ 画像 {}",
                     now.frames.saturating_sub(last_stats.frames),
                     now.keyframes.saturating_sub(last_stats.keyframes),
                     now.video_bytes.saturating_sub(last_stats.video_bytes) * 8 / 1000,
@@ -517,6 +517,8 @@ pub async fn serve(
                     now.retransmitted.saturating_sub(last_stats.retransmitted),
                     link.rtt().as_millis(),
                     media.estimator(),
+                    media.fec_permille(),
+                    media.profile_name(),
                 );
                 last_stats = now;
             }

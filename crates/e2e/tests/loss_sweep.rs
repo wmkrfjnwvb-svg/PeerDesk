@@ -25,7 +25,14 @@ fn loss_sweep() {
                         ..Link::lan()
                     },
                 )],
-                profile: Profile::WIRELESS,
+                // 真实会话里往返短时选的是“稳定”画像（不带纠错），实测如此
+                profile: std::env::var("PEERDESK_PROFILE").map_or(Profile::STABLE, |v| {
+                    if v == "wireless" {
+                        Profile::WIRELESS
+                    } else {
+                        Profile::STABLE
+                    }
+                }),
                 estimator,
                 ..Scenario::new(
                     "loss-sweep",

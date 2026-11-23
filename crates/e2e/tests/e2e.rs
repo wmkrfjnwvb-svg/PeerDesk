@@ -241,6 +241,33 @@ fn random_loss_without_congestion() {
     });
 }
 
+/// 往返短的 Wi-Fi：会话开始按往返选了“稳定”画像（不带纠错），实际有 5% 随机丢包。
+/// 应当自动加纠错、换成“无线”画像（2026-11-23 用户日志：原来丢一个包就等一个往返重传、重发关键帧）。
+#[test]
+fn random_loss_on_a_link_that_looked_stable() {
+    compare(&Scenario {
+        network: vec![(
+            0,
+            Link {
+                delay_us: 10_000,
+                jitter_us: 2_000,
+                loss_permille: 50,
+                rate_bps: Some(30_000_000),
+                ..Link::lan()
+            },
+        )],
+        profile: Profile::STABLE,
+        ..Scenario::new(
+            "lossy-stable",
+            vec![
+                phase(Action::Typing, 90),
+                phase(Action::Dragging, 90),
+                phase(Action::Idle, 30),
+            ],
+        )
+    });
+}
+
 /// 窄带宽上播放视频：每帧都装不进预算。应当降帧率保住画面，而不是每帧都超预算、排长队卡住。
 #[test]
 fn video_on_a_narrow_link() {

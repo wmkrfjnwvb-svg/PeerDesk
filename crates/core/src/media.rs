@@ -86,6 +86,11 @@ pub fn decode_feedback(buf: &[u8]) -> Result<DecodedFeedback, Error> {
     Ok((feedback, ext, nacks))
 }
 
+/// 丢包率达到这个值（千分比）才按丢包加纠错。
+const FEC_FROM_LOSS_PERMILLE: u16 = 10;
+/// 纠错比例上限（千分比）：再多就是浪费带宽，丢包更严重时靠重传和降码率。
+const FEC_MAX_PERMILLE: u16 = 330;
+
 /// 估计一帧传完要多久时用的最低速率，防止速率估计异常低时一帧永远不判丢失。
 const MIN_DRAIN_BPS: u64 = 50_000;
 
@@ -150,6 +155,8 @@ pub struct SenderStats {
     pub lost: u32,
     /// 按接收端的请求重传的分片数。
     pub retransmitted: u32,
+    /// 因为持续丢包从“稳定”换成“无线”画像的次数。
+    pub profile_switches: u32,
 }
 
 /// 交给编码器的一帧任务。编码可以在别的线程上做：任务里带着上次之后发送端判定的丢失和收到的确认，
@@ -209,6 +216,8 @@ pub struct MediaSender {
     resent: BTreeMap<(u32, u16), Time>,
     rtt_us: u64,
     last_obs: Option<Observation>,
+    /// 连续有丢包的反馈次数（决定要不要换成“无线”画像）。
+    lossy_feedbacks: u32,
     governor: FpsGovernor,
     /// 下一次 [`Self::finish_frame`] 用的编码时间（微秒），由编码线程报告。
     encode_us: u64,
@@ -255,6 +264,7 @@ impl MediaSender {
             resent: BTreeMap::new(),
             rtt_us: 0,
             last_obs: None,
+            lossy_feedbacks: 0,
             governor: FpsGovernor::new(cfg.fps),
             encode_us: 0,
         }
@@ -344,6 +354,12 @@ impl MediaSender {
         if max_payload > 0 {
             self.cfg.max_payload = max_payload;
         }
+    }
+
+    /// 现在用的画像名（日志用）。
+    #[must_use]
+    pub fn profile_name(&self) -> &'static str {
+        self.rate.profile().name
     }
 
     pub fn set_profile(&mut self, profile: Profile) {
@@ -453,7 +469,7 @@ impl MediaSender {
             .saturating_sub(PARITY_PREFIX);
         let mut packets = fragment(frame_id, ref_frame, &encoded.payload, max)?;
         let data_count = packets.len();
-        let parity = parity_for(&packets, self.rate.profile().fec_permille);
+        let parity = parity_for(&packets, self.fec_permille());
         packets.extend(parity);
         let out: Vec<Outgoing> = packets
             .into_iter()
@@ -562,8 +578,31 @@ impl MediaSender {
     ///
     /// 排队延迟越接近目标（[`QUEUE_TARGET_US`]），预算越小：一帧要在目标时间内送到，已经排着的
     /// 时间要扣掉。这样排队刚开始涨，下一帧就先变小，不用等码率调下来。最少保留四分之一。
+    /// 纠错冗余比例（千分比）：画像给的值和按实测丢包率算的取大。
+    ///
+    /// 实测（2026-11-23，用户日志）：往返短时选“稳定”画像，纠错是 0，丢一个包就要等一个往返重传，
+    /// 丢多了就重发关键帧；仿真 3% 丢包时冻结 8 次、关键帧 15 个。按丢包率的 3 倍加纠错
+    /// （丢包低于 1% 时不加，最多 33%），大部分丢包当场补回，不用等重传。
+    #[must_use]
+    pub fn fec_permille(&self) -> u16 {
+        let loss = self.last_obs.map_or(0, |o| o.feedback.loss_permille);
+        let adaptive = if loss < FEC_FROM_LOSS_PERMILLE {
+            0
+        } else {
+            loss.saturating_mul(3).clamp(100, FEC_MAX_PERMILLE)
+        };
+        self.rate.profile().fec_permille.max(adaptive)
+    }
+
     fn frame_budget(&self) -> usize {
+        // 按丢包额外加的纠错分片也占带宽：编码预算按比例让出来
+        // （画像本身带的纠错已经算在它的预算折扣 safety_permille 里，不重复扣）
+        let fec = u64::from(
+            self.fec_permille()
+                .saturating_sub(self.rate.profile().fec_permille),
+        );
         let per_frame = self.rate.rate_bps() / 8 / u64::from(self.governor.fps().max(1));
+        let per_frame = per_frame.saturating_mul(1000) / (1000 + fec);
         let budget =
             per_frame.saturating_mul(u64::from(self.rate.profile().safety_permille)) / 1000;
         let queue = u64::from(self.last_obs.map_or(0, |o| o.feedback.queue_delay_us));
@@ -583,6 +622,25 @@ impl MediaSender {
         self.rate.on_observation(now, &obs);
         self.last_obs = Some(obs);
         self.acknowledge(feedback);
+        self.adapt_profile(feedback.loss_permille);
+    }
+
+    /// 会话开始时按往返时间选的画像不知道是不是 Wi-Fi：往返短就选“稳定”（不带纠错、把 2% 丢包当拥塞）。
+    /// 连续两次反馈都有 1% 以上的丢包，说明是会随机丢包的链路（多半是 Wi-Fi），改用“无线”画像。
+    /// 只往宽容的方向换一次，不来回切。
+    fn adapt_profile(&mut self, loss_permille: u16) {
+        if self.rate.profile().name != Profile::STABLE.name {
+            return;
+        }
+        self.lossy_feedbacks = if loss_permille >= FEC_FROM_LOSS_PERMILLE {
+            self.lossy_feedbacks.saturating_add(1)
+        } else {
+            0
+        };
+        if self.lossy_feedbacks >= 2 {
+            self.rate.set_profile(Profile::WIRELESS);
+            self.stats.profile_switches = self.stats.profile_switches.saturating_add(1);
+        }
     }
 
     /// 接收端的反馈（没有扩展测量时用）。
@@ -1106,6 +1164,40 @@ mod tests {
         assert_eq!(tx.stats().keyframes, 2);
         assert_eq!(rx.stats().bad, 0, "从不把接不上的帧交给解码器");
         assert!(tx.stats().lost >= 1);
+    }
+
+    #[test]
+    fn sustained_loss_adds_fec_and_switches_to_the_wireless_profile() {
+        let mut tx = MediaSender::new(
+            SenderConfig {
+                profile: Profile::STABLE,
+                ..cfg()
+            },
+            Box::new(FakeEncoder::default()),
+        );
+        assert_eq!(tx.fec_permille(), 0);
+        let lossy = |loss| Feedback {
+            loss_permille: loss,
+            ..Feedback::default()
+        };
+        // 丢包低于 1%：不加纠错，不换画像
+        tx.on_feedback(Time(1), &lossy(5));
+        assert_eq!(tx.fec_permille(), 0);
+        // 6% 丢包：纠错按 3 倍加到 18%；连续两次才换画像
+        tx.on_feedback(Time(2), &lossy(60));
+        assert_eq!(tx.fec_permille(), 180);
+        assert_eq!(tx.stats().profile_switches, 0);
+        tx.on_feedback(Time(3), &lossy(60));
+        assert_eq!(tx.stats().profile_switches, 1);
+        assert_eq!(tx.profile_name(), "wireless");
+        // 换成“无线”后不再换；丢包很高时纠错封顶 33%
+        tx.on_feedback(Time(4), &lossy(300));
+        tx.on_feedback(Time(5), &lossy(300));
+        assert_eq!(tx.fec_permille(), FEC_MAX_PERMILLE);
+        assert_eq!(tx.stats().profile_switches, 1);
+        // 丢包恢复：回到画像自带的纠错
+        tx.on_feedback(Time(6), &lossy(0));
+        assert_eq!(tx.fec_permille(), Profile::WIRELESS.fec_permille);
     }
 
     #[test]

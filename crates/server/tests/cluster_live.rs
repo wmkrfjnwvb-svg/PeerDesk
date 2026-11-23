@@ -57,11 +57,17 @@ fn get(addr: SocketAddr, path: &str) -> String {
 
 #[test]
 fn three_nodes_interconnect_route_by_region_and_survive_a_crash() {
-    let ports = [free_udp_port(), free_udp_port(), free_udp_port()];
-    // 节点 2、3 只配置了节点 1 作为种子。
-    let n1 = Node::start(&config(1, "us", ports[0], &[]), FAST).unwrap();
-    let n2 = Node::start(&config(2, "us", ports[1], &[ports[0]]), FAST).unwrap();
-    let n3 = Node::start(&config(3, "eu", ports[2], &[ports[0]]), FAST).unwrap();
+    // 先挑端口再绑定：中间别的测试可能抢走其中一个（Windows 上并行跑测试时出现过），抢了就换一组再试。
+    let (ports, n1, n2, n3) = (0..5)
+        .find_map(|_| {
+            let ports = [free_udp_port(), free_udp_port(), free_udp_port()];
+            // 节点 2、3 只配置了节点 1 作为种子。
+            let n1 = Node::start(&config(1, "us", ports[0], &[]), FAST).ok()?;
+            let n2 = Node::start(&config(2, "us", ports[1], &[ports[0]]), FAST).ok()?;
+            let n3 = Node::start(&config(3, "eu", ports[2], &[ports[0]]), FAST).ok()?;
+            Some((ports, n1, n2, n3))
+        })
+        .unwrap();
     assert_eq!(n1.cluster_addr().port(), ports[0]);
 
     wait_for("三个节点互相发现", || {
