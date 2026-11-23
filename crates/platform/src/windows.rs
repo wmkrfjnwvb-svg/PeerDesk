@@ -271,6 +271,9 @@ fn create_device(
 }
 
 pub(crate) fn open_grabber(opts: &CaptureOptions) -> Result<Box<dyn Grabber>, PlatformError> {
+    // 代理模式：先切到当前输入桌面（锁屏、登录界面时是 Winlogon），桌面复制才能打开。
+    // 切换桌面会让旧的复制报 ACCESS_LOST，采集线程随后重新打开，又走到这里。
+    crate::winsession::follow_input_desktop();
     let list = outputs()?;
     let count = list.len();
     let o = list.into_iter().nth(opts.display).ok_or(E::NoDisplay {
@@ -655,6 +658,8 @@ impl WinInput {
         if self.batch.is_empty() {
             return;
         }
+        // 代理模式：输入要送到当前输入桌面（锁屏时是 Winlogon 桌面），否则被丢掉。
+        crate::winsession::follow_input_desktop();
         let size = i32::try_from(size_of::<INPUT>()).unwrap_or(0);
         // SAFETY: `batch` 里是完整构造的 INPUT 结构，`size` 是它的大小。
         // 返回值是成功注入的个数；被 UIPI 拦下（目标窗口权限更高）时没有办法补救，只能丢弃。

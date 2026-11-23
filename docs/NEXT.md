@@ -1,4 +1,31 @@
-# 下次继续（2026-11-21 中断点）
+# 下次继续（2026-11-23 中断点）
+
+## 正在做：Windows 系统服务 / 无人值守（设计见 research/G 第 1.2–1.4、6.2 节）
+已完成（已提交，默认不生效）：`crates/platform/src/winsession.rs`
+- `spawn_in_session(会话, 命令行)`：复制 SYSTEM 令牌、改会话号、CreateProcessAsUserW 到 winsta0\default
+- `active_console_session()`、`send_sas()`、`set_follow_input_desktop(true)`：采集打开前和每次
+  SendInput 前切到当前输入桌面（锁屏/登录/UAC）。windows.rs 已接上。本地可交叉检查：
+  `cargo clippy -p peerdesk --target x86_64-pc-windows-gnu`（需 g++-mingw-w64-x86-64-posix）
+还差（按顺序）：
+1. 客户端 `peerdesk service run|install|uninstall|configure`（windows-service 0.8 crate）：
+   服务每 200 ms 看活动控制台会话，代理不在就用 spawn_in_session 拉起 `peerdesk agent`；
+   会话变了就结束旧代理重拉；看到 ProgramData\PeerDesk\sas.request 就删掉并 send_sas()。
+   install 时设 HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\SoftwareSASGeneration=1，
+   失败自动重启。
+2. `peerdesk agent`：set_follow_input_desktop(true)，复用 gui::session::start_host（有剪贴板、声音、
+   锁屏拒绝后继续），数据目录 ProgramData\PeerDesk（配置 config.txt：server/pin/password，只有管理员能写），
+   把设备码写 status.txt 给界面读；WinInput 里 Ctrl+Alt+Del 组合时写 sas.request。
+3. 界面：服务在跑时“本机”卡片显示服务的设备码、不自己开被控；设置里“无人值守”卡片
+   （安装/卸载/设密码，用 runas 提权调 `peerdesk service ...`）。
+4. 安装包 peerdesk.iss：PrivilegesRequired=admin，[Run] service install，[UninstallRun] service uninstall。
+5. CI windows：装服务 → 确认代理进程起来、status.txt 有内容 → 卸载。
+
+## 其他待办（用户 2026-11-23 提的）
+- 右键等操作延迟接近 1 秒：先量（输入→注入→采集→编码→显示 各段计时），根因多半是软件编码 + 帧率调节。
+- 会话结束统计全是 0（画面 0 KB、RTT None）：统计没接上，修好才能和仿真对比真实指标。
+- 文件管理界面（两栏、拖拽、进度）；设备簿（添加、备注、分组、搜索）。
+- ToDesk 同时运行时卡顿：请用户单独测 ToDesk 对照。
+
 
 ## 已完成未推 CI 验证
 - 新旧版本兼容（docs/compat.md，crates/core/tests/compat.rs）、海外优先 IPv6、中英文切换。
