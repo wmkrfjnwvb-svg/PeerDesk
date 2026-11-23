@@ -10,4 +10,4 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 cargo llvm-cov --workspace --fail-under-lines 99 --summary-only \
-  --ignore-filename-regex 'crates/net/src/tls_verifier\.rs|crates/platform/src/(x11|windows|winsession|macos|clipboard_sys|audio_sys)\.rs|crates/client/src/gui/(app|viewer)\.rs' "$@"
+  --ignore-filename-regex 'crates/net/src/tls_verifier\.rs|crates/platform/src/(x11|windows|winsession|macos|clipboard_sys|audio_sys)\.rs|crates/media/src/mf\.rs|crates/client/src/gui/(app|viewer)\.rs' "$@"

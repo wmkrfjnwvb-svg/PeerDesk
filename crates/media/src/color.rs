@@ -84,3 +84,25 @@ mod tests {
         assert_eq!(out, vec![7, 0x0001_0203, 0x0004_0506]);
     }
 }
+
+/// I420（Y、U、V 三个平面）转成 NV12（Y 平面加 U、V 交错的一个平面），硬件编码器要这种格式。
+/// `out` 复用，长度变成 `y.len() + u.len() + v.len()`。
+pub fn i420_to_nv12(y: &[u8], u: &[u8], v: &[u8], out: &mut Vec<u8>) {
+    out.clear();
+    out.reserve(y.len() + u.len() + v.len());
+    out.extend_from_slice(y);
+    for (a, b) in u.iter().zip(v) {
+        out.push(*a);
+        out.push(*b);
+    }
+}
+
+#[cfg(test)]
+mod nv12_tests {
+    #[test]
+    fn interleaves_chroma() {
+        let mut out = vec![9; 3];
+        super::i420_to_nv12(&[1, 2, 3, 4], &[10], &[20], &mut out);
+        assert_eq!(out, [1, 2, 3, 4, 10, 20]);
+    }
+}

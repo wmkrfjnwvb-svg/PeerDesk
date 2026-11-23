@@ -11,14 +11,25 @@ peerdesk-core.workspace = true
 openh264 = { version = "0.9.10", default-features = false }
 openh264-sys2 = { version = "0.9.10", default-features = false }
 opus = "0.4"
+log = "0.4"
+
+# Windows：Media Foundation 硬件 H.264 编码（NVENC / QSV / AMF 都以 MFT 的形式注册）。
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+  "Win32_Foundation",
+  "Win32_Media_MediaFoundation",
+  "Win32_System_Com",
+  "Win32_System_Ole",
+  "Win32_System_Variant",
+] }
 
 [features]
 # 从源码编译 OpenH264（开发、测试、CI）。发布版改为运行时加载 Cisco 官方的二进制（以后加 `libloading`）。
 default = ["source"]
 source = ["openh264/source", "openh264-sys2/source"]
 
-# 与工作区相同的检查；只有改码率要调 OpenH264 的底层接口，所以 unsafe 从 forbid 放宽为 deny，
-# 只在那一个函数里放开。
+# 与工作区相同的检查；unsafe 从 forbid 放宽为 deny：改码率要调 OpenH264 的底层接口（只在那两个函数里放开），
+# Windows 硬件编码的系统接口在 mf.rs 里（整个文件放开，每处写 SAFETY）。
 [lints.rust]
 unsafe_code = "deny"
 unreachable_patterns = "deny"

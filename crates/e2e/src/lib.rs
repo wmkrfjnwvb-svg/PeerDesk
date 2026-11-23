@@ -623,16 +623,16 @@ mod tests {
                 },
                 Phase {
                     action: Action::Idle,
-                    frames: 20,
+                    frames: 90,
                 },
             ],
         );
         s.pacing = true;
-        s.start_bps = 300_000;
+        s.start_bps = 500_000;
         s.network = vec![(
             0,
             Link {
-                rate_bps: Some(400_000),
+                rate_bps: Some(1_000_000),
                 delay_us: 20_000,
                 ..Link::lan()
             },
