@@ -181,6 +181,33 @@ jobs:
             exit 0
           fi
           exit "$code"
+      # 无人值守：真的注册系统服务，看服务是否在控制台会话里拉起代理、代理是否开始监听，再卸载。
+      # 代理的服务器指向本机一个没人的端口（CI 不去登记真服务器）。
+      - name: unattended service (install → agent listening → uninstall)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path target\release\peerdesk.exe).Path
+          $base = Join-Path $env:ProgramData 'PeerDesk'
+          New-Item -ItemType Directory -Force (Join-Path $base 'agent') | Out-Null
+          Set-Content -Path (Join-Path $base 'agent\server.txt') -Value "127.0.0.1:9"
+          & $exe service password ci-unattended-pw | Out-Host
+          & $exe service install | Out-Host
+          sc.exe query PeerDesk | Out-Host
+          $ok = $false
+          for ($i = 0; $i -lt 60; $i++) {
+            Start-Sleep 1
+            $st = Join-Path $base 'status.txt'
+            if ((Test-Path $st) -and ((Get-Content $st -TotalCount 1) -eq '1')) { $ok = $true; break }
+          }
+          Write-Host "活动控制台会话：$((Get-CimInstance Win32_ComputerSystem).UserName)"
+          & $exe service status | Out-Host
+          Get-Process peerdesk -ErrorAction SilentlyContinue | Select-Object Id, SessionId, StartTime | Out-Host
+          Get-ChildItem (Join-Path $base 'logs') -ErrorAction SilentlyContinue | ForEach-Object { Get-Content $_.FullName -Tail 40 } | Out-Host
+          & $exe service uninstall | Out-Host
+          if (-not $ok) { Write-Error "代理没有开始监听（见上面的状态和日志）"; exit 1 }
+          if (Get-Process peerdesk -ErrorAction SilentlyContinue) { Start-Sleep 3 }
+          if (Get-Process peerdesk -ErrorAction SilentlyContinue) { Write-Error "卸载后代理还在运行"; exit 1 }
       - uses: actions/upload-artifact@v4
         if: always()
         with:

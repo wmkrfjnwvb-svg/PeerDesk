@@ -15,9 +15,14 @@ fn main() -> ExitCode {
         .skip(1)
         .filter(|a| !a.starts_with("-psn_"))
         .collect();
-    // 日志写到数据目录的 logs 里，出问题时把它发出来。
-    peerdesk::logfile::init(&peerdesk::data_dir().join("logs"), false);
-    peerdesk::crashreport::install_panic_hook(peerdesk::data_dir().join("logs"));
+    // 日志写到数据目录的 logs 里，出问题时把它发出来。无人值守的服务和代理以 SYSTEM 身份运行，
+    // 写到 %ProgramData%\PeerDesk\logs（和用户的日志分开，管理员能看到）。
+    let logs = match args.first().map(String::as_str) {
+        Some("service" | "agent") => peerdesk::unattended::base_dir().join("logs"),
+        Some(_) | None => peerdesk::data_dir().join("logs"),
+    };
+    peerdesk::logfile::init(&logs, false);
+    peerdesk::crashreport::install_panic_hook(logs);
     if args.is_empty() {
         return ExitCode::from(peerdesk::gui::run());
     }

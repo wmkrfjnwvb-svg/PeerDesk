@@ -11,6 +11,8 @@ use peerdesk_core::input::InputEvent;
 use peerdesk_net::host::{InputSink, ScreenSource};
 use peerdesk_platform::{CaptureOptions, PlatformError};
 
+use crate::unattended::SasDetector;
+
 type OpenScreen = fn(CaptureOptions) -> Result<Box<dyn ScreenSource>, PlatformError>;
 type OpenInput = fn() -> Result<Box<dyn InputSink>, PlatformError>;
 
@@ -44,15 +46,18 @@ pub fn local_screen_in(data_dir: &std::path::Path) -> Result<Box<dyn ScreenSourc
 }
 
 fn test_input() -> Result<Box<dyn InputSink>, PlatformError> {
-    Ok(Box::new(TapSink(Arc::new(Tap::default()), None)))
+    Ok(Box::new(Discard))
+}
+
+/// 测试构建里的“系统”输入：什么都不做（外面的 [`TapSink`] 负责记录）。
+struct Discard;
+
+impl InputSink for Discard {
+    fn inject(&mut self, _: &InputEvent) {}
 }
 
 /// 检查本机屏幕和键鼠能不能用（打开后马上关掉）。开启被控之前调用。
-pub fn check_local() -> Result<(), String> {
-    check_local_in(std::path::Path::new(""))
-}
-
-/// 同 [`check_local`]，屏幕按被控端的数据目录打开（测试用来模拟锁屏）。
+/// 屏幕按被控端的数据目录打开（测试用来模拟锁屏）。
 pub fn check_local_in(data_dir: &std::path::Path) -> Result<(), String> {
     drop(local_screen_in(data_dir)?);
     drop(local_input(Arc::new(Tap::default()))?);
@@ -62,7 +67,8 @@ pub fn check_local_in(data_dir: &std::path::Path) -> Result<(), String> {
 /// Windows 上锁屏、登录界面、管理员权限提示（安全桌面）时普通程序采集不到屏幕。
 const LOCKED_HINT: &str = if cfg!(windows) {
     "。如果这台电脑已锁屏、在登录界面或弹出了管理员权限提示，当前版本还不能远程这些界面\
-     （需要以系统服务运行，即将支持），请先在本机解锁"
+     ，请先在本机解锁；\
+     要远程这些界面，请以管理员身份安装并勾选“无人值守”（或运行 peerdesk service install）"
 } else {
     ""
 };
@@ -89,7 +95,7 @@ fn opened_input(
     opened: Result<Box<dyn InputSink>, PlatformError>,
 ) -> Result<Box<dyn InputSink>, String> {
     let sink = opened.map_err(|e| format!("无法控制本机键鼠：{e}"))?;
-    Ok(Box::new(TapSink(tap, Some(sink))))
+    Ok(Box::new(TapSink(tap, Some(sink), SasDetector::default())))
 }
 
 /// 记录收到的输入：数量和最后一个事件。被控端界面用它确认输入确实到了。
@@ -120,11 +126,31 @@ impl Tap {
     }
 }
 
-struct TapSink(Arc<Tap>, Option<Box<dyn InputSink>>);
+/// 收到 Ctrl+Alt+Del 时调用（无人值守的代理用它请求服务代发；普通注入触发不了安全界面）。
+type SasHook = Box<dyn Fn() + Send + Sync>;
+static SAS_HOOK: Mutex<Option<SasHook>> = Mutex::new(None);
+
+/// 设置收到 Ctrl+Alt+Del 时做什么。
+pub fn set_sas_hook(hook: SasHook) {
+    *SAS_HOOK.lock().unwrap_or_else(PoisonError::into_inner) = Some(hook);
+}
+
+struct TapSink(Arc<Tap>, Option<Box<dyn InputSink>>, SasDetector);
 
 impl InputSink for TapSink {
     fn inject(&mut self, event: &InputEvent) {
         self.0.record(event);
+        if let InputEvent::Key { code, down } = event {
+            if self.2.key(*code, *down) {
+                if let Some(hook) = SAS_HOOK
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .as_ref()
+                {
+                    hook();
+                }
+            }
+        }
         if let Some(system) = self.1.as_mut() {
             system.inject(event);
         }
@@ -138,7 +164,7 @@ mod tests {
 
     #[test]
     fn opens_or_explains_why_not() {
-        check_local().unwrap();
+        check_local_in(std::path::Path::new("")).unwrap();
         let mut screen = local_screen().unwrap();
         assert!(screen.capture().is_some());
 

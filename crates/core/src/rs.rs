@@ -179,11 +179,8 @@ pub fn reconstruct(
         a.swap(col, pivot);
         s.swap(col, pivot);
         let scale = inv(a.get(col).and_then(|r| r.get(col)).copied().unwrap_or(0));
-        if let (Some(row), Some(rhs)) = (a.get_mut(col), s.get_mut(col)) {
-            for v in row.iter_mut() {
-                *v = mul(*v, scale);
-            }
-            for v in rhs.iter_mut() {
+        for (row, rhs) in a.get_mut(col).into_iter().zip(s.get_mut(col)) {
+            for v in row.iter_mut().chain(rhs.iter_mut()) {
                 *v = mul(*v, scale);
             }
         }
@@ -193,11 +190,9 @@ pub fn reconstruct(
             if r == col {
                 continue;
             }
+            // 系数为 0 时乘出来全是 0，异或不变（mul_add 直接返回）
             let factor = a.get(r).and_then(|row| row.get(col)).copied().unwrap_or(0);
-            if factor == 0 {
-                continue;
-            }
-            if let (Some(row), Some(rhs)) = (a.get_mut(r), s.get_mut(r)) {
+            for (row, rhs) in a.get_mut(r).into_iter().zip(s.get_mut(r)) {
                 for (v, p) in row.iter_mut().zip(&pivot_row) {
                     *v ^= mul(factor, *p);
                 }

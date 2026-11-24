@@ -1,24 +1,21 @@
 # 下次继续（2026-11-23 中断点）
 
-## 正在做：Windows 系统服务 / 无人值守（设计见 research/G 第 1.2–1.4、6.2 节）
-已完成（已提交，默认不生效）：`crates/platform/src/winsession.rs`
-- `spawn_in_session(会话, 命令行)`：复制 SYSTEM 令牌、改会话号、CreateProcessAsUserW 到 winsta0\default
-- `active_console_session()`、`send_sas()`、`set_follow_input_desktop(true)`：采集打开前和每次
-  SendInput 前切到当前输入桌面（锁屏/登录/UAC）。windows.rs 已接上。本地可交叉检查：
-  `cargo clippy -p peerdesk --target x86_64-pc-windows-gnu`（需 g++-mingw-w64-x86-64-posix）
-还差（按顺序）：
-1. 客户端 `peerdesk service run|install|uninstall|configure`（windows-service 0.8 crate）：
-   服务每 200 ms 看活动控制台会话，代理不在就用 spawn_in_session 拉起 `peerdesk agent`；
-   会话变了就结束旧代理重拉；看到 ProgramData\PeerDesk\sas.request 就删掉并 send_sas()。
-   install 时设 HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\SoftwareSASGeneration=1，
-   失败自动重启。
-2. `peerdesk agent`：set_follow_input_desktop(true)，复用 gui::session::start_host（有剪贴板、声音、
-   锁屏拒绝后继续），数据目录 ProgramData\PeerDesk（配置 config.txt：server/pin/password，只有管理员能写），
-   把设备码写 status.txt 给界面读；WinInput 里 Ctrl+Alt+Del 组合时写 sas.request。
-3. 界面：服务在跑时“本机”卡片显示服务的设备码、不自己开被控；设置里“无人值守”卡片
-   （安装/卸载/设密码，用 runas 提权调 `peerdesk service ...`）。
-4. 安装包 peerdesk.iss：PrivilegesRequired=admin，[Run] service install，[UninstallRun] service uninstall。
-5. CI windows：装服务 → 确认代理进程起来、status.txt 有内容 → 卸载。
+## Windows 系统服务 / 无人值守（2026-11-24，设计见 research/G 第 1.2–1.4、6.2 节）
+已完成：
+- `crates/client/src/unattended.rs`：`peerdesk service install|uninstall|status|password|run`、`peerdesk agent`。
+  - 服务（SYSTEM，Session 0）每 200 ms 看活动控制台会话，用 `spawn_in_session` 拉起代理；会话变了结束重拉，
+    代理崩了隔 2 秒重拉；看到 `agent\sas.request` 就代发 Ctrl+Alt+Del。
+  - 代理：跟随输入桌面，复用 `gui::session::start_host`，数据目录 `%ProgramData%\PeerDesk\agent`
+    （icacls 只给 SYSTEM 和管理员：有身份和密码），状态写 `%ProgramData%\PeerDesk\status.txt`，
+    密码改了 2 秒内生效；没设密码就不开被控并说明原因。
+  - 安装用系统自带 `sc`/`reg`/`icacls`（不引入新依赖），服务管理器回调在 `platform/src/winservice.rs`。
+- 界面：服务在跑时“本设备”卡片显示服务的设备码和“无人值守”，本程序不自己开被控。
+- 安装包：选“为所有用户安装”时可勾选无人值守，向导里设密码；卸载时注销服务。
+- CI（[win]）：真的注册服务 → 等代理开始监听 → 卸载。
+还差：
+- 真机验证锁屏、登录界面、UAC 提示（CI 机器上能否拉起代理取决于有没有控制台会话）。
+- 设置里的“无人值守”卡片（安装/卸载/改密码，用 runas 提权）。
+- macOS LaunchDaemon、Linux systemd。
 
 ## 传输（2026-11-23，见 research/README.md 3.7.3）
 - 已修：窄带宽关键帧被作废/判丢的循环、MTU 变小时会话断开；1–3 默认生效，门槛 8/8。

@@ -35,6 +35,8 @@ mod macos;
 mod unsupported;
 #[cfg(windows)]
 mod windows;
+#[cfg(windows)]
+pub mod winservice;
 /// Windows 系统服务用到的会话和进程操作（无人值守）。
 #[cfg(windows)]
 pub mod winsession;

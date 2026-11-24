@@ -303,6 +303,10 @@ pub struct Strings {
     pub lan_addresses: &'static str,
     /// 开启后，别人可以用设备码连接这台电脑
     pub host_off_hint: &'static str,
+    /// 无人值守服务在运行时的状态标签。
+    pub unattended: &'static str,
+    /// 无人值守服务在运行时的说明。
+    pub unattended_hint: &'static str,
     /// 连接
     pub connect_this: &'static str,
     /// 外观
@@ -551,6 +555,8 @@ pub const ZH: Strings = Strings {
     expand: "展开工具条",
     lan_addresses: "局域网地址",
     host_off_hint: "开启后，别人可以用设备码连接这台电脑",
+    unattended: "无人值守",
+    unattended_hint: "系统服务在运行：锁屏和登录界面也能远程。连接用管理员设置的无人值守密码。",
     connect_this: "连接",
     appearance: "外观",
     appearance_system: "跟随系统",
@@ -751,6 +757,8 @@ pub const EN: Strings = Strings {
     expand: "Show toolbar",
     lan_addresses: "LAN addresses",
     host_off_hint: "Turn on to let others connect to this computer",
+    unattended: "Unattended",
+    unattended_hint: "The system service is running: the lock and sign-in screens can be controlled too. Connect with the unattended password set by the administrator.",
     connect_this: "Connect",
     appearance: "Appearance",
     appearance_system: "System",

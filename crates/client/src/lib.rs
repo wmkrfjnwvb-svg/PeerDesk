@@ -19,6 +19,7 @@ mod local;
 mod remote;
 mod screen_check;
 mod source;
+pub mod unattended;
 
 use peerdesk_core::config::ClientConfig;
 use peerdesk_core::crypto::{Policy, Suite};
@@ -52,6 +53,8 @@ const USAGE: &str = "\
                           通过服务器找到被控端：先试直连（打洞），不通再走中继
   bench-transport         对比裸 UDP 和 QUIC 数据报在本机回环上的延迟
   screen-check [选项]     采集一帧本机屏幕，报告尺寸和耗时
+  service install|uninstall|status|password <密码>
+                          Windows 无人值守：注册系统服务，锁屏和登录界面也能远程（需管理员）
   help                    显示本帮助
 
 host 的选项：
@@ -258,6 +261,14 @@ fn cmd_check_config(args: &[String], out: &mut dyn Write) -> Result<u8, Error> {
     Ok(EXIT_OK)
 }
 
+/// 输出失败原因，返回退出码。
+fn report(out: &mut dyn Write, result: Result<u8, String>) -> u8 {
+    result.unwrap_or_else(|why| {
+        let _ = writeln!(out, "错误：{why}");
+        EXIT_FAILED
+    })
+}
+
 /// 执行命令行，返回进程退出码。
 pub fn run(args: &[String], out: &mut dyn Write) -> u8 {
     let Some((command, rest)) = args.split_first() else {
@@ -290,6 +301,14 @@ pub fn run(args: &[String], out: &mut dyn Write) -> u8 {
         "netcheck" => return remote::netcheck(rest, out),
         "screen-check" => return screen_check::screen_check(rest, out),
         "check-config" => cmd_check_config(rest, out),
+        "service" => {
+            let result = unattended::cmd_service(rest, out);
+            return report(out, result);
+        }
+        "agent" => {
+            let result = unattended::cmd_agent(rest, out);
+            return report(out, result);
+        }
         other => Ok(usage_error(out, &format!("未知命令：{other}"))),
     };
     match result {

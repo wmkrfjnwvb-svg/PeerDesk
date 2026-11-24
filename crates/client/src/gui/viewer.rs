@@ -156,9 +156,13 @@ impl Viewer {
         let p = Palette::of(ctx);
         let mut picture = None;
         let live = matches!(self.phase, ViewPhase::Connected { .. });
-        // 远程画面顶部居中的悬浮工具条（助手）：快捷键、声音、全屏、统计、断开。可以收起成一个小把手。
+        // 远程画面上的悬浮工具条（助手）：快捷键、声音、全屏、统计、断开。默认在顶部居中，
+        // 按住空白处或左边的把手可以拖到任何位置；收起后是一个小图标，也能拖。
         egui::Area::new(egui::Id::new(("assistant", self.id)))
-            .anchor(Align2::CENTER_TOP, vec2(0.0, 8.0))
+            .pivot(Align2::CENTER_TOP)
+            .default_pos(ctx.screen_rect().center_top() + vec2(0.0, 8.0))
+            .movable(true)
+            .constrain(true)
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
                 let frame = Frame::new()
@@ -175,8 +179,21 @@ impl Viewer {
                 frame.show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 4.0;
+                        // 拖动把手（标签不吃点击，按住它拖的是整个助手）
+                        ui.label(
+                            RichText::new(icon::DOTS_SIX_VERTICAL)
+                                .size(16.0)
+                                .color(p.muted),
+                        )
+                        .on_hover_cursor(egui::CursorIcon::Grab);
                         if !self.assistant {
-                            if icon_button(ui, icon::CARET_DOWN, s.expand).clicked() {
+                            let open = egui::Button::new(
+                                RichText::new(format!("{}  {}", icon::MONITOR, icon::CARET_DOWN))
+                                    .size(17.0)
+                                    .color(p.accent),
+                            )
+                            .frame(false);
+                            if ui.add(open).on_hover_text(s.expand).clicked() {
                                 self.assistant = true;
                             }
                             return;
@@ -434,13 +451,26 @@ impl Viewer {
     }
 
     fn forward_input(&mut self, ctx: &egui::Context, picture: Option<Rect>) {
-        let (events, modifiers, focused, pointer) = ctx.input(|i| {
+        let (mut events, modifiers, focused, pointer) = ctx.input(|i| {
             (
                 i.events.clone(),
                 i.modifiers,
                 i.focused,
                 i.pointer.latest_pos(),
             )
+        });
+        // 指针在助手、菜单、详情窗口上时，移动、按下和滚轮是给它们的，不能再发给远程
+        // （否则点助手的按钮，助手下面的远程画面也被点了）。抬起照常发，远程不会卡在按下状态。
+        let over_ui = |pos: egui::Pos2| {
+            ctx.layer_id_at(pos)
+                .is_some_and(|layer| layer.order != egui::Order::Background)
+        };
+        let wheel_blocked = pointer.is_some_and(over_ui);
+        events.retain(|event| {
+            let blocked = matches!(event, egui::Event::PointerMoved(pos) if over_ui(*pos))
+                || matches!(event, egui::Event::PointerButton { pos, pressed: true, .. } if over_ui(*pos))
+                || (wheel_blocked && matches!(event, egui::Event::MouseWheel { .. }));
+            !blocked
         });
         // 工具栏的按钮不留键盘焦点，否则空格、回车会同时按下按钮。
         ctx.memory_mut(|m| {

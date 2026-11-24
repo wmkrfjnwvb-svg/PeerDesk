@@ -132,6 +132,9 @@ struct App {
     appearance: Appearance,
     /// 打开程序后自动开启被控（默认开；用户手动关过就记住，下次不自动开）。权限齐了才真正开启。
     auto_host: bool,
+    /// 无人值守服务的状态（每 2 秒读一次；没装为 `None`）。
+    service: Option<crate::unattended::Status>,
+    service_checked: Option<Instant>,
     /// 本机电脑名（首页“本机”卡片上显示）。
     name: String,
 }
@@ -246,6 +249,8 @@ impl App {
             preview_mac,
             appearance,
             auto_host,
+            service: None,
+            service_checked: None,
             name: crate::local::device_name(),
         }
     }
@@ -489,9 +494,65 @@ impl App {
         }
     }
 
+    /// 无人值守服务在运行时的“本设备”卡片：服务的设备码，本程序不自己当被控端。
+    fn service_card(&mut self, ui: &mut egui::Ui, p: &Palette, code: Option<u32>) {
+        let s = self.s;
+        let title = if self.name.is_empty() {
+            s.this_device.to_owned()
+        } else {
+            format!("{} · {}", s.this_device, self.name)
+        };
+        card_title(ui, p, os_icon(PeerOs::current()), &title, |ui| {
+            let _ = pill(ui, s.unattended, p.success);
+        });
+        ui.add_space(4.0);
+        let _ = muted(ui, p, s.unattended_hint);
+        ui.add_space(8.0);
+        let _ = muted(ui, p, s.device_code);
+        ui.horizontal(|ui| {
+            ui.set_min_height(40.0);
+            if let Some(code) = code {
+                let shown = format_code(code);
+                ui.label(RichText::new(&shown).monospace().size(30.0).strong());
+                if icon_button(ui, icon::COPY, s.copy).clicked() {
+                    self.copy(ui, &code.to_string(), &shown);
+                }
+            } else {
+                ui.add(egui::Spinner::new().size(16.0).color(p.muted));
+                let _ = muted(ui, p, s.code_pending);
+            }
+        });
+    }
+
+    /// 读无人值守服务的状态。服务在跑时本程序不再自己当被控端（端口和设备都让给服务）。
+    fn check_service(&mut self) {
+        let due = self
+            .service_checked
+            .is_none_or(|t| t.elapsed() >= Duration::from_secs(2));
+        if !due {
+            return;
+        }
+        self.service_checked = Some(Instant::now());
+        self.service = crate::unattended::read_status(&crate::unattended::base_dir());
+        if self.service.as_ref().is_some_and(|st| st.running) {
+            self.auto_host = false;
+            if self.phase.is_on() {
+                self.stop_hosting();
+            }
+        }
+    }
+
     /// “本设备”卡片：开关、设备码、密码、谁在控制。
     fn this_device_card(&mut self, ui: &mut egui::Ui, p: &Palette) {
         let s = self.s;
+        if let Some(code) = self
+            .service
+            .as_ref()
+            .filter(|st| st.running)
+            .map(|st| st.code)
+        {
+            return self.service_card(ui, p, code);
+        }
         let mut on = self.phase.is_on();
         // 权限不全时不能开启被控（关闭总是可以）。
         let enabled = !matches!(self.phase, HostPhase::Stopping | HostPhase::Starting)
@@ -1296,6 +1357,9 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if self.selftest && self.host.is_none() && self.phase == HostPhase::Off {
             self.start_hosting();
+        }
+        if !self.selftest {
+            self.check_service();
         }
         // 默认本机可以被控制：权限齐了就自动开启（只自动开一次，之后听用户的）
         if self.auto_host && !self.preview_mac && self.guide.ready && self.phase == HostPhase::Off {
