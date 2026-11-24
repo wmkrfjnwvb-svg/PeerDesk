@@ -49,7 +49,12 @@ fn test_input() -> Result<Box<dyn InputSink>, PlatformError> {
 
 /// 检查本机屏幕和键鼠能不能用（打开后马上关掉）。开启被控之前调用。
 pub fn check_local() -> Result<(), String> {
-    drop(local_screen()?);
+    check_local_in(std::path::Path::new(""))
+}
+
+/// 同 [`check_local`]，屏幕按被控端的数据目录打开（测试用来模拟锁屏）。
+pub fn check_local_in(data_dir: &std::path::Path) -> Result<(), String> {
+    drop(local_screen_in(data_dir)?);
     drop(local_input(Arc::new(Tap::default()))?);
     Ok(())
 }

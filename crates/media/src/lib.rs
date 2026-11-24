@@ -841,11 +841,14 @@ mod tests {
         let (h, data) = FrameHeader::parse(&frame.payload).unwrap();
         assert!(dec.decode(&h, data).unwrap().is_some());
         assert_eq!(dec.backend(), "软件 OpenH264");
-        // 没有硬件解码器：直接软件；Linux 上的入口没有硬件
-        let mut soft = AutoH264Decoder::new().unwrap();
+        // 没有硬件解码器：直接软件
+        let mut soft = AutoH264Decoder::with_hardware(None).unwrap();
         assert_eq!(soft.backend(), "软件 OpenH264");
         assert!(soft.decode(&h, data).unwrap().is_some());
         assert_eq!(H264Decoder::new().unwrap().backend(), "软件 OpenH264");
+        // 本系统的入口：Linux 上没有硬件解码；macOS 上有（实机测试另测）
+        let _ = AutoH264Decoder::new().unwrap();
+        #[cfg(not(target_os = "macos"))]
         assert!(open_system_hardware_decoder().is_err());
     }
 
@@ -886,7 +889,8 @@ mod tests {
         let mut enc = H264Encoder::new(30).with_hardware(fake_none);
         assert!(enc.encode(1, &screen, true, 5000).unwrap().unwrap().key);
         assert_eq!(enc.backend_name(), "软件 OpenH264");
-        // 这个系统的硬件编码入口：Linux 上没有
+        // 这个系统的硬件编码入口：Linux 上没有（Windows、macOS 的实机测试另测）
+        #[cfg(not(any(windows, target_os = "macos")))]
         assert!(open_system_hardware(64, 64, 30, 1_000_000).is_err());
         assert!(hardware_disabled(Some(std::ffi::OsStr::new("0"))));
         assert!(!hardware_disabled(Some(std::ffi::OsStr::new("1"))) && !hardware_disabled(None));
@@ -974,7 +978,7 @@ mod tests {
             Err(why) => assert!(!why.is_empty()),
         }
         // 无论有没有硬件编码器，编码器都能编出画面
-        let mut enc = H264Encoder::new(30);
+        let mut enc = H264Encoder::new(30).with_hardware(fake_none);
         assert!(enc
             .encode(1, &picture(640, 360), true, 50_000)
             .unwrap()
@@ -983,7 +987,7 @@ mod tests {
 
     #[test]
     fn encodes_decodes_refines_and_goes_quiet() {
-        let mut enc = H264Encoder::new(30);
+        let mut enc = H264Encoder::new(30).with_hardware(fake_none);
         let mut dec = H264Decoder::new().unwrap();
         assert_eq!(enc.codec(), Codec::H264);
         assert!(format!("{enc:?} {dec:?}").contains("H264"));
@@ -1043,7 +1047,7 @@ mod tests {
 
     #[test]
     fn odd_sizes_and_resizes_work() {
-        let mut enc = H264Encoder::new(60);
+        let mut enc = H264Encoder::new(60).with_hardware(fake_none);
         let mut dec = H264Decoder::new().unwrap();
         for (w, h) in [(33u16, 17u16), (64, 48)] {
             let screen = picture(w, h);
@@ -1068,7 +1072,7 @@ mod tests {
         let _ = dec.decode(&header, &[0, 0, 0, 1, 0xff, 0xff, 0xff]);
         assert!(dec.decode(&header, &[]).is_ok_and(|s| s.is_none()));
         // 帧头说的尺寸比码流大
-        let mut enc = H264Encoder::new(30);
+        let mut enc = H264Encoder::new(30).with_hardware(fake_none);
         let f = enc
             .encode(1, &picture(32, 32), true, 100_000)
             .unwrap()
@@ -1079,7 +1083,7 @@ mod tests {
 
     #[test]
     fn budget_changes_reach_the_encoder() {
-        let mut enc = H264Encoder::with_max_bps(30, 1_000_000);
+        let mut enc = H264Encoder::with_max_bps(30, 1_000_000).with_hardware(fake_none);
         let _ = enc.encode(1, &picture(64, 64), true, 1000).unwrap();
         assert_eq!(enc.bps, 240_000, "按当前预算打开");
         let (w, h, mut inner) = enc.inner.take().unwrap();
@@ -1110,7 +1114,7 @@ mod tests {
     fn hd_frames_encode_without_hanging() {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let mut enc = H264Encoder::new(60);
+            let mut enc = H264Encoder::new(60).with_hardware(fake_none);
             let mut dec = H264Decoder::new().unwrap();
             let start = std::time::Instant::now();
             let mut sizes = Vec::new();

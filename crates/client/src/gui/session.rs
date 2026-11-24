@@ -27,7 +27,7 @@ use peerdesk_net::{Identity, NetError, Node};
 use tokio::sync::watch;
 
 use super::form::Target;
-use crate::local::{check_local, local_input, local_screen_in, Tap};
+use crate::local::{check_local_in, local_input, local_screen_in, Tap};
 use crate::remote::{join_cluster, load_nodes, runtime, save_nodes, session, stay_registered};
 
 /// 请求界面重绘。
@@ -285,7 +285,7 @@ async fn host_main(
     ev: Emitter<HostEvent>,
 ) -> Result<(), NetError> {
     // 没有权限就不提供远程：先确认屏幕和键鼠都能用，再开始监听。
-    if let Err(why) = check_local() {
+    if let Err(why) = check_local_in(&config.data_dir) {
         ev.send(HostEvent::Unavailable(why));
         return Ok(());
     }

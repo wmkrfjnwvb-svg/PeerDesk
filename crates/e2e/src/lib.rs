@@ -67,11 +67,21 @@ impl CodecKind {
         Ok(match self {
             CodecKind::Tile => (Box::new(TileEncoder::new()), Box::new(TileDecoder::new())),
             CodecKind::H264 => (
-                Box::new(H264Encoder::with_max_bps(fps, max_bps)),
+                Box::new(H264Encoder::with_max_bps(fps, max_bps).with_hardware(software_only)),
                 Box::new(H264Decoder::new()?),
             ),
         })
     }
+}
+
+/// 仿真只用软件编码：结果在任何机器上都一样（开发者电脑上有硬件编码器也不用）。
+fn software_only(
+    _: u32,
+    _: u32,
+    _: u32,
+    _: u64,
+) -> Result<Box<dyn peerdesk_media::HardwareEncoder>, String> {
+    Err("仿真只用软件编码（结果可复现）".into())
 }
 
 /// 纠错方式的环境变量：`xor` 用异或（对照），其他用 RS。

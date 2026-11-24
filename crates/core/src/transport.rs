@@ -861,6 +861,19 @@ mod tests {
         for p in &parity {
             assert!(r.push(Time(2), p.clone()).unwrap().is_none());
         }
+        // 被篡改的校验分片（长度字段说的比实际数据长）：不“还原”出错误的内容
+        let mut r = Reassembler::new(1_000_000, 4);
+        r.set_fec(Fec::Rs);
+        for (i, p) in data.iter().enumerate() {
+            if i != 1 {
+                r.push(Time(1), p.clone()).unwrap();
+            }
+        }
+        let mut lying = parity[0].clone();
+        lying.data[2] = 0x7f; // 分片长度 0x7f..
+        lying.data[3] = 0xff;
+        assert!(r.push(Time(2), lying).unwrap().is_none());
+        assert_eq!(r.stats().recovered, 0);
         // 不合法的 RS 校验分片：报错
         let mut bad = parity[0].clone();
         bad.data[4] = 0xff; // 最后一片长度 > 分片长度

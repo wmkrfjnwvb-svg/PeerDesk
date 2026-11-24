@@ -495,6 +495,35 @@ fn connect_through_a_signaling_server() {
     }
 }
 
+/// 开启被控时屏幕就打不开（没有权限等）：不提供远程，说明原因。
+#[test]
+fn host_that_cannot_open_the_screen_says_why() {
+    let dir = temp_dir("unavailable");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(crate::local::TEST_LOCK_FILE), b"").unwrap();
+    let (repaint, _) = counter();
+    let h = start_host(
+        HostConfig {
+            port: 0,
+            data_dir: dir.clone(),
+            server: None,
+            fps: 30,
+        },
+        "pw",
+        repaint,
+    );
+    let mut seen = Log::new();
+    let e = wait_for(
+        || h.poll(),
+        &mut seen,
+        |e| matches!(e, HostEvent::Unavailable(_)),
+    );
+    assert!(
+        matches!(&e, HostEvent::Unavailable(why) if why.contains("锁定")),
+        "{e:?}"
+    );
+}
+
 #[test]
 fn locked_screen_refuses_one_connection_and_keeps_hosting() {
     let (host_dir, ctrl_dir) = (temp_dir("h7"), temp_dir("c7"));
