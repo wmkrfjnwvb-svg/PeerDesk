@@ -27,6 +27,11 @@ windows = { version = "0.62", features = [
   "Win32_System_Variant",
 ] }
 
+# Linux：VA-API 硬件编码（ChromeOS 的 cros-codecs，BSD-3）。构建要 libva-dev、libgbm-dev、libdrm-dev、libclang-dev；
+# 运行要 libva2、libva-drm2、libgbm1（桌面系统一般都有）。
+[target.'cfg(target_os = "linux")'.dependencies]
+cros-codecs = { version = "=0.0.6", features = ["vaapi"] }
+
 [features]
 # 从源码编译 OpenH264（开发、测试、CI）。发布版改为运行时加载 Cisco 官方的二进制（以后加 `libloading`）。
 default = ["source"]

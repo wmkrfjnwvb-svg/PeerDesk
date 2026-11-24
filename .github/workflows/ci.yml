@@ -36,7 +36,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-llvm-cov
       # 声卡（cpal）在 Linux 上要 ALSA 的开发库
-      - run: sudo apt-get update -qq && sudo apt-get install -y -qq libasound2-dev
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq libasound2-dev libva-dev libgbm-dev libdrm-dev libclang-dev
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -84,7 +84,7 @@ jobs:
       - run: rustup show
       - uses: Swatinem/rust-cache@v2
       # 声卡（cpal）在 Linux 上要 ALSA 的开发库
-      - run: sudo apt-get update -qq && sudo apt-get install -y -qq libasound2-dev
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq libasound2-dev libva-dev libgbm-dev libdrm-dev libclang-dev
       - name: Run scenarios
         run: cargo test --release -p peerdesk-e2e -- --nocapture --test-threads 2
       # 真实二进制的闭环：虚拟桌面上真采集、真注入，经回环网络和加了延迟丢包的网络各跑一次。
@@ -165,7 +165,7 @@ jobs:
       - name: Start a virtual X11 display
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq xvfb xterm libasound2-dev
+          sudo apt-get update -qq && sudo apt-get install -y -qq xvfb xterm libasound2-dev libva-dev libgbm-dev libdrm-dev libclang-dev
           Xvfb :99 -screen 0 1920x1080x24 &
           echo "DISPLAY=:99" >> "$GITHUB_ENV"
           sleep 2
@@ -300,7 +300,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup show
-      - run: sudo apt-get update -qq && sudo apt-get install -y -qq libasound2-dev
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq libasound2-dev libva-dev libgbm-dev libdrm-dev libclang-dev
       - uses: Swatinem/rust-cache@v2
         with:
           key: package-linux
@@ -369,7 +369,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq xvfb imagemagick libgl1-mesa-dri libegl1 libxkbcommon-x11-0 fonts-noto-cjk libasound2-dev
+          sudo apt-get install -y -qq xvfb imagemagick libgl1-mesa-dri libegl1 libxkbcommon-x11-0 fonts-noto-cjk libasound2-dev libva-dev libgbm-dev libdrm-dev libclang-dev
       - run: cargo build --release -p peerdesk
       - name: Run the GUI and take screenshots
         run: |

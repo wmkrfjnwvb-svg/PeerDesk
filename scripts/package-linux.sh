@@ -46,7 +46,7 @@ Version: $version~$short
 Architecture: amd64
 Maintainer: PeerDesk <noreply@peerdesk.invalid>
 Installed-Size: $size
-Depends: libc6 (>= 2.35), libasound2 | libasound2t64, libxkbcommon0, libxkbcommon-x11-0, libgl1, libegl1, libx11-6, libx11-xcb1, libxcursor1, libxrandr2, libxi6, libxtst6, libxdamage1, libxfixes3, libxext6
+Depends: libc6 (>= 2.35), libasound2 | libasound2t64, libxkbcommon0, libxkbcommon-x11-0, libgl1, libegl1, libx11-6, libx11-xcb1, libxcursor1, libxrandr2, libxi6, libxtst6, libxdamage1, libxfixes3, libxext6, libva2, libva-drm2, libgbm1
 Recommends: fonts-noto-cjk
 Section: net
 Priority: optional

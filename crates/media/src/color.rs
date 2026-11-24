@@ -102,8 +102,8 @@ pub fn i420_to_nv12(y: &[u8], u: &[u8], v: &[u8], out: &mut Vec<u8>) {
 /// `y`、`uv` 是两个平面，每行 `pitch` 字节（显卡对齐，常大于宽度）；只取左上角 `width`×`height`。
 /// 系数是 [`rgb_to_i420`] 的逆（BT.601 有限范围，×256 的整数），和软件解码出来的颜色一致。
 /// 平面不够长时缺的部分当黑色。
-// 只有 Windows 的硬件解码用（macOS 的 VideoToolbox 直接出 RGB）；其他系统只在测试里用
-#[cfg_attr(not(windows), allow(dead_code))]
+// Windows、Linux 的硬件解码用（macOS 的 VideoToolbox 直接出 RGB）
+#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
 pub fn nv12_to_rgb(
     y: &[u8],
     uv: &[u8],

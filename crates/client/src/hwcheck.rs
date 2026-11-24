@@ -105,6 +105,18 @@ fn report(screen: Option<Screen>) -> Vec<String> {
         lines.push("本机屏幕打不开，用合成桌面（结果参考价值低一些）。macOS 上在终端里运行时，要在“系统设置 → 隐私与安全性 → 屏幕录制”里给“终端”打开权限".into());
         synthetic()
     });
+    // Linux：有哪些显卡（硬件编码用 Intel、AMD 的 VA-API）
+    #[cfg(target_os = "linux")]
+    {
+        let gpus = peerdesk_media::gpu::list(Path::new("/sys/class/drm"));
+        if gpus.is_empty() {
+            lines.push("显卡：没有找到（/dev/dri 下没有渲染节点）".into());
+        }
+        lines.extend(
+            gpus.iter()
+                .map(|g| format!("显卡：{}", peerdesk_media::gpu::describe(g))),
+        );
+    }
     lines.push(format!(
         "画面 {}×{}，{FRAMES} 帧，方块每帧移动（模拟鼠标）",
         base.width(),

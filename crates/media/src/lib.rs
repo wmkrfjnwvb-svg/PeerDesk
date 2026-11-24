@@ -19,6 +19,11 @@ use openh264::formats::{YUVSlices, YUVSource};
 pub mod annexb;
 pub mod audio;
 mod color;
+/// Linux 的显卡和 VA-API 能力（检测和给用户的说明）。
+#[cfg(target_os = "linux")]
+pub mod gpu;
+#[cfg(target_os = "linux")]
+mod vaapi;
 use openh264::OpenH264API;
 use peerdesk_core::error::Error;
 use peerdesk_core::screen::Screen;
@@ -207,17 +212,19 @@ pub fn open_system_hardware_decoder() -> Result<Box<dyn HardwareDecoder>, String
     }
     #[cfg(target_os = "macos")]
     {
-        let dec: Box<dyn HardwareDecoder> = Box::new(vt::VtDecoder::new());
-        Ok(dec)
+        Ok(Box::new(vt::VtDecoder::new()))
     }
     #[cfg(windows)]
     {
-        let dec: Box<dyn HardwareDecoder> = Box::new(mf::MfDecoder::open()?);
-        Ok(dec)
+        Ok(Box::new(mf::MfDecoder::open()?))
     }
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(target_os = "linux")]
     {
-        Err("这个系统还没接硬件解码（目前有 macOS、Windows）".into())
+        Ok(Box::new(vaapi::VaapiDecoder::open()?))
+    }
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+    {
+        Err("这个系统还没接硬件解码".into())
     }
 }
 
@@ -394,18 +401,22 @@ pub fn open_system_hardware(
     }
     #[cfg(windows)]
     {
-        let enc: Box<dyn HardwareEncoder> = Box::new(mf::MfEncoder::open(width, height, fps, bps)?);
-        Ok(enc)
+        Ok(Box::new(mf::MfEncoder::open(width, height, fps, bps)?))
     }
     #[cfg(target_os = "macos")]
     {
-        let enc: Box<dyn HardwareEncoder> = Box::new(vt::VtEncoder::open(width, height, fps, bps)?);
-        Ok(enc)
+        Ok(Box::new(vt::VtEncoder::open(width, height, fps, bps)?))
     }
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(target_os = "linux")]
+    {
+        Ok(Box::new(vaapi::VaapiEncoder::open(
+            width, height, fps, bps,
+        )?))
+    }
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     {
         let _ = (width, height, fps, bps);
-        Err("这个系统还没接硬件编码（目前只有 Windows 和 macOS）".into())
+        Err("这个系统还没接硬件编码".into())
     }
 }
 
@@ -973,6 +984,8 @@ mod tests {
         hold_back: bool,
         held: Option<(Vec<u8>, bool)>,
         ready: Option<(Vec<u8>, bool)>,
+        /// 取攒着的帧时出错。
+        poll_error: bool,
     }
 
     impl HardwareEncoder for FakeHw {
@@ -1017,6 +1030,9 @@ mod tests {
             Ok(Some((data.to_vec(), f.key || self.always_key)))
         }
         fn poll(&mut self) -> Result<Option<(Vec<u8>, bool)>, String> {
+            if self.poll_error {
+                return Err("模拟取帧出错".into());
+            }
             Ok(self.ready.take())
         }
         fn drain(&mut self) -> Result<(), String> {
@@ -1035,6 +1051,7 @@ mod tests {
             hold_back: false,
             held: None,
             ready: None,
+            poll_error: false,
         }))
     }
 
@@ -1053,6 +1070,7 @@ mod tests {
             hold_back: false,
             held: None,
             ready: None,
+            poll_error: false,
         }))
     }
 
@@ -1097,7 +1115,52 @@ mod tests {
             hold_back: true,
             held: None,
             ready: None,
+            poll_error: false,
         }))
+    }
+
+    fn fake_poll_fails(
+        w: u32,
+        h: u32,
+        fps: u32,
+        _bps: u64,
+    ) -> Result<Box<dyn HardwareEncoder>, String> {
+        Ok(Box::new(FakeHw {
+            size: (w, h),
+            frames: 0,
+            fail_at: 0,
+            soft: H264Encoder::new(fps).with_hardware(fake_none),
+            always_key: false,
+            hold_back: true,
+            held: None,
+            ready: None,
+            poll_error: true,
+        }))
+    }
+
+    /// 画面停下后取攒着的帧时编码器出错：改用软件编码（说明原因），之后照常出画面。
+    #[test]
+    fn hardware_error_while_draining_falls_back_to_software() {
+        let mut enc = H264Encoder::new(30).with_hardware(fake_poll_fails);
+        assert!(enc
+            .encode(1, &picture(320, 192), true, 50_000)
+            .unwrap()
+            .is_none());
+        assert!(enc
+            .encode(2, &picture(320, 192), true, 50_000)
+            .unwrap()
+            .is_some());
+        // 画面不变：去取攒着的帧，出错
+        assert!(enc
+            .encode(3, &picture(320, 192), false, 50_000)
+            .unwrap()
+            .is_none());
+        assert_eq!(enc.backend_name(), "软件 OpenH264");
+        let f = enc
+            .encode(4, &picture(320, 192), true, 50_000)
+            .unwrap()
+            .unwrap();
+        assert!(f.key, "改用软件后从关键帧开始");
     }
 
     /// 同步的编码器（Media Foundation）不攒帧：默认的 poll、drain 什么都不做。
@@ -1195,6 +1258,7 @@ mod tests {
             hold_back: false,
             held: None,
             ready: None,
+            poll_error: false,
         }))
     }
 
@@ -1264,6 +1328,7 @@ mod tests {
         assert_eq!(H264Decoder::new().unwrap().backend(), "软件 OpenH264");
         // 本系统的入口：Linux 上没有硬件解码；macOS 上有（实机测试另测）
         let _ = AutoH264Decoder::new().unwrap();
+        // CI 的 Linux 没有显卡：打不开并说明原因
         #[cfg(not(any(windows, target_os = "macos")))]
         assert!(open_system_hardware_decoder().is_err());
     }
