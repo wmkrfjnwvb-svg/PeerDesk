@@ -15,7 +15,7 @@
 | [I-release.md](I-release.md) | 发布：硬件编码、代码签名和公证、自动更新 |
 | [J-keyboard.md](J-keyboard.md) | 远程键盘：跨系统快捷键映射、输入法、键盘布局、系统快捷键捕获 |
 
-## 实现状态总表（2026-11-24）
+## 实现状态总表（2026-11-24 晚）
 
 图例：✅ 已完成并有测试（进 CI）；🟡 部分完成；⬜ 未做。“代码”列是主要文件，测试在各 crate 的 `tests/` 目录。
 传输算法的逐项细节见第 3.8 节。
@@ -29,6 +29,7 @@
 | 前向纠错：RS 纠删码（GF(256) Cauchy，任意 k 个还原），老版本退回异或 | ✅ | `core/rs.rs`、`core/transport.rs` | 能力位 `FEC_RS`；5% 丢包冻结 8 次 → 0（3.7.6） |
 | 纠错比例按实测丢包自适应，自动换网络画像 | ✅ | `core/media.rs` | max(画像, 3 × 丢包率)，上限 33%（3.7.5） |
 | 窄带宽关键帧不被作废/判丢、MTU 变小不断会话 | ✅ | `core/transport.rs`、`net/node.rs` | 3.7.3 |
+| 关键帧丢一个包又没有后续帧时画面永远出不来（死锁） | ✅ | `core/media.rs` | 2026-11-24：会话循环每轮都检查迟迟没确认的帧，到时限按丢失处理（之前只在编新帧时检查，而关键帧没确认时不编新帧） |
 | 发送节奏（pacing） | 🟡 | `core/pacer.rs` | 实验，默认关：仿真和实测还不能同时变好 |
 | NACK 重传（一轮限量） | ✅ | `core/adaptive.rs`、`core/media.rs` | |
 | 接收端测量与反馈（排队延迟、丢包、速率） | ✅ | `core/adaptive.rs` | |
@@ -47,23 +48,32 @@
 
 ### 编解码（本文第 2 节，报告 I）
 
+硬件编解码三个平台都已接进真实链路，CI 全部通过；**还没有一台真机验证**（见下表“待真机”）。
+共同做法（2026-11-24 定，和 WebRTC、FFmpeg、Chromium 一致）：硬件编码器会攒 1–2 帧，所以交帧不等结果，
+输出由回调或事件放进队列，每次最多等 20 ms 取一帧；画面停下后让编码器交出攒着的帧。
+之前一帧一帧同步等，是 Mac“每帧都是关键帧”和 Windows“超时后整个改用软件”的共同根因。
+
 | 算法 / 模块 | 状态 | 代码 | 说明 |
 | --- | --- | --- | --- |
-| H.264 软件编码（OpenH264，屏幕内容模式） | ✅ | `media/lib.rs` | 1080p 每帧 45–60 ms，是帧率低的根因 |
+| H.264 软件编码（OpenH264，屏幕内容模式） | ✅ | `media/lib.rs` | 1080p 每帧 45–60 ms，是帧率低的根因；输出确认是 Constrained Baseline（Windows 硬件解码要求） |
 | 整数系数的 RGB→YUV 转换 | ✅ | `media/color.rs` | 与 openh264 逐字节一致 |
 | 静止后补清晰（最多约 8 帧残差） | ✅ | `media/lib.rs` | |
 | 块编码（对照组，渐进无损） | ✅ | `core/codec.rs` | 只在仿真里做对照 |
-| 硬件编码：Windows Media Foundation（异步硬件 MFT） | ✅ | `media/mf.rs` | 和 FFmpeg/Chromium 一样事件驱动：要输入才交、有输出就取、不一帧一帧等；2 秒没进展才算卡住；CBR、无 B 帧、低延迟、场景=远程桌面。之前同步等结果（硬件攒帧必超时→整个改软件）。真机待测 |
-| 零拷贝：显卡上 BGRA→NV12（着色器）直接喂编码器、解码出的纹理直接显示 | ⬜ | | Sunshine、Moonlight 的做法；现在要在内存和显卡之间来回拷两次、CPU 转颜色 |
-| 硬件编解码：Linux VA-API | 🟡 | `media/src/vaapi.rs`、`gpu.rs` | 用 cros-codecs（BSD-3）；Intel/AMD 编码和解码，各自独立线程；`hw-check` 列出显卡型号和驱动，用不了时说明装哪个包。待真机验证（CI 和容器没有显卡）。NVIDIA 要 NVENC，未接 |
-| 硬件编码器拿到所在显卡的 D3D11 设备（按 LUID 找卡），打开时试编一帧，不行再不给设备试 | ✅ | `media/mf.rs` | AMD 的编码器要设备才打得开；双显卡笔记本选对卡 |
-| 硬件解码：Windows（系统 H.264 解码器，有显卡走 DXVA，否则 CPU 并如实标注） | ✅ | `media/mf.rs`、`media/color.rs` | NV12 → RGB 整数转换，裁掉 16 对齐的行 |
+| 硬件编码器接口改成异步（交帧、取帧、画面停下时排空），按交帧顺序对上“是否要求了关键帧” | ✅ | `media/lib.rs` | 测试用会攒帧的假编码器 |
+| 硬件编解码：macOS VideoToolbox | ✅ 待真机 | `media/vt.rs`、`media/annexb.rs` | 回调取帧、每帧从缓冲池拿像素缓冲、不每帧 CompleteFrames；关键帧间隔 7200 帧/240 秒、码率上限 1.5 倍/秒；低延迟码控（打不开退回普通模式）。CI 虚拟机上 Mac 到 Mac 会话通过；Intel Mac 真机待测 |
+| 硬件编码：Windows Media Foundation（异步硬件 MFT） | ✅ 待真机 | `media/mf.rs` | 事件驱动：要输入才交、有输出就取；2 秒没进展才算卡住；CBR、无 B 帧、低延迟、场景=远程桌面；按 LUID 拿所在显卡的 D3D11 设备（AMD 要设备才打得开，双显卡选对卡）。CI 机器多半没有真显卡，硬件路径要真机确认 |
+| 硬件解码：Windows（系统 H.264 解码器，DXVA） | ✅ 待真机 | `media/mf.rs`、`media/color.rs` | 打开低延迟和硬件加速；NV12 → RGB 整数转换，裁掉 16 对齐的行 |
+| 硬件编解码：Linux VA-API（Intel、AMD） | ✅ 待真机 | `media/vaapi.rs`、`media/gpu.rs` | cros-codecs（BSD-3），编码、解码各在独立线程；用仓库里固定的 libva 2.20 头文件生成绑定（系统 2.14/2.23 都编不过，和 Chromium 一样带头文件）。只验证到编译和打包：CI 和容器没有显卡 |
+| Linux 识别显卡型号和驱动，用不了时说明装哪个包 | ✅ | `media/gpu.rs`、`client/hwcheck.rs` | 读 `/sys/class/drm`；核显优先；Intel 装 intel-media-va-driver 或 i965-va-driver，AMD 装 mesa-va-drivers |
+| 硬件中途出错或连续出没要求的关键帧（5 帧）时改用软件，详情面板写明原因；会话测试里出现就判失败 | ✅ | `media/lib.rs`、`client/tests/binary.rs` | 不悄悄降级；没有显卡一开始就用软件不算失败。去掉了“解码器猜测失败改软件”的兜底 |
+| 编码器体检 `peerdesk hw-check` | ✅ | `client/hwcheck.rs` | 各平台对比设置、关键帧数、耗时，Linux 列出显卡。Intel Mac 实测：普通模式每帧关键帧、110–310 ms；低延迟码控 1/30 关键帧、10 ms（异步改造前） |
 | 编码耗时拆开：颜色转换 / 编码器本身，统计行按秒平均 | ✅ | `media/lib.rs`、`net/host.rs` | 真机测试用它定位瓶颈 |
-| 硬件编解码：macOS VideoToolbox | ✅ | `media/vt.rs`、`media/annexb.rs` | 和 WebRTC 一样异步：交帧不等、回调取帧、每帧从缓冲池拿像素缓冲、不每帧 CompleteFrames；关键帧间隔 7200 帧/240 秒、码率上限 1.5 倍；加开低延迟码控（打不开退回普通模式）。之前同步等结果是每帧关键帧的根因 |
-| 硬件编码器连续出没要求的关键帧时改用软件编码 | ✅ | `media/lib.rs` | 兜底：连续 5 帧 |
-| 编码器体检 `peerdesk hw-check` | ✅ | `client/hwcheck.rs` | 用户机器上对比各种设置。Intel Mac 实测：普通模式每帧关键帧、110–310 ms；低延迟码控 1/30 关键帧、10 ms |
-| 详情面板显示双方编解码器（硬件/软件） | ✅ | `client/gui/state.rs` | |
+| 详情面板显示双方编解码器（硬件/软件及原因） | ✅ | `client/gui/state.rs` | |
 | 编解码在独立线程（编码线程、解码线程） | ✅ | `net/host.rs`、`net/controller.rs` | |
+| Linux 上 NVIDIA 硬件编码（NVENC） | ⬜ | | 现在说明原因、用软件编码 |
+| 零拷贝编码：显卡上 BGRA→NV12（着色器）直接喂编码器 | ⬜ | | 下一项（Windows 先，Sunshine 的做法）；先拿真机计时定瓶颈 |
+| 零拷贝显示：解码出的纹理直接显示 | ⬜ | | 现在解码后拷回内存、CPU 转 RGB |
+| Retina 屏按逻辑分辨率编码 | ⬜ | | 本机实测 1080p 软件编码 28 ms → 半分辨率 6 ms |
 | AV1、HEVC、4:4:4 文字清晰度、4K/8K | ⬜ | | |
 | 发布版运行时下载 Cisco OpenH264 二进制 | ⬜ | | |
 
@@ -110,7 +120,9 @@
 | 浮动助手：可拖动，收起成图标；点击不穿透到远程画面 | ✅ | `client/gui/viewer.rs` | 2026-11-24，待真机确认手感 |
 | 详情面板：双方网络、分辨率、往返/路由器延迟、丢包、帧率、解码耗时、纠错、编解码器 | ✅ | `client/gui/state.rs` | F12；网络差时工具条显示原因 |
 | 浮动助手：剪贴板开关、文件传输入口、画质和帧率、切换显示器 | ⬜ | | |
-| 键盘原生捕获（Win 键、Alt+Tab）、跨系统映射、输入法 | ⬜ | | 报告 J，排在最后 |
+| 跨系统 Ctrl ↔ Command 对调（复制粘贴等快捷键按对端系统） | ✅ | `client/gui/input.rs` | 2026-11-24，用户确认快捷键复制可用 |
+| 指针在远程画面上时本机不开输入法 | ✅ | `client/gui/viewer.rs` | |
+| 键盘原生捕获（Win 键、Alt+Tab）、输入法、键盘布局 | ⬜ | | 报告 J，排在最后 |
 | 声音：Opus 编解码、RED 自适应冗余 | ✅ | `media/audio.rs`、`core/audio.rs` | 报告 H |
 | 声音：NetEQ 式抖动缓冲（目标 20–200 ms、补帧、合并加速） | ✅ | `core/audio.rs` | |
 | 声音采集：WASAPI 回环、PulseAudio 监听源、ScreenCaptureKit；cpal 播放 | ✅ | `platform/audio_sys.rs`、`platform/macos.rs` | 实机听感待测 |
@@ -157,6 +169,15 @@
 | AI 特征记录（每次反馈一行，带仿真真值） | ✅ | `e2e/lib.rs` |
 | 帧号条码测端到端延迟、输入到显示延迟 | ⬜ | |
 | L3 跨机器每晚测试、性能趋势记录 | ⬜ | |
+
+### 当前顺序（2026-11-24 产品负责人定）
+
+1. 硬件编解码收尾：等三个平台真机的 `hw-check` 和会话详情；Windows 零拷贝编码、零拷贝显示。
+2. 传输待办：降分辨率、发送节奏校准、长期参考帧、空闲后探测、链路满度、中继升级直连、Retina 半分辨率编码。
+3. 文件复制改成系统原生体验（右键复制、粘贴时弹进度，文字和文件都走这条路）。
+4. 最后：扩大微软真实网络轨迹的仿真样本。
+
+等用户反馈的问题：画面花屏且提示“丢包 20%”（要日志，以及 `PEERDESK_HW=0` 关掉硬件的对比）；Mac 复制文件到 Windows 的细节。
 
 ### 尚未开始的大块
 
