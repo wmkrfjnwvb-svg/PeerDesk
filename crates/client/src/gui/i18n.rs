@@ -151,6 +151,62 @@ pub struct Strings {
     pub session_ended: &'static str,
     pub you_disconnected: &'static str,
     pub stats: &'static str,
+    /// 详情面板。
+    pub d_title: &'static str,
+    /// 详情面板。
+    pub d_local: &'static str,
+    /// 详情面板。
+    pub d_remote: &'static str,
+    /// 详情面板。
+    pub d_path: &'static str,
+    /// 详情面板。
+    pub d_rtt: &'static str,
+    /// 详情面板。
+    pub d_router: &'static str,
+    /// 详情面板。
+    pub d_loss: &'static str,
+    /// 详情面板。
+    pub d_queue: &'static str,
+    /// 详情面板。
+    pub d_net: &'static str,
+    /// 详情面板。
+    pub d_recv: &'static str,
+    /// 详情面板。
+    pub d_picture: &'static str,
+    /// 详情面板。
+    pub d_decoder: &'static str,
+    /// 详情面板。
+    pub d_reaction: &'static str,
+    /// 详情面板。
+    pub d_fec: &'static str,
+    /// 详情面板。
+    pub d_encoder: &'static str,
+    /// 详情面板。
+    pub d_encode: &'static str,
+    /// 详情面板。
+    pub d_fps: &'static str,
+    /// 详情面板。
+    pub d_bitrate: &'static str,
+    /// 详情面板。
+    pub d_profile: &'static str,
+    /// 详情面板。
+    pub d_capture: &'static str,
+    /// 详情面板。
+    pub d_unknown: &'static str,
+    /// 详情面板。
+    pub d_none: &'static str,
+    /// 详情面板。
+    pub d_old_peer: &'static str,
+    /// 详情面板。
+    pub d_good: &'static str,
+    /// 详情面板。
+    pub d_fair: &'static str,
+    /// 详情面板。
+    pub d_poor: &'static str,
+    /// 详情面板。
+    pub d_waiting: &'static str,
+    /// 详情面板。
+    pub d_slowest: &'static str,
     pub fps: &'static str,
     pub bitrate: &'static str,
     pub rtt: &'static str,
@@ -410,7 +466,35 @@ pub const ZH: Strings = Strings {
     net_bandwidth_hint: "网络带宽不够，画面已自动降低清晰度和帧率。关掉占用网络的下载、视频可以改善。",
     session_ended: "会话已结束",
     you_disconnected: "你断开了连接",
-    stats: "统计 (F12)",
+    stats: "详情 (F12)",
+    d_title: "连接详情",
+    d_local: "本机（控制端）",
+    d_remote: "对方（被控端）",
+    d_path: "连接路径",
+    d_rtt: "往返延迟",
+    d_router: "到路由器",
+    d_loss: "丢包",
+    d_queue: "排队延迟",
+    d_net: "网络状况",
+    d_recv: "接收码率",
+    d_picture: "画面",
+    d_decoder: "解码",
+    d_reaction: "操作到画面",
+    d_fec: "纠错",
+    d_encoder: "编码器",
+    d_encode: "编码耗时",
+    d_fps: "帧率",
+    d_bitrate: "码率（实际 / 目标）",
+    d_profile: "码率策略",
+    d_capture: "采集分辨率",
+    d_unknown: "测不出",
+    d_none: "—",
+    d_old_peer: "对方是老版本，没有发送状态",
+    d_good: "正常",
+    d_fair: "一般",
+    d_poor: "差",
+    d_waiting: "等待数据…",
+    d_slowest: "最慢",
     fps: "帧率",
     bitrate: "码率",
     rtt: "往返延迟",
@@ -582,7 +666,35 @@ pub const EN: Strings = Strings {
     net_bandwidth_hint: "Not enough bandwidth: picture quality and frame rate were lowered automatically. Pausing downloads or videos helps.",
     session_ended: "Session ended",
     you_disconnected: "You disconnected",
-    stats: "Stats (F12)",
+    stats: "Details (F12)",
+    d_title: "Connection details",
+    d_local: "This computer (controller)",
+    d_remote: "Remote computer (host)",
+    d_path: "Path",
+    d_rtt: "Round trip",
+    d_router: "To router",
+    d_loss: "Packet loss",
+    d_queue: "Queueing delay",
+    d_net: "Network",
+    d_recv: "Received bitrate",
+    d_picture: "Picture",
+    d_decoder: "Decoder",
+    d_reaction: "Action to picture",
+    d_fec: "Error correction",
+    d_encoder: "Encoder",
+    d_encode: "Encode time",
+    d_fps: "Frame rate",
+    d_bitrate: "Bitrate (actual / target)",
+    d_profile: "Rate profile",
+    d_capture: "Capture size",
+    d_unknown: "n/a",
+    d_none: "—",
+    d_old_peer: "The remote computer runs an older version and sends no status",
+    d_good: "Good",
+    d_fair: "Fair",
+    d_poor: "Poor",
+    d_waiting: "Waiting for data…",
+    d_slowest: "slowest",
     fps: "fps",
     bitrate: "bitrate",
     rtt: "rtt",

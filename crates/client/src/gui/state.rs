@@ -423,9 +423,179 @@ pub fn net_texts(cause: NetCause, s: &Strings) -> (String, String) {
     }
 }
 
+/// “详情”面板的内容：两组（本机、对方），每组若干行（名称, 数值）。`path` 是连接路径的说明。
+#[must_use]
+pub fn detail_rows(
+    q: Option<&peerdesk_net::controller::LinkQuality>,
+    meter: &NetMeter,
+    path: &str,
+    fps: u32,
+    s: &Strings,
+) -> Vec<(&'static str, Vec<(&'static str, String)>)> {
+    let Some(q) = q else {
+        return vec![(
+            s.d_local,
+            vec![
+                (s.d_path, path.to_owned()),
+                (s.d_net, s.d_waiting.to_owned()),
+            ],
+        )];
+    };
+    let ms = |v: u32| format!("{v} ms");
+    let opt_ms = |v: Option<u32>| v.map_or_else(|| s.d_unknown.to_owned(), ms);
+    let (level, cause) = meter.shown();
+    let level_text = match level {
+        NetLevel::Good => s.d_good.to_owned(),
+        NetLevel::Fair | NetLevel::Poor => {
+            let name = if level == NetLevel::Poor {
+                s.d_poor
+            } else {
+                s.d_fair
+            };
+            cause.map_or_else(
+                || name.to_owned(),
+                |c| format!("{name} · {}", net_texts(c, s).0),
+            )
+        }
+    };
+    let local = vec![
+        (s.d_path, path.to_owned()),
+        (s.d_net, level_text),
+        (s.d_rtt, ms(q.rtt_ms)),
+        (s.d_router, opt_ms(q.router_ms)),
+        (
+            s.d_loss,
+            format!("{:.1}%", f64::from(q.loss_permille) / 10.0),
+        ),
+        (s.d_queue, ms(q.queue_ms)),
+        (s.d_recv, format!("{} kbps", q.recv_kbps)),
+        (s.d_picture, format!("{}×{} · {fps} fps", q.width, q.height)),
+        (
+            s.d_decoder,
+            format!("{} · {} {}", q.decoder, s.d_slowest, ms(q.decode_ms)),
+        ),
+        // 没有按键或点击时没有数，显示“—”（不是“测不出”）
+        (
+            s.d_reaction,
+            q.reaction_ms.map_or_else(|| s.d_none.to_owned(), ms),
+        ),
+        (s.d_fec, q.fec.to_owned()),
+    ];
+    let remote = match &q.host {
+        None => vec![(s.d_remote, s.d_old_peer.to_owned())],
+        Some(h) => {
+            let router =
+                (h.router_ms != peerdesk_core::stats::UNKNOWN).then(|| u32::from(h.router_ms));
+            vec![
+                (
+                    s.d_encoder,
+                    if h.encoder.is_empty() {
+                        s.d_none.to_owned()
+                    } else {
+                        h.encoder.clone()
+                    },
+                ),
+                (s.d_encode, ms(u32::from(h.encode_ms))),
+                (s.d_fps, format!("{} / {}", h.fps, h.fps_cap)),
+                (
+                    s.d_bitrate,
+                    format!("{} / {} kbps", h.sent_kbps, h.target_kbps),
+                ),
+                (s.d_capture, format!("{}×{}", h.width, h.height)),
+                (s.d_fec, format!("{:.1}%", f64::from(h.fec_permille) / 10.0)),
+                (s.d_profile, h.profile.clone()),
+                (s.d_router, opt_ms(router)),
+            ]
+        }
+    };
+    vec![(s.d_local, local), (s.d_remote, remote)]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detail_panel_rows() {
+        use peerdesk_net::controller::LinkQuality;
+        let s = &EN;
+        let meter = NetMeter::default();
+        // 还没有数据
+        let rows = detail_rows(None, &meter, "Direct", 0, s);
+        assert_eq!(rows.len(), 1);
+        // 对方是老版本（没有状态）
+        let q = LinkQuality {
+            rtt_ms: 21,
+            width: 1920,
+            height: 1080,
+            decoder: "软件 OpenH264".into(),
+            fec: "RS",
+            ..LinkQuality::default()
+        };
+        let rows = detail_rows(Some(&q), &meter, "Direct", 30, s);
+        assert_eq!(rows[1].1[0].1, s.d_old_peer);
+        assert!(rows[0]
+            .1
+            .iter()
+            .any(|(k, v)| *k == s.d_picture && v.contains("1920×1080")));
+        assert!(rows[0]
+            .1
+            .iter()
+            .any(|(k, v)| *k == s.d_router && v == s.d_unknown));
+        // 对方发了状态；网络差
+        let mut meter = NetMeter::default();
+        meter.push(&LinkQuality {
+            loss_permille: 80,
+            ..LinkQuality::default()
+        });
+        let q = LinkQuality {
+            router_ms: Some(3),
+            reaction_ms: Some(120),
+            host: Some(peerdesk_core::stats::HostStats {
+                encoder: "硬件 NVIDIA".into(),
+                encode_ms: 4,
+                router_ms: 2,
+                ..peerdesk_core::stats::HostStats::default()
+            }),
+            ..q
+        };
+        let rows = detail_rows(Some(&q), &meter, "Direct", 30, s);
+        let remote = &rows[1].1;
+        assert!(remote
+            .iter()
+            .any(|(k, v)| *k == s.d_encoder && v == "硬件 NVIDIA"));
+        assert!(remote.iter().any(|(k, v)| *k == s.d_router && v == "2 ms"));
+        assert!(rows[0]
+            .1
+            .iter()
+            .any(|(k, v)| *k == s.d_net && v.starts_with(s.d_poor)));
+        assert!(rows[0]
+            .1
+            .iter()
+            .any(|(k, v)| *k == s.d_reaction && v == "120 ms"));
+        // 对方编码器名字还没报上来；网络一般
+        let mut meter = NetMeter::default();
+        meter.push(&LinkQuality {
+            rtt_ms: 150,
+            ..LinkQuality::default()
+        });
+        let q2 = LinkQuality {
+            host: Some(peerdesk_core::stats::HostStats {
+                router_ms: peerdesk_core::stats::UNKNOWN,
+                ..peerdesk_core::stats::HostStats::default()
+            }),
+            ..q
+        };
+        let rows = detail_rows(Some(&q2), &meter, "Relay", 5, s);
+        assert!(rows[1]
+            .1
+            .iter()
+            .any(|(k, v)| *k == s.d_encoder && v == s.d_none));
+        assert!(rows[0]
+            .1
+            .iter()
+            .any(|(k, v)| *k == s.d_net && v.starts_with(s.d_fair)));
+    }
 
     #[test]
     fn network_quality_levels_and_hysteresis() {
@@ -438,12 +608,12 @@ mod tests {
         let lossy = LinkQuality {
             loss_permille: 60,
             rtt_ms: 120,
-            ..good
+            ..good.clone()
         };
         assert_eq!(classify(&lossy), (NetLevel::Poor, Some(NetCause::Loss(60))));
         let far = LinkQuality {
             rtt_ms: 150,
-            ..good
+            ..good.clone()
         };
         assert_eq!(
             classify(&far),
@@ -451,7 +621,7 @@ mod tests {
         );
         let full = LinkQuality {
             queue_ms: 200,
-            ..good
+            ..good.clone()
         };
         assert_eq!(classify(&full).1, Some(NetCause::Bandwidth(200)));
         // 变差立刻显示，变好要连续 5 秒

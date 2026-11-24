@@ -270,6 +270,28 @@ pub async fn gateway_rtt(gw: IpAddr, tries: u32, timeout: Duration) -> Option<Du
     best
 }
 
+/// 每 10 秒测一次本机到路由器的往返时间，写进 `cell`（毫秒；测不出来时是 `u32::MAX`）。
+/// 会话期间在后台跑，“详情”面板显示；会话结束时由调用方取消。
+pub async fn watch_router(cell: std::sync::Arc<std::sync::atomic::AtomicU32>) {
+    loop {
+        let gateways = tokio::task::spawn_blocking(default_gateways)
+            .await
+            .unwrap_or_default();
+        let mut best = None;
+        for gw in gateways {
+            if let Some(rtt) = gateway_rtt(gw, 3, Duration::from_millis(500)).await {
+                best = Some(rtt);
+                break;
+            }
+        }
+        let ms = best.map_or(u32::MAX, |d| {
+            u32::try_from(d.as_millis()).unwrap_or(u32::MAX)
+        });
+        cell.store(ms, std::sync::atomic::Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_secs(10)).await;
+    }
+}
+
 /// 第 `i` 次尝试用的目标端口。
 fn probe_port(i: u32) -> u16 {
     let offset = u16::try_from(i % PROBE_PORT_SPAN).unwrap_or(0);

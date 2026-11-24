@@ -68,7 +68,8 @@ pub(crate) fn session(identity: &Identity, policy: &Policy, auth: Auth) -> Sessi
             .with(Caps::CLIPBOARD)
             .with(Caps::AUDIO)
             .with(Caps::CLIPBOARD_FILES)
-            .with(Caps::FEC_RS),
+            .with(Caps::FEC_RS)
+            .with(Caps::HOST_STATS),
         policy: policy.clone(),
         auth,
         // 由网络层替换成真实连接的通道绑定。

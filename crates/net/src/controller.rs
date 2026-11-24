@@ -65,8 +65,8 @@ pub struct ControllerOptions {
     pub on_quality: Option<QualityHook>,
 }
 
-/// 每秒报告一次的链路质量。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// 每秒报告一次的链路质量和两端的状态（“详情”面板显示）。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct LinkQuality {
     /// 往返时间（毫秒）。
     pub rtt_ms: u32,
@@ -78,6 +78,22 @@ pub struct LinkQuality {
     pub fps: u32,
     /// 这一秒“按键或点击到下一幅画面”的中位数（毫秒）；没有操作时为 `None`。
     pub reaction_ms: Option<u32>,
+    /// 这一秒收到的画面码率（kbps）。
+    pub recv_kbps: u32,
+    /// 这一秒最慢的一次解码（毫秒）。
+    pub decode_ms: u32,
+    /// 显示的画面分辨率。
+    pub width: u16,
+    /// 显示的画面分辨率。
+    pub height: u16,
+    /// 本机到路由器的往返（毫秒）；测不出来时为 `None`。
+    pub router_ms: Option<u32>,
+    /// 本机的解码器。
+    pub decoder: String,
+    /// 纠错方式（"RS" 或 "XOR"）。
+    pub fec: &'static str,
+    /// 被控端最近一次发来的状态（老版本不发）。
+    pub host: Option<peerdesk_core::stats::HostStats>,
 }
 
 /// 链路质量的回调。
@@ -106,6 +122,8 @@ impl std::fmt::Debug for EstablishedHook {
 /// 统计日志的一个窗口：上一次写日志时的累计值，以及这一秒里的帧数和最长间隔。
 #[derive(Debug, Default)]
 struct StatsWindow {
+    /// 这一秒最慢的一次解码（微秒）。
+    decode_us: u64,
     /// 这一秒里“按键或点击之后到下一幅画面”的时间（微秒）：用户感觉到的操作延迟（上限）。
     reactions: Vec<u64>,
     frames: u32,
@@ -171,7 +189,8 @@ pub struct ControllerReport {
 }
 
 /// 解码线程交回的结果：帧号和解出的画面。
-type Decoded = (u32, Result<Option<Screen>, peerdesk_core::Error>);
+/// 解码结果：帧号、画面、解码耗时（微秒）。
+type Decoded = (u32, Result<Option<Screen>, peerdesk_core::Error>, u64);
 
 /// 启动解码线程。解码一帧要好几毫秒到几十毫秒，放在会话循环里会让本地的键鼠输入排队等它。
 /// 任务通道关闭（会话结束）时线程退出。
@@ -186,7 +205,10 @@ fn spawn_decoder(
     std::thread::spawn(move || {
         let mut worker = DecodeWorker::new(decoder);
         while let Ok(job) = job_rx.recv() {
-            if done_tx.send((job.frame_id, worker.decode(&job))).is_err() {
+            let started = std::time::Instant::now();
+            let result = worker.decode(&job);
+            let took = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+            if done_tx.send((job.frame_id, result, took)).is_err() {
                 break;
             }
         }
@@ -314,8 +336,22 @@ pub async fn run(
     } else {
         Box::new(TileDecoder::new())
     };
+    let decoder_name = if caps.common(Caps::H264) == Caps::H264 {
+        "软件 OpenH264".to_owned()
+    } else {
+        "块编码".to_owned()
+    };
+    let fec_name = if caps.has(Caps::FEC_RS) { "RS" } else { "XOR" };
     let mut media = MediaReceiver::detached(link.now(), opts.deadline_us);
     media.set_keyframe_grace(caps.common(Caps::H264) == Caps::H264);
+    // 详情面板：本机到路由器的往返在后台测；被控端的状态和画面尺寸随时更新
+    let router_ms = Arc::new(std::sync::atomic::AtomicU32::new(u32::MAX));
+    let router_task = opts
+        .on_quality
+        .as_ref()
+        .map(|_| tokio::spawn(crate::gateway::watch_router(Arc::clone(&router_ms))));
+    let mut host_stats: Option<peerdesk_core::stats::HostStats> = None;
+    let mut shown_size = (0u16, 0u16);
     media.set_fec(if caps.has(Caps::FEC_RS) {
         peerdesk_core::transport::Fec::Rs
     } else {
@@ -343,7 +379,9 @@ pub async fn run(
             () = &mut time_limit, if !time_up => time_up = true,
             // 解码线程交回一帧：显示。
             done = decoded_rx.recv() => match done {
-                Some((frame_id, Ok(Some(screen)))) => {
+                Some((frame_id, Ok(Some(screen)), took)) => {
+                    window.decode_us = window.decode_us.max(took);
+                    shown_size = (screen.width(), screen.height());
                     media.decode_succeeded();
                     let now = link.now();
                     window.frames = window.frames.saturating_add(1);
@@ -359,8 +397,8 @@ pub async fn run(
                     sink.present(&screen);
                     last_screen = Some(screen);
                 }
-                Some((_, Ok(None))) => {}
-                Some((_, Err(_))) => media.decode_failed(),
+                Some((_, Ok(None), _)) => {}
+                Some((_, Err(_), _)) => media.decode_failed(),
                 None => break "解码线程结束".to_owned(),
             },
             result = async {
@@ -436,7 +474,12 @@ pub async fn run(
                         Ok(ack) => sender.ack(u32::from_be_bytes(ack)),
                         Err(_) => bad_datagrams = bad_datagrams.saturating_add(1),
                     },
-                    Channel::Control | Channel::Cursor | Channel::Clipboard | Channel::File => {
+                    // 被控端每秒的状态（详情面板）
+                    Channel::Control => match peerdesk_core::stats::HostStats::decode(&payload) {
+                        Ok(stats) => host_stats = Some(stats),
+                        Err(_) => bad_datagrams = bad_datagrams.saturating_add(1),
+                    },
+                    Channel::Cursor | Channel::Clipboard | Channel::File => {
                         bad_datagrams = bad_datagrams.saturating_add(1);
                     }
                 },
@@ -489,6 +532,14 @@ pub async fn run(
                         fps: window.frames,
                         reaction_ms: (!window.reactions.is_empty())
                             .then(|| u32::try_from(reaction_summary(&window.reactions).0).unwrap_or(u32::MAX)),
+                        recv_kbps: u32::try_from(stats.video_bytes.saturating_sub(window.bytes) * 8 / 1000).unwrap_or(u32::MAX),
+                        decode_ms: u32::try_from(window.decode_us / 1000).unwrap_or(u32::MAX),
+                        width: shown_size.0,
+                        height: shown_size.1,
+                        router_ms: Some(router_ms.load(std::sync::atomic::Ordering::Relaxed)).filter(|v| *v != u32::MAX),
+                        decoder: decoder_name.clone(),
+                        fec: fec_name,
+                        host: host_stats.clone(),
                     });
                 }
                 window = StatsWindow {
@@ -542,6 +593,9 @@ pub async fn run(
             },
         }
     };
+    if let Some(t) = &router_task {
+        t.abort();
+    }
 
     let bye = session.close(link.now(), &mut tracer);
     let _ = write_control(&mut ctrl_send, &bye).await;

@@ -273,6 +273,8 @@ impl Caps {
     pub const CLIPBOARD_FILES: Caps = Caps(1 << 18);
     /// 视频纠错用 RS 码（老版本只认异或纠错）。
     pub const FEC_RS: Caps = Caps(1 << 19);
+    /// 被控端每秒发状态（编码器、编码耗时等，控制端“详情”面板显示）。
+    pub const HOST_STATS: Caps = Caps(1 << 20);
 
     // 第 24–26 位不是能力，是被控端在 Accept 里告诉控制端自己的系统（见 [`PeerOs`]），
     // 控制端据此把快捷键里的 Ctrl 换成 Cmd 等。老版本只看能力位，会忽略这几位。
@@ -298,7 +300,12 @@ impl Caps {
 
     /// 本版本支持的全部能力。
     pub const ALL: Caps = Caps(
-        Self::H264.0 | Self::CLIPBOARD.0 | Self::AUDIO.0 | Self::CLIPBOARD_FILES.0 | Self::FEC_RS.0,
+        Self::H264.0
+            | Self::CLIPBOARD.0
+            | Self::AUDIO.0
+            | Self::CLIPBOARD_FILES.0
+            | Self::FEC_RS.0
+            | Self::HOST_STATS.0,
     );
 
     /// 并集。

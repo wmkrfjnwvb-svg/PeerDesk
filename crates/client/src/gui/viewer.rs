@@ -17,8 +17,8 @@ use super::coords::fit;
 use super::i18n::Strings;
 use super::input::InputState;
 use super::session::ViewHandle;
-use super::state::{net_texts, route_name, NetLevel, NetMeter, ViewPhase};
-use super::stats::{average_bps, bitrate, millis, FpsMeter};
+use super::state::{detail_rows, net_texts, route_name, NetLevel, NetMeter, ViewPhase};
+use super::stats::FpsMeter;
 
 /// 一次 [`Viewer::show`] 的结果。
 #[derive(Debug, Clone)]
@@ -54,6 +54,8 @@ pub struct Viewer {
     peer_name: String,
     /// 网络状况（工具条上的提示）。
     net: NetMeter,
+    /// 最近一秒的链路质量和对方状态（详情面板）。
+    quality: Option<peerdesk_net::controller::LinkQuality>,
     /// 浮动助手是否展开。
     assistant: bool,
     /// 是否全屏。
@@ -73,7 +75,8 @@ impl Viewer {
             texture: None,
             size: [0, 0],
             input: InputState::new(),
-            overlay: false,
+            // 截图用：PEERDESK_GUI_DETAILS=1 一打开就显示详情面板
+            overlay: std::env::var_os("PEERDESK_GUI_DETAILS").is_some(),
             fps: FpsMeter::default(),
             frames_seen: 0,
             started: Instant::now(),
@@ -82,6 +85,7 @@ impl Viewer {
             peer_os: PeerOs::Unknown,
             peer_name: String::new(),
             net: NetMeter::default(),
+            quality: None,
             assistant: true,
             fullscreen: false,
             original: false,
@@ -119,6 +123,7 @@ impl Viewer {
             }
             if let super::session::ViewEvent::Quality(q) = &event {
                 self.net.push(q);
+                self.quality = Some(q.clone());
             }
             if let super::session::ViewEvent::Peer(os, name) = &event {
                 self.peer_os = *os;
@@ -348,9 +353,7 @@ impl Viewer {
                         Color32::GRAY,
                     );
                 }
-                if self.overlay {
-                    self.paint_stats(painter, avail, now, s);
-                }
+
                 // 重连中：盖一层提示，画面停在最后一帧。
                 if matches!(self.phase, ViewPhase::Reconnecting { .. }) && self.texture.is_some() {
                     let _ = painter.text(
@@ -385,54 +388,49 @@ impl Viewer {
                 });
         }
 
+        // 详情面板：两端的网络、画面、编解码（工具条“详情”按钮或 F12 打开）
+        if self.overlay {
+            let route = route_name(self.phase.route(), s);
+            let path = match self.phase.detail() {
+                "" => route.to_owned(),
+                detail => format!("{route} · {detail}"),
+            };
+            let fps = u32::try_from(self.fps.fps(now)).unwrap_or(u32::MAX);
+            let rows = detail_rows(self.quality.as_ref(), &self.net, &path, fps, s);
+            let p = Palette::of(ctx);
+            let mut open = true;
+            egui::Window::new(s.d_title)
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(Align2::RIGHT_TOP, vec2(-12.0, 64.0))
+                .show(ctx, |ui| {
+                    for (section, items) in rows {
+                        ui.label(RichText::new(section).strong());
+                        egui::Grid::new(section)
+                            .num_columns(2)
+                            .spacing(vec2(18.0, 4.0))
+                            .striped(true)
+                            .show(ui, |ui| {
+                                for (name, value) in items {
+                                    ui.label(RichText::new(name).color(p.muted));
+                                    ui.label(value);
+                                    ui.end_row();
+                                }
+                            });
+                        ui.add_space(8.0);
+                    }
+                });
+            if !open {
+                self.overlay = false;
+            }
+        }
         self.forward_input(ctx, picture);
         if ctx.input(|i| i.viewport().close_requested()) {
             self.stop();
             outcome.open = false;
         }
         outcome
-    }
-
-    fn paint_stats(&mut self, painter: &egui::Painter, avail: Rect, now: Duration, s: &Strings) {
-        let (rtt, rate) = match &self.phase {
-            ViewPhase::Ended {
-                summary: Some(summary),
-                ..
-            } => (
-                summary
-                    .rtt
-                    .map_or_else(|| s.not_available.to_owned(), millis),
-                bitrate(average_bps(summary.video_bytes, summary.elapsed)),
-            ),
-            ViewPhase::Connecting
-            | ViewPhase::Connected { .. }
-            | ViewPhase::Reconnecting { .. }
-            | ViewPhase::Ended { .. } => (
-                s.live_stats_pending.to_owned(),
-                s.live_stats_pending.to_owned(),
-            ),
-        };
-        let lines = [
-            format!("{}: {}", s.fps, self.fps.fps(now)),
-            format!("{}: {rate}", s.bitrate),
-            format!("{}: {rtt}", s.rtt),
-            format!("{}: {}", s.latency, s.not_available),
-            format!(
-                "{}: {}",
-                s.path,
-                match self.phase.detail() {
-                    "" => route_name(self.phase.route(), s),
-                    detail => detail,
-                }
-            ),
-            format!("{}: {}×{}", s.resolution, self.size[0], self.size[1]),
-        ];
-        let text = lines.join("\n");
-        let at = avail.min + vec2(8.0, 8.0);
-        let galley = painter.layout_no_wrap(text, FontId::monospace(13.0), Color32::WHITE);
-        let bg = Rect::from_min_size(at, galley.size()).expand(6.0);
-        painter.rect_filled(bg, 4.0, Color32::from_black_alpha(170));
-        painter.galley(at, galley, Color32::WHITE);
     }
 
     fn forward_input(&mut self, ctx: &egui::Context, picture: Option<Rect>) {

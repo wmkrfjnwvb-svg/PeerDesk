@@ -46,6 +46,7 @@ pub mod screen;
 pub mod session;
 pub mod signal;
 pub mod sim;
+pub mod stats;
 pub mod time;
 pub mod trace;
 pub mod transport;

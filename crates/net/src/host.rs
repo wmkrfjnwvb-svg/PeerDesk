@@ -209,6 +209,7 @@ type EncodeDone = (
 /// 任务通道关闭（会话结束）时线程退出。
 fn spawn_encoder(
     mut encoder: Box<dyn VideoEncoder>,
+    backend: Arc<Mutex<String>>,
 ) -> (
     std::sync::mpsc::Sender<EncodeJob>,
     mpsc::UnboundedReceiver<EncodeDone>,
@@ -220,6 +221,13 @@ fn spawn_encoder(
             let started = std::time::Instant::now();
             let result = encode_job(encoder.as_mut(), &job, &screen, changed);
             let took = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+            // 编码器可能中途从硬件换成软件：每帧记下现在用的是哪个
+            let name = encoder.backend();
+            if let Ok(mut b) = backend.lock() {
+                if *b != name {
+                    *b = name;
+                }
+            }
             if done_tx.send((job, result, took)).is_err() {
                 break;
             }
@@ -336,7 +344,14 @@ pub async fn serve(
         Box::new(TileEncoder::new())
     };
     let codec = encoder.codec();
-    let (jobs, encoded_rx) = spawn_encoder(encoder);
+    let backend = Arc::new(Mutex::new(String::new()));
+    let (jobs, encoded_rx) = spawn_encoder(encoder, Arc::clone(&backend));
+    // 详情面板：对方支持时每秒发一次本机状态；本机到路由器的往返在后台测
+    let send_stats = caps.has(Caps::HOST_STATS);
+    let router_ms = Arc::new(std::sync::atomic::AtomicU32::new(u32::MAX));
+    let router_task =
+        send_stats.then(|| tokio::spawn(crate::gateway::watch_router(Arc::clone(&router_ms))));
+    let mut screen_size = (0u16, 0u16);
     let mut media = MediaSender::detached(
         SenderConfig {
             fps: opts.fps,
@@ -527,6 +542,24 @@ pub async fn serve(
                     media.fec_permille(),
                     media.profile_name(),
                 );
+                if send_stats {
+                    let stats = peerdesk_core::stats::HostStats {
+                        encoder: backend.lock().map(|b| b.clone()).unwrap_or_default(),
+                        width: screen_size.0,
+                        height: screen_size.1,
+                        fps: u16::try_from(now.frames.saturating_sub(last_stats.frames)).unwrap_or(u16::MAX),
+                        fps_cap: u16::try_from(media.fps()).unwrap_or(u16::MAX),
+                        encode_ms: u16::try_from(last_encode_us / 1000).unwrap_or(u16::MAX),
+                        target_kbps: u32::try_from(media.rate_bps() / 1000).unwrap_or(u32::MAX),
+                        sent_kbps: u32::try_from(now.video_bytes.saturating_sub(last_stats.video_bytes) * 8 / 1000).unwrap_or(u32::MAX),
+                        fec_permille: media.fec_permille(),
+                        profile: media.profile_name().to_owned(),
+                        router_ms: u16::try_from(router_ms.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(peerdesk_core::stats::UNKNOWN),
+                    };
+                    if let Ok(bytes) = stats.encode() {
+                        let _ = link.send(Channel::Control, &bytes);
+                    }
+                }
                 last_stats = now;
             }
             _ = ticker.tick() => {
@@ -541,6 +574,7 @@ pub async fn serve(
                     out.unwrap_or_default().iter().for_each(|o| drop(link.send_flags(Channel::Video, o.flags, &o.body)));
                     break "画面来源结束".to_owned();
                 };
+                screen_size = (screen.width(), screen.height());
                 let changed = match seq {
                     Some(seq) => last_seq.replace(seq) != Some(seq),
                     None => {
@@ -575,6 +609,9 @@ pub async fn serve(
     let _ = ctrl_send.finish();
 
     let _ = stop_clip.send(true);
+    if let Some(t) = &router_task {
+        t.abort();
+    }
     let mut files = Vec::new();
     for task in file_tasks {
         if let Ok(Ok(Ok(results))) = tokio::time::timeout(FILE_DRAIN_TIMEOUT, task).await {

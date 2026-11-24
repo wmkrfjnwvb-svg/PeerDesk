@@ -198,7 +198,7 @@ impl H264Encoder {
 
     /// 现在用的是哪个编码器（日志、统计用）。
     #[must_use]
-    pub fn backend(&self) -> String {
+    pub fn backend_name(&self) -> String {
         self.hw.as_ref().map_or_else(
             || "软件 OpenH264".to_owned(),
             |e| format!("硬件 {}", e.name()),
@@ -457,6 +457,10 @@ impl VideoEncoder for H264Encoder {
     fn wants_refine(&self) -> bool {
         self.force_key || self.refine_left > 0
     }
+
+    fn backend(&self) -> String {
+        self.backend_name()
+    }
 }
 
 /// H.264 解码器（OpenH264）。
@@ -646,7 +650,7 @@ mod tests {
         let mut enc = H264Encoder::new(30).with_hardware(fake_ok);
         let first = enc.encode(1, &screen, true, 5000).unwrap().unwrap();
         assert!(first.key);
-        assert_eq!(enc.backend(), "硬件 假硬件");
+        assert_eq!(enc.backend_name(), "硬件 假硬件");
         let mut quiet = false;
         for id in 2..80 {
             if enc.encode(id, &screen, false, 5000).unwrap().is_none() {
@@ -670,12 +674,12 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(f.key, "换成软件编码要从关键帧开始");
-        assert_eq!(enc.backend(), "软件 OpenH264");
+        assert_eq!(enc.backend_name(), "软件 OpenH264");
         decode(&mut dec, &f).unwrap();
         // 打不开：直接用软件
         let mut enc = H264Encoder::new(30).with_hardware(fake_none);
         assert!(enc.encode(1, &screen, true, 5000).unwrap().unwrap().key);
-        assert_eq!(enc.backend(), "软件 OpenH264");
+        assert_eq!(enc.backend_name(), "软件 OpenH264");
         // 这个系统的硬件编码入口：Linux 上没有
         assert!(open_system_hardware(64, 64, 30, 1_000_000).is_err());
         assert!(hardware_disabled(Some(std::ffi::OsStr::new("0"))));
