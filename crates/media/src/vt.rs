@@ -320,24 +320,23 @@ impl VtOptions {
         complete_each_frame: false,
         baseline: true,
         max_frame_delay: Some(0),
-        low_latency: false,
+        low_latency: true,
         pipelined: false,
     };
 
     /// `hw-check` 对比的几种设置：（名称, 设置）。
     pub const VARIANTS: [(&'static str, Self); 5] = [
-        ("攒 0 帧（MaxFrameDelayCount=0，新的默认）", Self::DEFAULT),
+        ("低延迟码控 + 攒 0 帧 + Baseline（默认）", Self::DEFAULT),
         (
-            "低延迟码控 + 攒 0 帧",
+            "不开低延迟码控、攒 0 帧",
             Self {
-                low_latency: true,
+                low_latency: false,
                 ..Self::DEFAULT
             },
         ),
         (
             "低延迟码控、不限 Baseline",
             Self {
-                low_latency: true,
                 baseline: false,
                 ..Self::DEFAULT
             },
@@ -346,6 +345,7 @@ impl VtOptions {
             "流水线：不等也不强制（量编码器攒几帧）",
             Self {
                 max_frame_delay: None,
+                low_latency: false,
                 pipelined: true,
                 ..Self::DEFAULT
             },
@@ -354,6 +354,7 @@ impl VtOptions {
             "旧做法：每帧强制交出",
             Self {
                 max_frame_delay: None,
+                low_latency: false,
                 complete_each_frame: true,
                 ..Self::DEFAULT
             },
@@ -532,7 +533,21 @@ unsafe fn read_sample(sample: CFTypeRef) -> Result<(Vec<u8>, bool), String> {
 impl VtEncoder {
     /// 按 `width`×`height`、`fps`、`bps` 打开硬件编码会话。没有硬件编码器时返回原因。
     pub fn open(width: u32, height: u32, fps: u32, bps: u64) -> Result<Self, String> {
-        Self::open_with(width, height, fps, bps, VtOptions::DEFAULT)
+        // 低延迟码控要 macOS 11.3+、并且编码器支持；打不开时退回普通模式
+        // （Intel Mac 上普通模式每帧都是关键帧，由 H264Encoder 的兜底改用软件编码）
+        Self::open_with(width, height, fps, bps, VtOptions::DEFAULT).or_else(|why| {
+            log::info!("视频编码：低延迟码控打不开（{why}），用普通模式");
+            Self::open_with(
+                width,
+                height,
+                fps,
+                bps,
+                VtOptions {
+                    low_latency: false,
+                    ..VtOptions::DEFAULT
+                },
+            )
+        })
     }
 
     /// 按指定的设置打开（`peerdesk hw-check` 用它对比几种设置）。
