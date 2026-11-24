@@ -598,6 +598,8 @@ pub async fn serve(
                     }
                 };
                 pending_change |= changed;
+                // 每一轮都检查迟迟没有确认的帧（不能只在编帧时查：关键帧没确认时根本不编帧）
+                media.expire_unacked(link.now());
                 // 在途数据超过上限：这一帧不编，变化攒着，等确认之后编最新的画面。
                 if encoding || pacer.busy(peerdesk_core::pacer::rate_for(pacing, media.rate_bps()), 1_000_000 / u64::from(opts.fps.max(1))) || media.in_flight_full(link.now()) || !media.due(link.now()) || (!pending_change && !media.wants_frame()) {
                     continue;

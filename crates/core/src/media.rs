@@ -419,8 +419,24 @@ impl MediaSender {
                 self.resent.retain(|(frame, _), _| *frame != id);
             }
         }
-        // 迟迟等不到反馈的帧按丢失处理。时限里加上这一帧按接收端实际收的速度传完要多久：
-        // 窄带宽上一个大关键帧要传一两秒，按固定时限判丢会重发新的关键帧，越堵越多，画面始终出不来。
+        self.expire_unacked(now);
+        let (lost, feedback) = std::mem::take(&mut self.notes);
+        FrameJob {
+            frame_id: self.last_frame.wrapping_add(1).max(1),
+            budget: self.frame_budget(),
+            lost,
+            feedback,
+        }
+    }
+
+    /// 迟迟等不到反馈的帧按丢失处理。会话循环每一轮都要调用（不能只在编下一帧时检查）：
+    /// 关键帧没确认时 [`Self::in_flight_full`] 不让编新帧，如果只在编帧时判丢，
+    /// 关键帧丢了一个包而接收端又发现不了（例如丢的是最后一片），就永远等下去，画面一直是黑的。
+    ///
+    /// 时限里加上这一帧按接收端实际收的速度传完要多久：
+    /// 窄带宽上一个大关键帧要传一两秒，按固定时限判丢会重发新的关键帧，越堵越多，画面始终出不来。
+    pub fn expire_unacked(&mut self, now: Time) {
+        let rtt_us = self.rtt_us;
         let ack_timeout = self
             .cfg
             .deadline_us
@@ -439,13 +455,6 @@ impl MediaSender {
             }
             self.unacked.pop_front();
             self.lost(id);
-        }
-        let (lost, feedback) = std::mem::take(&mut self.notes);
-        FrameJob {
-            frame_id: self.last_frame.wrapping_add(1).max(1),
-            budget: self.frame_budget(),
-            lost,
-            feedback,
         }
     }
 
@@ -1379,6 +1388,31 @@ mod tests {
             .unwrap()
             .is_empty());
         assert!(tx.on_feedback_datagram(Time(400_200), &[1]).is_err());
+    }
+
+    /// 关键帧发出后一直没有反馈（丢了一片，接收端发现不了）：会话循环判它丢失，
+    /// 之后允许编新帧、并且要编（恢复），而不是一直等那个关键帧。
+    #[test]
+    fn unacked_keyframe_is_expired_even_when_nothing_new_is_encoded() {
+        let mut remote = MediaSender::detached(cfg(), Codec::H264);
+        let mut encoder = FakeEncoder::default();
+        let screen = Screen::new(16, 16, 1);
+        let job = remote.start_frame(Time::ZERO, 50_000);
+        let (encoded, refine) = encode_job(&mut encoder, &job, &screen, true).unwrap();
+        assert!(!remote
+            .finish_frame(Time::ZERO, &job, encoded, refine)
+            .unwrap()
+            .is_empty());
+        // 关键帧没确认：不编新帧
+        assert!(remote.in_flight_full(Time(10_000)));
+        // 画面静止，不再调用 start_frame；会话循环照常检查
+        remote.expire_unacked(Time(100_000));
+        assert!(remote.in_flight_full(Time(100_000)), "还没到时限");
+        remote.expire_unacked(Time(5_000_000));
+        assert!(!remote.in_flight_full(Time(5_000_000)), "判丢之后不再挡着");
+        assert!(remote.wants_frame(), "要重新编关键帧");
+        let job = remote.start_frame(Time(5_000_000), 50_000);
+        assert_eq!(job.lost.len(), 1);
     }
 
     #[test]

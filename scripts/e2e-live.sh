@@ -101,14 +101,18 @@ run_case loopback
 start_flood
 run_flood loopback bbr legacy
 kill "$FLOOD" 2>/dev/null || true
-if command -v tc >/dev/null && sudo -n tc qdisc add dev lo root netem delay 25ms 5ms loss 2% 2>/dev/null; then
+# 延迟和丢包可以用环境变量改（例如 LIVE_LOSS=10 复现丢包恢复的问题）
+LIVE_DELAY=${LIVE_DELAY:-25}
+LIVE_LOSS=${LIVE_LOSS:-2}
+CASE="delay${LIVE_DELAY}ms-loss${LIVE_LOSS}%"
+if command -v tc >/dev/null && sudo -n tc qdisc add dev lo root netem delay "${LIVE_DELAY}ms" 5ms loss "${LIVE_LOSS}%" 2>/dev/null; then
   NETEM=1
-  run_case "delay25ms-loss2%"
+  run_case "$CASE"
   start_flood
   # 原来（cubic + legacy）、现在的产品默认（bbr + legacy）、候选（bbr + v1）
-  run_flood "delay25ms-loss2%" cubic legacy
-  run_flood "delay25ms-loss2%" bbr legacy
-  run_flood "delay25ms-loss2%" bbr v1
+  run_flood "$CASE" cubic legacy
+  run_flood "$CASE" bbr legacy
+  run_flood "$CASE" bbr v1
   kill "$FLOOD" 2>/dev/null || true
   sudo tc qdisc del dev lo root; NETEM=
 else

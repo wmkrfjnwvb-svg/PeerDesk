@@ -1493,10 +1493,10 @@ mod tests {
         // 同一个端口马上重开：Windows 上刚关的端口要过一会儿才放出来
         let b = (0..50)
             .find_map(|_| {
-                TestServer::start(&b_id, b_addr).ok().or_else(|| {
-                    std::thread::sleep(Duration::from_millis(100));
-                    None
-                })
+                let started = TestServer::start(&b_id, b_addr);
+                // 失败时等 100 ms 再试，成功时不等
+                std::thread::sleep(Duration::from_millis(100 * u64::from(started.is_err())));
+                started.ok()
             })
             .unwrap();
         let host_rt = runtime().unwrap();

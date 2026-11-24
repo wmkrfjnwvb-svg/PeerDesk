@@ -429,10 +429,8 @@ impl H264Encoder {
                     0
                 };
                 if self.unasked_keys >= UNASKED_KEY_LIMIT {
-                    log::warn!(
-                        "硬件编码器 {} 连续 {UNASKED_KEY_LIMIT} 帧都是没要求的关键帧，改用软件编码（OpenH264）",
-                        self.backend_name()
-                    );
+                    let name = self.backend_name();
+                    log::warn!("硬件编码器 {name} 连续 {UNASKED_KEY_LIMIT} 帧都是没要求的关键帧，改用软件编码");
                     self.hw = None;
                     self.hw_off = true;
                     self.force_key = true;
