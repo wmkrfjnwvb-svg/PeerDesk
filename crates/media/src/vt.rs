@@ -320,7 +320,12 @@ impl VtOptions {
     /// 普通模式每帧都是关键帧、打开后 1/30 关键帧、10 ms/帧；而 Apple 芯片的 CI 上打开后
     /// Mac 控制 Mac 一帧都出不来（原因还没定位），普通模式一直正常。通用包按架构分别编译，自动区分。
     pub const DEFAULT: Self = Self {
-        max_key_interval: Some(7200),
+        // Apple 芯片保持最后一次 CI 通过时的值
+        max_key_interval: if cfg!(target_arch = "x86_64") {
+            Some(7200)
+        } else {
+            Some(i32::MAX)
+        },
         complete_each_frame: false,
         baseline: true,
         max_frame_delay: if cfg!(target_arch = "x86_64") {
@@ -467,7 +472,12 @@ pub fn probe(
 }
 
 /// 等编码输出回调最多这么久。
-const OUTPUT_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
+// Apple 芯片（CI 虚拟机编码慢）保持最后一次 CI 通过时的 300 ms
+const OUTPUT_WAIT: std::time::Duration = if cfg!(target_arch = "x86_64") {
+    std::time::Duration::from_millis(100)
+} else {
+    std::time::Duration::from_millis(300)
+};
 
 /// 编码输出回调：取出码流（AVCC → Annex B），判断是否关键帧，放进 `refcon` 指向的槽。
 unsafe extern "C" fn on_encoded(

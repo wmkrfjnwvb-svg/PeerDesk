@@ -103,6 +103,8 @@ fn session_through_server(tag: &str, extra: &[&str]) -> (String, String) {
         .args(["--server", &addr, "--server-pin", &server_pin])
         .arg("--data-dir")
         .arg(&host_dir)
+        // 日志也写到这个目录（失败时附上，看被控端编码器的情况）
+        .env("PEERDESK_DATA_DIR", &host_dir)
         .stdout(Stdio::piped())
         .spawn()
         .unwrap();
@@ -132,9 +134,19 @@ fn session_through_server(tag: &str, extra: &[&str]) -> (String, String) {
         .args(extra)
         .arg("--data-dir")
         .arg(&ctrl_dir)
+        .env("PEERDESK_DATA_DIR", &ctrl_dir)
         .output()
         .unwrap();
     let text = String::from_utf8(out.stdout).unwrap();
+    // 失败时附上两边的日志（编码器、关键帧、解码器）
+    let logs = |dir: &std::path::Path| {
+        std::fs::read_to_string(dir.join("logs").join("peerdesk.log")).unwrap_or_default()
+    };
+    let text = format!(
+        "{text}\n--- 被控端日志\n{}\n--- 控制端日志\n{}",
+        logs(&host_dir),
+        logs(&ctrl_dir)
+    );
     assert!(out.status.success(), "{text}");
     assert!(text.contains(&format!("对端指纹 {host_pin}")), "{text}");
     assert!(text.contains("画面尺寸      1280×720"), "{text}");
