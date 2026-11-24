@@ -9,7 +9,7 @@ use super::assistant::{os_label, Shortcut};
 use super::theme::{icon, icon_button, pill, Palette};
 
 use eframe::egui::{
-    self, pos2, vec2, Align2, Color32, FontId, Frame, Rect, RichText, TextureHandle,
+    self, pos2, vec2, Align2, Color32, FontId, Frame, Pos2, Rect, RichText, TextureHandle,
     TextureOptions, ViewportBuilder, ViewportId,
 };
 
@@ -58,6 +58,8 @@ pub struct Viewer {
     quality: Option<peerdesk_net::controller::LinkQuality>,
     /// 浮动助手是否展开。
     assistant: bool,
+    /// 助手的位置（顶边中点）；没拖过时在画面顶部居中。
+    assistant_at: Option<Pos2>,
     /// 是否全屏。
     fullscreen: bool,
     /// 按原始大小显示（最清楚）；默认放大铺满窗口。
@@ -87,6 +89,7 @@ impl Viewer {
             net: NetMeter::default(),
             quality: None,
             assistant: true,
+            assistant_at: None,
             fullscreen: false,
             original: false,
         }
@@ -158,13 +161,19 @@ impl Viewer {
         let live = matches!(self.phase, ViewPhase::Connected { .. });
         // 远程画面上的悬浮工具条（助手）：快捷键、声音、全屏、统计、断开。默认在顶部居中，
         // 按住空白处或左边的把手可以拖到任何位置；收起后是一个小图标，也能拖。
+        // 位置自己记：按住左边的把手拖（egui 的可拖动区域会被按钮、文字盖住，拖不动）
+        let screen = ctx.screen_rect();
+        let at = self
+            .assistant_at
+            .unwrap_or_else(|| screen.center_top() + vec2(0.0, 8.0));
         egui::Area::new(egui::Id::new(("assistant", self.id)))
             .pivot(Align2::CENTER_TOP)
-            .default_pos(ctx.screen_rect().center_top() + vec2(0.0, 8.0))
-            .movable(true)
+            .current_pos(at)
             .constrain(true)
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
+                // 工具条上的字不能被选中（选字会吃掉拖动）
+                ui.style_mut().interaction.selectable_labels = false;
                 let frame = Frame::new()
                     .fill(p.card.gamma_multiply(0.96))
                     .stroke(egui::Stroke::new(1.0_f32, p.border))
@@ -179,13 +188,27 @@ impl Viewer {
                 frame.show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 4.0;
-                        // 拖动把手（标签不吃点击，按住它拖的是整个助手）
-                        ui.label(
-                            RichText::new(icon::DOTS_SIX_VERTICAL)
-                                .size(16.0)
-                                .color(p.muted),
-                        )
-                        .on_hover_cursor(egui::CursorIcon::Grab);
+                        // 拖动把手：按住拖整个助手（收起时也能拖）
+                        let grip = ui
+                            .add(
+                                egui::Label::new(
+                                    RichText::new(icon::DOTS_SIX_VERTICAL)
+                                        .size(18.0)
+                                        .color(p.muted),
+                                )
+                                .selectable(false)
+                                .sense(egui::Sense::drag()),
+                            )
+                            .on_hover_cursor(egui::CursorIcon::Grab);
+                        if grip.dragged() {
+                            ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+                            let moved = at + grip.drag_delta();
+                            // 不拖出窗口：顶边中点留在画面里
+                            self.assistant_at = Some(pos2(
+                                moved.x.clamp(screen.left() + 40.0, screen.right() - 40.0),
+                                moved.y.clamp(screen.top(), screen.bottom() - 40.0),
+                            ));
+                        }
                         if !self.assistant {
                             let open = egui::Button::new(
                                 RichText::new(format!("{}  {}", icon::MONITOR, icon::CARET_DOWN))
@@ -455,7 +478,7 @@ impl Viewer {
             ctx.input(|i| (i.events.clone(), i.modifiers, i.pointer.latest_pos()));
         // 指针在助手、菜单、详情窗口上时，移动、按下和滚轮是给它们的，不能再发给远程
         // （否则点助手的按钮，助手下面的远程画面也被点了）。抬起照常发，远程不会卡在按下状态。
-        let over_ui = |pos: egui::Pos2| {
+        let over_ui = |pos: Pos2| {
             ctx.layer_id_at(pos)
                 .is_some_and(|layer| layer.order != egui::Order::Background)
         };

@@ -698,3 +698,43 @@ mod tests {
         assert_eq!(s.release_all(), Some(InputEvent::ReleaseAll));
     }
 }
+
+/// 观看窗口靠 `layer_id_at` 判断指针在不在助手、菜单上（在就不把移动和按下发给远程）。
+/// 这里确认它的行为：画面在 Background 层，助手在 Foreground 层，第二帧起认得出。
+#[cfg(test)]
+mod layer_probe {
+    #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
+    use eframe::egui;
+
+    #[test]
+    fn toolbar_is_found_above_the_picture() {
+        let ctx = egui::Context::default();
+        let mut found = Vec::new();
+        for _ in 0..3 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 600.0),
+                )),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.label("picture");
+                });
+                egui::Area::new(egui::Id::new("toolbar"))
+                    .fixed_pos(egui::pos2(300.0, 8.0))
+                    .order(egui::Order::Foreground)
+                    .show(ctx, |ui| {
+                        let _ = ui.button("button in toolbar");
+                    });
+                found.push((
+                    ctx.layer_id_at(egui::pos2(310.0, 15.0)).map(|l| l.order),
+                    ctx.layer_id_at(egui::pos2(100.0, 300.0)).map(|l| l.order),
+                ));
+            });
+        }
+        assert_eq!(found[2].0, Some(egui::Order::Foreground));
+        assert_eq!(found[2].1, Some(egui::Order::Background));
+    }
+}
