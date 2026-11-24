@@ -57,7 +57,7 @@
 | 硬件编码器拿到所在显卡的 D3D11 设备（按 LUID 找卡），打开时试编一帧，不行再不给设备试 | ✅ | `media/mf.rs` | AMD 的编码器要设备才打得开；双显卡笔记本选对卡 |
 | 硬件解码：Windows（系统 H.264 解码器，有显卡走 DXVA，否则 CPU 并如实标注） | ✅ | `media/mf.rs`、`media/color.rs` | NV12 → RGB 整数转换，裁掉 16 对齐的行 |
 | 编码耗时拆开：颜色转换 / 编码器本身，统计行按秒平均 | ✅ | `media/lib.rs`、`net/host.rs` | 真机测试用它定位瓶颈 |
-| 硬件编解码：macOS VideoToolbox | ✅ | `media/vt.rs`、`media/annexb.rs` | 低延迟码控 + 每收一帧交一帧（MaxFrameDelayCount=0）+ Baseline；老系统退回普通模式 |
+| 硬件编解码：macOS VideoToolbox | ✅ | `media/vt.rs`、`media/annexb.rs` | 和 WebRTC 一样异步：交帧不等、回调取帧、每帧从缓冲池拿像素缓冲、不每帧 CompleteFrames；关键帧间隔 7200 帧/240 秒、码率上限 1.5 倍；加开低延迟码控（打不开退回普通模式）。之前同步等结果是每帧关键帧的根因 |
 | 硬件编码器连续出没要求的关键帧时改用软件编码 | ✅ | `media/lib.rs` | 兜底：连续 5 帧 |
 | 编码器体检 `peerdesk hw-check` | ✅ | `client/hwcheck.rs` | 用户机器上对比各种设置。Intel Mac 实测：普通模式每帧关键帧、110–310 ms；低延迟码控 1/30 关键帧、10 ms |
 | 硬件编码：Linux VA-API | ⬜ | | |

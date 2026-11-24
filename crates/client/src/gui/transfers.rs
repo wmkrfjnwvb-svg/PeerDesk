@@ -751,6 +751,8 @@ mod tests {
         assert_eq!(state(&q, big), State::Cancelled);
         assert!(!runner.busy());
         assert!(format!("{runner:?}").contains("Runner"));
+        let hook = peerdesk_net::controller::LinkHook(Arc::new(|_| {}));
+        assert_eq!(format!("{hook:?}"), "LinkHook");
         // 浏览请求在后台做，结果从通道取
         let rx = runner.request(
             &link,

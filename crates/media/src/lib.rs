@@ -60,7 +60,7 @@ fn report_with(
     for (i, nv12) in frames.iter().enumerate() {
         let started = std::time::Instant::now();
         let (data, key) = match enc.encode(nv12, 4_000_000, i == 0) {
-            Ok(done) => done,
+            Ok(done) => done.unwrap_or_default(),
             Err(why) => return vec![format!("{name}：第 {i} 帧编码失败：{why}")],
         };
         total += started.elapsed().as_micros();
@@ -155,8 +155,14 @@ impl HardwareEncoder for vt::VtEncoder {
         nv12: &[u8],
         bps: u64,
         force_key: bool,
-    ) -> Result<(Vec<u8>, bool), String> {
+    ) -> Result<Option<(Vec<u8>, bool)>, String> {
         vt::VtEncoder::encode(self, nv12, bps, force_key)
+    }
+    fn poll(&mut self) -> Result<Option<(Vec<u8>, bool)>, String> {
+        vt::VtEncoder::poll(self)
+    }
+    fn drain(&mut self) -> Result<(), String> {
+        vt::VtEncoder::complete(self)
     }
 }
 
@@ -260,14 +266,6 @@ impl VideoDecoder for AutoH264Decoder {
     fn decode(&mut self, header: &FrameHeader, data: &[u8]) -> Result<Option<&Screen>, Error> {
         if let Some(hw) = self.hw.as_mut() {
             match hw.decode(data) {
-                // 关键帧一定要出画面：硬件解码器收了关键帧却不出（Mac CI 上 VideoToolbox 解
-                // 低延迟码控编出的码流就是这样，画面一直出不来），当作硬件解码不能用，改用软件
-                Ok(None) if header.key => {
-                    let name = hw.name().to_owned();
-                    log::warn!("硬件解码器 {name} 收到关键帧没出画面，改用软件解码");
-                    self.hw = None;
-                    self.screen = None;
-                }
                 Ok(None) => return Ok(None),
                 Ok(Some((w, h, pixels))) => {
                     let (hw_w, hh) = (usize::from(header.width), usize::from(header.height));
@@ -319,12 +317,34 @@ pub trait HardwareEncoder: Send + std::fmt::Debug {
     fn name(&self) -> &str;
     /// 打开时的尺寸。
     fn size(&self) -> (u32, u32);
-    /// 编一帧。返回码流和是否关键帧。
+    /// 交一帧，取回一个编好的帧（码流和是否关键帧）。异步的编码器（VideoToolbox）可能攒着帧：
+    /// 取回的可以是之前交的帧；还没编好时为 `None`，之后用 [`Self::poll`] 取。
+    /// 码流为空表示编码器丢了这一帧。
     ///
     /// # Errors
-    /// 编码器出错或超时：调用方改用软件编码。
-    fn encode(&mut self, nv12: &[u8], bps: u64, force_key: bool)
-        -> Result<(Vec<u8>, bool), String>;
+    /// 编码器出错：调用方改用软件编码。
+    fn encode(
+        &mut self,
+        nv12: &[u8],
+        bps: u64,
+        force_key: bool,
+    ) -> Result<Option<(Vec<u8>, bool)>, String>;
+
+    /// 取走一个之前交的、现在编好了的帧（同步的编码器没有，总是 `None`）。
+    ///
+    /// # Errors
+    /// 编码器出错。
+    fn poll(&mut self) -> Result<Option<(Vec<u8>, bool)>, String> {
+        Ok(None)
+    }
+
+    /// 画面停下后让编码器交出攒着的帧，之后用 [`Self::poll`] 取。
+    ///
+    /// # Errors
+    /// 编码器出错。
+    fn drain(&mut self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 #[cfg(windows)]
@@ -340,8 +360,9 @@ impl HardwareEncoder for mf::MfEncoder {
         nv12: &[u8],
         bps: u64,
         force_key: bool,
-    ) -> Result<(Vec<u8>, bool), String> {
-        mf::MfEncoder::encode(self, nv12, bps, force_key)
+    ) -> Result<Option<(Vec<u8>, bool)>, String> {
+        // Media Foundation 这边是一帧一帧等结果的（同步）
+        mf::MfEncoder::encode(self, nv12, bps, force_key).map(Some)
     }
 }
 
@@ -408,6 +429,18 @@ pub struct H264Encoder {
     convert_us: u64,
     /// 硬件编码器连续出了几个没要求的关键帧。
     unasked_keys: u32,
+    /// 交给硬件编码器、还没取回的帧：每帧是否要求了关键帧（按顺序；异步编码器会攒帧）。
+    hw_sent: std::collections::VecDeque<bool>,
+}
+
+/// 硬件编码这一步的结果。
+enum Hw {
+    /// 不用硬件（没有、打不开或刚出错）：用软件编。
+    Off,
+    /// 交给硬件了，还没有编好的帧。
+    Pending,
+    /// 取回一个编好的帧：码流（空表示编码器丢了这一帧）、是否关键帧、是否刚打开。
+    Frame(Vec<u8>, bool, bool),
 }
 
 /// 硬件编码器连续这么多帧给出没要求的关键帧，就认为它不能用。
@@ -450,6 +483,7 @@ impl H264Encoder {
             encoded_size: None,
             convert_us: 0,
             unasked_keys: 0,
+            hw_sent: std::collections::VecDeque::new(),
         }
     }
 
@@ -469,15 +503,48 @@ impl H264Encoder {
         )
     }
 
-    /// 试着用硬件编一帧。返回 `None` 表示没有硬件编码器（或刚失败）、要用软件编。
-    fn encode_hardware(&mut self, w: usize, h: usize, bps: u64) -> Option<(Vec<u8>, bool, bool)> {
+    /// 硬件出错：之后一直用软件编码（从关键帧开始）。
+    fn hardware_failed(&mut self, why: &str) {
+        log::warn!("硬件编码失败，改用软件编码（OpenH264）：{why}");
+        self.hw = None;
+        self.hw_off = true;
+        self.hw_sent.clear();
+        self.force_key = true;
+    }
+
+    /// 取回了一个硬件编好的帧：对上它交的时候是否要求了关键帧，检查“没要求却是关键帧”。
+    fn hardware_output(&mut self, data: Vec<u8>, key: bool, fresh: bool) -> Hw {
+        let asked = self.hw_sent.pop_front().unwrap_or(true);
+        // 没要求却一直出关键帧：每帧都是整幅画面（几百 KB），码率和帧率都垮掉，画面忽糊忽清。
+        // 这是用法或编码器的问题，记日志说明，改用软件编码（这一帧本身是完整的关键帧，照常发出）。
+        self.unasked_keys = if key && !asked {
+            self.unasked_keys + 1
+        } else {
+            0
+        };
+        if self.unasked_keys >= UNASKED_KEY_LIMIT {
+            let name = self.backend_name();
+            log::warn!(
+                "硬件编码器 {name} 连续 {UNASKED_KEY_LIMIT} 帧都是没要求的关键帧，改用软件编码"
+            );
+            self.hw = None;
+            self.hw_off = true;
+            self.hw_sent.clear();
+            self.force_key = true;
+        }
+        Hw::Frame(data, key, fresh)
+    }
+
+    /// 试着用硬件编一帧（交给编码器，取回一个编好的帧）。
+    fn encode_hardware(&mut self, w: usize, h: usize, bps: u64) -> Hw {
         if self.hw_off {
-            return None;
+            return Hw::Off;
         }
         let size = (u32::try_from(w).unwrap_or(0), u32::try_from(h).unwrap_or(0));
         let reopen = self.hw.as_ref().is_none_or(|e| e.size() != size);
         if reopen {
             self.hw = None;
+            self.hw_sent.clear();
             match (self.hw_open)(size.0, size.1, self.fps, bps) {
                 Ok(e) => {
                     log::info!("视频编码：硬件 {}（{}×{}）", e.name(), size.0, size.1);
@@ -486,7 +553,7 @@ impl H264Encoder {
                 Err(why) => {
                     log::info!("视频编码：软件 OpenH264（不用硬件编码：{why}）");
                     self.hw_off = true;
-                    return None;
+                    return Hw::Off;
                 }
             }
         }
@@ -499,35 +566,42 @@ impl H264Encoder {
         );
         self.convert_us = self.convert_us.saturating_add(micros_since(packing));
         let force_key = self.force_key || reopen;
-        let result = self
-            .hw
-            .as_mut()
-            .map(|e| e.encode(&self.nv12, bps, force_key))?;
-        match result {
-            Ok((data, key)) => {
-                // 没要求却一直出关键帧：每帧都是整幅画面（几百 KB），码率和帧率都垮掉，画面忽糊忽清。
-                // 这种编码器不能用，改用软件编码（这一帧本身是完整的关键帧，照常发出）。
-                self.unasked_keys = if key && !force_key {
-                    self.unasked_keys + 1
-                } else {
-                    0
-                };
-                if self.unasked_keys >= UNASKED_KEY_LIMIT {
-                    let name = self.backend_name();
-                    log::warn!("硬件编码器 {name} 连续 {UNASKED_KEY_LIMIT} 帧都是没要求的关键帧，改用软件编码");
-                    self.hw = None;
-                    self.hw_off = true;
-                    self.force_key = true;
+        let Some(enc) = self.hw.as_mut() else {
+            return Hw::Off;
+        };
+        match enc.encode(&self.nv12, bps, force_key) {
+            Ok(got) => {
+                self.hw_sent.push_back(force_key);
+                // 要求已经交给编码器了：不再对后面的帧重复要求
+                self.force_key = false;
+                match got {
+                    Some((data, key)) => self.hardware_output(data, key, reopen),
+                    None => Hw::Pending,
                 }
-                Some((data, key, reopen))
             }
             Err(why) => {
-                log::warn!("硬件编码失败，改用软件编码（OpenH264）：{why}");
-                self.hw = None;
-                self.hw_off = true;
-                // 软件编码器从关键帧开始
-                self.force_key = true;
-                None
+                self.hardware_failed(&why);
+                Hw::Off
+            }
+        }
+    }
+
+    /// 画面没变时取硬件攒着的帧；停了一阵还取不到，让编码器交出来。
+    fn poll_hardware(&mut self) -> Hw {
+        let idle = self.still >= self.refine_after();
+        let Some(enc) = self.hw.as_mut() else {
+            return Hw::Off;
+        };
+        let mut got = enc.poll();
+        if matches!(got, Ok(None)) && idle {
+            got = enc.drain().and_then(|()| enc.poll());
+        }
+        match got {
+            Ok(Some((data, key))) => self.hardware_output(data, key, false),
+            Ok(None) => Hw::Pending,
+            Err(why) => {
+                self.hardware_failed(&why);
+                Hw::Off
             }
         }
     }
@@ -682,6 +756,15 @@ impl VideoEncoder for H264Encoder {
         if !fresh && !changed && !self.force_key {
             // 画面停下了：先等一会儿，确认真的停了再补清晰。
             self.still = self.still.saturating_add(1);
+            // 硬件编码器还攒着之前交的帧：先把它们取回来
+            if !self.hw_sent.is_empty() {
+                return Ok(match self.poll_hardware() {
+                    Hw::Frame(data, key, fresh) if !data.is_empty() => {
+                        Some(self.finish(&data, key, size, false, fresh))
+                    }
+                    Hw::Frame(..) | Hw::Pending | Hw::Off => None,
+                });
+            }
             if self.refine_left == 0 || self.still < self.refine_after() {
                 return Ok(None);
             }
@@ -700,8 +783,13 @@ impl VideoEncoder for H264Encoder {
         self.convert_us = micros_since(converting);
         // 有硬件编码器就用它（快得多、几乎不占 CPU）；没有或失败时用 OpenH264
         let bps = self.budget_bps(budget);
-        if let Some((data, key, fresh_hw)) = self.encode_hardware(w, h, bps) {
-            return Ok(Some(self.finish(&data, key, size, changed, fresh_hw)));
+        match self.encode_hardware(w, h, bps) {
+            Hw::Frame(data, key, fresh_hw) if !data.is_empty() => {
+                return Ok(Some(self.finish(&data, key, size, changed, fresh_hw)));
+            }
+            // 还没编好，或编码器丢了这一帧：这一次没有帧发（之后再取）
+            Hw::Frame(..) | Hw::Pending => return Ok(None),
+            Hw::Off => {}
         }
         let fresh = self.inner.as_ref().is_none_or(|(w, h, _)| (*w, *h) != size);
         // 编码器先拿出来用，编完放回去；编码出错时丢掉，下一帧重新打开（从关键帧开始）。
@@ -747,7 +835,8 @@ impl VideoEncoder for H264Encoder {
     }
 
     fn wants_refine(&self) -> bool {
-        self.force_key || self.refine_left > 0
+        // 硬件编码器还攒着帧时也要接着调用，把它们取回来
+        self.force_key || self.refine_left > 0 || !self.hw_sent.is_empty()
     }
 
     fn backend(&self) -> String {
@@ -875,6 +964,10 @@ mod tests {
         soft: H264Encoder,
         /// 每帧都说是关键帧（模拟出问题的编码器）。
         always_key: bool,
+        /// 攒一帧（异步编码器）。
+        hold_back: bool,
+        held: Option<(Vec<u8>, bool)>,
+        ready: Option<(Vec<u8>, bool)>,
     }
 
     impl HardwareEncoder for FakeHw {
@@ -889,7 +982,7 @@ mod tests {
             nv12: &[u8],
             _bps: u64,
             force_key: bool,
-        ) -> Result<(Vec<u8>, bool), String> {
+        ) -> Result<Option<(Vec<u8>, bool)>, String> {
             self.frames += 1;
             if self.frames == self.fail_at {
                 return Err("模拟显卡出错".into());
@@ -910,7 +1003,20 @@ mod tests {
                 .unwrap()
                 .unwrap();
             let (_, data) = FrameHeader::parse(&f.payload).unwrap();
-            Ok((data.to_vec(), f.key || self.always_key))
+            if self.hold_back {
+                // 像 Intel Mac 的编码器：收到下一帧才交出上一帧
+                let out = self.held.take();
+                self.held = Some((data.to_vec(), f.key));
+                return Ok(out);
+            }
+            Ok(Some((data.to_vec(), f.key || self.always_key)))
+        }
+        fn poll(&mut self) -> Result<Option<(Vec<u8>, bool)>, String> {
+            Ok(self.ready.take())
+        }
+        fn drain(&mut self) -> Result<(), String> {
+            self.ready = self.held.take();
+            Ok(())
         }
     }
 
@@ -921,6 +1027,9 @@ mod tests {
             fail_at: 0,
             soft: H264Encoder::new(fps).with_hardware(fake_none),
             always_key: false,
+            hold_back: false,
+            held: None,
+            ready: None,
         }))
     }
 
@@ -936,6 +1045,9 @@ mod tests {
             fail_at: 0,
             soft: H264Encoder::new(fps).with_hardware(fake_none),
             always_key: true,
+            hold_back: false,
+            held: None,
+            ready: None,
         }))
     }
 
@@ -963,6 +1075,87 @@ mod tests {
         assert!(!soft_decodes(None, 320, 192, data));
         // 本系统（CI 的 Linux 没有硬件编码器；Windows、macOS 上真的测）
         assert!(!hardware_report(320, 192, &frames).is_empty());
+    }
+
+    fn fake_holds_back(
+        w: u32,
+        h: u32,
+        fps: u32,
+        _bps: u64,
+    ) -> Result<Box<dyn HardwareEncoder>, String> {
+        Ok(Box::new(FakeHw {
+            size: (w, h),
+            frames: 0,
+            fail_at: 0,
+            soft: H264Encoder::new(fps).with_hardware(fake_none),
+            always_key: false,
+            hold_back: true,
+            held: None,
+            ready: None,
+        }))
+    }
+
+    /// 同步的编码器（Media Foundation）不攒帧：默认的 poll、drain 什么都不做。
+    #[test]
+    fn synchronous_hardware_has_nothing_pending() {
+        #[derive(Debug)]
+        struct Sync;
+        impl HardwareEncoder for Sync {
+            fn name(&self) -> &str {
+                "同步"
+            }
+            fn size(&self) -> (u32, u32) {
+                (2, 2)
+            }
+            fn encode(
+                &mut self,
+                _: &[u8],
+                _: u64,
+                _: bool,
+            ) -> Result<Option<(Vec<u8>, bool)>, String> {
+                Ok(Some((vec![1], true)))
+            }
+        }
+        let mut e = Sync;
+        assert_eq!(e.poll(), Ok(None));
+        assert_eq!(e.drain(), Ok(()));
+        assert_eq!(e.encode(&[], 0, true), Ok(Some((vec![1], true))));
+        assert_eq!((e.name(), e.size()), ("同步", (2, 2)));
+    }
+
+    /// 异步编码器攒一帧（像 Intel Mac）：每次取回上一帧，只有第一帧是关键帧，软件解码接得上；
+    /// 画面停下后把攒着的最后一帧取出来，不会丢。
+    #[test]
+    fn asynchronous_hardware_is_drained_in_order() {
+        let mut enc = H264Encoder::new(30).with_hardware(fake_holds_back);
+        let mut dec = H264Decoder::new().unwrap();
+        let mut got = Vec::new();
+        for id in 1..8u32 {
+            let f = enc.encode(id, &picture(320, 192), true, 50_000).unwrap();
+            if id == 1 {
+                assert!(f.is_none(), "第一帧还攒在编码器里");
+                assert!(enc.wants_refine(), "有攒着的帧：要接着调用");
+            }
+            got.extend(f);
+        }
+        assert_eq!(got.len(), 6);
+        assert!(
+            got[0].key && got.iter().skip(1).all(|f| !f.key),
+            "只有第一帧是关键帧"
+        );
+        for f in &got {
+            decode(&mut dec, f).unwrap();
+        }
+        // 画面停下：先取不到，停够了让编码器交出最后一帧
+        let mut last = None;
+        for id in 8..40u32 {
+            if let Some(f) = enc.encode(id, &picture(320, 192), false, 50_000).unwrap() {
+                last = Some(f);
+                break;
+            }
+        }
+        decode(&mut dec, &last.expect("最后一帧要取出来")).unwrap();
+        assert_eq!(enc.backend_name(), "硬件 假硬件");
     }
 
     #[test]
@@ -994,6 +1187,9 @@ mod tests {
             fail_at: 3,
             soft: H264Encoder::new(fps).with_hardware(fake_none),
             always_key: false,
+            hold_back: false,
+            held: None,
+            ready: None,
         }))
     }
 
@@ -1054,10 +1250,6 @@ mod tests {
             .unwrap()
             .unwrap();
         let (h, data) = FrameHeader::parse(&frame.payload).unwrap();
-        assert!(dec.decode(&h, data).unwrap().is_some());
-        assert_eq!(dec.backend(), "软件 OpenH264");
-        // 关键帧却没有画面：改用软件
-        let mut dec = AutoH264Decoder::with_hardware(Some(Box::new(FakeHwDec(0)))).unwrap();
         assert!(dec.decode(&h, data).unwrap().is_some());
         assert_eq!(dec.backend(), "软件 OpenH264");
         // 没有硬件解码器：直接软件
@@ -1152,7 +1344,14 @@ mod tests {
                 let (pw, _, px) = even_pixels(&screen);
                 color::rgb_to_i420(&px, pw, &mut y, &mut u, &mut v);
                 color::i420_to_nv12(&y, &u, &v, &mut nv12);
-                let (bytes, key) = enc.encode(&nv12, 2_000_000, true).unwrap();
+                // 异步：这一次没取到就让编码器交出来
+                let (bytes, key) = match enc.encode(&nv12, 2_000_000, true).unwrap() {
+                    Some(got) => got,
+                    None => {
+                        enc.drain().unwrap();
+                        enc.poll().unwrap().expect("交出攒着的帧")
+                    }
+                };
                 assert!(key && annexb::has_idr(&bytes));
                 let header = FrameHeader {
                     codec: Codec::H264,
@@ -1179,7 +1378,10 @@ mod tests {
                     }
                     color::rgb_to_i420(&px, 640, &mut y, &mut u, &mut v);
                     color::i420_to_nv12(&y, &u, &v, &mut nv12);
-                    let (bytes, key) = enc.encode(&nv12, 2_000_000, false).unwrap();
+                    let (bytes, key) = enc
+                        .encode(&nv12, 2_000_000, false)
+                        .unwrap()
+                        .unwrap_or_default();
                     keys += u32::from(key);
                     if !bytes.is_empty() {
                         let header = FrameHeader {
@@ -1214,7 +1416,7 @@ mod tests {
                 color::rgb_to_i420(&pixels, w, &mut y, &mut u, &mut v);
                 color::i420_to_nv12(&y, &u, &v, &mut nv12);
                 for i in 0..5 {
-                    let (data, key) = hw.encode(&nv12, 2_000_000, i == 0).unwrap();
+                    let (data, key) = hw.encode(&nv12, 2_000_000, i == 0).unwrap().unwrap();
                     assert!(i > 0 || key, "第一帧要是关键帧");
                     let header = FrameHeader {
                         codec: Codec::H264,

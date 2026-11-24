@@ -60,6 +60,13 @@ extern "C" {
     fn CFArrayGetCount(array: CFTypeRef) -> isize;
     fn CFArrayGetValueAtIndex(array: CFTypeRef, index: isize) -> CFTypeRef;
     fn CFDictionaryContainsKey(dict: CFTypeRef, key: CFTypeRef) -> u8;
+    static kCFTypeArrayCallBacks: u8;
+    fn CFArrayCreate(
+        allocator: CFTypeRef,
+        values: *const CFTypeRef,
+        count: isize,
+        callbacks: *const c_void,
+    ) -> CFTypeRef;
 }
 
 #[link(name = "CoreMedia", kind = "framework")]
@@ -136,6 +143,11 @@ extern "C" {
     fn CVPixelBufferGetBytesPerRow(buffer: CFTypeRef) -> usize;
     fn CVPixelBufferGetWidth(buffer: CFTypeRef) -> usize;
     fn CVPixelBufferGetHeight(buffer: CFTypeRef) -> usize;
+    fn CVPixelBufferPoolCreatePixelBuffer(
+        allocator: CFTypeRef,
+        pool: CFTypeRef,
+        out: *mut CFTypeRef,
+    ) -> i32;
 }
 
 #[link(name = "VideoToolbox", kind = "framework")]
@@ -151,6 +163,9 @@ extern "C" {
     static kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: CFTypeRef;
     static kVTVideoEncoderSpecification_EnableLowLatencyRateControl: CFTypeRef;
     static kVTCompressionPropertyKey_MaxFrameDelayCount: CFTypeRef;
+    static kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration: CFTypeRef;
+    static kVTCompressionPropertyKey_DataRateLimits: CFTypeRef;
+    fn VTCompressionSessionGetPixelBufferPool(session: CFTypeRef) -> CFTypeRef;
     fn VTCompressionSessionCreate(
         allocator: CFTypeRef,
         width: i32,
@@ -222,6 +237,14 @@ fn number_i32(v: i32) -> Owned {
     Owned(unsafe { CFNumberCreate(std::ptr::null(), CF_SINT32, std::ptr::from_ref(&v).cast()) })
 }
 
+/// kCFNumberFloat64Type。
+const CF_FLOAT64: isize = 6;
+
+fn number_f64(v: f64) -> Owned {
+    // SAFETY: 值是局部变量，CFNumberCreate 复制它。
+    Owned(unsafe { CFNumberCreate(std::ptr::null(), CF_FLOAT64, std::ptr::from_ref(&v).cast()) })
+}
+
 fn number_i64(v: i64) -> Owned {
     // SAFETY: 同上（64 位）。
     Owned(unsafe { CFNumberCreate(std::ptr::null(), CF_SINT64, std::ptr::from_ref(&v).cast()) })
@@ -275,7 +298,6 @@ struct EncodeSlot {
 /// 一个硬件编码会话。
 pub struct VtEncoder {
     session: CFTypeRef,
-    pixels: CFTypeRef,
     slot: Box<EncodeSlot>,
     width: u32,
     height: u32,
@@ -315,33 +337,25 @@ pub struct VtOptions {
 
 impl VtOptions {
     /// 产品现在用的设置。
-    ///
-    /// 低延迟码控和“每收一帧交一帧”只在 Intel Mac 上打开：用户的 Intel Mac 上 hw-check 实测
-    /// 普通模式每帧都是关键帧、打开后 1/30 关键帧、10 ms/帧；而 Apple 芯片的 CI 上打开后
-    /// Mac 控制 Mac 一帧都出不来（原因还没定位），普通模式一直正常。通用包按架构分别编译，自动区分。
     pub const DEFAULT: Self = Self {
-        // Apple 芯片保持最后一次 CI 通过时的值
-        max_key_interval: if cfg!(target_arch = "x86_64") {
-            Some(7200)
-        } else {
-            Some(i32::MAX)
-        },
+        // 和 WebRTC 一样：最多 7200 帧或 240 秒一个关键帧（实际上关键帧由我们按需要求）
+        max_key_interval: Some(7200),
         complete_each_frame: false,
         baseline: true,
-        max_frame_delay: if cfg!(target_arch = "x86_64") {
-            Some(0)
-        } else {
-            None
-        },
-        low_latency: cfg!(target_arch = "x86_64"),
+        max_frame_delay: None,
+        // 苹果给实时场景的低延迟模式（WWDC21），去掉编码器攒的那一帧；系统不支持时 open 退回普通模式
+        low_latency: true,
         pipelined: false,
     };
 
     /// `hw-check` 对比的几种设置：（名称, 设置）。
     pub const VARIANTS: [(&'static str, Self); 5] = [
-        ("低延迟码控 + 攒 0 帧 + Baseline（默认）", Self::DEFAULT),
         (
-            "不开低延迟码控、攒 0 帧",
+            "默认：异步 + 低延迟码控（和 WebRTC 一样的设置）",
+            Self::DEFAULT,
+        ),
+        (
+            "异步、不开低延迟码控（老系统退回的模式）",
             Self {
                 low_latency: false,
                 ..Self::DEFAULT
@@ -432,7 +446,9 @@ pub fn probe(
         for (i, nv12) in frames.iter().enumerate() {
             let started = std::time::Instant::now();
             match enc.encode(nv12, 4_000_000, i == 0) {
-                Ok((data, key)) => {
+                // 异步：这一次还没编好，下一次再取
+                Ok(None) => empty += 1,
+                Ok(Some((data, key))) => {
                     let took = started.elapsed().as_micros();
                     total += took;
                     worst = worst.max(took);
@@ -459,7 +475,7 @@ pub fn probe(
         }
         let n = u128::try_from(frames.len().max(1)).unwrap_or(1);
         lines.push(format!(
-            "{name}：关键帧 {keys}/{}，编码平均 {} ms、最长 {} ms，平均 {} KB/帧，空帧 {empty}，软件解码 {}，前 12 帧 KB（K=关键帧）{}",
+            "{name}：关键帧 {keys}/{}，编码平均 {} ms、最长 {} ms，平均 {} KB/帧，当时没取到 {empty}，软件解码 {}，前 12 帧 KB（K=关键帧）{}",
             frames.len(),
             total / n / 1000,
             worst / 1000,
@@ -471,13 +487,9 @@ pub fn probe(
     lines
 }
 
-/// 等编码输出回调最多这么久。
-// Apple 芯片（CI 虚拟机编码慢）保持最后一次 CI 通过时的 300 ms
-const OUTPUT_WAIT: std::time::Duration = if cfg!(target_arch = "x86_64") {
-    std::time::Duration::from_millis(100)
-} else {
-    std::time::Duration::from_millis(300)
-};
+/// 交帧之后最多等多久看有没有编好的帧（异步：等不到也不强制，下一次再取）。
+/// 低延迟模式下编码器编完就回调（实测 10 ms），等一小会儿能少一帧延迟。
+const OUTPUT_WAIT: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// 编码输出回调：取出码流（AVCC → Annex B），判断是否关键帧，放进 `refcon` 指向的槽。
 unsafe extern "C" fn on_encoded(
@@ -616,7 +628,6 @@ impl VtEncoder {
         )?;
         let mut enc = Self {
             session,
-            pixels: std::ptr::null(),
             slot,
             width,
             height,
@@ -662,6 +673,12 @@ impl VtEncoder {
                     kVTCompressionPropertyKey_MaxKeyFrameInterval,
                     interval.0,
                 );
+                let seconds = number_f64(240.0);
+                let _ = VTSessionSetProperty(
+                    session,
+                    kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration,
+                    seconds.0,
+                );
             }
             let rate = number_i32(enc.fps);
             let _ =
@@ -669,22 +686,6 @@ impl VtEncoder {
             let _ = VTCompressionSessionPrepareToEncodeFrames(session);
         }
         enc.set_bitrate(bps);
-        let mut pixels: CFTypeRef = std::ptr::null();
-        // SAFETY: 输出参数指向局部变量。
-        let status = unsafe {
-            CVPixelBufferCreate(
-                std::ptr::null(),
-                usize::try_from(width).unwrap_or(0),
-                usize::try_from(height).unwrap_or(0),
-                PIXEL_NV12,
-                std::ptr::null(),
-                &mut pixels,
-            )
-        };
-        if status != 0 {
-            return Err(format!("创建像素缓冲失败（{status}）"));
-        }
-        enc.pixels = pixels;
         Ok(enc)
     }
 
@@ -710,25 +711,69 @@ impl VtEncoder {
         {
             self.bps = bps;
         }
+        // 和 WebRTC 一样：每秒最多平均码率的 1.5 倍（大帧不至于把链路塞爆）
+        let bytes = number_i64(i64::try_from(bps.saturating_mul(3) / 16).unwrap_or(i64::MAX));
+        let second = number_f64(1.0);
+        let values = [bytes.0, second.0];
+        // SAFETY: 数组在调用期间有效；数组持有两个数字；会话有效。
+        unsafe {
+            let limits = Owned(CFArrayCreate(
+                std::ptr::null(),
+                values.as_ptr(),
+                2,
+                std::ptr::addr_of!(kCFTypeArrayCallBacks).cast(),
+            ));
+            let _ = VTSessionSetProperty(
+                self.session,
+                kVTCompressionPropertyKey_DataRateLimits,
+                limits.0,
+            );
+        }
     }
 
     /// 把 NV12 拷进像素缓冲（按缓冲区的行宽）。
-    fn fill(&self, nv12: &[u8]) -> Result<(), String> {
+    /// 拿一个新的像素缓冲（编码器的缓冲池里取，没有池时新建）：异步编码时编码器可能还在读
+    /// 上一帧的缓冲，不能覆盖（WebRTC 也是每帧从池里取）。
+    fn buffer(&self) -> Result<Owned, String> {
+        let mut out: CFTypeRef = std::ptr::null();
+        // SAFETY: 会话有效；输出参数指向局部变量；池由会话持有。
+        let status = unsafe {
+            let pool = VTCompressionSessionGetPixelBufferPool(self.session);
+            if pool.is_null() {
+                CVPixelBufferCreate(
+                    std::ptr::null(),
+                    usize::try_from(self.width).unwrap_or(0),
+                    usize::try_from(self.height).unwrap_or(0),
+                    PIXEL_NV12,
+                    std::ptr::null(),
+                    &mut out,
+                )
+            } else {
+                CVPixelBufferPoolCreatePixelBuffer(std::ptr::null(), pool, &mut out)
+            }
+        };
+        if status != 0 || out.is_null() {
+            return Err(format!("拿不到像素缓冲（{status}）"));
+        }
+        Ok(Owned(out))
+    }
+
+    fn fill(pixels: CFTypeRef, width: u32, height: u32, nv12: &[u8]) -> Result<(), String> {
         let (w, h) = (
-            usize::try_from(self.width).unwrap_or(0),
-            usize::try_from(self.height).unwrap_or(0),
+            usize::try_from(width).unwrap_or(0),
+            usize::try_from(height).unwrap_or(0),
         );
         if nv12.len() < w * h * 3 / 2 {
             return Err("画面数据不够".into());
         }
         // SAFETY: 加锁后基地址和行宽有效；每行拷 w 字节，不超过行宽和缓冲区；之后解锁。
         unsafe {
-            check(CVPixelBufferLockBaseAddress(self.pixels, 0), "锁像素缓冲")?;
+            check(CVPixelBufferLockBaseAddress(pixels, 0), "锁像素缓冲")?;
             for (plane, rows, offset) in [(0usize, h, 0usize), (1usize, h / 2, w * h)] {
-                let base = CVPixelBufferGetBaseAddressOfPlane(self.pixels, plane);
-                let stride = CVPixelBufferGetBytesPerRowOfPlane(self.pixels, plane);
+                let base = CVPixelBufferGetBaseAddressOfPlane(pixels, plane);
+                let stride = CVPixelBufferGetBytesPerRowOfPlane(pixels, plane);
                 if base.is_null() || stride < w {
-                    let _ = CVPixelBufferUnlockBaseAddress(self.pixels, 0);
+                    let _ = CVPixelBufferUnlockBaseAddress(pixels, 0);
                     return Err("像素缓冲格式不对".into());
                 }
                 for y in 0..rows {
@@ -738,7 +783,7 @@ impl VtEncoder {
                     std::ptr::copy_nonoverlapping(src.as_ptr(), base.add(y * stride), src.len());
                 }
             }
-            let _ = CVPixelBufferUnlockBaseAddress(self.pixels, 0);
+            let _ = CVPixelBufferUnlockBaseAddress(pixels, 0);
         }
         Ok(())
     }
@@ -746,7 +791,8 @@ impl VtEncoder {
     /// 交一帧 NV12 给编码器，不等结果（结果由输出回调放进队列）。
     pub fn submit(&mut self, nv12: &[u8], bps: u64, force_key: bool) -> Result<(), String> {
         self.set_bitrate(bps);
-        self.fill(nv12)?;
+        let pixels = self.buffer()?;
+        Self::fill(pixels.0, self.width, self.height, nv12)?;
         let props = force_key.then(|| {
             dict1(unsafe { kVTEncodeFrameOptionKey_ForceKeyFrame }, unsafe {
                 kCFBooleanTrue
@@ -760,7 +806,7 @@ impl VtEncoder {
             check(
                 VTCompressionSessionEncodeFrame(
                     self.session,
-                    self.pixels,
+                    pixels.0,
                     pts,
                     duration,
                     props.as_ref().map_or(std::ptr::null(), |p| p.0),
@@ -783,55 +829,56 @@ impl VtEncoder {
             .unwrap_or_default()
     }
 
-    /// 强制交出所有攒着的帧（之后的第一帧会是关键帧）。
-    pub fn flush(&mut self) -> Result<Vec<Encoded>, String> {
+    /// 让编码器交出所有攒着的帧（放进队列，由 [`Self::poll`] 取）。画面停下后用：
+    /// 苹果文档里 CompleteFrames 就是干这个的；之后的第一帧会是关键帧，所以不能每帧都调。
+    pub fn complete(&mut self) -> Result<(), String> {
         // SAFETY: 会话有效；返回前输出回调已执行。
         check(
             unsafe { VTCompressionSessionCompleteFrames(self.session, kCMTimeInvalid) },
             "完成编码",
-        )?;
+        )
+    }
+
+    /// 交出所有攒着的帧并取走（hw-check 用）。
+    pub fn flush(&mut self) -> Result<Vec<Encoded>, String> {
+        self.complete()?;
         Ok(self.take_ready())
     }
 
-    /// 编一帧 NV12。返回 Annex B 码流和是否关键帧。
-    ///
-    /// 等输出回调，不每帧调用 CompleteFrames：每帧都“完成”会结束当前的参考帧序列，下一帧又是关键帧。
-    /// 编码器设成每收一帧就交出一帧（`MaxFrameDelayCount` = 0）；等不到才强制完成
-    /// （会多一个关键帧，不会卡住）。一次交出好几帧时按顺序拼在一起（解码器依次解）。
+    /// 取走一个编好的帧（不等）。
+    pub fn poll(&mut self) -> Result<Option<(Vec<u8>, bool)>, String> {
+        self.slot
+            .result
+            .lock()
+            .ok()
+            .and_then(|mut q| q.pop_front())
+            .transpose()
+    }
+
+    /// 编一帧 NV12：交给编码器，取回一个编好的帧（Annex B 和是否关键帧）。**异步**：编码器
+    /// 可能攒着几帧才交出，取回的可以是之前交的帧；这一次还没有就返回空，下一次再取（编码器交出
+    /// 的帧按顺序一个一个取，不拼在一起）。不强制完成：每帧都强制完成会结束参考帧序列，
+    /// 下一帧又是关键帧（用户 Intel Mac 上实测每帧都是关键帧）。做法和 WebRTC 一样。
     pub fn encode(
         &mut self,
         nv12: &[u8],
         bps: u64,
         force_key: bool,
-    ) -> Result<(Vec<u8>, bool), String> {
+    ) -> Result<Option<(Vec<u8>, bool)>, String> {
         self.submit(nv12, bps, force_key)?;
-        let wait = if self.opts.complete_each_frame {
-            std::time::Duration::ZERO
-        } else {
-            OUTPUT_WAIT
-        };
-        let got = self
-            .slot
-            .result
-            .lock()
-            .ok()
-            .and_then(|guard| {
-                self.slot
-                    .ready
-                    .wait_timeout_while(guard, wait, |q| q.is_empty())
-                    .ok()
-                    .map(|(mut q, _)| q.drain(..).collect::<Vec<_>>())
-            })
-            .unwrap_or_default();
-        let got = if got.is_empty() { self.flush()? } else { got };
-        let (mut data, mut key) = (Vec::new(), false);
-        for one in got {
-            let (bytes, k) = one?;
-            data.extend_from_slice(&bytes);
-            key |= k;
+        if self.opts.complete_each_frame {
+            // 只给 hw-check 对照旧做法用
+            self.complete()?;
         }
-        // 什么都没有：编码器丢了这一帧（码率控制），当作没有画面
-        Ok((data, key))
+        let got = self.slot.result.lock().ok().and_then(|guard| {
+            self.slot
+                .ready
+                .wait_timeout_while(guard, OUTPUT_WAIT, |q| q.is_empty())
+                .ok()
+                .and_then(|(mut q, _)| q.pop_front())
+        });
+        // `None`：还没编好；`Some(空)`：编码器丢了这一帧
+        got.transpose()
     }
 }
 
@@ -841,9 +888,6 @@ impl Drop for VtEncoder {
         unsafe {
             VTCompressionSessionInvalidate(self.session);
             CFRelease(self.session);
-            if !self.pixels.is_null() {
-                CFRelease(self.pixels);
-            }
         }
     }
 }
