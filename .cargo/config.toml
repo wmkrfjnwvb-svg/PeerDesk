@@ -1,0 +1,6 @@
+# cros-libva 编译时用仓库里固定版本的 libva 头文件生成绑定，不看系统装的版本。
+# 原因：它手写的代码只对得上一小段 libva 版本，系统是 2.14 或 2.23 都编不过（2026-11 CI）。
+# libva 2.x 的二进制接口是稳定的（结构体留了保留字段，新版只加函数），
+# 所以用 2.20 的头文件编出来的程序，在装了别的 2.x 版本的机器上也能跑。Chromium 也是这样带自己的一份 libva 头文件。
+[env]
+CROS_LIBVA_H_PATH = { value = "third_party/libva/include", relative = true }
