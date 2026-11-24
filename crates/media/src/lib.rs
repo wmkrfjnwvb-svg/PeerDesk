@@ -352,6 +352,12 @@ pub trait HardwareEncoder: Send + std::fmt::Debug {
     fn drain(&mut self) -> Result<(), String> {
         Ok(())
     }
+
+    /// 上一次 [`Self::encode`] 交的这一帧编码器没收（例如 Media Foundation 的 `MF_E_NOTACCEPTING`）：
+    /// 这一帧不会有输出，它带的关键帧要求也没有送到，调用方下一帧重新要求。
+    fn last_rejected(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(windows)]
@@ -375,6 +381,9 @@ impl HardwareEncoder for mf::MfEncoder {
     }
     fn drain(&mut self) -> Result<(), String> {
         mf::MfEncoder::drain(self)
+    }
+    fn last_rejected(&self) -> bool {
+        mf::MfEncoder::last_rejected(self)
     }
 }
 
@@ -594,9 +603,14 @@ impl H264Encoder {
         };
         match enc.encode(&self.nv12, bps, force_key) {
             Ok(got) => {
-                self.hw_sent.push_back(force_key);
-                // 要求已经交给编码器了：不再对后面的帧重复要求
-                self.force_key = false;
+                if enc.last_rejected() {
+                    // 编码器没收这一帧：不会有它的输出；关键帧要求留到下一帧
+                    self.force_key = force_key;
+                } else {
+                    self.hw_sent.push_back(force_key);
+                    // 要求已经交给编码器了：不再对后面的帧重复要求
+                    self.force_key = false;
+                }
                 match got {
                     Some((data, key)) => self.hardware_output(data, key, reopen),
                     None => Hw::Pending,
@@ -1145,6 +1159,78 @@ mod tests {
         }))
     }
 
+    /// 第一帧不收（像 Media Foundation 的 `MF_E_NOTACCEPTING`），之后照常编。
+    #[derive(Debug)]
+    struct RejectsFirst {
+        calls: u32,
+        rejected: bool,
+        soft: H264Encoder,
+    }
+
+    impl HardwareEncoder for RejectsFirst {
+        fn name(&self) -> &str {
+            "不收第一帧"
+        }
+        fn size(&self) -> (u32, u32) {
+            (320, 192)
+        }
+        fn encode(
+            &mut self,
+            _nv12: &[u8],
+            _bps: u64,
+            force_key: bool,
+        ) -> Result<Option<(Vec<u8>, bool)>, String> {
+            self.calls += 1;
+            self.rejected = self.calls == 1;
+            if self.rejected {
+                return Ok(None);
+            }
+            // 第一帧的关键帧要求没送到：第二帧必须重新要求
+            assert!(self.calls != 2 || force_key, "关键帧要求丢了");
+            let f = self
+                .soft
+                .encode(self.calls, &picture(320, 192), true, 100_000)
+                .unwrap()
+                .unwrap();
+            let (_, data) = FrameHeader::parse(&f.payload).unwrap();
+            Ok(Some((data.to_vec(), f.key)))
+        }
+        fn last_rejected(&self) -> bool {
+            self.rejected
+        }
+    }
+
+    fn fake_rejects_first(
+        _w: u32,
+        _h: u32,
+        fps: u32,
+        _bps: u64,
+    ) -> Result<Box<dyn HardwareEncoder>, String> {
+        Ok(Box::new(RejectsFirst {
+            calls: 0,
+            rejected: false,
+            soft: H264Encoder::new(fps).with_hardware(fake_none),
+        }))
+    }
+
+    /// 编码器没收的帧不等它的输出（不算攒着），它带的关键帧要求留给下一帧。
+    #[test]
+    fn rejected_frame_keeps_the_keyframe_request() {
+        let mut enc = H264Encoder::new(30).with_hardware(fake_rejects_first);
+        assert_eq!(enc.backend_name(), "软件 OpenH264", "还没开始编码");
+        assert!(enc
+            .encode(1, &picture(320, 192), true, 50_000)
+            .unwrap()
+            .is_none());
+        assert!(enc.hw_sent.is_empty(), "没收的帧不算攒着");
+        let f = enc
+            .encode(2, &picture(320, 192), true, 50_000)
+            .unwrap()
+            .unwrap();
+        assert!(f.key);
+        assert_eq!(enc.backend_name(), "硬件 不收第一帧");
+    }
+
     /// 画面停下后取攒着的帧时编码器出错：改用软件编码（说明原因），之后照常出画面。
     #[test]
     fn hardware_error_while_draining_falls_back_to_software() {
@@ -1249,11 +1335,7 @@ mod tests {
             keys += u32::from(f.key);
         }
         // 第一帧（要求的）加 5 个没要求的之后改用软件，之后是增量帧
-        assert!(
-            enc.backend_name().starts_with("软件 OpenH264（"),
-            "{}",
-            enc.backend_name()
-        );
+        assert!(enc.backend_name().starts_with("软件 OpenH264（"));
         assert!(keys <= 1 + UNASKED_KEY_LIMIT + 1, "{keys}");
     }
 
@@ -1382,20 +1464,12 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(f.key, "换成软件编码要从关键帧开始");
-        assert!(
-            enc.backend_name().starts_with("软件 OpenH264（"),
-            "{}",
-            enc.backend_name()
-        );
+        assert!(enc.backend_name().starts_with("软件 OpenH264（"));
         decode(&mut dec, &f).unwrap();
         // 打不开：直接用软件
         let mut enc = H264Encoder::new(30).with_hardware(fake_none);
         assert!(enc.encode(1, &screen, true, 5000).unwrap().unwrap().key);
-        assert!(
-            enc.backend_name().starts_with("软件 OpenH264（"),
-            "{}",
-            enc.backend_name()
-        );
+        assert!(enc.backend_name().starts_with("软件 OpenH264（"));
         // 这个系统的硬件编码入口：Linux 上没有（Windows、macOS 的实机测试另测）
         #[cfg(not(any(windows, target_os = "macos")))]
         assert!(open_system_hardware(64, 64, 30, 1_000_000).is_err());

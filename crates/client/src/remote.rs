@@ -752,6 +752,13 @@ async fn connect_session(
             report.frames_delivered, report.frames_expired, report.bad_frames, report.recovered
         ),
         format!("画面更新      {} 次", sink.count()),
+        format!(
+            "第一幅画面    {}",
+            report
+                .first_frame
+                .map_or_else(|| "没有".to_owned(), |d| format!("{} ms", d.as_millis()))
+        ),
+        format!("最长停顿      {} ms", report.max_gap.as_millis()),
         format!("画面数据      {} 字节", report.video_bytes),
         format!("往返延迟      {} us", report.rtt.as_micros()),
         format!("异常数据报    {}", report.bad_datagrams),

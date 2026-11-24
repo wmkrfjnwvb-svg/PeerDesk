@@ -39,11 +39,11 @@ use windows::Win32::Media::MediaFoundation::{
     CODECAPI_AVScenarioInfo, ICodecAPI, IMFActivate, IMFMediaEventGenerator, IMFMediaType,
     IMFSample, IMFTransform, METransformDrainComplete, METransformHaveOutput, METransformNeedInput,
     MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video,
-    MFSampleExtension_CleanPoint, MFStartup, MFTEnumEx, MFVideoFormat_H264, MFVideoFormat_NV12,
-    MFVideoInterlace_Progressive, MFSTARTUP_NOSOCKET, MFT_CATEGORY_VIDEO_ENCODER,
-    MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER, MFT_MESSAGE_COMMAND_DRAIN,
-    MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_OF_STREAM,
-    MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
+    MFSampleExtension_CleanPoint, MFSampleExtension_Discontinuity, MFStartup, MFTEnumEx,
+    MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoInterlace_Progressive, MFSTARTUP_NOSOCKET,
+    MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER,
+    MFT_MESSAGE_COMMAND_DRAIN, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
+    MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
     MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES, MFT_OUTPUT_STREAM_PROVIDES_SAMPLES,
     MFT_REGISTER_TYPE_INFO, MF_EVENT_FLAG_NO_WAIT, MF_E_NOTACCEPTING, MF_E_NO_EVENTS_AVAILABLE,
     MF_E_TRANSFORM_STREAM_CHANGE, MF_LOW_LATENCY, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE,
@@ -173,6 +173,12 @@ pub struct MfEncoder {
     frame: i64,
     /// 编码器要了几次输入还没给。
     need_input: u32,
+    /// 发了排空（DRAIN）还没收到 DrainComplete：这期间编码器不要输入。
+    draining: bool,
+    /// 排空之后的第一帧要标成不连续（微软对异步 MFT 的要求）。
+    discontinuity: bool,
+    /// 上一次交的帧编码器没收（`MF_E_NOTACCEPTING`）。
+    rejected: bool,
     /// 编码器交出的帧（按顺序；硬件编码器可能攒几帧才交出，交出时可能一次好几帧）。
     ready: std::collections::VecDeque<(Vec<u8>, bool)>,
     /// 最近一次有进展（编码器要输入或交出帧）的时刻：长时间没有进展才算编码器卡住。
@@ -418,6 +424,9 @@ impl MfEncoder {
                 height,
                 frame: 0,
                 need_input: 0,
+                draining: false,
+                discontinuity: false,
+                rejected: false,
                 ready: std::collections::VecDeque::new(),
                 progress_at: Instant::now(),
                 bps,
@@ -482,87 +491,90 @@ impl MfEncoder {
             sample
                 .SetSampleDuration(duration)
                 .map_err(|e| err("时长", &e))?;
+            if std::mem::take(&mut self.discontinuity) {
+                sample
+                    .SetUINT32(&MFSampleExtension_Discontinuity, 1)
+                    .map_err(|e| err("不连续标记", &e))?;
+            }
             self.frame = self.frame.saturating_add(1);
             Ok(sample)
         }
     }
 
-    /// 取一帧输出：H.264 码流（Annex B）和是否关键帧。
-    fn output(&mut self) -> Result<(Vec<u8>, bool), String> {
-        for _ in 0..3 {
-            let sample = if self.provides_samples {
-                None
-            } else {
-                // SAFETY: 按编码器要求的大小建输出缓冲区。
-                unsafe {
-                    let buffer = MFCreateMemoryBuffer(self.output_size)
-                        .map_err(|e| err("输出缓冲区", &e))?;
-                    let s = MFCreateSample().map_err(|e| err("输出样本", &e))?;
-                    s.AddBuffer(&buffer).map_err(|e| err("输出样本", &e))?;
-                    Some(s)
-                }
-            };
-            let mut buffers = [MFT_OUTPUT_DATA_BUFFER {
-                dwStreamID: 0,
-                pSample: ManuallyDrop::new(sample),
-                dwStatus: 0,
-                pEvents: ManuallyDrop::new(None),
-            }];
-            let mut status = 0u32;
-            // SAFETY: 输出数组只有一项，按约定填好；调用后取走其中的样本和事件集合释放。
-            let result = unsafe { self.transform.ProcessOutput(0, &mut buffers, &mut status) };
-            let (sample, events) = match buffers.first_mut() {
-                // SAFETY: 每个 ManuallyDrop 只取一次。
-                Some(b) => unsafe {
-                    (
-                        ManuallyDrop::take(&mut b.pSample),
-                        ManuallyDrop::take(&mut b.pEvents),
-                    )
-                },
-                None => (None, None),
-            };
-            drop(events);
-            match result {
-                Ok(()) => {
-                    let sample = sample.ok_or_else(|| "编码器没有给出样本".to_owned())?;
-                    // SAFETY: 样本有效；Lock 的指针和长度在 Unlock 之前有效。
-                    unsafe {
-                        let key = sample.GetUINT32(&MFSampleExtension_CleanPoint).unwrap_or(0) != 0;
-                        let buffer = sample
-                            .ConvertToContiguousBuffer()
-                            .map_err(|e| err("输出缓冲区", &e))?;
-                        let mut ptr: *mut u8 = std::ptr::null_mut();
-                        let mut len = 0u32;
-                        buffer
-                            .Lock(&mut ptr, None, Some(&mut len))
-                            .map_err(|e| err("锁输出", &e))?;
-                        let data =
-                            std::slice::from_raw_parts(ptr, usize::try_from(len).unwrap_or(0))
-                                .to_vec();
-                        buffer.Unlock().map_err(|e| err("解锁输出", &e))?;
-                        return Ok((data, key));
-                    }
-                }
-                Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
-                    // 编码器要重新协商输出格式（有些硬件编码器在第一帧时这样做）：用它给的第一种。
-                    // SAFETY: 接口有效。
-                    unsafe {
-                        let t = self
-                            .transform
-                            .GetOutputAvailableType(0, 0)
-                            .map_err(|e| err("可用输出格式", &e))?;
-                        self.transform
-                            .SetOutputType(0, &t, 0)
-                            .map_err(|e| err("重设输出格式", &e))?;
-                    }
-                }
-                Err(e) => return Err(err("取编码结果", &e)),
+    /// 取一帧输出：H.264 码流（Annex B）和是否关键帧。输出格式变了时返回 `None`：
+    /// 异步 MFT 重新协商后会再发 HaveOutput，在那之前再调 ProcessOutput 会得到 E_UNEXPECTED
+    /// （“灾难性故障 0x8000FFFF”，用户的 Intel 核显上试编一帧就这样失败过）。Chromium 也是这样等下一个事件。
+    fn output(&mut self) -> Result<Option<(Vec<u8>, bool)>, String> {
+        let sample = if self.provides_samples {
+            None
+        } else {
+            // SAFETY: 按编码器要求的大小建输出缓冲区。
+            unsafe {
+                let buffer =
+                    MFCreateMemoryBuffer(self.output_size).map_err(|e| err("输出缓冲区", &e))?;
+                let s = MFCreateSample().map_err(|e| err("输出样本", &e))?;
+                s.AddBuffer(&buffer).map_err(|e| err("输出样本", &e))?;
+                Some(s)
             }
+        };
+        let mut buffers = [MFT_OUTPUT_DATA_BUFFER {
+            dwStreamID: 0,
+            pSample: ManuallyDrop::new(sample),
+            dwStatus: 0,
+            pEvents: ManuallyDrop::new(None),
+        }];
+        let mut status = 0u32;
+        // SAFETY: 输出数组只有一项，按约定填好；调用后取走其中的样本和事件集合释放。
+        let result = unsafe { self.transform.ProcessOutput(0, &mut buffers, &mut status) };
+        let (sample, events) = match buffers.first_mut() {
+            // SAFETY: 每个 ManuallyDrop 只取一次。
+            Some(b) => unsafe {
+                (
+                    ManuallyDrop::take(&mut b.pSample),
+                    ManuallyDrop::take(&mut b.pEvents),
+                )
+            },
+            None => (None, None),
+        };
+        drop(events);
+        match result {
+            Ok(()) => {
+                let sample = sample.ok_or_else(|| "编码器没有给出样本".to_owned())?;
+                // SAFETY: 样本有效；Lock 的指针和长度在 Unlock 之前有效。
+                unsafe {
+                    let key = sample.GetUINT32(&MFSampleExtension_CleanPoint).unwrap_or(0) != 0;
+                    let buffer = sample
+                        .ConvertToContiguousBuffer()
+                        .map_err(|e| err("输出缓冲区", &e))?;
+                    let mut ptr: *mut u8 = std::ptr::null_mut();
+                    let mut len = 0u32;
+                    buffer
+                        .Lock(&mut ptr, None, Some(&mut len))
+                        .map_err(|e| err("锁输出", &e))?;
+                    let data =
+                        std::slice::from_raw_parts(ptr, usize::try_from(len).unwrap_or(0)).to_vec();
+                    buffer.Unlock().map_err(|e| err("解锁输出", &e))?;
+                    Ok(Some((data, key)))
+                }
+            }
+            Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
+                // 编码器要重新协商输出格式（有些硬件编码器在第一帧时这样做）：用它给的第一种。
+                // SAFETY: 接口有效。
+                unsafe {
+                    let t = self
+                        .transform
+                        .GetOutputAvailableType(0, 0)
+                        .map_err(|e| err("可用输出格式", &e))?;
+                    self.transform
+                        .SetOutputType(0, &t, 0)
+                        .map_err(|e| err("重设输出格式", &e))?;
+                }
+                Ok(None)
+            }
+            Err(e) => Err(err("取编码结果", &e)),
         }
-        Err("编码器反复要求重设输出格式".into())
     }
 
-    /// 编一帧 NV12。`force_key` 时编关键帧。
     /// 收下编码器发来的所有事件（不等）：要输入就记下，有输出就取出来排队。返回是否排空了（DrainComplete）。
     fn pump(&mut self) -> Result<bool, String> {
         let mut drained = false;
@@ -579,13 +591,37 @@ impl MfEncoder {
                 self.need_input = self.need_input.saturating_add(1);
                 self.progress_at = Instant::now();
             } else if kind == METransformHaveOutput.0 {
-                let frame = self.output()?;
-                self.ready.push_back(frame);
+                // 输出格式变了时这次没有帧：编码器重新协商后会再发 HaveOutput
+                if let Some(frame) = self.output()? {
+                    self.ready.push_back(frame);
+                }
                 self.progress_at = Instant::now();
             } else if kind == METransformDrainComplete.0 {
                 drained = true;
+                self.resume_after_drain()?;
             }
         }
+    }
+
+    /// 排空完成后继续编码。微软的异步 MFT 文档：排空之后编码器不再要输入，直到收到
+    /// `MFT_MESSAGE_NOTIFY_START_OF_STREAM`；之前记下的“要输入”作废；排空后的第一帧标成不连续。
+    /// 以前少了这一步：画面停下排空后，下一帧一直等不到编码器要输入，2 秒后判卡住、改用软件编码。
+    fn resume_after_drain(&mut self) -> Result<(), String> {
+        self.draining = false;
+        self.need_input = 0;
+        self.discontinuity = true;
+        self.progress_at = Instant::now();
+        // SAFETY: 对象有效。
+        unsafe {
+            self.transform
+                .ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)
+        }
+        .map_err(|e| err("排空后重新开始", &e))
+    }
+
+    /// 上一次交的帧编码器没收。
+    pub const fn last_rejected(&self) -> bool {
+        self.rejected
     }
 
     /// 等事件，直到 `done` 为真或者过了 `limit`；编码器很久没有任何进展时报错（卡住了）。
@@ -625,9 +661,10 @@ impl MfEncoder {
                     unsafe { c.SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &VARIANT::from(1u32)) };
             }
         }
-        // 等编码器要输入（第一帧硬件要初始化，给长一点）
+        self.rejected = false;
+        // 等编码器要输入（第一帧硬件要初始化，给长一点）；还在排空时先等排空完成
         let limit = if self.frame == 0 { FIRST_WAIT } else { STALL };
-        self.pump_until(limit, |e| e.need_input > 0)?;
+        self.pump_until(limit, |e| !e.draining && e.need_input > 0)?;
         if self.need_input == 0 {
             return Err(format!("{} 一直不要输入", self.name));
         }
@@ -635,8 +672,11 @@ impl MfEncoder {
         // SAFETY: 样本有效。
         match unsafe { self.transform.ProcessInput(0, &sample, 0) } {
             Ok(()) => self.need_input = self.need_input.saturating_sub(1),
-            // 编码器还没准备好收：这一帧不编（下一帧再说），不算出错
-            Err(e) if e.code() == MF_E_NOTACCEPTING => {}
+            // 编码器还没准备好收：这一帧不编（下一帧再说），不算出错；调用方不等它的输出
+            Err(e) if e.code() == MF_E_NOTACCEPTING => {
+                self.need_input = 0;
+                self.rejected = true;
+            }
             Err(e) => return Err(err("送入画面", &e)),
         }
         // 编好的帧一般马上就到：等一小会儿（低延迟），等不到下次再取
@@ -655,6 +695,7 @@ impl MfEncoder {
         // SAFETY: 对象有效。
         unsafe { self.transform.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0) }
             .map_err(|e| err("排空", &e))?;
+        self.draining = true;
         let started = Instant::now();
         while started.elapsed() < DRAIN_WAIT {
             if self.pump()? {

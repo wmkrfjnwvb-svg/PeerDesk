@@ -208,6 +208,10 @@ pub struct ControllerReport {
     pub end: String,
     /// 业务追踪。
     pub trace: String,
+    /// 从会话开始（握手完成）到显示第一幅画面用了多久；没显示过画面时为 `None`。
+    pub first_frame: Option<Duration>,
+    /// 显示第一幅画面之后，相邻两次画面更新最长隔了多久（停下时画面不变也算在内，看卡顿要结合场景）。
+    pub max_gap: Duration,
 }
 
 /// 解码线程交回的结果：帧号和解出的画面。
@@ -401,6 +405,9 @@ pub async fn run(
     let mut window = StatsWindow::default();
     let mut waiting_input: Option<peerdesk_core::time::Time> = None;
     let mut last_shown = link.now();
+    let session_start = link.now();
+    let mut first_frame: Option<u64> = None;
+    let mut max_gap_us = 0u64;
 
     let end = loop {
         if time_up && upload_task.is_none() {
@@ -417,6 +424,11 @@ pub async fn run(
                     let now = link.now();
                     window.frames = window.frames.saturating_add(1);
                     window.max_gap_us = window.max_gap_us.max(now.since(last_shown));
+                    if first_frame.is_some() {
+                        max_gap_us = max_gap_us.max(now.since(last_shown));
+                    } else {
+                        first_frame = Some(now.since(session_start));
+                    }
                     last_shown = now;
                     if let Some(at) = waiting_input.take() {
                         let took = now.since(at);
@@ -667,6 +679,8 @@ pub async fn run(
         wire_bytes,
         end,
         trace: tracer.dump(),
+        first_frame: first_frame.map(Duration::from_micros),
+        max_gap: Duration::from_micros(max_gap_us),
     })
 }
 
