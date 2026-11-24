@@ -148,6 +148,10 @@ fn session_through_server(tag: &str, extra: &[&str]) -> (String, String) {
         logs(&ctrl_dir)
     );
     assert!(out.status.success(), "{text}");
+    // 硬件编码器中途出错或每帧都是关键帧而改用软件：是代码或用法的问题，不能悄悄过去。
+    // （没有显卡时一开始就用软件编码，日志写的是“不用硬件编码”，不算。）
+    assert!(!logs(&host_dir).contains("改用软件编码"), "{text}");
+    assert!(!logs(&ctrl_dir).contains("改用软件解码"), "{text}");
     assert!(text.contains(&format!("对端指纹 {host_pin}")), "{text}");
     assert!(text.contains("画面尺寸      1280×720"), "{text}");
     assert!(host.wait().unwrap().success());

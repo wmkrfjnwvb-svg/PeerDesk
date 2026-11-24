@@ -564,7 +564,7 @@ impl VtEncoder {
     /// 按 `width`×`height`、`fps`、`bps` 打开硬件编码会话。没有硬件编码器时返回原因。
     pub fn open(width: u32, height: u32, fps: u32, bps: u64) -> Result<Self, String> {
         // 低延迟码控要 macOS 11.3+、并且编码器支持；打不开时退回普通模式
-        // （Intel Mac 上普通模式每帧都是关键帧，由 H264Encoder 的兜底改用软件编码）
+        // （如果每帧都是关键帧，H264Encoder 会改用软件编码，详情面板写明原因，实机测试判失败）
         Self::open_with(width, height, fps, bps, VtOptions::DEFAULT).or_else(|why| {
             log::info!("视频编码：低延迟码控打不开（{why}），用普通模式");
             Self::open_with(

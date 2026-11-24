@@ -445,6 +445,8 @@ pub struct H264Encoder {
     convert_us: u64,
     /// 硬件编码器连续出了几个没要求的关键帧。
     unasked_keys: u32,
+    /// 用软件编码的原因（打不开硬件编码器，或硬件中途出错），显示在详情面板里。
+    soft_reason: Option<String>,
     /// 交给硬件编码器、还没取回的帧：每帧是否要求了关键帧（按顺序；异步编码器会攒帧）。
     hw_sent: std::collections::VecDeque<bool>,
 }
@@ -499,6 +501,7 @@ impl H264Encoder {
             encoded_size: None,
             convert_us: 0,
             unasked_keys: 0,
+            soft_reason: None,
             hw_sent: std::collections::VecDeque::new(),
         }
     }
@@ -513,15 +516,17 @@ impl H264Encoder {
     /// 现在用的是哪个编码器（日志、统计用）。
     #[must_use]
     pub fn backend_name(&self) -> String {
-        self.hw.as_ref().map_or_else(
-            || "软件 OpenH264".to_owned(),
-            |e| format!("硬件 {}", e.name()),
-        )
+        match (&self.hw, &self.soft_reason) {
+            (Some(e), _) => format!("硬件 {}", e.name()),
+            (None, Some(why)) => format!("软件 OpenH264（{why}）"),
+            (None, None) => "软件 OpenH264".to_owned(),
+        }
     }
 
     /// 硬件出错：之后一直用软件编码（从关键帧开始）。
     fn hardware_failed(&mut self, why: &str) {
         log::warn!("硬件编码失败，改用软件编码（OpenH264）：{why}");
+        self.soft_reason = Some(format!("硬件出错：{why}"));
         self.hw = None;
         self.hw_off = true;
         self.hw_sent.clear();
@@ -543,6 +548,7 @@ impl H264Encoder {
             log::warn!(
                 "硬件编码器 {name} 连续 {UNASKED_KEY_LIMIT} 帧都是没要求的关键帧，改用软件编码"
             );
+            self.soft_reason = Some(format!("{name} 每帧都是关键帧"));
             self.hw = None;
             self.hw_off = true;
             self.hw_sent.clear();
@@ -568,6 +574,7 @@ impl H264Encoder {
                 }
                 Err(why) => {
                     log::info!("视频编码：软件 OpenH264（不用硬件编码：{why}）");
+                    self.soft_reason = Some(why);
                     self.hw_off = true;
                     return Hw::Off;
                 }
@@ -1155,7 +1162,10 @@ mod tests {
             .encode(3, &picture(320, 192), false, 50_000)
             .unwrap()
             .is_none());
-        assert_eq!(enc.backend_name(), "软件 OpenH264");
+        assert_eq!(
+            enc.backend_name(),
+            "软件 OpenH264（硬件出错：模拟取帧出错）"
+        );
         let f = enc
             .encode(4, &picture(320, 192), true, 50_000)
             .unwrap()
@@ -1239,7 +1249,11 @@ mod tests {
             keys += u32::from(f.key);
         }
         // 第一帧（要求的）加 5 个没要求的之后改用软件，之后是增量帧
-        assert_eq!(enc.backend_name(), "软件 OpenH264");
+        assert!(
+            enc.backend_name().starts_with("软件 OpenH264（"),
+            "{}",
+            enc.backend_name()
+        );
         assert!(keys <= 1 + UNASKED_KEY_LIMIT + 1, "{keys}");
     }
 
@@ -1368,12 +1382,20 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(f.key, "换成软件编码要从关键帧开始");
-        assert_eq!(enc.backend_name(), "软件 OpenH264");
+        assert!(
+            enc.backend_name().starts_with("软件 OpenH264（"),
+            "{}",
+            enc.backend_name()
+        );
         decode(&mut dec, &f).unwrap();
         // 打不开：直接用软件
         let mut enc = H264Encoder::new(30).with_hardware(fake_none);
         assert!(enc.encode(1, &screen, true, 5000).unwrap().unwrap().key);
-        assert_eq!(enc.backend_name(), "软件 OpenH264");
+        assert!(
+            enc.backend_name().starts_with("软件 OpenH264（"),
+            "{}",
+            enc.backend_name()
+        );
         // 这个系统的硬件编码入口：Linux 上没有（Windows、macOS 的实机测试另测）
         #[cfg(not(any(windows, target_os = "macos")))]
         assert!(open_system_hardware(64, 64, 30, 1_000_000).is_err());
