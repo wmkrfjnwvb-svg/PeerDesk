@@ -15,7 +15,7 @@
 | [I-release.md](I-release.md) | 发布：硬件编码、代码签名和公证、自动更新 |
 | [J-keyboard.md](J-keyboard.md) | 远程键盘：跨系统快捷键映射、输入法、键盘布局、系统快捷键捕获 |
 
-## 实现状态总表（2026-11-23）
+## 实现状态总表（2026-11-24）
 
 图例：✅ 已完成并有测试（进 CI）；🟡 部分完成；⬜ 未做。“代码”列是主要文件，测试在各 crate 的 `tests/` 目录。
 传输算法的逐项细节见第 3.8 节。
@@ -26,7 +26,10 @@
 | --- | --- | --- | --- |
 | QUIC 连接、数据报、可靠流 | ✅ | `net/node.rs`、`net/stream.rs` | quinn 0.11；QUIC 层用 BBR 兜底 |
 | 分片、重组、新帧优先、截止时间作废 | ✅ | `core/transport.rs` | |
-| 前向纠错（分组异或校验） | ✅ | `core/transport.rs` | 比例按网络画像固定 |
+| 前向纠错：RS 纠删码（GF(256) Cauchy，任意 k 个还原），老版本退回异或 | ✅ | `core/rs.rs`、`core/transport.rs` | 能力位 `FEC_RS`；5% 丢包冻结 8 次 → 0（3.7.6） |
+| 纠错比例按实测丢包自适应，自动换网络画像 | ✅ | `core/media.rs` | max(画像, 3 × 丢包率)，上限 33%（3.7.5） |
+| 窄带宽关键帧不被作废/判丢、MTU 变小不断会话 | ✅ | `core/transport.rs`、`net/node.rs` | 3.7.3 |
+| 发送节奏（pacing） | 🟡 | `core/pacer.rs` | 实验，默认关：仿真和实测还不能同时变好 |
 | NACK 重传（一轮限量） | ✅ | `core/adaptive.rs`、`core/media.rs` | |
 | 接收端测量与反馈（排队延迟、丢包、速率） | ✅ | `core/adaptive.rs` | |
 | 延迟趋势线（WebRTC trendline，自适应门限） | ✅ | `core/estimator.rs` | |
@@ -39,7 +42,7 @@
 | 空闲后先探测带宽 | ⬜ | | 现在靠第一个大帧的包串重新测 |
 | 降分辨率（先接后断） | ⬜ | | |
 | 长期参考帧恢复 | ⬜ | | 等硬件编码器；现在丢帧发关键帧 |
-| 按预测调纠错比例 | ⬜ | | |
+| 按预测调纠错比例 | ⬜ | | 现在按实测丢包调 |
 | 视频区域抖动缓冲 | ⬜ | | |
 
 ### 编解码（本文第 2 节，报告 I）
@@ -50,8 +53,10 @@
 | 整数系数的 RGB→YUV 转换 | ✅ | `media/color.rs` | 与 openh264 逐字节一致 |
 | 静止后补清晰（最多约 8 帧残差） | ✅ | `media/lib.rs` | |
 | 块编码（对照组，渐进无损） | ✅ | `core/codec.rs` | 只在仿真里做对照 |
-| 硬件能力探测与档位 | 🟡 | `core/probe.rs` | 只有判定规则，没有接硬件编码器 |
-| 硬件编码（Media Foundation、VideoToolbox、VA-API） | ⬜ | | **下一项** |
+| 硬件编码：Windows Media Foundation（异步硬件 MFT） | ✅ | `media/mf.rs` | 失败自动回退 OpenH264；CI 验证不崩，真机速度待测 |
+| 硬件编解码：macOS VideoToolbox | ✅ | `media/vt.rs`、`media/annexb.rs` | Mac CI 实机编解码通过；失败回退软件 |
+| 硬件编码：Linux VA-API | ⬜ | | |
+| 详情面板显示双方编解码器（硬件/软件） | ✅ | `client/gui/state.rs` | |
 | 编解码挪到独立线程 | ⬜ | | |
 | AV1、HEVC、4:4:4 文字清晰度、4K/8K | ⬜ | | |
 | 发布版运行时下载 Cisco OpenH264 二进制 | ⬜ | | |
@@ -84,6 +89,7 @@
 | 密码认证（SPAKE2 + 通道绑定，失败限次） | ✅ | `core/auth.rs` | |
 | 握手、能力位、新旧版本兼容（快照测试） | ✅ | `core/session.rs`、`core/proto.rs`、`docs/compat.md` | |
 | 双因素、审计日志、访问控制列表 | ⬜ | | 见报告 G 第 5 节 |
+| 崩溃日志自动上传（默认服务器，打包可关） | ✅ | `client/crashreport.rs`、`net/service.rs` | 服务端需要更新才收得到 |
 
 ### 采集、输入、声音、剪贴板、文件
 
@@ -94,7 +100,9 @@
 | 屏幕采集：Linux X11（MIT-SHM、DAMAGE） | ✅ | `platform/x11.rs` | |
 | 屏幕采集：Linux Wayland | ⬜ | | 现在给出明确错误 |
 | 键鼠注入（SendInput、CGEvent、XTEST），HID 键位表 | ✅ | `platform/*`、`platform/keymap.rs` | |
-| 浮动助手：12 个快捷键（按对端系统选键）、声音、全屏、统计、断开 | ✅ | `client/gui/assistant.rs`、`viewer.rs` | |
+| 浮动助手：12 个快捷键（按对端系统选键）、声音、全屏、原始大小、详情、断开 | ✅ | `client/gui/assistant.rs`、`viewer.rs` | |
+| 浮动助手：可拖动，收起成图标；点击不穿透到远程画面 | ✅ | `client/gui/viewer.rs` | 2026-11-24，待真机确认手感 |
+| 详情面板：双方网络、分辨率、往返/路由器延迟、丢包、帧率、解码耗时、纠错、编解码器 | ✅ | `client/gui/state.rs` | F12；网络差时工具条显示原因 |
 | 浮动助手：剪贴板开关、文件传输入口、画质和帧率、切换显示器 | ⬜ | | |
 | 键盘原生捕获（Win 键、Alt+Tab）、跨系统映射、输入法 | ⬜ | | 报告 J，排在最后 |
 | 声音：Opus 编解码、RED 自适应冗余 | ✅ | `media/audio.rs`、`core/audio.rs` | 报告 H |
@@ -110,8 +118,10 @@
 | 算法 / 模块 | 状态 | 说明 |
 | --- | --- | --- |
 | 锁屏时拒绝本次连接并说明原因，继续被控 | ✅ | `client/local.rs` |
-| 系统服务（Windows 服务、macOS LaunchDaemon、Linux systemd） | ⬜ | |
-| 锁屏和登录界面的采集与控制，服务发送 Ctrl+Alt+Del（SAS） | ⬜ | |
+| Windows 系统服务：跟随控制台会话拉起代理、崩溃重拉、安装包可选、CI 实装测试 | ✅ | `client/unattended.rs`、`platform/winservice.rs` | CI 上服务（会话 0）在会话 2 拉起代理并监听 |
+| Windows 锁屏、登录界面、UAC 的采集与控制，服务代发 Ctrl+Alt+Del | 🟡 | `platform/winsession.rs` | 代码完成，**待真机验证** |
+| 设置页“无人值守”卡片（安装、卸载、改密码） | ⬜ | | 现在用安装包或命令行 |
+| macOS LaunchDaemon、Linux systemd | ⬜ | | |
 | 无显示器主机的虚拟显示器 | ⬜ | |
 | 隐私屏（黑掉被控端屏幕）、锁定被控端键鼠 | ⬜ | |
 
@@ -122,7 +132,10 @@
 | 主窗口（首页、设备、设置），浅色、深色、跟随系统 | ✅ | `client/gui/app.rs`、`theme.rs` |
 | 中英文切换（跟随系统或手动） | ✅ | `client/gui/i18n.rs` |
 | macOS 授权引导（示意图按系统版本和语言绘制） | ✅ | `client/gui/guide_art.rs`、`platform/guide.rs` |
-| 安装包（Windows、macOS、Linux 服务端、Docker） | ✅ | `scripts/package-*.sh` |
+| 安装包（Windows、macOS、Linux 客户端 .deb、Linux 服务端、Docker），文件名带提交号 | ✅ | `scripts/package-*.sh` |
+| Linux 启动前检查缺的系统库并给出安装命令 | ✅ | `client/libcheck.rs` |
+| 设备显示机器名和系统类型 | ✅ | `client/local.rs`、`gui/recent.rs` |
+| 设备簿（添加、备注、分组、搜索） | ⬜ | |
 | 代码签名、公证、自动更新 | ⬜ | 报告 I；需要公司主体和 Apple 开发者账号 |
 | 账户、Stripe 收费（Supabase） | ⬜ | 服务端已有计费账本 |
 | 英文官网（中英切换） | ⬜ | |
@@ -132,11 +145,12 @@
 
 | 模块 | 状态 | 说明 |
 | --- | --- | --- |
-| L1 进程内确定性仿真，真实编码器，8 个场景，硬门槛 | ✅ | `crates/e2e` |
+| L1 进程内确定性仿真，真实编码器，9 个场景，硬门槛 | ✅ | `crates/e2e` |
+| 微软真实网络轨迹（MMSys 2024，CC BY 4.0）回放与回归门槛 | ✅ | `e2e/tests/ms_traces.rs` | 3.7.2 |
 | L2 真实二进制闭环（虚拟桌面、真实 QUIC） | ✅ | `scripts/e2e-live.sh` |
 | AI 特征记录（每次反馈一行，带仿真真值） | ✅ | `e2e/lib.rs` |
 | 帧号条码测端到端延迟、输入到显示延迟 | ⬜ | |
-| 真实网络轨迹回放、L3 跨机器每晚测试、性能趋势记录 | ⬜ | |
+| L3 跨机器每晚测试、性能趋势记录 | ⬜ | |
 
 ### 尚未开始的大块
 
