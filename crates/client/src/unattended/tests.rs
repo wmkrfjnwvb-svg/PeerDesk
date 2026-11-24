@@ -404,14 +404,31 @@ fn agent_says_why_it_stopped() {
     // 端口被别的程序占着：被控起不来，代理说明原因
     let busy = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
     let port = busy.local_addr().unwrap().port();
-    let stop = AtomicBool::new(false);
-    let err = run_agent(&base, &agent_dir(&base), port, &stop).unwrap_err();
-    assert!(!err.is_empty());
+    // Windows 上同一个 UDP 端口可以重复绑定，被控照样起来：最多等 15 秒后让它停下，不能卡住测试
+    let stop = Arc::new(AtomicBool::new(false));
+    let timer = {
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let until = Instant::now() + Duration::from_secs(15);
+            while Instant::now() < until && !stop.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            stop.store(true, Ordering::Relaxed);
+        })
+    };
+    let result = run_agent(&base, &agent_dir(&base), port, &stop);
+    stop.store(true, Ordering::Relaxed);
+    timer.join().unwrap();
+    // Linux、macOS：端口冲突，被控起不来，代理说明原因
+    #[cfg(not(windows))]
+    assert!(!result.unwrap_err().is_empty());
+    #[cfg(windows)]
+    let _ = result;
     assert!(!read_status(&base).unwrap().running);
     // 状态目录写不了：只记日志，照样说明原因
     let file = base.join("not-a-dir");
     std::fs::write(&file, b"").unwrap();
-    assert!(run_agent(&file, &agent_dir(&file), 0, &stop).is_err());
+    assert!(run_agent(&file, &agent_dir(&file), 0, &AtomicBool::new(false)).is_err());
 }
 
 #[test]

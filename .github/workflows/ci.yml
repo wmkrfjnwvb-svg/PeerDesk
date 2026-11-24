@@ -51,6 +51,8 @@ jobs:
   # Windows / macOS 跑全部测试和发布构建的冒烟测试（Linux 的测试已经在覆盖率任务里跑过）。按需触发。
   platforms:
     name: test + release (${{ matrix.os }})
+    # 有测试卡住时不要拖到默认的 6 小时
+    timeout-minutes: 75
     if: ${{ (github.event_name == 'workflow_dispatch' && inputs.scope != 'packages') || contains(github.event.head_commit.message, '[full]') || contains(github.event.head_commit.message, '[mac]') || contains(github.event.head_commit.message, '[win]') }}
     strategy:
       fail-fast: false
