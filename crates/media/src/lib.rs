@@ -42,6 +42,82 @@ fn codec_error(what: &'static str) -> impl Fn(openh264::Error) -> Error {
 }
 
 /// OpenH264 要求宽高都是偶数：奇数时补一行（列），复制边上的像素。
+/// 用 `open` 打开的硬件编码器编 `frames`：一行结果（Windows；macOS 用 `vt::probe` 对比几种设置）。
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn report_with(
+    open: HardwareOpener,
+    width: u32,
+    height: u32,
+    frames: &[Vec<u8>],
+    decodes: &mut dyn FnMut(&[u8]) -> bool,
+) -> Vec<String> {
+    let mut enc = match open(width, height, 30, 4_000_000) {
+        Ok(enc) => enc,
+        Err(why) => return vec![format!("没有可用的硬件编码器：{why}")],
+    };
+    let name = enc.name().to_owned();
+    let (mut keys, mut total, mut ok) = (0u32, 0u128, true);
+    for (i, nv12) in frames.iter().enumerate() {
+        let started = std::time::Instant::now();
+        let (data, key) = match enc.encode(nv12, 4_000_000, i == 0) {
+            Ok(done) => done,
+            Err(why) => return vec![format!("{name}：第 {i} 帧编码失败：{why}")],
+        };
+        total += started.elapsed().as_micros();
+        keys += u32::from(key);
+        ok &= data.is_empty() || decodes(&data);
+    }
+    let n = u128::try_from(frames.len().max(1)).unwrap_or(1);
+    vec![format!(
+        "{name}：关键帧 {keys}/{}，编码平均 {} ms，软件解码 {}",
+        frames.len(),
+        total / n / 1000,
+        if ok { "正常" } else { "失败" }
+    )]
+}
+
+/// 画面转成 NV12（宽高补成偶数）：（宽, 高, NV12）。`hw-check` 用它准备硬件编码器的输入。
+#[must_use]
+pub fn screen_to_nv12(screen: &Screen) -> (u32, u32, Vec<u8>) {
+    let (w, h, pixels) = even_pixels(screen);
+    let (mut y, mut u, mut v, mut nv12) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    color::rgb_to_i420(&pixels, w, &mut y, &mut u, &mut v);
+    color::i420_to_nv12(&y, &u, &v, &mut nv12);
+    (
+        u32::try_from(w).unwrap_or(0),
+        u32::try_from(h).unwrap_or(0),
+        nv12,
+    )
+}
+
+/// 软件解码器解不解得了这一帧（Annex B）。
+fn soft_decodes(dec: Option<&mut H264Decoder>, width: u32, height: u32, data: &[u8]) -> bool {
+    let header = FrameHeader {
+        codec: Codec::H264,
+        key: annexb::has_idr(data),
+        width: u16::try_from(width).unwrap_or(u16::MAX),
+        height: u16::try_from(height).unwrap_or(u16::MAX),
+    };
+    dec.is_some_and(|d| d.decode(&header, data).is_ok())
+}
+
+/// 硬件编码器体检：用本系统的硬件编码器（macOS 对比几种设置）编 `frames`（NV12，第一帧要求关键帧），
+/// 每种设置一行结果。没有硬件编码器时说明原因。
+#[must_use]
+pub fn hardware_report(width: u32, height: u32, frames: &[Vec<u8>]) -> Vec<String> {
+    // 软件解码器能不能接上硬件编出的码流（接收端在 Linux 上用它）
+    let mut soft = H264Decoder::new().ok();
+    let mut decodes = |data: &[u8]| soft_decodes(soft.as_mut(), width, height, data);
+    #[cfg(target_os = "macos")]
+    {
+        vt::probe(width, height, frames, &mut decodes)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        report_with(open_system_hardware, width, height, frames, &mut decodes)
+    }
+}
+
 fn even_pixels(screen: &Screen) -> (usize, usize, Vec<u32>) {
     let (w, h) = (usize::from(screen.width()), usize::from(screen.height()));
     let (ew, eh) = (w + w % 2, h + h % 2);
@@ -853,6 +929,32 @@ mod tests {
             soft: H264Encoder::new(fps).with_hardware(fake_none),
             always_key: true,
         }))
+    }
+
+    #[test]
+    fn hardware_report_lines() {
+        let frames: Vec<Vec<u8>> = (0..4)
+            .map(|_| screen_to_nv12(&picture(320, 192)).2)
+            .collect();
+        let mut yes = |_: &[u8]| true;
+        let ok = report_with(fake_ok, 320, 192, &frames, &mut yes);
+        assert!(ok[0].contains("假硬件") && ok[0].contains("正常"), "{ok:?}");
+        let mut no = |_: &[u8]| false;
+        assert!(report_with(fake_ok, 320, 192, &frames, &mut no)[0].contains("失败"));
+        assert!(report_with(fake_none, 320, 192, &frames, &mut yes)[0].contains("没有可用"));
+        assert!(report_with(fake_failing, 320, 192, &frames, &mut yes)[0].contains("第 2 帧"));
+        // 软件解码器的检查：真的 H.264 帧解得了，没有解码器时算失败
+        let mut enc = H264Encoder::new(30).with_hardware(fake_none);
+        let f = enc
+            .encode(1, &picture(320, 192), true, 50_000)
+            .unwrap()
+            .unwrap();
+        let (_, data) = FrameHeader::parse(&f.payload).unwrap();
+        let mut dec = H264Decoder::new().unwrap();
+        assert!(soft_decodes(Some(&mut dec), 320, 192, data));
+        assert!(!soft_decodes(None, 320, 192, data));
+        // 本系统（CI 的 Linux 没有硬件编码器；Windows、macOS 上真的测）
+        assert!(!hardware_report(320, 192, &frames).is_empty());
     }
 
     #[test]

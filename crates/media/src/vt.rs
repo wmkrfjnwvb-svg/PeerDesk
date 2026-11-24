@@ -273,6 +273,7 @@ pub struct VtEncoder {
     fps: i32,
     frame: i64,
     bps: u64,
+    opts: VtOptions,
 }
 
 impl std::fmt::Debug for VtEncoder {
@@ -285,6 +286,123 @@ impl std::fmt::Debug for VtEncoder {
 
 // SAFETY: VideoToolbox 会话和像素缓冲可以在线程之间移动；实际只在编码线程上使用。
 unsafe impl Send for VtEncoder {}
+
+/// 编码器的设置（产品用 [`VtOptions::DEFAULT`]，`hw-check` 对比其他几种）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VtOptions {
+    /// 最大关键帧间隔（帧数）；`None` 不设，由编码器决定。
+    pub max_key_interval: Option<i32>,
+    /// 每帧编完都强制完成（旧做法；怀疑会让下一帧变成关键帧）。
+    pub complete_each_frame: bool,
+    /// 要求 Baseline 档次（OpenH264 解得了）；否则由编码器选。
+    pub baseline: bool,
+}
+
+impl VtOptions {
+    /// 产品现在用的设置。
+    pub const DEFAULT: Self = Self {
+        max_key_interval: Some(i32::MAX),
+        complete_each_frame: false,
+        baseline: true,
+    };
+
+    /// `hw-check` 对比的几种设置：（名称, 设置）。
+    pub const VARIANTS: [(&'static str, Self); 5] = [
+        ("现在的设置（间隔 i32::MAX）", Self::DEFAULT),
+        (
+            "关键帧间隔 7200（WebRTC 的值）",
+            Self {
+                max_key_interval: Some(7200),
+                ..Self::DEFAULT
+            },
+        ),
+        (
+            "不设关键帧间隔",
+            Self {
+                max_key_interval: None,
+                ..Self::DEFAULT
+            },
+        ),
+        (
+            "每帧 CompleteFrames（旧做法）",
+            Self {
+                complete_each_frame: true,
+                ..Self::DEFAULT
+            },
+        ),
+        (
+            "不限 Baseline、间隔 7200",
+            Self {
+                max_key_interval: Some(7200),
+                complete_each_frame: false,
+                baseline: false,
+            },
+        ),
+    ];
+}
+
+/// 用几种设置分别编 `frames`（NV12，第一帧要求关键帧），每种一行结果：
+/// 关键帧数、平均/最长编码耗时、平均每帧字节、软件解码器（`decodes`）能不能解。
+pub fn probe(
+    width: u32,
+    height: u32,
+    frames: &[Vec<u8>],
+    decodes: &mut dyn FnMut(&[u8]) -> bool,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    for (name, opts) in VtOptions::VARIANTS {
+        let mut enc = match VtEncoder::open_with(width, height, 30, 4_000_000, opts) {
+            Ok(enc) => enc,
+            Err(why) => {
+                lines.push(format!("{name}：打不开：{why}"));
+                continue;
+            }
+        };
+        let (mut keys, mut bytes, mut total, mut worst, mut empty) =
+            (0u32, 0usize, 0u128, 0u128, 0u32);
+        let mut decoded_ok = true;
+        let mut sizes = Vec::new();
+        for (i, nv12) in frames.iter().enumerate() {
+            let started = std::time::Instant::now();
+            match enc.encode(nv12, 4_000_000, i == 0) {
+                Ok((data, key)) => {
+                    let took = started.elapsed().as_micros();
+                    total += took;
+                    worst = worst.max(took);
+                    keys += u32::from(key);
+                    bytes += data.len();
+                    if data.is_empty() {
+                        empty += 1;
+                    } else {
+                        decoded_ok &= decodes(&data);
+                    }
+                    if i < 12 {
+                        sizes.push(format!(
+                            "{}{}",
+                            data.len() / 1024,
+                            if key { "K" } else { "" }
+                        ));
+                    }
+                }
+                Err(why) => {
+                    lines.push(format!("{name}：第 {i} 帧编码失败：{why}"));
+                    break;
+                }
+            }
+        }
+        let n = u128::try_from(frames.len().max(1)).unwrap_or(1);
+        lines.push(format!(
+            "{name}：关键帧 {keys}/{}，编码平均 {} ms、最长 {} ms，平均 {} KB/帧，空帧 {empty}，软件解码 {}，前 12 帧 KB（K=关键帧）{}",
+            frames.len(),
+            total / n / 1000,
+            worst / 1000,
+            bytes / frames.len().max(1) / 1024,
+            if decoded_ok { "正常" } else { "失败" },
+            sizes.join(" "),
+        ));
+    }
+    lines
+}
 
 /// 等编码输出回调最多这么久。
 const OUTPUT_WAIT: std::time::Duration = std::time::Duration::from_millis(300);
@@ -361,6 +479,17 @@ unsafe fn read_sample(sample: CFTypeRef) -> Result<(Vec<u8>, bool), String> {
 impl VtEncoder {
     /// 按 `width`×`height`、`fps`、`bps` 打开硬件编码会话。没有硬件编码器时返回原因。
     pub fn open(width: u32, height: u32, fps: u32, bps: u64) -> Result<Self, String> {
+        Self::open_with(width, height, fps, bps, VtOptions::DEFAULT)
+    }
+
+    /// 按指定的设置打开（`peerdesk hw-check` 用它对比几种设置）。
+    pub fn open_with(
+        width: u32,
+        height: u32,
+        fps: u32,
+        bps: u64,
+        opts: VtOptions,
+    ) -> Result<Self, String> {
         let w = i32::try_from(width).map_err(|_| "画面太大".to_owned())?;
         let h = i32::try_from(height).map_err(|_| "画面太大".to_owned())?;
         let slot: Box<EncodeSlot> = Box::default();
@@ -398,31 +527,36 @@ impl VtEncoder {
             fps: i32::try_from(fps.max(1)).unwrap_or(30),
             frame: 0,
             bps: 0,
+            opts,
         };
         // SAFETY: 会话有效；键和值都是系统常量或刚创建的数字。
         unsafe {
             let _ =
                 VTSessionSetProperty(session, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
-            check(
-                VTSessionSetProperty(
-                    session,
-                    kVTCompressionPropertyKey_ProfileLevel,
-                    kVTProfileLevel_H264_Baseline_AutoLevel,
-                ),
-                "设置 Baseline 档次",
-            )?;
+            if opts.baseline {
+                check(
+                    VTSessionSetProperty(
+                        session,
+                        kVTCompressionPropertyKey_ProfileLevel,
+                        kVTProfileLevel_H264_Baseline_AutoLevel,
+                    ),
+                    "设置 Baseline 档次",
+                )?;
+            }
             // 不重排帧（不要 B 帧）：低延迟
             let _ = VTSessionSetProperty(
                 session,
                 kVTCompressionPropertyKey_AllowFrameReordering,
                 kCFBooleanFalse,
             );
-            let interval = number_i32(i32::MAX);
-            let _ = VTSessionSetProperty(
-                session,
-                kVTCompressionPropertyKey_MaxKeyFrameInterval,
-                interval.0,
-            );
+            if let Some(frames) = opts.max_key_interval {
+                let interval = number_i32(frames);
+                let _ = VTSessionSetProperty(
+                    session,
+                    kVTCompressionPropertyKey_MaxKeyFrameInterval,
+                    interval.0,
+                );
+            }
             let rate = number_i32(enc.fps);
             let _ =
                 VTSessionSetProperty(session, kVTCompressionPropertyKey_ExpectedFrameRate, rate.0);
@@ -542,10 +676,15 @@ impl VtEncoder {
         // 等输出回调，不调用 CompleteFrames：每帧都“完成”会结束当前的参考帧序列，
         // 编码器下一帧又从关键帧开始（实测 Intel Mac 上每帧都是关键帧、200 KB、5 帧/秒）。
         // 实时模式、不重排帧时编码器编完就回调；等不到才强制完成（会多一个关键帧，但不会卡住）。
+        let wait = if self.opts.complete_each_frame {
+            std::time::Duration::ZERO
+        } else {
+            OUTPUT_WAIT
+        };
         let waited = self.slot.result.lock().ok().and_then(|guard| {
             self.slot
                 .ready
-                .wait_timeout_while(guard, OUTPUT_WAIT, |r| r.is_none())
+                .wait_timeout_while(guard, wait, |r| r.is_none())
                 .ok()
                 .and_then(|(mut r, _)| r.take())
         });

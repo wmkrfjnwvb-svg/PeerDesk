@@ -15,6 +15,7 @@ pub mod logfile;
 pub fn data_dir() -> std::path::PathBuf {
     remote::default_data_dir()
 }
+mod hwcheck;
 mod local;
 mod remote;
 mod screen_check;
@@ -53,6 +54,7 @@ const USAGE: &str = "\
                           通过服务器找到被控端：先试直连（打洞），不通再走中继
   bench-transport         对比裸 UDP 和 QUIC 数据报在本机回环上的延迟
   screen-check [选项]     采集一帧本机屏幕，报告尺寸和耗时
+  hw-check                编码器体检：软件和硬件编码的耗时、关键帧，结果存到日志目录
   service install|uninstall|status|password <密码>
                           Windows 无人值守：注册系统服务，锁屏和登录界面也能远程（需管理员）
   help                    显示本帮助
@@ -301,6 +303,7 @@ pub fn run(args: &[String], out: &mut dyn Write) -> u8 {
         "netcheck" => return remote::netcheck(rest, out),
         "screen-check" => return screen_check::screen_check(rest, out),
         "check-config" => cmd_check_config(rest, out),
+        "hw-check" => return hwcheck::hw_check(out, &data_dir().join("logs")),
         "service" => {
             let result = unattended::cmd_service(rest, out);
             return report(out, result);

@@ -480,7 +480,10 @@ impl Viewer {
             self.overlay = !self.overlay;
         }
         if live {
+            // 跨系统时 Ctrl 和 Command 对调（Windows 上 Ctrl+C 就是 Mac 上的复制）
+            let local = PeerOs::current();
             for event in translated.events {
+                let event = super::input::swap_ctrl_and_command(event, local, self.peer_os);
                 let _ = self.handle.send(event);
             }
             // 不打开本机输入法：按键原样发给远程，由远程自己的输入法处理（和 ToDesk、Parsec 一样）。

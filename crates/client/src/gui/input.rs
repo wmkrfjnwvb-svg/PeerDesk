@@ -12,6 +12,7 @@ use eframe::egui::{
 };
 use num_traits::ToPrimitive;
 use peerdesk_core::input::{InputEvent, MAX_TEXT_LEN};
+use peerdesk_core::proto::PeerOs;
 
 use super::coords::normalize;
 use super::keys::{hid_of, MODIFIERS};
@@ -70,6 +71,34 @@ pub fn split_text(text: &str) -> Vec<String> {
         parts.push(current);
     }
     parts
+}
+
+/// 跨系统的修饰键对调：Windows、Linux 的 Ctrl 相当于 macOS 的 Command。
+///
+/// - 本机不是 macOS、对端是 macOS：Ctrl ↔ Command（在 Windows 上按 Ctrl+C，Mac 上就是 Command+C 复制）；
+/// - 本机是 macOS、对端不是：Command ↔ Ctrl（在 Mac 上按 Command+V，Windows 上就是 Ctrl+V）；
+/// - 两边一样或不知道对端是什么系统：不变。
+///
+/// 对调而不是单向映射：对端原来的那个键（Mac 的 Control、Windows 的 Win 键）仍然按得到。
+#[must_use]
+pub fn swap_ctrl_and_command(event: InputEvent, local: PeerOs, peer: PeerOs) -> InputEvent {
+    let local_mac = local == PeerOs::Mac;
+    let peer_mac = peer == PeerOs::Mac;
+    if local_mac == peer_mac || peer == PeerOs::Unknown || local == PeerOs::Unknown {
+        return event;
+    }
+    let InputEvent::Key { code, down } = event else {
+        return event;
+    };
+    // 左 Ctrl 0xE0 ↔ 左 GUI 0xE3，右 Ctrl 0xE4 ↔ 右 GUI 0xE7
+    let code = match code {
+        0xE0 => 0xE3,
+        0xE3 => 0xE0,
+        0xE4 => 0xE7,
+        0xE7 => 0xE4,
+        other => other,
+    };
+    InputEvent::Key { code, down }
 }
 
 impl InputState {
@@ -386,6 +415,59 @@ mod tests {
             None,
         );
         assert_eq!(t.events, vec![down(0xE1), down(0xE2), down(0xE3)]);
+    }
+
+    #[test]
+    fn ctrl_and_command_swap_between_mac_and_others() {
+        let key = |code, down| InputEvent::Key { code, down };
+        let swap = |e, l, p| swap_ctrl_and_command(e, l, p);
+        // Windows 控制 Mac：Ctrl+C → Command+C；Win 键 → Control
+        assert_eq!(
+            swap(key(0xE0, true), PeerOs::Windows, PeerOs::Mac),
+            key(0xE3, true)
+        );
+        assert_eq!(
+            swap(key(0xE4, false), PeerOs::Windows, PeerOs::Mac),
+            key(0xE7, false)
+        );
+        assert_eq!(
+            swap(key(0xE3, true), PeerOs::Linux, PeerOs::Mac),
+            key(0xE0, true)
+        );
+        // Mac 控制 Windows：Command → Ctrl
+        assert_eq!(
+            swap(key(0xE3, true), PeerOs::Mac, PeerOs::Windows),
+            key(0xE0, true)
+        );
+        assert_eq!(
+            swap(key(0xE7, true), PeerOs::Mac, PeerOs::Linux),
+            key(0xE4, true)
+        );
+        // 其他键、同系统、不知道对端：不变
+        assert_eq!(
+            swap(key(0x06, true), PeerOs::Windows, PeerOs::Mac),
+            key(0x06, true)
+        );
+        assert_eq!(
+            swap(key(0xE0, true), PeerOs::Windows, PeerOs::Linux),
+            key(0xE0, true)
+        );
+        assert_eq!(
+            swap(key(0xE0, true), PeerOs::Mac, PeerOs::Mac),
+            key(0xE0, true)
+        );
+        assert_eq!(
+            swap(key(0xE0, true), PeerOs::Windows, PeerOs::Unknown),
+            key(0xE0, true)
+        );
+        assert_eq!(
+            swap(key(0xE0, true), PeerOs::Unknown, PeerOs::Mac),
+            key(0xE0, true)
+        );
+        assert_eq!(
+            swap(InputEvent::ReleaseAll, PeerOs::Windows, PeerOs::Mac),
+            InputEvent::ReleaseAll
+        );
     }
 
     #[test]
