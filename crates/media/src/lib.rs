@@ -16,6 +16,7 @@ use openh264::encoder::{
 };
 use openh264::formats::{YUVSlices, YUVSource};
 
+pub mod annexb;
 pub mod audio;
 mod color;
 use openh264::OpenH264API;
@@ -62,6 +63,148 @@ fn even_pixels(screen: &Screen) -> (usize, usize, Vec<u32>) {
 
 #[cfg(windows)]
 mod mf;
+#[cfg(target_os = "macos")]
+mod vt;
+
+#[cfg(target_os = "macos")]
+impl HardwareEncoder for vt::VtEncoder {
+    fn name(&self) -> &str {
+        "VideoToolbox"
+    }
+    fn size(&self) -> (u32, u32) {
+        vt::VtEncoder::size(self)
+    }
+    fn encode(
+        &mut self,
+        nv12: &[u8],
+        bps: u64,
+        force_key: bool,
+    ) -> Result<(Vec<u8>, bool), String> {
+        vt::VtEncoder::encode(self, nv12, bps, force_key)
+    }
+}
+
+/// 硬件解码器（系统胶水实现，例如 macOS 的 VideoToolbox）。输入 Annex B 码流。
+pub trait HardwareDecoder: Send + std::fmt::Debug {
+    /// 名称（日志、详情面板用）。
+    fn name(&self) -> &str;
+    /// 解一帧，返回（宽, 高, `0x00RRGGBB` 像素）；还没收到关键帧时返回 `None`。
+    ///
+    /// # Errors
+    /// 解码出错：调用方改用软件解码。
+    fn decode(&mut self, data: &[u8]) -> Result<Option<(usize, usize, Vec<u32>)>, String>;
+}
+
+#[cfg(target_os = "macos")]
+impl HardwareDecoder for vt::VtDecoder {
+    fn name(&self) -> &str {
+        "VideoToolbox"
+    }
+    fn decode(&mut self, data: &[u8]) -> Result<Option<(usize, usize, Vec<u32>)>, String> {
+        vt::VtDecoder::decode(self, data)
+    }
+}
+
+/// 本系统的硬件解码器（目前只有 macOS）。`PEERDESK_HW=0` 关掉。
+///
+/// # Errors
+/// 被关掉，或者这个系统还没接硬件解码。
+pub fn open_system_hardware_decoder() -> Result<Box<dyn HardwareDecoder>, String> {
+    if hardware_disabled(std::env::var_os("PEERDESK_HW").as_deref()) {
+        return Err("已用 PEERDESK_HW=0 关掉".into());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let dec: Box<dyn HardwareDecoder> = Box::new(vt::VtDecoder::new());
+        Ok(dec)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err("这个系统还没接硬件解码（目前只有 macOS）".into())
+    }
+}
+
+/// H.264 解码：有硬件解码器就用（macOS），出错时改用 OpenH264 并且不再换回。
+pub struct AutoH264Decoder {
+    hw: Option<Box<dyn HardwareDecoder>>,
+    soft: H264Decoder,
+    /// 硬件解出的最近一幅画面。
+    screen: Option<Screen>,
+}
+
+impl std::fmt::Debug for AutoH264Decoder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AutoH264Decoder")
+            .field("hw", &self.hw)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AutoH264Decoder {
+    /// 用本系统的硬件解码器（没有就只用软件）。
+    ///
+    /// # Errors
+    /// OpenH264 解码器创建失败。
+    pub fn new() -> Result<Self, Error> {
+        Self::with_hardware(open_system_hardware_decoder().ok())
+    }
+
+    /// 指定硬件解码器（测试用假的）。
+    ///
+    /// # Errors
+    /// OpenH264 解码器创建失败。
+    pub fn with_hardware(hw: Option<Box<dyn HardwareDecoder>>) -> Result<Self, Error> {
+        if let Some(h) = &hw {
+            log::info!("视频解码：硬件 {}", h.name());
+        }
+        Ok(Self {
+            hw,
+            soft: H264Decoder::new()?,
+            screen: None,
+        })
+    }
+}
+
+impl VideoDecoder for AutoH264Decoder {
+    fn decode(&mut self, header: &FrameHeader, data: &[u8]) -> Result<Option<&Screen>, Error> {
+        if let Some(hw) = self.hw.as_mut() {
+            match hw.decode(data) {
+                Ok(None) => return Ok(None),
+                Ok(Some((w, h, pixels))) => {
+                    let (hw_w, hh) = (usize::from(header.width), usize::from(header.height));
+                    if w < hw_w || h < hh {
+                        return Err(Error::Inconsistent("解出的画面比帧头说的小"));
+                    }
+                    // 硬件按 16 对齐时多出的边裁掉
+                    let mut cropped = Vec::with_capacity(hw_w * hh);
+                    for y in 0..hh {
+                        cropped
+                            .extend_from_slice(pixels.get(y * w..y * w + hw_w).unwrap_or_default());
+                    }
+                    self.screen = Some(Screen::from_pixels(header.width, header.height, cropped)?);
+                    return Ok(self.screen.as_ref());
+                }
+                Err(why) => {
+                    log::warn!("硬件解码失败，改用软件解码（OpenH264）：{why}");
+                    self.hw = None;
+                    self.screen = None;
+                }
+            }
+        }
+        self.soft.decode(header, data)
+    }
+
+    fn screen(&self) -> Option<&Screen> {
+        self.screen.as_ref().or_else(|| self.soft.screen())
+    }
+
+    fn backend(&self) -> String {
+        self.hw.as_ref().map_or_else(
+            || "软件 OpenH264".to_owned(),
+            |h| format!("硬件 {}", h.name()),
+        )
+    }
+}
 
 /// 硬件编码器（系统胶水实现，例如 Windows 的 Media Foundation）。输入 NV12，输出 H.264 Annex B。
 pub trait HardwareEncoder: Send + std::fmt::Debug {
@@ -121,10 +264,15 @@ pub fn open_system_hardware(
         let enc: Box<dyn HardwareEncoder> = Box::new(mf::MfEncoder::open(width, height, fps, bps)?);
         Ok(enc)
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        let enc: Box<dyn HardwareEncoder> = Box::new(vt::VtEncoder::open(width, height, fps, bps)?);
+        Ok(enc)
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = (width, height, fps, bps);
-        Err("这个系统还没接硬件编码（目前只有 Windows）".into())
+        Err("这个系统还没接硬件编码（目前只有 Windows 和 macOS）".into())
     }
 }
 
@@ -518,6 +666,10 @@ impl VideoDecoder for H264Decoder {
     fn screen(&self) -> Option<&Screen> {
         self.screen.as_ref()
     }
+
+    fn backend(&self) -> String {
+        "软件 OpenH264".to_owned()
+    }
 }
 
 #[cfg(test)]
@@ -643,6 +795,60 @@ mod tests {
         Err("没有".into())
     }
 
+    /// 假的硬件解码器：先说“还没关键帧”，再给一幅比帧头大的画面（对齐），之后出错。
+    #[derive(Debug)]
+    struct FakeHwDec(u32);
+
+    impl HardwareDecoder for FakeHwDec {
+        fn name(&self) -> &str {
+            "假硬件"
+        }
+        fn decode(&mut self, _data: &[u8]) -> Result<Option<(usize, usize, Vec<u32>)>, String> {
+            self.0 += 1;
+            match self.0 {
+                1 => Ok(None),
+                2 => Ok(Some((32, 18, vec![0x00ff_0000; 32 * 18]))),
+                3 => Ok(Some((8, 8, vec![0; 64]))),
+                _ => Err("模拟出错".into()),
+            }
+        }
+    }
+
+    #[test]
+    fn hardware_decoder_then_software_fallback() {
+        let header = FrameHeader {
+            codec: Codec::H264,
+            key: true,
+            width: 30,
+            height: 16,
+        };
+        let mut dec = AutoH264Decoder::with_hardware(Some(Box::new(FakeHwDec(0)))).unwrap();
+        assert_eq!(dec.backend(), "硬件 假硬件");
+        assert!(format!("{dec:?}").contains("AutoH264Decoder"));
+        assert!(dec.decode(&header, b"x").unwrap().is_none());
+        // 对齐多出的边被裁掉
+        let shown = dec.decode(&header, b"x").unwrap().unwrap();
+        assert_eq!((shown.width(), shown.height()), (30, 16));
+        assert!(dec.screen().is_some());
+        // 比帧头小：报错
+        assert!(dec.decode(&header, b"x").is_err());
+        // 硬件出错：改用软件，用真的 OpenH264 码流能解出来，之后一直是软件
+        let mut enc = H264Encoder::new(30).with_hardware(fake_none);
+        let frame = enc
+            .encode(1, &picture(320, 192), true, 50_000)
+            .unwrap()
+            .unwrap();
+        let (h, data) = FrameHeader::parse(&frame.payload).unwrap();
+        assert!(dec.decode(&h, data).unwrap().is_some());
+        assert_eq!(dec.backend(), "软件 OpenH264");
+        // 没有硬件解码器：直接软件；Linux 上的入口没有硬件
+        let mut soft = AutoH264Decoder::new().unwrap();
+        assert_eq!(soft.backend(), "软件 OpenH264");
+        assert!(soft.decode(&h, data).unwrap().is_some());
+        assert_eq!(H264Decoder::new().unwrap().backend(), "软件 OpenH264");
+        assert!(open_system_hardware_decoder().is_err());
+    }
+
     #[test]
     fn hardware_encoder_is_preferred_and_failures_fall_back_to_software() {
         let screen = picture(320, 192);
@@ -684,6 +890,58 @@ mod tests {
         assert!(open_system_hardware(64, 64, 30, 1_000_000).is_err());
         assert!(hardware_disabled(Some(std::ffi::OsStr::new("0"))));
         assert!(!hardware_disabled(Some(std::ffi::OsStr::new("1"))) && !hardware_disabled(None));
+    }
+
+    /// macOS 实机：VideoToolbox 解 OpenH264 的码流（验证格式转换、颜色）；有硬件编码器时
+    /// 编几帧并用 OpenH264 解出来（验证是 Baseline，接收端解得了）。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_videotoolbox_decode_and_encode() {
+        let screen = picture(640, 360);
+        let mut soft_enc = H264Encoder::new(30).with_hardware(fake_none);
+        let frame = soft_enc.encode(1, &screen, true, 200_000).unwrap().unwrap();
+        let (header, data) = FrameHeader::parse(&frame.payload).unwrap();
+        let mut hw = open_system_hardware_decoder().unwrap();
+        let decoded = hw.decode(data).unwrap();
+        assert!(decoded.is_some(), "关键帧应当解出画面");
+        let (w, h, pixels) = decoded.unwrap();
+        assert!(w >= 640 && h >= 360);
+        // 和 OpenH264 解出来的差不多（颜色转换一致）
+        let mut soft = H264Decoder::new().unwrap();
+        let reference = soft.decode(&header, data).unwrap().unwrap().clone();
+        let cropped: Vec<u32> = (0..360)
+            .flat_map(|y| pixels[y * w..y * w + 640].to_vec())
+            .collect();
+        let hw_screen = Screen::from_pixels(640, 360, cropped).unwrap();
+        assert!(
+            psnr(&hw_screen, &reference) > 30.0,
+            "{}",
+            psnr(&hw_screen, &reference)
+        );
+        match open_system_hardware(640, 360, 30, 2_000_000) {
+            Ok(mut enc) => {
+                let (mut y, mut u, mut v, mut nv12) =
+                    (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+                let (pw, _, px) = even_pixels(&screen);
+                color::rgb_to_i420(&px, pw, &mut y, &mut u, &mut v);
+                color::i420_to_nv12(&y, &u, &v, &mut nv12);
+                let (bytes, key) = enc.encode(&nv12, 2_000_000, true).unwrap();
+                assert!(key && annexb::has_idr(&bytes));
+                let header = FrameHeader {
+                    codec: Codec::H264,
+                    key,
+                    width: 640,
+                    height: 360,
+                };
+                let mut dec = H264Decoder::new().unwrap();
+                assert!(
+                    dec.decode(&header, &bytes).unwrap().is_some(),
+                    "OpenH264 要解得了硬件编出的码流"
+                );
+                log::info!("硬件编码器可用：{}", enc.name());
+            }
+            Err(why) => assert!(!why.is_empty()),
+        }
     }
 
     /// Windows 实机：真的调 Media Foundation。有硬件编码器就编几帧并用 OpenH264 解出来（验证是 Baseline、

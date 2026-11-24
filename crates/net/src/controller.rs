@@ -13,7 +13,6 @@ use peerdesk_core::screen::Screen;
 use peerdesk_core::session::{Session, SessionConfig, State};
 use peerdesk_core::trace::{Stage, TraceId, Tracer};
 use peerdesk_core::video::{TileDecoder, VideoDecoder};
-use peerdesk_media::H264Decoder;
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 
@@ -196,6 +195,7 @@ type Decoded = (u32, Result<Option<Screen>, peerdesk_core::Error>, u64);
 /// 任务通道关闭（会话结束）时线程退出。
 fn spawn_decoder(
     decoder: Box<dyn VideoDecoder>,
+    backend: Arc<std::sync::Mutex<String>>,
 ) -> (
     std::sync::mpsc::Sender<DecodeJob>,
     mpsc::UnboundedReceiver<Decoded>,
@@ -208,6 +208,13 @@ fn spawn_decoder(
             let started = std::time::Instant::now();
             let result = worker.decode(&job);
             let took = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+            // 解码器可能中途从硬件换成软件：每帧记下现在用的是哪个
+            let name = worker.backend();
+            if let Ok(mut b) = backend.lock() {
+                if *b != name {
+                    *b = name;
+                }
+            }
             if done_tx.send((job.frame_id, result, took)).is_err() {
                 break;
             }
@@ -332,15 +339,11 @@ pub async fn run(
     let (mut bad_datagrams, mut input_sent) = (0u64, 0u64);
     // 两端都支持 H.264 就用它，否则用块编码。
     let decoder: Box<dyn VideoDecoder> = if caps.common(Caps::H264) == Caps::H264 {
-        Box::new(H264Decoder::new()?)
+        Box::new(peerdesk_media::AutoH264Decoder::new()?)
     } else {
         Box::new(TileDecoder::new())
     };
-    let decoder_name = if caps.common(Caps::H264) == Caps::H264 {
-        "软件 OpenH264".to_owned()
-    } else {
-        "块编码".to_owned()
-    };
+    let decoder_name = Arc::new(std::sync::Mutex::new(decoder.backend()));
     let fec_name = if caps.has(Caps::FEC_RS) { "RS" } else { "XOR" };
     let mut media = MediaReceiver::detached(link.now(), opts.deadline_us);
     media.set_keyframe_grace(caps.common(Caps::H264) == Caps::H264);
@@ -357,7 +360,7 @@ pub async fn run(
     } else {
         peerdesk_core::transport::Fec::Xor
     });
-    let (decode_jobs, mut decoded_rx) = spawn_decoder(decoder);
+    let (decode_jobs, mut decoded_rx) = spawn_decoder(decoder, Arc::clone(&decoder_name));
     let mut last_screen: Option<Screen> = None;
     // 反馈只在有新情况时发；什么都没发生时每秒一次，证明自己还在。
     let mut video_since_feedback = 0u32;
@@ -537,7 +540,7 @@ pub async fn run(
                         width: shown_size.0,
                         height: shown_size.1,
                         router_ms: Some(router_ms.load(std::sync::atomic::Ordering::Relaxed)).filter(|v| *v != u32::MAX),
-                        decoder: decoder_name.clone(),
+                        decoder: decoder_name.lock().map(|n| n.clone()).unwrap_or_default(),
                         fec: fec_name,
                         host: host_stats.clone(),
                     });

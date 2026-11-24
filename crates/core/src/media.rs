@@ -741,6 +741,12 @@ impl DecodeWorker {
         }
     }
 
+    /// 现在用的解码器（详情面板用）。
+    #[must_use]
+    pub fn backend(&self) -> String {
+        self.decoder.backend()
+    }
+
     /// 解一帧。返回解出的画面（`None` 表示这一帧没有新画面）；失败或因为等关键帧而没解时返回错误。
     pub fn decode(&mut self, job: &DecodeJob) -> Result<Option<Screen>, Error> {
         let independent = job.header.key || job.header.codec == Codec::Tile;

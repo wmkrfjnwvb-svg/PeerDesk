@@ -148,6 +148,11 @@ pub trait VideoDecoder: Send {
 
     /// 最近解出的画面。
     fn screen(&self) -> Option<&Screen>;
+
+    /// 现在用的解码器（“详情”面板、日志用）。
+    fn backend(&self) -> String {
+        "软件".to_owned()
+    }
 }
 
 /// 块编码的适配。
