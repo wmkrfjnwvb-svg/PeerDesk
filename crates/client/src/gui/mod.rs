@@ -7,6 +7,8 @@
 mod app;
 pub mod assistant;
 pub mod coords;
+pub mod files;
+pub mod files_window;
 pub mod fonts;
 pub mod form;
 pub mod guide_art;

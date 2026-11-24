@@ -168,6 +168,21 @@ fn view_a_host_send_input_and_get_kicked() {
     assert!(v.frames().frames() >= 1);
     assert!(repaints.load(Ordering::Relaxed) >= 1);
 
+    // 文件管理：连上后拿得到连接，能列被控端的目录（真的被控端在回答）
+    let link = v.files_link().expect("对方支持文件管理");
+    let runner = crate::gui::transfers::Runner::new().unwrap();
+    let rx = runner.request(
+        &link,
+        peerdesk_core::browse::Request::List {
+            path: host_dir.display().to_string(),
+        },
+    );
+    let reply = rx.recv_timeout(WAIT).unwrap().unwrap();
+    assert!(
+        matches!(reply, peerdesk_core::browse::Reply::List { ref entries, .. } if !entries.is_empty()),
+        "{reply:?}"
+    );
+
     // 输入到了被控端
     assert!(v.send(InputEvent::Key {
         code: 4,
@@ -193,6 +208,7 @@ fn view_a_host_send_input_and_get_kicked() {
     // 被控端断开控制端，然后继续等下一个
     h.kick();
     let summary = ended(&v, &mut seen).unwrap();
+    assert!(v.files_link().is_none(), "会话结束后交回连接");
     assert!(!summary.cancelled);
     assert!(
         summary.rtt.is_some() && summary.video_bytes > 0,

@@ -29,6 +29,8 @@ pub struct Outcome {
     pub connected: bool,
     /// 被控端的系统和电脑名。
     pub peer: (PeerOs, String),
+    /// 点了助手上的“文件”：打开文件管理并选中这个会话。
+    pub open_files: bool,
 }
 
 /// 一个观看窗口。
@@ -103,6 +105,18 @@ impl Viewer {
         self.handle.stop();
     }
 
+    /// 窗口标题（文件管理里选会话用）。
+    #[must_use]
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    /// 文件管理用的连接（见 [`ViewHandle::files_link`]）。
+    #[must_use]
+    pub fn files_link(&self) -> Option<std::sync::Arc<peerdesk_net::Link>> {
+        self.handle.files_link()
+    }
+
     /// 画这个窗口。
     pub fn show(&mut self, ctx: &egui::Context, s: &'static Strings) -> Outcome {
         let builder = ViewportBuilder::default()
@@ -117,6 +131,7 @@ impl Viewer {
             open: true,
             connected: false,
             peer: (PeerOs::Unknown, String::new()),
+            open_files: false,
         };
         for event in self.handle.poll() {
             if let super::session::ViewEvent::Clipboard(note) = &event {
@@ -328,6 +343,13 @@ impl Viewer {
                             .clicked()
                         {
                             self.overlay = !self.overlay;
+                        }
+                        // 文件管理（对方支持时可点）
+                        let files_ok = self.handle.files_link().is_some();
+                        if toolbar_toggle(ui, &p, icon::FOLDER_OPEN, "文件管理", false, files_ok)
+                            .clicked()
+                        {
+                            outcome.open_files = true;
                         }
                         ui.separator();
                         let (label, glyph) = if self.phase.is_ended() {

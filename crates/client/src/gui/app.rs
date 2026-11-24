@@ -114,6 +114,8 @@ struct App {
     form_password: String,
     recent: RecentStore,
     views: Vec<(Viewer, Option<(String, String)>)>,
+    /// 文件管理窗口。
+    files: super::files_window::FilesWindow,
     serial: u64,
     status: Status,
     selftest: bool,
@@ -229,6 +231,12 @@ impl App {
             form: ConnectForm::default(),
             form_password: String::new(),
             views: Vec::new(),
+            files: {
+                // PEERDESK_GUI_FILES=1：启动就打开文件管理（截图用）
+                let mut w = super::files_window::FilesWindow::new(default_data_dir());
+                w.open = std::env::var_os("PEERDESK_GUI_FILES").is_some();
+                w
+            },
             serial: 0,
             status,
             selftest: std::env::var_os(SELFTEST_ENV).is_some(),
@@ -1283,6 +1291,10 @@ impl App {
             }
             ui.add_space(2.0);
         }
+        // 文件管理：单独的窗口
+        if nav_item(ui, p, icon::FOLDER_OPEN, "文件", self.files.open).clicked() {
+            self.files.open = true;
+        }
         ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
             ui.add_space(14.0);
             let (text, color) = if !self.server.is_set() {
@@ -1337,7 +1349,7 @@ impl App {
 }
 
 /// 用系统的文件管理器打开文件夹（不存在时先建好）。
-fn open_folder(dir: &std::path::Path) -> Result<(), String> {
+pub(super) fn open_folder(dir: &std::path::Path) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("{}：{e}", dir.display()))?;
     let program = if cfg!(target_os = "windows") {
         "explorer"
@@ -1417,8 +1429,12 @@ impl eframe::App for App {
         self.show_toast(ctx, &p);
         let s = self.s;
         let mut remembered = Vec::new();
+        let mut open_files = None;
         self.views.retain_mut(|(viewer, remember)| {
             let outcome = viewer.show(ctx, s);
+            if outcome.open_files {
+                open_files = Some(viewer.title().to_owned());
+            }
             if outcome.connected {
                 if let Some((addr, pin)) = remember.take() {
                     remembered.push((addr, pin, outcome.peer.0, outcome.peer.1));
@@ -1426,6 +1442,19 @@ impl eframe::App for App {
             }
             outcome.open
         });
+        // 文件管理：在当前的远程会话上浏览、传文件
+        if let Some(title) = open_files {
+            self.files.open_for(&title);
+        }
+        let sessions: Vec<super::files_window::Session> = self
+            .views
+            .iter()
+            .map(|(viewer, _)| super::files_window::Session {
+                title: viewer.title().to_owned(),
+                link: viewer.files_link(),
+            })
+            .collect();
+        self.files.show(ctx, &sessions);
         for (addr, pin, os, name) in remembered {
             if let Err(e) = self.recent.remember(&addr, &pin, os, &name) {
                 self.status = Status::error(e.to_string());

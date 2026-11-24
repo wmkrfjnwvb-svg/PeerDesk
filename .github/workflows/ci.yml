@@ -389,6 +389,8 @@ jobs:
           shot zh host main-zh
           shot en host main-en
           shot zh connect viewer-zh
+          # 文件管理（连接本机：右栏是“对方”，其实也是本机）
+          PEERDESK_GUI_FILES=1 shot zh connect files-zh
           # macOS 授权引导（在 Linux 上预览 macOS 15）和设置页
           PEERDESK_GUI_PAGE=permissions PEERDESK_GUI_PREVIEW_MAC=15 shot zh host guide-zh
           PEERDESK_GUI_PAGE=settings shot en host settings-en

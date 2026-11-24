@@ -18,7 +18,7 @@ use peerdesk_core::proto::{Caps, PeerOs};
 use peerdesk_core::screen::Screen;
 use peerdesk_core::signal::format_code;
 use peerdesk_net::clipsync::{ClipNote, ClipboardHandle};
-use peerdesk_net::controller::{self, ControllerOptions, ScreenSink};
+use peerdesk_net::controller::{self, ControllerOptions, LinkHook, ScreenSink};
 use peerdesk_net::host::{self, HostOptions, ScreenSource, FRAME_DEADLINE_US};
 use peerdesk_net::identity::to_hex;
 use peerdesk_net::netcheck::{prepare_host, NetReport};
@@ -501,7 +501,12 @@ struct GuiSink {
     repaint: Repaint,
     /// 声音开关（助手里切换，默认关）；重连后的新会话也看同一个开关。
     sound: watch::Receiver<bool>,
+    /// 当前连接（对方支持文件管理时有），文件管理在上面开浏览流；重连后换成新连接。
+    files: FilesLink,
 }
+
+/// 文件管理用的当前连接。
+type FilesLink = Arc<Mutex<Option<Arc<peerdesk_net::Link>>>>;
 
 impl ScreenSink for GuiSink {
     fn present(&mut self, screen: &Screen) {
@@ -634,12 +639,22 @@ pub struct ViewHandle {
     stop: watch::Sender<bool>,
     slot: Arc<FrameSlot>,
     sound: watch::Sender<bool>,
+    files: FilesLink,
 }
 
 impl ViewHandle {
     /// 打开或关闭远程声音（默认关）。
     pub fn set_sound(&self, on: bool) {
         let _ = self.sound.send(on);
+    }
+
+    /// 文件管理用的连接：已连上、对方支持文件管理时有。
+    #[must_use]
+    pub fn files_link(&self) -> Option<Arc<peerdesk_net::Link>> {
+        self.files
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// 远程声音是否打开。
@@ -694,10 +709,12 @@ pub fn start_view(
     };
     let emitter = Emitter { tx, repaint };
     let (sound, sound_rx) = watch::channel(false);
+    let files = FilesLink::default();
     let sink = GuiSink {
         slot: Arc::clone(&slot),
         repaint: Arc::clone(&emitter.repaint),
         sound: sound_rx,
+        files: Arc::clone(&files),
     };
     let task = view_main(
         target,
@@ -715,6 +732,7 @@ pub fn start_view(
         stop,
         slot,
         sound,
+        files,
     }
 }
 
@@ -949,7 +967,12 @@ async fn one_session(
                     },
                 )))
             },
-            on_link: None,
+            on_link: Some(LinkHook({
+                let files = Arc::clone(&sink.files);
+                Arc::new(move |link| {
+                    *files.lock().unwrap_or_else(PoisonError::into_inner) = link;
+                })
+            })),
             on_quality: {
                 let ev = ev.clone();
                 Some(controller::QualityHook(Arc::new(move |q| {

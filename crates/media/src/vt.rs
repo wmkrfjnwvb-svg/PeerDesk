@@ -315,12 +315,20 @@ pub struct VtOptions {
 
 impl VtOptions {
     /// 产品现在用的设置。
+    ///
+    /// 低延迟码控和“每收一帧交一帧”只在 Intel Mac 上打开：用户的 Intel Mac 上 hw-check 实测
+    /// 普通模式每帧都是关键帧、打开后 1/30 关键帧、10 ms/帧；而 Apple 芯片的 CI 上打开后
+    /// Mac 控制 Mac 一帧都出不来（原因还没定位），普通模式一直正常。通用包按架构分别编译，自动区分。
     pub const DEFAULT: Self = Self {
         max_key_interval: Some(7200),
         complete_each_frame: false,
         baseline: true,
-        max_frame_delay: Some(0),
-        low_latency: true,
+        max_frame_delay: if cfg!(target_arch = "x86_64") {
+            Some(0)
+        } else {
+            None
+        },
+        low_latency: cfg!(target_arch = "x86_64"),
         pipelined: false,
     };
 

@@ -373,6 +373,22 @@ impl Runner {
         ended
     }
 
+    /// 在后台发一个浏览请求（列目录、位置、新建），结果从返回的通道取（不卡界面）。
+    pub fn request(
+        &self,
+        link: &Arc<peerdesk_net::Link>,
+        request: peerdesk_core::browse::Request,
+    ) -> std::sync::mpsc::Receiver<Result<peerdesk_core::browse::Reply, String>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let link = Arc::clone(link);
+        // 结果走通道，任务本身不用等
+        drop(self.rt.spawn(async move {
+            let reply = peerdesk_net::browse::request(&link, &request).await;
+            let _ = tx.send(reply.map_err(|e| e.to_string()));
+        }));
+        rx
+    }
+
     /// 取消任务：运行中的中止（关流；对方留下的半截文件下次续传），排队中的直接取消。
     pub fn cancel(&mut self, queue: &mut Queue, id: u64) {
         if queue.cancel(id) {
@@ -735,6 +751,18 @@ mod tests {
         assert_eq!(state(&q, big), State::Cancelled);
         assert!(!runner.busy());
         assert!(format!("{runner:?}").contains("Runner"));
+        // 浏览请求在后台做，结果从通道取
+        let rx = runner.request(
+            &link,
+            peerdesk_core::browse::Request::List {
+                path: remote_s.clone(),
+            },
+        );
+        let reply = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        assert!(matches!(reply, peerdesk_core::browse::Reply::List { .. }));
     }
 
     #[test]
