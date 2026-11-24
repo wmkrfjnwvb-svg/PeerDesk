@@ -1292,12 +1292,8 @@ mod tests {
             }
             tx.send((start.elapsed(), sizes)).unwrap();
         });
-        match rx.recv_timeout(std::time::Duration::from_secs(10)) {
-            Ok((took, sizes)) => assert!(sizes.iter().all(|s| *s > 0), "{took:?} {sizes:?}"),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                panic!("720p 编码 10 秒没有结束：卡住了")
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => panic!("编码线程 panic 了"),
-        }
+        // Timeout：720p 编码 10 秒没有结束（卡住了）；Disconnected：编码线程 panic 了
+        let (took, sizes) = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+        assert!(sizes.iter().all(|s| *s > 0), "{took:?} {sizes:?}");
     }
 }

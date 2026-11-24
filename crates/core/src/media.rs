@@ -1184,6 +1184,7 @@ mod tests {
             vec![(1, 1)],
             "第一帧是关键帧"
         );
+        assert!(rx.screen().is_some(), "显示的画面可以取到");
         assert_eq!(step(&mut tx, &mut rx, 2, false), vec![(2, 2)]);
         assert!(
             step(&mut tx, &mut rx, 3, true).is_empty(),
