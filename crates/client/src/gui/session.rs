@@ -949,6 +949,7 @@ async fn one_session(
                     },
                 )))
             },
+            on_link: None,
             on_quality: {
                 let ev = ev.clone();
                 Some(controller::QualityHook(Arc::new(move |q| {

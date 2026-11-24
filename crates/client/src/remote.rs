@@ -69,7 +69,8 @@ pub(crate) fn session(identity: &Identity, policy: &Policy, auth: Auth) -> Sessi
             .with(Caps::AUDIO)
             .with(Caps::CLIPBOARD_FILES)
             .with(Caps::FEC_RS)
-            .with(Caps::HOST_STATS),
+            .with(Caps::HOST_STATS)
+            .with(Caps::FILE_BROWSE),
         policy: policy.clone(),
         auth,
         // 由网络层替换成真实连接的通道绑定。
@@ -730,6 +731,7 @@ async fn connect_session(
             duration: Some(Duration::from_secs(args.seconds)),
             clipboard: None,
             on_established: None,
+            on_link: None,
             on_quality: None,
             audio: None,
         },

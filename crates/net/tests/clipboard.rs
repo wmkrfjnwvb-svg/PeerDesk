@@ -96,6 +96,7 @@ async fn session_with<F, Fut>(
                     *seen_os.lock().unwrap() = Some((caps.os(), name.to_owned()));
                 },
             ))),
+            on_link: None,
             on_quality: None,
             audio: None,
         },

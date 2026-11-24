@@ -62,6 +62,29 @@ pub struct ControllerOptions {
     pub audio: Option<crate::audio::AudioOut>,
     /// 每秒报告一次链路质量（界面显示网络状况用）。
     pub on_quality: Option<QualityHook>,
+    /// 握手完成后交出这条连接（文件管理在上面开浏览流），会话结束时交出 `None`。
+    pub on_link: Option<LinkHook>,
+}
+
+/// 交出连接的回调（见 [`ControllerOptions::on_link`]）。
+#[derive(Clone)]
+pub struct LinkHook(pub Arc<dyn Fn(Option<Arc<Link>>) + Send + Sync>);
+
+impl std::fmt::Debug for LinkHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LinkHook")
+    }
+}
+
+/// 会话结束（任何路径）时告诉界面连接没了。
+struct LinkGone(Option<LinkHook>);
+
+impl Drop for LinkGone {
+    fn drop(&mut self) {
+        if let Some(hook) = &self.0 {
+            (hook.0)(None);
+        }
+    }
 }
 
 /// 每秒报告一次的链路质量和两端的状态（“详情”面板显示）。
@@ -294,6 +317,11 @@ pub async fn run(
     let mut ctrl_rx = control_reader(ctrl_recv);
     if let Some(hook) = &opts.on_established {
         (hook.0)(caps, session.peer_name());
+    }
+    // 对方支持文件管理时交出连接；会话结束时收回
+    let _link_gone = LinkGone(opts.on_link.clone().filter(|_| caps.has(Caps::FILE_BROWSE)));
+    if let Some(hook) = &_link_gone.0 {
+        (hook.0)(Some(Arc::clone(&link)));
     }
 
     // 剪贴板同步：由控制端打开专用的流。对方是不支持剪贴板的老版本时不开。

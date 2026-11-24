@@ -93,6 +93,7 @@ async fn session_with_capture(
             duration: None,
             clipboard: None,
             on_established: None,
+            on_link: None,
             on_quality: None,
             audio: Some(AudioOut {
                 playback: PlaybackHandle(recorder.clone()),
