@@ -149,6 +149,8 @@ extern "C" {
     static kVTProfileLevel_H264_Baseline_AutoLevel: CFTypeRef;
     static kVTEncodeFrameOptionKey_ForceKeyFrame: CFTypeRef;
     static kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: CFTypeRef;
+    static kVTVideoEncoderSpecification_EnableLowLatencyRateControl: CFTypeRef;
+    static kVTCompressionPropertyKey_MaxFrameDelayCount: CFTypeRef;
     fn VTCompressionSessionCreate(
         allocator: CFTypeRef,
         width: i32,
@@ -227,15 +229,21 @@ fn number_i64(v: i64) -> Owned {
 
 /// 一个键值对的字典。
 fn dict1(key: CFTypeRef, value: CFTypeRef) -> Owned {
-    let keys = [key];
-    let values = [value];
+    dict(&[(key, value)])
+}
+
+/// 几个键值对的字典。
+fn dict(pairs: &[(CFTypeRef, CFTypeRef)]) -> Owned {
+    let keys: Vec<CFTypeRef> = pairs.iter().map(|(k, _)| *k).collect();
+    let values: Vec<CFTypeRef> = pairs.iter().map(|(_, v)| *v).collect();
+    let count = isize::try_from(pairs.len()).unwrap_or(0);
     // SAFETY: 数组在调用期间有效；回调表是系统常量，字典会持有键和值。
     Owned(unsafe {
         CFDictionaryCreate(
             std::ptr::null(),
             keys.as_ptr(),
             values.as_ptr(),
-            1,
+            count,
             std::ptr::addr_of!(kCFTypeDictionaryKeyCallBacks).cast(),
             std::ptr::addr_of!(kCFTypeDictionaryValueCallBacks).cast(),
         )
@@ -259,7 +267,8 @@ type Encoded = Result<(Vec<u8>, bool), String>;
 /// 编码输出回调把结果放进这里，编码线程等它（不调用 CompleteFrames，见 [`VtEncoder::encode`]）。
 #[derive(Default)]
 struct EncodeSlot {
-    result: Mutex<Option<Encoded>>,
+    /// 按输出顺序排队（编码器可能攒几帧才一起交出）。
+    result: Mutex<std::collections::VecDeque<Encoded>>,
     ready: std::sync::Condvar,
 }
 
@@ -296,49 +305,89 @@ pub struct VtOptions {
     pub complete_each_frame: bool,
     /// 要求 Baseline 档次（OpenH264 解得了）；否则由编码器选。
     pub baseline: bool,
+    /// 最多攒几帧才交出（`None` 不设）。
+    pub max_frame_delay: Option<i32>,
+    /// 低延迟码控（编码器规格里打开）。
+    pub low_latency: bool,
+    /// 只用于体检：不等也不强制，量编码器攒几帧。
+    pub pipelined: bool,
 }
 
 impl VtOptions {
     /// 产品现在用的设置。
     pub const DEFAULT: Self = Self {
-        max_key_interval: Some(i32::MAX),
+        max_key_interval: Some(7200),
         complete_each_frame: false,
         baseline: true,
+        max_frame_delay: Some(0),
+        low_latency: false,
+        pipelined: false,
     };
 
     /// `hw-check` 对比的几种设置：（名称, 设置）。
     pub const VARIANTS: [(&'static str, Self); 5] = [
-        ("现在的设置（间隔 i32::MAX）", Self::DEFAULT),
+        ("攒 0 帧（MaxFrameDelayCount=0，新的默认）", Self::DEFAULT),
         (
-            "关键帧间隔 7200（WebRTC 的值）",
+            "低延迟码控 + 攒 0 帧",
             Self {
-                max_key_interval: Some(7200),
+                low_latency: true,
                 ..Self::DEFAULT
             },
         ),
         (
-            "不设关键帧间隔",
+            "低延迟码控、不限 Baseline",
             Self {
-                max_key_interval: None,
+                low_latency: true,
+                baseline: false,
                 ..Self::DEFAULT
             },
         ),
         (
-            "每帧 CompleteFrames（旧做法）",
+            "流水线：不等也不强制（量编码器攒几帧）",
             Self {
+                max_frame_delay: None,
+                pipelined: true,
+                ..Self::DEFAULT
+            },
+        ),
+        (
+            "旧做法：每帧强制交出",
+            Self {
+                max_frame_delay: None,
                 complete_each_frame: true,
                 ..Self::DEFAULT
             },
         ),
-        (
-            "不限 Baseline、间隔 7200",
-            Self {
-                max_key_interval: Some(7200),
-                complete_each_frame: false,
-                baseline: false,
-            },
-        ),
     ];
+}
+
+/// 流水线方式：按 30 帧/秒交帧、不等结果，量编码器最多攒几帧、出的是不是关键帧。
+fn pipeline_line(name: &str, enc: &mut VtEncoder, frames: &[Vec<u8>]) -> String {
+    let (mut got, mut lag, mut keys, mut errors) = (0usize, 0usize, 0u32, 0u32);
+    let count = |out: Vec<Encoded>, keys: &mut u32, errors: &mut u32| {
+        for one in &out {
+            match one {
+                Ok((_, k)) => *keys += u32::from(*k),
+                Err(_) => *errors += 1,
+            }
+        }
+        out.len()
+    };
+    for (i, nv12) in frames.iter().enumerate() {
+        if let Err(why) = enc.submit(nv12, 4_000_000, i == 0) {
+            return format!("{name}：第 {i} 帧交不进去：{why}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(33));
+        got += count(enc.take_ready(), &mut keys, &mut errors);
+        lag = lag.max((i + 1).saturating_sub(got));
+    }
+    let before_flush = got;
+    let flushed = enc.flush().map(|out| count(out, &mut keys, &mut errors));
+    format!(
+        "{name}：交了 {} 帧，强制之前出了 {before_flush} 帧，最多攒 {lag} 帧，强制交出 {} 帧，关键帧 {keys}，出错 {errors}",
+        frames.len(),
+        flushed.map_or_else(|e| format!("失败（{e}）"), |n| n.to_string()),
+    )
 }
 
 /// 用几种设置分别编 `frames`（NV12，第一帧要求关键帧），每种一行结果：
@@ -358,6 +407,10 @@ pub fn probe(
                 continue;
             }
         };
+        if opts.pipelined {
+            lines.push(pipeline_line(name, &mut enc, frames));
+            continue;
+        }
         let (mut keys, mut bytes, mut total, mut worst, mut empty) =
             (0u32, 0usize, 0u128, 0u128, 0u32);
         let mut decoded_ok = true;
@@ -405,7 +458,7 @@ pub fn probe(
 }
 
 /// 等编码输出回调最多这么久。
-const OUTPUT_WAIT: std::time::Duration = std::time::Duration::from_millis(300);
+const OUTPUT_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// 编码输出回调：取出码流（AVCC → Annex B），判断是否关键帧，放进 `refcon` 指向的槽。
 unsafe extern "C" fn on_encoded(
@@ -427,7 +480,7 @@ unsafe extern "C" fn on_encoded(
         unsafe { read_sample(sample) }
     };
     if let Ok(mut s) = slot.result.lock() {
-        *s = Some(result);
+        s.push_back(result);
     }
     slot.ready.notify_all();
 }
@@ -494,10 +547,20 @@ impl VtEncoder {
         let h = i32::try_from(height).map_err(|_| "画面太大".to_owned())?;
         let slot: Box<EncodeSlot> = Box::default();
         // SAFETY: 键是系统常量；kCFBooleanTrue 是系统常量。
-        let spec = dict1(
-            unsafe { kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder },
-            unsafe { kCFBooleanTrue },
-        );
+        let spec = unsafe {
+            let mut pairs = vec![(
+                kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder,
+                kCFBooleanTrue,
+            )];
+            // 低延迟码控（macOS 11.3+，系统不支持时打开会话会失败，由调用方回退）
+            if opts.low_latency {
+                pairs.push((
+                    kVTVideoEncoderSpecification_EnableLowLatencyRateControl,
+                    kCFBooleanTrue,
+                ));
+            }
+            dict(&pairs)
+        };
         let mut session: CFTypeRef = std::ptr::null();
         // SAFETY: 输出参数指向局部变量；refcon 指向 Box 里的槽，地址在编码器活着时不变。
         let status = unsafe {
@@ -549,6 +612,16 @@ impl VtEncoder {
                 kVTCompressionPropertyKey_AllowFrameReordering,
                 kCFBooleanFalse,
             );
+            // 最多攒几帧才交出：0 = 每收一帧就交出一帧（Intel Mac 默认要攒，等不到就只能强制完成，
+            // 强制完成又让下一帧变成关键帧，hw-check 实测每帧 310 ms、全是关键帧）
+            if let Some(frames) = opts.max_frame_delay {
+                let delay = number_i32(frames);
+                let _ = VTSessionSetProperty(
+                    session,
+                    kVTCompressionPropertyKey_MaxFrameDelayCount,
+                    delay.0,
+                );
+            }
             if let Some(frames) = opts.max_key_interval {
                 let interval = number_i32(frames);
                 let _ = VTSessionSetProperty(
@@ -637,13 +710,8 @@ impl VtEncoder {
         Ok(())
     }
 
-    /// 编一帧 NV12。返回 Annex B 码流和是否关键帧。
-    pub fn encode(
-        &mut self,
-        nv12: &[u8],
-        bps: u64,
-        force_key: bool,
-    ) -> Result<(Vec<u8>, bool), String> {
+    /// 交一帧 NV12 给编码器，不等结果（结果由输出回调放进队列）。
+    pub fn submit(&mut self, nv12: &[u8], bps: u64, force_key: bool) -> Result<(), String> {
         self.set_bitrate(bps);
         self.fill(nv12)?;
         let props = force_key.then(|| {
@@ -651,9 +719,6 @@ impl VtEncoder {
                 kCFBooleanTrue
             })
         });
-        if let Ok(mut s) = self.slot.result.lock() {
-            *s = None;
-        }
         // SAFETY: 会话、像素缓冲有效；属性字典在调用期间有效。
         unsafe {
             let pts = CMTimeMake(self.frame, self.fps);
@@ -673,37 +738,67 @@ impl VtEncoder {
             )?;
         }
         self.frame = self.frame.saturating_add(1);
-        // 等输出回调，不调用 CompleteFrames：每帧都“完成”会结束当前的参考帧序列，
-        // 编码器下一帧又从关键帧开始（实测 Intel Mac 上每帧都是关键帧、200 KB、5 帧/秒）。
-        // 实时模式、不重排帧时编码器编完就回调；等不到才强制完成（会多一个关键帧，但不会卡住）。
+        Ok(())
+    }
+
+    /// 取走已经交出的结果（不等）。
+    pub fn take_ready(&self) -> Vec<Encoded> {
+        self.slot
+            .result
+            .lock()
+            .map(|mut q| q.drain(..).collect())
+            .unwrap_or_default()
+    }
+
+    /// 强制交出所有攒着的帧（之后的第一帧会是关键帧）。
+    pub fn flush(&mut self) -> Result<Vec<Encoded>, String> {
+        // SAFETY: 会话有效；返回前输出回调已执行。
+        check(
+            unsafe { VTCompressionSessionCompleteFrames(self.session, kCMTimeInvalid) },
+            "完成编码",
+        )?;
+        Ok(self.take_ready())
+    }
+
+    /// 编一帧 NV12。返回 Annex B 码流和是否关键帧。
+    ///
+    /// 等输出回调，不每帧调用 CompleteFrames：每帧都“完成”会结束当前的参考帧序列，下一帧又是关键帧。
+    /// 编码器设成每收一帧就交出一帧（`MaxFrameDelayCount` = 0）；等不到才强制完成
+    /// （会多一个关键帧，不会卡住）。一次交出好几帧时按顺序拼在一起（解码器依次解）。
+    pub fn encode(
+        &mut self,
+        nv12: &[u8],
+        bps: u64,
+        force_key: bool,
+    ) -> Result<(Vec<u8>, bool), String> {
+        self.submit(nv12, bps, force_key)?;
         let wait = if self.opts.complete_each_frame {
             std::time::Duration::ZERO
         } else {
             OUTPUT_WAIT
         };
-        let waited = self.slot.result.lock().ok().and_then(|guard| {
-            self.slot
-                .ready
-                .wait_timeout_while(guard, wait, |r| r.is_none())
-                .ok()
-                .and_then(|(mut r, _)| r.take())
-        });
-        let waited = match waited {
-            Some(r) => Some(r),
-            None => {
-                // SAFETY: 会话有效；返回前输出回调已执行。
-                check(
-                    unsafe { VTCompressionSessionCompleteFrames(self.session, kCMTimeInvalid) },
-                    "完成编码",
-                )?;
-                self.slot.result.lock().ok().and_then(|mut s| s.take())
-            }
-        };
-        match waited {
-            Some(result) => result,
-            // 编码器丢了这一帧（码率控制）：当作没有画面
-            None => Ok((Vec::new(), false)),
+        let got = self
+            .slot
+            .result
+            .lock()
+            .ok()
+            .and_then(|guard| {
+                self.slot
+                    .ready
+                    .wait_timeout_while(guard, wait, |q| q.is_empty())
+                    .ok()
+                    .map(|(mut q, _)| q.drain(..).collect::<Vec<_>>())
+            })
+            .unwrap_or_default();
+        let got = if got.is_empty() { self.flush()? } else { got };
+        let (mut data, mut key) = (Vec::new(), false);
+        for one in got {
+            let (bytes, k) = one?;
+            data.extend_from_slice(&bytes);
+            key |= k;
         }
+        // 什么都没有：编码器丢了这一帧（码率控制），当作没有画面
+        Ok((data, key))
     }
 }
 

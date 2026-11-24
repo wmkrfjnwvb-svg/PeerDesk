@@ -102,7 +102,7 @@ fn report(screen: Option<Screen>) -> Vec<String> {
         std::env::consts::ARCH
     )];
     let base = screen.unwrap_or_else(|| {
-        lines.push("本机屏幕打不开，用合成桌面（结果参考价值低一些）".into());
+        lines.push("本机屏幕打不开，用合成桌面（结果参考价值低一些）。macOS 上在终端里运行时，要在“系统设置 → 隐私与安全性 → 屏幕录制”里给“终端”打开权限".into());
         synthetic()
     });
     lines.push(format!(
