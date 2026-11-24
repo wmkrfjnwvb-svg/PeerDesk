@@ -478,6 +478,10 @@ pub async fn serve(
                                 drop(send);
                                 Ok(Vec::new())
                             }
+                            // 文件管理：和文件传输用同一个权限开关
+                            StreamKind::Browse => {
+                                crate::browse::serve(send, recv, allowed, &crate::files::Progress::default()).await
+                            }
                             StreamKind::Control | StreamKind::Signal | StreamKind::Crash => {
                                 Err(NetError::Protocol("会话里不该出现这种流"))
                             }

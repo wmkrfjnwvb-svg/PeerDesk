@@ -27,6 +27,7 @@ macro_rules! note {
 pub mod audio;
 #[cfg(feature = "media")]
 pub mod bench;
+pub mod browse;
 pub mod candidates;
 pub mod clipsync;
 #[cfg(feature = "media")]

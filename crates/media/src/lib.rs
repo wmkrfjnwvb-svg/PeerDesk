@@ -260,6 +260,14 @@ impl VideoDecoder for AutoH264Decoder {
     fn decode(&mut self, header: &FrameHeader, data: &[u8]) -> Result<Option<&Screen>, Error> {
         if let Some(hw) = self.hw.as_mut() {
             match hw.decode(data) {
+                // 关键帧一定要出画面：硬件解码器收了关键帧却不出（Mac CI 上 VideoToolbox 解
+                // 低延迟码控编出的码流就是这样，画面一直出不来），当作硬件解码不能用，改用软件
+                Ok(None) if header.key => {
+                    let name = hw.name().to_owned();
+                    log::warn!("硬件解码器 {name} 收到关键帧没出画面，改用软件解码");
+                    self.hw = None;
+                    self.screen = None;
+                }
                 Ok(None) => return Ok(None),
                 Ok(Some((w, h, pixels))) => {
                     let (hw_w, hh) = (usize::from(header.width), usize::from(header.height));
@@ -1027,7 +1035,12 @@ mod tests {
             "系统 Media Foundation（CPU）"
         );
         assert!(format!("{dec:?}").contains("AutoH264Decoder"));
-        assert!(dec.decode(&header, b"x").unwrap().is_none());
+        // 增量帧可以暂时没有画面
+        let delta = FrameHeader {
+            key: false,
+            ..header
+        };
+        assert!(dec.decode(&delta, b"x").unwrap().is_none());
         // 对齐多出的边被裁掉
         let shown = dec.decode(&header, b"x").unwrap().unwrap();
         assert_eq!((shown.width(), shown.height()), (30, 16));
@@ -1041,6 +1054,10 @@ mod tests {
             .unwrap()
             .unwrap();
         let (h, data) = FrameHeader::parse(&frame.payload).unwrap();
+        assert!(dec.decode(&h, data).unwrap().is_some());
+        assert_eq!(dec.backend(), "软件 OpenH264");
+        // 关键帧却没有画面：改用软件
+        let mut dec = AutoH264Decoder::with_hardware(Some(Box::new(FakeHwDec(0)))).unwrap();
         assert!(dec.decode(&h, data).unwrap().is_some());
         assert_eq!(dec.backend(), "软件 OpenH264");
         // 没有硬件解码器：直接软件

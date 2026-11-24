@@ -565,7 +565,11 @@ async fn serve_device(state: Arc<SignalState>, link: Link) -> Result<(), NetErro
     match read_kind(&mut recv).await? {
         StreamKind::Signal => {}
         StreamKind::Crash => return serve_crash(&state, &link, send, recv).await,
-        StreamKind::Control | StreamKind::File | StreamKind::Clipboard | StreamKind::Audio => {
+        StreamKind::Control
+        | StreamKind::File
+        | StreamKind::Clipboard
+        | StreamKind::Audio
+        | StreamKind::Browse => {
             return Err(NetError::Protocol("信令端口只接受信令流和崩溃报告"));
         }
     }

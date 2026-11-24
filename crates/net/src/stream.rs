@@ -22,6 +22,8 @@ pub enum StreamKind {
     Audio,
     /// 客户端 → 服务器：崩溃报告（见 [`peerdesk_core::crash`]）。
     Crash,
+    /// 文件管理：浏览对方的目录、指定目录的上传下载（见 [`peerdesk_core::browse`]）。
+    Browse,
 }
 
 impl StreamKind {
@@ -33,6 +35,7 @@ impl StreamKind {
             StreamKind::Clipboard => 4,
             StreamKind::Audio => 5,
             StreamKind::Crash => 6,
+            StreamKind::Browse => 7,
         }
     }
 
@@ -44,6 +47,7 @@ impl StreamKind {
             4 => Some(StreamKind::Clipboard),
             5 => Some(StreamKind::Audio),
             6 => Some(StreamKind::Crash),
+            7 => Some(StreamKind::Browse),
             _ => None,
         }
     }
@@ -174,10 +178,11 @@ mod tests {
             StreamKind::Clipboard,
             StreamKind::Audio,
             StreamKind::Crash,
+            StreamKind::Browse,
         ] {
             assert_eq!(StreamKind::from_id(kind.id()), Some(kind));
         }
         assert_eq!(StreamKind::from_id(0), None);
-        assert_eq!(StreamKind::from_id(7), None);
+        assert_eq!(StreamKind::from_id(8), None);
     }
 }
