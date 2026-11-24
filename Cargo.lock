@@ -2517,6 +2517,7 @@ dependencies = [
  "log",
  "num-traits",
  "peerdesk-core",
+ "peerdesk-media",
  "peerdesk-net",
  "peerdesk-platform",
  "peerdesk-server",
