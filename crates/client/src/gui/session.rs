@@ -501,6 +501,8 @@ struct GuiSink {
     repaint: Repaint,
     /// 声音开关（助手里切换，默认关）；重连后的新会话也看同一个开关。
     sound: watch::Receiver<bool>,
+    /// 显示画面的区域（像素，0×0 表示不限）：被控端按这个大小编码；重连后的新会话也看它。
+    view: watch::Receiver<(u16, u16)>,
     /// 当前连接（对方支持文件管理时有），文件管理在上面开浏览流；重连后换成新连接。
     files: FilesLink,
 }
@@ -639,6 +641,7 @@ pub struct ViewHandle {
     stop: watch::Sender<bool>,
     slot: Arc<FrameSlot>,
     sound: watch::Sender<bool>,
+    view: watch::Sender<(u16, u16)>,
     files: FilesLink,
 }
 
@@ -646,6 +649,15 @@ impl ViewHandle {
     /// 打开或关闭远程声音（默认关）。
     pub fn set_sound(&self, on: bool) {
         let _ = self.sound.send(on);
+    }
+
+    /// 显示画面的区域变了（像素；0×0 表示不限，例如“原始大小”）。被控端按它编码。
+    pub fn set_view(&self, size: (u16, u16)) {
+        let _ = self.view.send_if_modified(|v| {
+            let changed = *v != size;
+            *v = size;
+            changed
+        });
     }
 
     /// 文件管理用的连接：已连上、对方支持文件管理时有。
@@ -709,11 +721,13 @@ pub fn start_view(
     };
     let emitter = Emitter { tx, repaint };
     let (sound, sound_rx) = watch::channel(false);
+    let (view, view_rx) = watch::channel((0, 0));
     let files = FilesLink::default();
     let sink = GuiSink {
         slot: Arc::clone(&slot),
         repaint: Arc::clone(&emitter.repaint),
         sound: sound_rx,
+        view: view_rx,
         files: Arc::clone(&files),
     };
     let task = view_main(
@@ -732,6 +746,7 @@ pub fn start_view(
         stop,
         slot,
         sound,
+        view,
         files,
     }
 }
@@ -983,6 +998,7 @@ async fn one_session(
                 playback: SYSTEM_AUDIO.1(),
                 on: sink.sound.clone(),
             }),
+            view: Some(sink.view.clone()),
         },
         Box::new(sink),
         input,

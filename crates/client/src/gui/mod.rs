@@ -25,5 +25,6 @@ pub mod stats;
 pub mod theme;
 pub mod transfers;
 mod viewer;
+pub mod viewsize;
 
 pub use app::run;

@@ -129,7 +129,7 @@ pub struct Scenario {
     pub seed: u64,
     /// 带宽估计器。
     pub estimator: EstimatorKind,
-    /// 发送节奏（见 [`peerdesk_core::pacer`]）。默认打开，环境变量 `PEERDESK_PACE=0` 关掉。
+    /// 发送节奏（实验，见 [`peerdesk_core::pacer`]）。默认关，环境变量 `PEERDESK_PACE=1` 打开。
     pub pacing: bool,
     /// 纠错方式。默认 RS（新版本之间）；`PEERDESK_FEC=xor` 对照。
     pub fec: peerdesk_core::transport::Fec,

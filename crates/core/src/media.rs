@@ -176,6 +176,8 @@ pub struct FrameJob {
     pub feedback: Option<(u32, u32)>,
     /// 按源画面的多少编码（千分比）。
     pub scale_permille: u16,
+    /// 控制端显示画面的区域（像素），编码尺寸不超过它；`None` 表示不限。
+    pub view: Option<(u16, u16)>,
 }
 
 /// 在编码器所在的地方执行一个任务。返回编码结果，以及之后画面不变时还要不要继续交画面（补清晰、恢复）。
@@ -192,6 +194,7 @@ pub fn encode_job(
         encoder.on_feedback(floor, mask);
     }
     encoder.set_scale(job.scale_permille);
+    encoder.set_view(job.view);
     let encoded = encoder.encode(job.frame_id, screen, changed, job.budget)?;
     Ok((encoded, encoder.wants_refine()))
 }
@@ -235,6 +238,8 @@ pub struct MediaSender {
     scale_up: bool,
     /// 最近发出的关键帧：(帧号, 发出时间)。
     key_sent: Option<(u32, Time)>,
+    /// 控制端显示画面的区域（见 [`FrameJob::view`]）。
+    view: Option<(u16, u16)>,
 }
 
 impl std::fmt::Debug for MediaSender {
@@ -284,6 +289,7 @@ impl MediaSender {
             encode_us: 0,
             scale_up: false,
             key_sent: None,
+            view: None,
             scale: if codec == Codec::H264 {
                 ScalePolicy::new()
             } else {
@@ -357,6 +363,11 @@ impl MediaSender {
     /// 用来判断画面是不是停下了（见 [`crate::scale`]）。
     pub fn screen_changed(&mut self, now: Time) {
         self.scale.on_change(now);
+    }
+
+    /// 控制端报告了显示画面的区域（像素）；`(0, 0)` 或 `None` 表示不限（例如“原始大小”）。
+    pub fn set_view(&mut self, view: Option<(u16, u16)>) {
+        self.view = view.filter(|(w, h)| *w > 0 && *h > 0);
     }
 
     /// 最近的关键帧还没确认。
@@ -466,6 +477,7 @@ impl MediaSender {
             lost,
             feedback,
             scale_permille,
+            view: self.view,
         }
     }
 

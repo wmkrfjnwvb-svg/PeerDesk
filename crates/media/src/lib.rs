@@ -26,7 +26,7 @@ pub mod gpu;
 mod vaapi;
 use openh264::OpenH264API;
 use peerdesk_core::error::Error;
-use peerdesk_core::scale::scaled_size;
+use peerdesk_core::scale::{fit, scaled_size};
 use peerdesk_core::screen::Screen;
 use peerdesk_core::video::{Codec, EncodedFrame, FrameHeader, VideoDecoder, VideoEncoder};
 
@@ -459,6 +459,8 @@ pub struct H264Encoder {
     soft_reason: Option<String>,
     /// 按源画面的多少编码（千分比，见 [`VideoEncoder::set_scale`]）。
     scale_permille: u16,
+    /// 控制端显示画面的区域（见 [`VideoEncoder::set_view`]）。
+    view: Option<(u16, u16)>,
     /// 交给硬件编码器、还没取回的帧：每帧是否要求了关键帧（按顺序；异步编码器会攒帧）。
     hw_sent: std::collections::VecDeque<bool>,
 }
@@ -515,6 +517,7 @@ impl H264Encoder {
             unasked_keys: 0,
             soft_reason: None,
             scale_permille: peerdesk_core::scale::FULL_PERMILLE,
+            view: None,
             hw_sent: std::collections::VecDeque::new(),
         }
     }
@@ -792,7 +795,11 @@ impl VideoEncoder for H264Encoder {
         budget: usize,
     ) -> Result<Option<EncodedFrame>, Error> {
         // 编码尺寸：发送端按网络定的比例（见 peerdesk_core::scale）；帧头写的就是这个尺寸
-        let size = scaled_size(screen.width(), screen.height(), self.scale_permille);
+        // 再等比缩到放得进控制端的窗口（Retina 屏在小窗口里看时不用编 2880×1800）
+        let size = fit(
+            scaled_size(screen.width(), screen.height(), self.scale_permille),
+            self.view,
+        );
         // 按“上一次编出来的尺寸”判断，和用的是硬件还是软件编码器无关
         let fresh = self.encoded_size != Some(size);
         if !fresh && !changed && !self.force_key {
@@ -898,6 +905,14 @@ impl VideoEncoder for H264Encoder {
             self.force_key = true;
         }
         self.scale_permille = permille;
+    }
+
+    fn set_view(&mut self, view: Option<(u16, u16)>) {
+        let view = view.filter(|(w, h)| *w > 0 && *h > 0);
+        if view != self.view && self.encoded_size.is_some() {
+            self.force_key = true;
+        }
+        self.view = view;
     }
 }
 
@@ -1177,6 +1192,33 @@ mod tests {
             ready: None,
             poll_error: true,
         }))
+    }
+
+    /// 控制端窗口小：按窗口大小编码；窗口变了出关键帧；不限时回到原尺寸。
+    #[test]
+    fn encodes_at_the_viewers_size() {
+        let mut enc = H264Encoder::new(30).with_hardware(fake_none);
+        enc.set_view(Some((160, 96)));
+        let f = enc
+            .encode(1, &picture(320, 192), true, 50_000)
+            .unwrap()
+            .unwrap();
+        let (h, _) = FrameHeader::parse(&f.payload).unwrap();
+        assert_eq!((h.width, h.height), (160, 96));
+        enc.set_view(Some((160, 96)));
+        assert!(
+            !enc.wants_refine() || enc.refine_left > 0,
+            "没变不要求关键帧"
+        );
+        enc.set_view(None);
+        assert!(enc.wants_refine(), "窗口变了：画面不动也要编");
+        let f = enc
+            .encode(2, &picture(320, 192), false, 50_000)
+            .unwrap()
+            .unwrap();
+        let (h, _) = FrameHeader::parse(&f.payload).unwrap();
+        assert!(f.key);
+        assert_eq!((h.width, h.height), (320, 192));
     }
 
     /// 第一帧不收（像 Media Foundation 的 `MF_E_NOTACCEPTING`），之后照常编。

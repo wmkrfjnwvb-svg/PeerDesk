@@ -24,6 +24,8 @@ pub enum StreamKind {
     Crash,
     /// 文件管理：浏览对方的目录、指定目录的上传下载（见 [`peerdesk_core::browse`]）。
     Browse,
+    /// 控制端显示画面的区域有多大：每次变化写 4 字节（宽、高，各 u16 大端；0×0 表示不限）。
+    View,
 }
 
 impl StreamKind {
@@ -36,6 +38,7 @@ impl StreamKind {
             StreamKind::Audio => 5,
             StreamKind::Crash => 6,
             StreamKind::Browse => 7,
+            StreamKind::View => 8,
         }
     }
 
@@ -48,6 +51,7 @@ impl StreamKind {
             5 => Some(StreamKind::Audio),
             6 => Some(StreamKind::Crash),
             7 => Some(StreamKind::Browse),
+            8 => Some(StreamKind::View),
             _ => None,
         }
     }
@@ -179,10 +183,11 @@ mod tests {
             StreamKind::Audio,
             StreamKind::Crash,
             StreamKind::Browse,
+            StreamKind::View,
         ] {
             assert_eq!(StreamKind::from_id(kind.id()), Some(kind));
         }
         assert_eq!(StreamKind::from_id(0), None);
-        assert_eq!(StreamKind::from_id(8), None);
+        assert_eq!(StreamKind::from_id(9), None);
     }
 }

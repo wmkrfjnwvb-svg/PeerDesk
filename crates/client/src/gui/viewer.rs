@@ -35,6 +35,8 @@ pub struct Outcome {
 
 /// 一个观看窗口。
 pub struct Viewer {
+    /// 显示区域大小的防抖（见 [`super::viewsize`]）。
+    sizer: super::viewsize::ViewSizer,
     id: ViewportId,
     title: String,
     handle: ViewHandle,
@@ -72,6 +74,7 @@ impl Viewer {
     /// 为一个刚开始的会话建窗口。
     pub fn new(serial: u64, title: String, handle: ViewHandle) -> Self {
         Self {
+            sizer: super::viewsize::ViewSizer::default(),
             id: ViewportId::from_hash_of(("peerdesk-viewer", serial)),
             title,
             handle,
@@ -393,6 +396,18 @@ impl Viewer {
             .frame(Frame::NONE.fill(Color32::BLACK))
             .show(ctx, |ui| {
                 let avail = ui.max_rect();
+                // 告诉被控端显示区域多大（像素），它按这个大小编码；原始大小时不限
+                let want = if self.original {
+                    (0, 0)
+                } else {
+                    super::viewsize::pixels(avail.width(), avail.height(), ctx.pixels_per_point())
+                };
+                if let Some(size) = self.sizer.update(Instant::now(), want) {
+                    self.handle.set_view(size);
+                }
+                if self.sizer.is_pending() {
+                    ctx.request_repaint_after(super::viewsize::SETTLE);
+                }
                 let painter = ui.painter();
                 if let Some(texture) = &self.texture {
                     let rect = fit(avail, self.size, ctx.pixels_per_point(), self.original);

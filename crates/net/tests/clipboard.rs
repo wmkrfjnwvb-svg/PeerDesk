@@ -97,6 +97,7 @@ async fn session_with<F, Fut>(
                 },
             ))),
             on_link: None,
+            view: None,
             on_quality: None,
             audio: None,
         },

@@ -64,6 +64,9 @@ pub struct ControllerOptions {
     pub on_quality: Option<QualityHook>,
     /// 握手完成后交出这条连接（文件管理在上面开浏览流），会话结束时交出 `None`。
     pub on_link: Option<LinkHook>,
+    /// 显示画面的区域（像素，0×0 表示不限）：变了就告诉被控端，被控端按这个大小编码。
+    /// 对方不支持（老版本）时不发。
+    pub view: Option<tokio::sync::watch::Receiver<(u16, u16)>>,
 }
 
 /// 交出连接的回调（见 [`ControllerOptions::on_link`]）。
@@ -344,6 +347,11 @@ pub async fn run(
         None => None,
     };
 
+    // 画面区域：变了就写给被控端（第一次写时开流）。一开始就发一次当前值。
+    let mut view_rx = opts.view.clone().filter(|_| caps.has(Caps::VIEW_SIZE));
+    let mut view_stream: Option<quinn::SendStream> = None;
+    let mut view_pending = view_rx.is_some();
+
     // 声音：开关打开时开一条声音流（开着被控端就发），关掉时关流。
     let mut audio_switch = opts.audio.clone().filter(|_| caps.has(Caps::AUDIO));
     let mut audio_stream: Option<quinn::SendStream> = None;
@@ -452,6 +460,32 @@ pub async fn run(
             } => {
                 upload_task = None;
                 upload_result = Some(result.unwrap_or_else(|e| Err(NetError::Io(e.to_string()))));
+            }
+            ok = async {
+                match view_rx.as_mut() {
+                    Some(_) if view_pending => true,
+                    Some(rx) => rx.changed().await.is_ok(),
+                    None => std::future::pending().await,
+                }
+            } => {
+                view_pending = false;
+                let Some(rx) = view_rx.as_ref().filter(|_| ok) else {
+                    view_rx = None;
+                    continue;
+                };
+                let (w, h) = *rx.borrow();
+                if view_stream.is_none() {
+                    let (mut send, _recv) = link.open_stream().await?;
+                    write_kind(&mut send, StreamKind::View).await?;
+                    view_stream = Some(send);
+                }
+                if let Some(send) = view_stream.as_mut() {
+                    let packed = (u32::from(w) << 16) | u32::from(h);
+                    send.write_all(&packed.to_be_bytes())
+                        .await
+                        .map_err(|e| NetError::Closed(e.to_string()))?;
+                    crate::note!(info, "画面区域 {w}×{h}（0×0 表示不限）");
+                }
             }
             changed = async {
                 match audio_switch.as_mut() {

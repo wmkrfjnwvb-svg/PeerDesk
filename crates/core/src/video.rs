@@ -139,6 +139,10 @@ pub trait VideoEncoder: Send {
     /// 尺寸变了的那一帧是关键帧。不支持缩放的编码器忽略。
     fn set_scale(&mut self, _permille: u16) {}
 
+    /// 控制端显示画面的区域（像素）；编码尺寸不超过它（等比缩小）。`None` 表示不限。
+    /// 尺寸变了的那一帧是关键帧。不支持缩放的编码器忽略。
+    fn set_view(&mut self, _view: Option<(u16, u16)>) {}
+
     /// 现在用的编码器（“详情”面板、日志用）。
     fn backend(&self) -> String {
         format!("{:?}", self.codec())

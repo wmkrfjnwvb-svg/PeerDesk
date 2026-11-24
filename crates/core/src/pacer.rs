@@ -9,25 +9,30 @@
 //! 正常带宽上一帧在预算之内，几乎都在突发额度里直接发出，行为和原来一样。
 //! 重传的分片插到队首：接收端正在等它们。
 //!
-//! **状态：默认打开，按估计带宽的 2.5 倍发（和 WebRTC 的 pacing factor 一样）**（`PEERDESK_PACE=0` 关掉）。
-//! 2026-11-24 校准（`scripts/pace-lab.sh`：真实二进制、tbf 限速的回环；仿真：`crates/e2e`），
-//! 同时修了码率估计降过头和重传判重（见 `estimator.rs`、`media.rs`），加了半分辨率起步（`scale.rs`）：
-//! - 真实二进制：400 kbps 最长停顿 3.8 → 2.0 秒，5 Mbps 441 → 225 ms，1.5 Mbps（缓冲 60 ms）700 → 439 ms；
-//!   第一幅画面基本不变（20 Mbps 62 → 78 ms）。
-//! - 仿真 10 个场景全部达标，瓶颈排队丢包几乎都降到 0；窄带宽看视频最长等待 868 → 147 ms；
-//!   代价是局域网第一幅画面 0 → 26 ms、快速升带宽的场景 6 → 150 ms。
-//! - 之前按 1.25 倍发时自己限制自己（估计靠包串测，按估计发又测不出更高），两边不能同时变好。
+//! **状态：默认关**（`PEERDESK_PACE=1` 打开，打开时按估计带宽的 2.5 倍发，和 WebRTC 的 pacing factor 一样）。
+//! 2026-11-24 校准，两边的证据不一致，所以不默认打开：
+//! - 真实二进制、tbf 限速的回环（`scripts/pace-lab.sh`，没有随机丢包和抖动）：2.5 倍时 400 kbps 最长停顿
+//!   3.8 → 2.0 秒，5 Mbps 441 → 225 ms，1.5 Mbps（缓冲 60 ms）700 → 439 ms。
+//! - 仿真 10 个场景全过，瓶颈排队丢包几乎都降到 0。
+//! - 微软真实网络轨迹（带宽变化、随机丢包；冻结次数 / 最长等待 ms / 首帧 ms）：
+//!   | 轨迹 | 关 | 2.5 倍 | 4 倍 |
+//!   |---|---|---|---|
+//!   | ms-09401 | 4 / 1519 / 526 | 7 / 1784 / 461 | 4 / 1310 / 471 |
+//!   | ms-02560 | 19 / 322 / 66 | 18 / 409 / 186 | 23 / 339 / 110 |
+//!   | ms-05729 | 13 / 1531 / 558 | 15 / 2020 / 493 | 15 / 1366 / 515 |
+//!   每种倍数都有一项变差（超过回归门槛）。
+//! - 下一步：仿真的瓶颈模型按 tbf（字节桶）校准，再在两边一起选默认值；或只对超过一帧预算的大帧（关键帧）限速。
 
-/// 发送节奏是否打开：默认打开，`PEERDESK_PACE=0` 关掉（对照用）。
+/// 发送节奏是否打开：默认关，`PEERDESK_PACE=1` 打开（见模块说明里的取舍）。
 #[must_use]
 pub fn enabled() -> bool {
     enabled_from(std::env::var_os("PEERDESK_PACE").as_deref())
 }
 
-/// 按环境变量的值判断：只有 `0` 表示关。
+/// 按环境变量的值判断：只有 `1` 表示开。
 #[must_use]
 pub fn enabled_from(value: Option<&std::ffi::OsStr>) -> bool {
-    value.is_none_or(|v| v != "0")
+    value.is_some_and(|v| v == "1")
 }
 
 /// 交给 [`Pacer`] 的速率：打开时是估计带宽，关闭时不限速。
@@ -190,7 +195,7 @@ mod tests {
         assert_eq!(factor_from(Some(OsStr::new("9000"))), PACE_FACTOR_PERMILLE);
         assert_eq!(factor_from(Some(OsStr::new("快"))), PACE_FACTOR_PERMILLE);
         assert!(factor_permille() >= 1000);
-        assert!(enabled_from(None));
+        assert!(!enabled_from(None));
         assert!(enabled_from(Some(OsStr::new("1"))));
         assert!(!enabled_from(Some(OsStr::new("0"))));
     }

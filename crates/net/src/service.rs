@@ -569,7 +569,8 @@ async fn serve_device(state: Arc<SignalState>, link: Link) -> Result<(), NetErro
         | StreamKind::File
         | StreamKind::Clipboard
         | StreamKind::Audio
-        | StreamKind::Browse => {
+        | StreamKind::Browse
+        | StreamKind::View => {
             return Err(NetError::Protocol("信令端口只接受信令流和崩溃报告"));
         }
     }

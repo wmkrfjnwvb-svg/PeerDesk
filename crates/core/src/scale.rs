@@ -144,6 +144,26 @@ impl ScalePolicy {
     }
 }
 
+/// 把 `size` 等比缩小到放得进 `view`（不放大）；缩小时取偶数，至少 16×16。`view` 为 `None` 时不变。
+#[must_use]
+pub fn fit(size: (u16, u16), view: Option<(u16, u16)>) -> (u16, u16) {
+    let Some((vw, vh)) = view.filter(|(w, h)| *w > 0 && *h > 0) else {
+        return size;
+    };
+    let (w, h) = (u32::from(size.0), u32::from(size.1));
+    if w <= u32::from(vw) && h <= u32::from(vh) {
+        return size;
+    }
+    // 按更紧的那一边缩：那一边正好等于窗口，另一边等比
+    let (nw, nh) = if w * u32::from(vh) >= h * u32::from(vw) {
+        (u32::from(vw), h * u32::from(vw) / w.max(1))
+    } else {
+        (w * u32::from(vh) / h.max(1), u32::from(vh))
+    };
+    let even = |v: u32, max: u16| u16::try_from((v & !1).max(16)).unwrap_or(max).min(max);
+    (even(nw, size.0), even(nh, size.1))
+}
+
 /// 按比例算编码尺寸：缩小时取偶数（H.264 的 4:2:0 要求），至少 16×16，不超过原尺寸；原尺寸不变。
 #[must_use]
 pub fn scaled_size(width: u16, height: u16, permille: u16) -> (u16, u16) {
@@ -229,6 +249,18 @@ mod tests {
         assert!(p.on_idle(Time(700_000), 400_000, false));
         assert_eq!(p.permille(), FULL_PERMILLE);
         assert!(!p.on_idle(Time(2_000_000), 400_000, false), "已经是原尺寸");
+    }
+
+    #[test]
+    fn fits_inside_the_view() {
+        // Retina 屏 2880×1800，控制端窗口 1440×900：编 1440×900
+        assert_eq!(fit((2880, 1800), Some((1440, 900))), (1440, 900));
+        // 窗口比例不同：按更紧的一边
+        assert_eq!(fit((1920, 1080), Some((1000, 1000))), (1000, 562));
+        // 窗口比画面大、不限：不变
+        assert_eq!(fit((1280, 720), Some((2560, 1440))), (1280, 720));
+        assert_eq!(fit((1280, 720), None), (1280, 720));
+        assert_eq!(fit((1280, 720), Some((0, 0))), (1280, 720));
     }
 
     #[test]

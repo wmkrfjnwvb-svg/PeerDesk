@@ -115,7 +115,7 @@ pub struct HostOptions {
     pub audio: Option<crate::audio::CaptureHandle>,
     /// 本机电脑名：握手时告诉控制端，显示在对方的设备列表里。空表示不发。
     pub name: String,
-    /// 发送节奏（见 [`peerdesk_core::pacer`]）。默认打开，环境变量 `PEERDESK_PACE=0` 关掉。
+    /// 发送节奏（实验，见 [`peerdesk_core::pacer`]）。默认关，环境变量 `PEERDESK_PACE=1` 打开。
     pub pacing: bool,
 }
 
@@ -332,6 +332,9 @@ pub async fn serve(
         .clipboard
         .clone()
         .filter(|_| opts.permissions.clipboard && caps.has(Caps::CLIPBOARD));
+    // 控制端显示画面的区域（宽 << 16 | 高；0 表示不限），由“画面区域”流更新（见 StreamKind::View）
+    let view = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let view_ok = caps.has(Caps::VIEW_SIZE);
     let audio = opts
         .audio
         .clone()
@@ -445,6 +448,7 @@ pub async fn serve(
                     let clipboard = clipboard.clone();
                     let files = caps.has(Caps::CLIPBOARD_FILES);
                     let audio = audio.clone();
+                    let view = Arc::clone(&view);
                     let link = Arc::clone(&link);
                     let mut clip_stopped = clip_stopped.clone();
                     file_tasks.push(tokio::spawn(async move {
@@ -475,6 +479,18 @@ pub async fn serve(
                                     let _ = clip_stopped.wait_for(|stop| *stop).await;
                                 };
                                 crate::audio::send(&link, audio.0.as_ref(), recv, stopped).await?;
+                                drop(send);
+                                Ok(Vec::new())
+                            }
+                            StreamKind::View if !view_ok => {
+                                Err(NetError::Protocol("没有协商画面区域"))
+                            }
+                            // 控制端窗口大小：每次 4 字节，流结束（控制端走了）就停
+                            StreamKind::View => {
+                                let mut buf = [0u8; 4];
+                                while recv.read_exact(&mut buf).await.is_ok() {
+                                    view.store(u32::from_be_bytes(buf), std::sync::atomic::Ordering::Relaxed);
+                                }
                                 drop(send);
                                 Ok(Vec::new())
                             }
@@ -612,6 +628,11 @@ pub async fn serve(
                     continue;
                 }
                 let rtt = u64::try_from(link.rtt().as_micros()).unwrap_or(u64::MAX);
+                let packed = view.load(std::sync::atomic::Ordering::Relaxed);
+                media.set_view(Some((
+                    u16::try_from(packed >> 16).unwrap_or(0),
+                    u16::try_from(packed & 0xffff).unwrap_or(0),
+                )));
                 let job = media.start_frame(link.now(), rtt);
                 if jobs.send((job, screen.clone(), std::mem::take(&mut pending_change))).is_err() {
                     break "编码线程结束".to_owned();

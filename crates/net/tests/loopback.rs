@@ -149,6 +149,7 @@ async fn full_session_video_input_and_files() {
             clipboard: None,
             on_established: None,
             on_link: None,
+            view: None,
             on_quality: None,
             audio: None,
         },
@@ -264,6 +265,7 @@ async fn interrupted_upload_resumes_from_partial_file() {
             clipboard: None,
             on_established: None,
             on_link: None,
+            view: None,
             on_quality: None,
             audio: None,
         },
@@ -305,6 +307,7 @@ async fn host_ending_first_is_reported_to_controller() {
             clipboard: None,
             on_established: None,
             on_link: None,
+            view: None,
             on_quality: None,
             audio: None,
         },
@@ -355,6 +358,7 @@ async fn paced_session_delivers_frames() {
             clipboard: None,
             on_established: None,
             on_link: None,
+            view: None,
             on_quality: None,
             audio: None,
         },
@@ -521,6 +525,7 @@ async fn controller_reports_rejection() {
             clipboard: None,
             on_established: None,
             on_link: None,
+            view: None,
             on_quality: None,
             audio: None,
         },
@@ -612,6 +617,7 @@ async fn idle_screen_costs_almost_nothing_on_the_wire() {
                 clipboard: None,
                 on_established: None,
                 on_link: None,
+                view: None,
                 on_quality: None,
                 audio: None,
             },
@@ -699,6 +705,7 @@ async fn sources_with_a_change_counter_are_encoded_only_when_it_moves() {
             clipboard: None,
             on_established: None,
             on_link: None,
+            view: None,
             on_quality: None,
             audio: None,
         },
@@ -717,4 +724,48 @@ async fn sources_with_a_change_counter_are_encoded_only_when_it_moves() {
         host_report.frames_sent
     );
     assert!(report.frames_delivered <= u64::from(host_report.frames_sent));
+}
+
+/// 控制端窗口只有 320×180：告诉被控端后，被控端按这个大小编码（Retina 屏在小窗口里看时不用编全尺寸）。
+#[tokio::test(flavor = "multi_thread")]
+async fn host_encodes_at_the_viewers_size() {
+    let policy = Policy::recommended();
+    let p = pair(&policy, &policy);
+    let (host_link, ctrl_link) = links(&p).await;
+    let with_view = |id: &Identity| SessionConfig {
+        caps: Caps::H264.with(Caps::VIEW_SIZE),
+        ..session_h264(id, &policy)
+    };
+    // 一直在打字：画面不停变化
+    let desktop = DemoDesktop::new(640, 360, 1).with_script(vec![(Workload::Typing, 1000)]);
+    let host_task = tokio::spawn(host::serve(
+        host_link,
+        HostOptions::new(with_view(&p.host_id), 30, temp_dir("view")),
+        Box::new(desktop),
+        Box::new(Recorder::default()),
+    ));
+    let (_view_tx, view_rx) = tokio::sync::watch::channel((320u16, 180u16));
+    let (_tx, rx) = mpsc::channel(1);
+    let report = controller::run(
+        ctrl_link,
+        ControllerOptions {
+            session: with_view(&p.ctrl_id),
+            deadline_us: 200_000,
+            duration: Some(Duration::from_millis(1500)),
+            clipboard: None,
+            on_established: None,
+            on_link: None,
+            view: Some(view_rx),
+            on_quality: None,
+            audio: None,
+        },
+        Box::new(CountSink::new()),
+        rx,
+        None,
+    )
+    .await
+    .unwrap();
+    let _ = host_task.await.unwrap().unwrap();
+    let seen = report.screen.unwrap();
+    assert_eq!((seen.width(), seen.height()), (320, 180));
 }

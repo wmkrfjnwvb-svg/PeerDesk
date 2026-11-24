@@ -732,6 +732,7 @@ async fn connect_session(
             clipboard: None,
             on_established: None,
             on_link: None,
+            view: None,
             on_quality: None,
             audio: None,
         },
