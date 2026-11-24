@@ -139,6 +139,12 @@ pub trait VideoEncoder: Send {
     fn backend(&self) -> String {
         format!("{:?}", self.codec())
     }
+
+    /// 上一帧花在颜色转换（RGB → YUV，交给硬件时还有 NV12 打包）上的微秒数。
+    /// 和编码总耗时对照，看时间花在转换还是编码器本身。没有单独转换步骤的编码器为 0。
+    fn convert_micros(&self) -> u64 {
+        0
+    }
 }
 
 /// 视频解码器。
@@ -294,6 +300,8 @@ mod tests {
 
     #[test]
     fn tile_codec_through_the_common_interface() {
+        // 块编码没有单独的颜色转换步骤
+        assert_eq!(TileEncoder::new().convert_micros(), 0);
         let mut enc = TileEncoder::default();
         let mut dec = TileDecoder::new();
         assert_eq!(enc.codec(), Codec::Tile);

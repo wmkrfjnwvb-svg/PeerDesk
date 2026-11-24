@@ -10,6 +10,9 @@
 //! - 硬件 MFT 是异步的：靠事件（要输入 / 有输出）推进。这里一帧一帧同步地等，每次等待都有时限，
 //!   超时算失败，由调用方改用软件编码（不卡住会话）。
 //! - 所有调用都在编码线程上（第一次编码时才打开），COM 按多线程套间初始化。
+//! - 编码器声明支持 D3D11 时，给它一个建在**它所在显卡**上的 D3D11 设备（按 `MFT_ENUM_ADAPTER_LUID`
+//!   找显卡；双显卡笔记本上默认显卡不一定是编码器那块）。AMD 的编码器没有设备打不开；
+//!   NVIDIA、Intel 有设备时走显存更省。给了设备打不开时再不给设备试一次。
 //!
 //! 只在 Windows 上编译，覆盖率统计不含这个文件（Linux 上不编译），由 Windows 实机测试验证。
 
@@ -20,6 +23,14 @@ use std::sync::Once;
 use std::time::{Duration, Instant};
 
 use windows::core::Interface;
+use windows::Win32::Foundation::HMODULE;
+use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN};
+use windows::Win32::Graphics::Direct3D10::ID3D10Multithread;
+use windows::Win32::Graphics::Direct3D11::{
+    D3D11CreateDevice, ID3D11Device, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+    D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_SDK_VERSION,
+};
+use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter, IDXGIFactory1};
 use windows::Win32::Media::MediaFoundation::{
     eAVEncCommonRateControlMode_CBR, eAVEncH264VProfile_Base, CODECAPI_AVEncCommonMeanBitRate,
     CODECAPI_AVEncCommonRateControlMode, CODECAPI_AVEncMPVDefaultBPictureCount,
@@ -37,7 +48,14 @@ use windows::Win32::Media::MediaFoundation::{
     MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MPEG2_PROFILE,
     MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION,
 };
-use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, COINIT_MULTITHREADED};
+use windows::Win32::Media::MediaFoundation::{
+    CLSID_MSH264DecoderMFT, IMF2DBuffer, IMFDXGIDeviceManager, MFCreateDXGIDeviceManager,
+    MFT_ENUM_ADAPTER_LUID, MFT_MESSAGE_SET_D3D_MANAGER, MF_E_TRANSFORM_NEED_MORE_INPUT,
+    MF_MT_DEFAULT_STRIDE, MF_MT_MINIMUM_DISPLAY_APERTURE, MF_SA_D3D11_AWARE,
+};
+use windows::Win32::System::Com::{
+    CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
+};
 use windows::Win32::System::Variant::VARIANT;
 
 /// 等一个事件（要输入 / 有输出）最多这么久。第一帧硬件要初始化，给长一点。
@@ -66,6 +84,75 @@ fn startup() -> Result<(), String> {
     }
 }
 
+/// 编码器所在显卡（按 LUID 找；找不到时用默认显卡）上的 D3D11 设备和 DXGI 设备管理器。
+fn d3d_manager(activate: &IMFActivate) -> Result<(ID3D11Device, IMFDXGIDeviceManager), String> {
+    // SAFETY: 读属性。
+    let adapter = unsafe { activate.GetUINT64(&MFT_ENUM_ADAPTER_LUID) }
+        .ok()
+        .and_then(adapter_by_luid);
+    d3d_device(adapter)
+}
+
+/// 在显卡 `adapter`（`None` 为默认显卡）上建 D3D11 设备和 DXGI 设备管理器。
+fn d3d_device(
+    adapter: Option<IDXGIAdapter>,
+) -> Result<(ID3D11Device, IMFDXGIDeviceManager), String> {
+    // SAFETY: 建设备、建管理器，输出参数都指向局部变量。
+    unsafe {
+        let driver = if adapter.is_some() {
+            D3D_DRIVER_TYPE_UNKNOWN
+        } else {
+            D3D_DRIVER_TYPE_HARDWARE
+        };
+        let mut device: Option<ID3D11Device> = None;
+        D3D11CreateDevice(
+            adapter.as_ref(),
+            driver,
+            HMODULE::default(),
+            D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            None,
+            D3D11_SDK_VERSION,
+            Some(&mut device),
+            None,
+            None,
+        )
+        .map_err(|e| err("建 D3D11 设备", &e))?;
+        let device = device.ok_or("D3D11CreateDevice 没有返回设备")?;
+        // 编码器在自己的线程上用这个设备：打开多线程保护
+        if let Ok(mt) = device.cast::<ID3D10Multithread>() {
+            let _ = mt.SetMultithreadProtected(true);
+        }
+        let mut token = 0u32;
+        let mut manager: Option<IMFDXGIDeviceManager> = None;
+        MFCreateDXGIDeviceManager(&mut token, &mut manager)
+            .map_err(|e| err("建 DXGI 设备管理器", &e))?;
+        let manager = manager.ok_or("MFCreateDXGIDeviceManager 没有返回管理器")?;
+        manager
+            .ResetDevice(&device, token)
+            .map_err(|e| err("设备交给管理器", &e))?;
+        Ok((device, manager))
+    }
+}
+
+/// LUID（低 32 位 `LowPart`，高 32 位 `HighPart`）对应的显卡。
+fn adapter_by_luid(luid: u64) -> Option<IDXGIAdapter> {
+    // SAFETY: 枚举显卡，输出都是返回值。
+    unsafe {
+        let factory: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
+        let mut i = 0u32;
+        while let Ok(adapter) = factory.EnumAdapters1(i) {
+            if let Ok(desc) = adapter.GetDesc1() {
+                let high = u64::from(u32::from_ne_bytes(desc.AdapterLuid.HighPart.to_ne_bytes()));
+                if (high << 32) | u64::from(desc.AdapterLuid.LowPart) == luid {
+                    return adapter.cast().ok();
+                }
+            }
+            i += 1;
+        }
+        None
+    }
+}
+
 /// 一个打开的硬件编码器。
 pub struct MfEncoder {
     activate: IMFActivate,
@@ -82,6 +169,8 @@ pub struct MfEncoder {
     bps: u64,
     provides_samples: bool,
     output_size: u32,
+    /// 给编码器的 D3D11 设备和管理器（没给时为 `None`）。编码器用着，要活得比它长。
+    _d3d: Option<(ID3D11Device, IMFDXGIDeviceManager)>,
 }
 
 impl std::fmt::Debug for MfEncoder {
@@ -168,9 +257,16 @@ impl MfEncoder {
         }
         let mut reasons = Vec::new();
         for activate in found {
-            match Self::open_one(activate, width, height, fps, bps) {
-                Ok(enc) => return Ok(enc),
-                Err(why) => reasons.push(why),
+            // 先给 D3D11 设备试，不行再不给设备试（同一个激活对象要先关掉才能重新激活）
+            for with_d3d in [true, false] {
+                match Self::open_one(&activate, width, height, fps, bps, with_d3d)
+                    .and_then(Self::self_test)
+                {
+                    Ok(enc) => return Ok(enc),
+                    Err(why) => reasons.push(why),
+                }
+                // SAFETY: 释放这次激活出来的对象，下一次重新激活。
+                let _ = unsafe { activate.ShutdownObject() };
             }
         }
         if reasons.is_empty() {
@@ -180,12 +276,29 @@ impl MfEncoder {
         }
     }
 
+    /// 编一帧黑画面试试：有的编码器打开时不报错，第一帧才失败（例如给了设备却不收内存里的画面）。
+    /// 试的这一帧不发出去；之后第一帧照样是关键帧（尺寸变了要重开时调用方会强制关键帧）。
+    fn self_test(mut self) -> Result<Self, String> {
+        let (w, h) = (
+            usize::try_from(self.width).unwrap_or(0),
+            usize::try_from(self.height).unwrap_or(0),
+        );
+        let mut black = vec![16u8; w * h];
+        black.resize(w * h + w * h / 2, 128);
+        let bps = self.bps;
+        let name = self.name.clone();
+        self.encode(&black, bps, true)
+            .map_err(|e| format!("{name}：试编一帧失败：{e}"))?;
+        Ok(self)
+    }
+
     fn open_one(
-        activate: IMFActivate,
+        activate: &IMFActivate,
         width: u32,
         height: u32,
         fps: u32,
         bps: u64,
+        with_d3d: bool,
     ) -> Result<Self, String> {
         // SAFETY: 以下都是对刚创建的 COM 对象的方法调用，参数是本地值。
         unsafe {
@@ -205,11 +318,29 @@ impl MfEncoder {
                 }
             };
             let transform: IMFTransform = activate.ActivateObject().map_err(|e| err(&name, &e))?;
+            let mut d3d_aware = false;
             if let Ok(attrs) = transform.GetAttributes() {
                 // 硬件 MFT 是异步的，要先“解锁”才能用；低延迟。
                 let _ = attrs.SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1);
                 let _ = attrs.SetUINT32(&MF_LOW_LATENCY, 1);
+                d3d_aware = attrs.GetUINT32(&MF_SA_D3D11_AWARE).is_ok_and(|v| v != 0);
             }
+            let d3d = if with_d3d && d3d_aware {
+                let made = d3d_manager(activate)?;
+                transform
+                    .ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, made.1.as_raw() as usize)
+                    .map_err(|e| err(&format!("{name}：交给 D3D11 设备"), &e))?;
+                Some(made)
+            } else if with_d3d {
+                return Err(format!("{name}：不支持 D3D11，直接用内存"));
+            } else {
+                None
+            };
+            let name = if d3d.is_some() {
+                format!("{name}（D3D11）")
+            } else {
+                name
+            };
             let events: IMFMediaEventGenerator =
                 transform.cast().map_err(|e| err("事件接口", &e))?;
             let codec: Option<ICodecAPI> = transform.cast().ok();
@@ -254,7 +385,7 @@ impl MfEncoder {
                 .ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)
                 .map_err(|e| err("开始", &e))?;
             Ok(Self {
-                activate,
+                activate: activate.clone(),
                 transform,
                 events,
                 codec,
@@ -267,6 +398,7 @@ impl MfEncoder {
                 bps,
                 provides_samples: provides,
                 output_size: info.cbSize.max(width.saturating_mul(height)),
+                _d3d: d3d,
             })
         }
     }
@@ -484,4 +616,295 @@ impl Drop for MfEncoder {
             let _ = self.activate.ShutdownObject();
         }
     }
+}
+
+/// Windows H.264 解码：系统自带的 Microsoft H.264 解码器 MFT。给了 D3D11 设备时用显卡解码（DXVA），
+/// 解出的画面由 Media Foundation 拷回内存；不支持时在 CPU 上解（名称里写明）。输出 NV12，转成 RGB。
+pub struct MfDecoder {
+    transform: IMFTransform,
+    name: String,
+    provides_samples: bool,
+    output_size: u32,
+    /// 解码器输出的尺寸（高度按 16 对齐，例如 1080 → 1088）。
+    coded: (usize, usize),
+    /// 实际画面的尺寸（裁掉对齐的部分）。
+    shown: (usize, usize),
+    /// 每行字节数（没有 2D 缓冲区接口时用）。
+    stride: usize,
+    frame: i64,
+    _d3d: Option<(ID3D11Device, IMFDXGIDeviceManager)>,
+}
+
+impl std::fmt::Debug for MfDecoder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MfDecoder")
+            .field("name", &self.name)
+            .field("shown", &self.shown)
+            .finish_non_exhaustive()
+    }
+}
+
+// SAFETY: COM 对象按多线程套间创建，可以在线程之间移动；实际只在解码线程上使用。
+unsafe impl Send for MfDecoder {}
+
+/// 从小端字节里读一个 i32（`MFVideoArea` 的字段）。
+fn le_i32(bytes: &[u8], at: usize) -> Option<i32> {
+    let b: [u8; 4] = bytes.get(at..at + 4)?.try_into().ok()?;
+    Some(i32::from_le_bytes(b))
+}
+
+impl MfDecoder {
+    /// 打开系统的 H.264 解码器。
+    pub fn open() -> Result<Self, String> {
+        // SAFETY: 同 MfEncoder::open；以下是对刚创建的 COM 对象的方法调用，参数是本地值。
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+            startup()?;
+            let transform: IMFTransform =
+                CoCreateInstance(&CLSID_MSH264DecoderMFT, None, CLSCTX_INPROC_SERVER)
+                    .map_err(|e| err("打开系统 H.264 解码器", &e))?;
+            let mut aware = false;
+            if let Ok(attrs) = transform.GetAttributes() {
+                let _ = attrs.SetUINT32(&MF_LOW_LATENCY, 1);
+                aware = attrs.GetUINT32(&MF_SA_D3D11_AWARE).is_ok_and(|v| v != 0);
+            }
+            // 有 D3D11 设备才是显卡解码；给不了就在 CPU 上解（照样能用，名称里写明）
+            let d3d = if aware {
+                match d3d_device(None).and_then(|made| {
+                    transform
+                        .ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, made.1.as_raw() as usize)
+                        .map_err(|e| err("交给 D3D11 设备", &e))
+                        .map(|()| made)
+                }) {
+                    Ok(made) => Some(made),
+                    Err(why) => {
+                        log::info!("H.264 解码不用显卡：{why}");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let name = if d3d.is_some() {
+                "Media Foundation（显卡 DXVA）"
+            } else {
+                "Media Foundation（CPU）"
+            };
+            let input = MFCreateMediaType().map_err(|e| err("输入格式", &e))?;
+            input
+                .SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)
+                .map_err(|e| err("输入格式", &e))?;
+            input
+                .SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)
+                .map_err(|e| err("输入格式", &e))?;
+            transform
+                .SetInputType(0, &input, 0)
+                .map_err(|e| err("设置输入格式（H.264）", &e))?;
+            let mut dec = Self {
+                transform,
+                name: name.to_owned(),
+                provides_samples: false,
+                output_size: 0,
+                coded: (0, 0),
+                shown: (0, 0),
+                stride: 0,
+                frame: 0,
+                _d3d: d3d,
+            };
+            dec.select_output()?;
+            dec.transform
+                .ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)
+                .map_err(|e| err("开始", &e))?;
+            dec.transform
+                .ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)
+                .map_err(|e| err("开始", &e))?;
+            Ok(dec)
+        }
+    }
+
+    /// 解码器名称。
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// 选 NV12 输出，记下尺寸、每行字节、实际画面区域。开始时和画面尺寸变了（STREAM_CHANGE）时调用。
+    fn select_output(&mut self) -> Result<(), String> {
+        // SAFETY: 对解码器和它给出的格式对象的方法调用，输出参数指向局部变量。
+        unsafe {
+            let mut i = 0u32;
+            loop {
+                let t = self
+                    .transform
+                    .GetOutputAvailableType(0, i)
+                    .map_err(|e| err("解码器没有 NV12 输出", &e))?;
+                i += 1;
+                if t.GetGUID(&MF_MT_SUBTYPE).ok() != Some(MFVideoFormat_NV12) {
+                    continue;
+                }
+                self.transform
+                    .SetOutputType(0, &t, 0)
+                    .map_err(|e| err("设置输出格式（NV12）", &e))?;
+                let packed = t.GetUINT64(&MF_MT_FRAME_SIZE).unwrap_or(0);
+                let w = usize::try_from(packed >> 32).unwrap_or(0);
+                let h = usize::try_from(packed & 0xffff_ffff).unwrap_or(0);
+                self.coded = (w, h);
+                self.stride = t
+                    .GetUINT32(&MF_MT_DEFAULT_STRIDE)
+                    .ok()
+                    .and_then(|s| usize::try_from(s).ok())
+                    .filter(|s| *s >= w)
+                    .unwrap_or(w);
+                // 实际画面区域（H.264 的裁剪，例如 1088 行里只有 1080 行是画面）
+                let mut area = [0u8; 16];
+                let mut len = 0u32;
+                let shown = t
+                    .GetBlob(&MF_MT_MINIMUM_DISPLAY_APERTURE, &mut area, Some(&mut len))
+                    .ok()
+                    .and_then(|()| Some((le_i32(&area, 8)?, le_i32(&area, 12)?)))
+                    .and_then(|(cw, ch)| {
+                        Some((usize::try_from(cw).ok()?, usize::try_from(ch).ok()?))
+                    })
+                    .filter(|(cw, ch)| *cw > 0 && *ch > 0 && *cw <= w && *ch <= h);
+                self.shown = shown.unwrap_or((w, h));
+                let info = self
+                    .transform
+                    .GetOutputStreamInfo(0)
+                    .map_err(|e| err("输出信息", &e))?;
+                self.provides_samples = info.dwFlags
+                    & u32::try_from(
+                        MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0
+                            | MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES.0,
+                    )
+                    .unwrap_or(0)
+                    != 0;
+                let nv12 = u32::try_from(self.stride * h * 3 / 2).unwrap_or(u32::MAX);
+                self.output_size = info.cbSize.max(nv12);
+                return Ok(());
+            }
+        }
+    }
+
+    /// 解一帧（Annex B）。返回（宽, 高, `0x00RRGGBB`）；还没有画面时为 `None`。
+    pub fn decode(&mut self, data: &[u8]) -> Result<Option<(usize, usize, Vec<u32>)>, String> {
+        let len = u32::try_from(data.len()).map_err(|_| "数据太大".to_owned())?;
+        // SAFETY: 缓冲区按长度创建；Lock 的指针在 Unlock 之前有效，拷贝长度不超过缓冲区。
+        let sample = unsafe {
+            let buffer = MFCreateMemoryBuffer(len).map_err(|e| err("建缓冲区", &e))?;
+            let mut ptr: *mut u8 = std::ptr::null_mut();
+            buffer
+                .Lock(&mut ptr, None, None)
+                .map_err(|e| err("锁缓冲区", &e))?;
+            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
+            buffer.Unlock().map_err(|e| err("解锁缓冲区", &e))?;
+            buffer
+                .SetCurrentLength(len)
+                .map_err(|e| err("缓冲区长度", &e))?;
+            let sample = MFCreateSample().map_err(|e| err("建样本", &e))?;
+            sample.AddBuffer(&buffer).map_err(|e| err("样本", &e))?;
+            let _ = sample.SetSampleTime(self.frame.saturating_mul(166_666));
+            self.frame = self.frame.saturating_add(1);
+            sample
+        };
+        // SAFETY: 样本有效。
+        unsafe { self.transform.ProcessInput(0, &sample, 0) }.map_err(|e| err("送入码流", &e))?;
+        let mut latest = None;
+        for _ in 0..8 {
+            match self.output()? {
+                Step::Frame(f) => latest = Some(f),
+                Step::Changed => self.select_output()?,
+                Step::NeedInput => break,
+            }
+        }
+        Ok(latest)
+    }
+
+    fn output(&mut self) -> Result<Step, String> {
+        let sample = if self.provides_samples {
+            None
+        } else {
+            // SAFETY: 按解码器要求的大小建输出缓冲区。
+            unsafe {
+                let buffer =
+                    MFCreateMemoryBuffer(self.output_size).map_err(|e| err("输出缓冲区", &e))?;
+                let s = MFCreateSample().map_err(|e| err("输出样本", &e))?;
+                s.AddBuffer(&buffer).map_err(|e| err("输出样本", &e))?;
+                Some(s)
+            }
+        };
+        let mut buffers = [MFT_OUTPUT_DATA_BUFFER {
+            dwStreamID: 0,
+            pSample: ManuallyDrop::new(sample),
+            dwStatus: 0,
+            pEvents: ManuallyDrop::new(None),
+        }];
+        let mut status = 0u32;
+        // SAFETY: 输出数组只有一项；调用后取走其中的样本和事件集合释放。
+        let result = unsafe { self.transform.ProcessOutput(0, &mut buffers, &mut status) };
+        let (sample, events) = match buffers.first_mut() {
+            // SAFETY: 每个 ManuallyDrop 只取一次。
+            Some(b) => unsafe {
+                (
+                    ManuallyDrop::take(&mut b.pSample),
+                    ManuallyDrop::take(&mut b.pEvents),
+                )
+            },
+            None => (None, None),
+        };
+        drop(events);
+        match result {
+            Ok(()) => {
+                let sample = sample.ok_or_else(|| "解码器没有给出样本".to_owned())?;
+                self.read(&sample).map(Step::Frame)
+            }
+            Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => Ok(Step::NeedInput),
+            Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => Ok(Step::Changed),
+            Err(e) => Err(err("取解码结果", &e)),
+        }
+    }
+
+    /// 把一帧 NV12 读出来转成 RGB。显卡上的画面由 2D 缓冲区接口拷回内存。
+    fn read(&self, sample: &IMFSample) -> Result<(usize, usize, Vec<u32>), String> {
+        let (w, h) = self.shown;
+        let rows = self.coded.1;
+        let mut rgb = Vec::new();
+        // SAFETY: Lock/Lock2D 返回的指针在对应的 Unlock 之前有效，读取长度按缓冲区实际长度截断。
+        unsafe {
+            let buffer = sample
+                .ConvertToContiguousBuffer()
+                .map_err(|e| err("取画面", &e))?;
+            if let Ok(two_d) = buffer.cast::<IMF2DBuffer>() {
+                let mut ptr: *mut u8 = std::ptr::null_mut();
+                let mut pitch = 0i32;
+                two_d
+                    .Lock2D(&mut ptr, &mut pitch)
+                    .map_err(|e| err("读画面", &e))?;
+                let pitch = usize::try_from(pitch).unwrap_or(0);
+                let total = pitch * rows * 3 / 2;
+                let bytes = std::slice::from_raw_parts(ptr, total);
+                let (y, uv) = bytes.split_at((pitch * rows).min(total));
+                crate::color::nv12_to_rgb(y, uv, pitch, w, h, &mut rgb);
+                let _ = two_d.Unlock2D();
+            } else {
+                let mut ptr: *mut u8 = std::ptr::null_mut();
+                let mut len = 0u32;
+                buffer
+                    .Lock(&mut ptr, None, Some(&mut len))
+                    .map_err(|e| err("读画面", &e))?;
+                let bytes = std::slice::from_raw_parts(ptr, usize::try_from(len).unwrap_or(0));
+                let split = (self.stride * rows).min(bytes.len());
+                let (y, uv) = bytes.split_at(split);
+                crate::color::nv12_to_rgb(y, uv, self.stride, w, h, &mut rgb);
+                let _ = buffer.Unlock();
+            }
+        }
+        Ok((w, h, rgb))
+    }
+}
+
+/// 取一次输出的结果。
+enum Step {
+    Frame((usize, usize, Vec<u32>)),
+    Changed,
+    NeedInput,
 }

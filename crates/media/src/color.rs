@@ -97,8 +97,79 @@ pub fn i420_to_nv12(y: &[u8], u: &[u8], v: &[u8], out: &mut Vec<u8>) {
     }
 }
 
+/// NV12（硬件解码器的输出）转成 `0x00RRGGBB` 像素，写进 `out`（先清空）。
+///
+/// `y`、`uv` 是两个平面，每行 `pitch` 字节（显卡对齐，常大于宽度）；只取左上角 `width`×`height`。
+/// 系数是 [`rgb_to_i420`] 的逆（BT.601 有限范围，×256 的整数），和软件解码出来的颜色一致。
+/// 平面不够长时缺的部分当黑色。
+// 只有 Windows 的硬件解码用（macOS 的 VideoToolbox 直接出 RGB）；其他系统只在测试里用
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn nv12_to_rgb(
+    y: &[u8],
+    uv: &[u8],
+    pitch: usize,
+    width: usize,
+    height: usize,
+    out: &mut Vec<u32>,
+) {
+    out.clear();
+    out.reserve(width * height);
+    let clamp = |v: i32| u32::try_from((v >> 8).clamp(0, 255)).unwrap_or(0);
+    for row in 0..height {
+        let luma = y.get(row * pitch..).unwrap_or_default();
+        let chroma = uv.get((row / 2) * pitch..).unwrap_or_default();
+        for col in 0..width {
+            let c = 298 * (i32::from(luma.get(col).copied().unwrap_or(16)) - 16) + 128;
+            let pair = col & !1;
+            let d = i32::from(chroma.get(pair).copied().unwrap_or(128)) - 128;
+            let e = i32::from(chroma.get(pair + 1).copied().unwrap_or(128)) - 128;
+            let r = clamp(c + 409 * e);
+            let g = clamp(c - 100 * d - 208 * e);
+            let b = clamp(c + 516 * d);
+            out.push((r << 16) | (g << 8) | b);
+        }
+    }
+}
+
 #[cfg(test)]
 mod nv12_tests {
+    #[test]
+    fn nv12_back_to_rgb_matches_the_source() {
+        // 渐变色块：RGB → I420 → NV12 → RGB，误差在有限范围量化之内
+        let (w, h) = (16usize, 8usize);
+        let pixels: Vec<u32> = (0..w * h)
+            .map(|i| {
+                let (x, y) = (u32::try_from(i % w).unwrap(), u32::try_from(i / w).unwrap());
+                ((x * 15) << 16) | ((y * 30) << 8) | (255 - x * 10)
+            })
+            .collect();
+        let (mut yp, mut up, mut vp, mut nv12) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        super::rgb_to_i420(&pixels, w, &mut yp, &mut up, &mut vp);
+        super::i420_to_nv12(&yp, &up, &vp, &mut nv12);
+        // 模拟显卡对齐：每行补到 32 字节
+        let pitch = 32;
+        let pad = |plane: &[u8], rows: usize| -> Vec<u8> {
+            plane
+                .chunks(w)
+                .take(rows)
+                .flat_map(|r| r.iter().copied().chain(std::iter::repeat_n(0, pitch - w)))
+                .collect()
+        };
+        let (luma, chroma) = nv12.split_at(w * h);
+        let mut back = Vec::new();
+        super::nv12_to_rgb(&pad(luma, h), &pad(chroma, h / 2), pitch, w, h, &mut back);
+        assert_eq!(back.len(), w * h);
+        for (a, b) in pixels.iter().zip(&back) {
+            for shift in [0, 8, 16] {
+                let (x, y) = ((a >> shift) & 0xff, (b >> shift) & 0xff);
+                assert!(x.abs_diff(y) <= 40, "{a:06x} → {b:06x}");
+            }
+        }
+        // 平面太短：缺的部分是黑色，不越界
+        super::nv12_to_rgb(&[], &[], 4, 2, 2, &mut back);
+        assert_eq!(back, [0, 0, 0, 0]);
+    }
+
     #[test]
     fn interleaves_chroma() {
         let mut out = vec![9; 3];

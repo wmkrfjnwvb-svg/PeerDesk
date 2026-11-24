@@ -105,6 +105,16 @@ impl HardwareDecoder for vt::VtDecoder {
     }
 }
 
+#[cfg(windows)]
+impl HardwareDecoder for mf::MfDecoder {
+    fn name(&self) -> &str {
+        mf::MfDecoder::name(self)
+    }
+    fn decode(&mut self, data: &[u8]) -> Result<Option<(usize, usize, Vec<u32>)>, String> {
+        mf::MfDecoder::decode(self, data)
+    }
+}
+
 /// 本系统的硬件解码器（目前只有 macOS）。`PEERDESK_HW=0` 关掉。
 ///
 /// # Errors
@@ -118,9 +128,14 @@ pub fn open_system_hardware_decoder() -> Result<Box<dyn HardwareDecoder>, String
         let dec: Box<dyn HardwareDecoder> = Box::new(vt::VtDecoder::new());
         Ok(dec)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
     {
-        Err("这个系统还没接硬件解码（目前只有 macOS）".into())
+        let dec: Box<dyn HardwareDecoder> = Box::new(mf::MfDecoder::open()?);
+        Ok(dec)
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        Err("这个系统还没接硬件解码（目前有 macOS、Windows）".into())
     }
 }
 
@@ -155,7 +170,7 @@ impl AutoH264Decoder {
     /// OpenH264 解码器创建失败。
     pub fn with_hardware(hw: Option<Box<dyn HardwareDecoder>>) -> Result<Self, Error> {
         if let Some(h) = &hw {
-            log::info!("视频解码：硬件 {}", h.name());
+            log::info!("视频解码：{}", decoder_label(h.name()));
         }
         Ok(Self {
             hw,
@@ -199,10 +214,18 @@ impl VideoDecoder for AutoH264Decoder {
     }
 
     fn backend(&self) -> String {
-        self.hw.as_ref().map_or_else(
-            || "软件 OpenH264".to_owned(),
-            |h| format!("硬件 {}", h.name()),
-        )
+        self.hw
+            .as_ref()
+            .map_or_else(|| "软件 OpenH264".to_owned(), |h| decoder_label(h.name()))
+    }
+}
+
+/// 系统解码器的显示名：在 CPU 上解的（例如没有显卡解码时的 Media Foundation）不能叫“硬件”。
+fn decoder_label(name: &str) -> String {
+    if name.contains("CPU") {
+        format!("系统 {name}")
+    } else {
+        format!("硬件 {name}")
     }
 }
 
@@ -297,7 +320,14 @@ pub struct H264Encoder {
     nv12: Vec<u8>,
     /// 上一次编出来的尺寸（不管用的哪个编码器）。
     encoded_size: Option<(u16, u16)>,
+    /// 上一帧颜色转换的耗时（微秒）。
+    convert_us: u64,
+    /// 硬件编码器连续出了几个没要求的关键帧。
+    unasked_keys: u32,
 }
+
+/// 硬件编码器连续这么多帧给出没要求的关键帧，就认为它不能用。
+const UNASKED_KEY_LIMIT: u32 = 5;
 
 impl std::fmt::Debug for H264Encoder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -334,6 +364,8 @@ impl H264Encoder {
             hw_open: open_system_hardware,
             nv12: Vec::new(),
             encoded_size: None,
+            convert_us: 0,
+            unasked_keys: 0,
         }
     }
 
@@ -374,19 +406,39 @@ impl H264Encoder {
                 }
             }
         }
+        let packing = std::time::Instant::now();
         color::i420_to_nv12(
             &self.planes.0,
             &self.planes.1,
             &self.planes.2,
             &mut self.nv12,
         );
+        self.convert_us = self.convert_us.saturating_add(micros_since(packing));
         let force_key = self.force_key || reopen;
         let result = self
             .hw
             .as_mut()
             .map(|e| e.encode(&self.nv12, bps, force_key))?;
         match result {
-            Ok((data, key)) => Some((data, key, reopen)),
+            Ok((data, key)) => {
+                // 没要求却一直出关键帧：每帧都是整幅画面（几百 KB），码率和帧率都垮掉，画面忽糊忽清。
+                // 这种编码器不能用，改用软件编码（这一帧本身是完整的关键帧，照常发出）。
+                self.unasked_keys = if key && !force_key {
+                    self.unasked_keys + 1
+                } else {
+                    0
+                };
+                if self.unasked_keys >= UNASKED_KEY_LIMIT {
+                    log::warn!(
+                        "硬件编码器 {} 连续 {UNASKED_KEY_LIMIT} 帧都是没要求的关键帧，改用软件编码（OpenH264）",
+                        self.backend_name()
+                    );
+                    self.hw = None;
+                    self.hw_off = true;
+                    self.force_key = true;
+                }
+                Some((data, key, reopen))
+            }
             Err(why) => {
                 log::warn!("硬件编码失败，改用软件编码（OpenH264）：{why}");
                 self.hw = None;
@@ -526,6 +578,10 @@ fn set_bitrate(enc: &mut Encoder, bps: u64) -> bool {
     status == 0
 }
 
+fn micros_since(t: std::time::Instant) -> u64 {
+    u64::try_from(t.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
+
 impl VideoEncoder for H264Encoder {
     fn codec(&self) -> Codec {
         Codec::H264
@@ -550,6 +606,7 @@ impl VideoEncoder for H264Encoder {
         } else {
             self.still = 0;
         }
+        let converting = std::time::Instant::now();
         let (w, h, pixels) = even_pixels(screen);
         color::rgb_to_i420(
             &pixels,
@@ -558,6 +615,7 @@ impl VideoEncoder for H264Encoder {
             &mut self.planes.1,
             &mut self.planes.2,
         );
+        self.convert_us = micros_since(converting);
         // 有硬件编码器就用它（快得多、几乎不占 CPU）；没有或失败时用 OpenH264
         let bps = self.budget_bps(budget);
         if let Some((data, key, fresh_hw)) = self.encode_hardware(w, h, bps) {
@@ -596,6 +654,10 @@ impl VideoEncoder for H264Encoder {
     }
 
     fn on_feedback(&mut self, _floor: u32, _mask: u32) {}
+
+    fn convert_micros(&self) -> u64 {
+        self.convert_us
+    }
 
     fn on_lost(&mut self, _frame_id: u32) {
         // 之后的增量帧都参考了丢的那一帧，接收端解不了：下一帧编关键帧。
@@ -729,6 +791,8 @@ mod tests {
         frames: u32,
         fail_at: u32,
         soft: H264Encoder,
+        /// 每帧都说是关键帧（模拟出问题的编码器）。
+        always_key: bool,
     }
 
     impl HardwareEncoder for FakeHw {
@@ -764,7 +828,7 @@ mod tests {
                 .unwrap()
                 .unwrap();
             let (_, data) = FrameHeader::parse(&f.payload).unwrap();
-            Ok((data.to_vec(), f.key))
+            Ok((data.to_vec(), f.key || self.always_key))
         }
     }
 
@@ -774,7 +838,40 @@ mod tests {
             frames: 0,
             fail_at: 0,
             soft: H264Encoder::new(fps).with_hardware(fake_none),
+            always_key: false,
         }))
+    }
+
+    fn fake_always_key(
+        w: u32,
+        h: u32,
+        fps: u32,
+        _bps: u64,
+    ) -> Result<Box<dyn HardwareEncoder>, String> {
+        Ok(Box::new(FakeHw {
+            size: (w, h),
+            frames: 0,
+            fail_at: 0,
+            soft: H264Encoder::new(fps).with_hardware(fake_none),
+            always_key: true,
+        }))
+    }
+
+    #[test]
+    fn hardware_that_only_makes_keyframes_is_dropped() {
+        let mut enc = H264Encoder::new(30).with_hardware(fake_always_key);
+        let mut keys = 0;
+        for id in 1..12u32 {
+            // 画面一直在变（鼠标在动）
+            let f = enc
+                .encode(id, &picture(320, 192), true, 50_000)
+                .unwrap()
+                .unwrap();
+            keys += u32::from(f.key);
+        }
+        // 第一帧（要求的）加 5 个没要求的之后改用软件，之后是增量帧
+        assert_eq!(enc.backend_name(), "软件 OpenH264");
+        assert!(keys <= 1 + UNASKED_KEY_LIMIT + 1, "{keys}");
     }
 
     fn fake_failing(
@@ -788,6 +885,7 @@ mod tests {
             frames: 0,
             fail_at: 3,
             soft: H264Encoder::new(fps).with_hardware(fake_none),
+            always_key: false,
         }))
     }
 
@@ -824,6 +922,10 @@ mod tests {
         };
         let mut dec = AutoH264Decoder::with_hardware(Some(Box::new(FakeHwDec(0)))).unwrap();
         assert_eq!(dec.backend(), "硬件 假硬件");
+        assert_eq!(
+            decoder_label("Media Foundation（CPU）"),
+            "系统 Media Foundation（CPU）"
+        );
         assert!(format!("{dec:?}").contains("AutoH264Decoder"));
         assert!(dec.decode(&header, b"x").unwrap().is_none());
         // 对齐多出的边被裁掉
@@ -848,7 +950,7 @@ mod tests {
         assert_eq!(H264Decoder::new().unwrap().backend(), "软件 OpenH264");
         // 本系统的入口：Linux 上没有硬件解码；macOS 上有（实机测试另测）
         let _ = AutoH264Decoder::new().unwrap();
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(windows, target_os = "macos")))]
         assert!(open_system_hardware_decoder().is_err());
     }
 
@@ -857,9 +959,13 @@ mod tests {
         let screen = picture(320, 192);
         // 能用：一直用硬件，画面不变时照样停发
         let mut enc = H264Encoder::new(30).with_hardware(fake_ok);
-        let first = enc.encode(1, &screen, true, 5000).unwrap().unwrap();
+        let big = picture(1280, 720);
+        let first = enc.encode(1, &big, true, 5000).unwrap().unwrap();
         assert!(first.key);
         assert_eq!(enc.backend_name(), "硬件 假硬件");
+        // 颜色转换单独计时（RGB → I420 → NV12），720p 一定要花时间
+        assert!(enc.convert_micros() > 0);
+        assert!(enc.convert_micros() < 5_000_000);
         let mut quiet = false;
         for id in 2..80 {
             if enc.encode(id, &screen, false, 5000).unwrap().is_none() {
@@ -942,6 +1048,34 @@ mod tests {
                     dec.decode(&header, &bytes).unwrap().is_some(),
                     "OpenH264 要解得了硬件编出的码流"
                 );
+                // 画面一直在变（模拟鼠标移动）：之后必须是增量帧，并且软件解码器接得上。
+                // 以前每帧都调 CompleteFrames，Intel Mac 上每帧都成了关键帧。
+                let mut keys = 0;
+                for i in 1..10u16 {
+                    // 一个小方块（光标）每帧挪一点
+                    let mut px = screen.pixels().to_vec();
+                    let left = usize::from(i) * 24;
+                    for row in 100..116 {
+                        for p in px.iter_mut().skip(row * 640 + left).take(16) {
+                            *p = 0x00ff_ffff;
+                        }
+                    }
+                    color::rgb_to_i420(&px, 640, &mut y, &mut u, &mut v);
+                    color::i420_to_nv12(&y, &u, &v, &mut nv12);
+                    let (bytes, key) = enc.encode(&nv12, 2_000_000, false).unwrap();
+                    keys += u32::from(key);
+                    if !bytes.is_empty() {
+                        let header = FrameHeader {
+                            codec: Codec::H264,
+                            key,
+                            width: 640,
+                            height: 360,
+                        };
+                        assert!(dec.decode(&header, &bytes).is_ok(), "第 {i} 帧软件解不了");
+                    }
+                }
+                eprintln!("硬件编码器 {}：9 个变化帧里关键帧 {keys} 个", enc.name());
+                assert!(keys <= 1, "没要求却出了 {keys} 个关键帧");
                 log::info!("硬件编码器可用：{}", enc.name());
             }
             Err(why) => assert!(!why.is_empty()),
@@ -983,6 +1117,39 @@ mod tests {
             .encode(1, &picture(640, 360), true, 50_000)
             .unwrap()
             .is_some());
+    }
+
+    /// Windows 实机：系统 H.264 解码器解 OpenH264 的码流（验证 NV12 读取、对齐裁剪、颜色），
+    /// 连着解几帧；尺寸不是 16 的倍数（360 行 → 解码器输出 368 行）。打不开时要给出原因。
+    #[cfg(windows)]
+    #[test]
+    fn windows_media_foundation_decodes() {
+        let mut hw = match open_system_hardware_decoder() {
+            Ok(hw) => hw,
+            Err(why) => {
+                assert!(!why.is_empty());
+                eprintln!("没有系统 H.264 解码器：{why}");
+                return;
+            }
+        };
+        eprintln!("解码器：{}", hw.name());
+        let mut enc = H264Encoder::new(30).with_hardware(fake_none);
+        let mut soft = H264Decoder::new().unwrap();
+        for id in 1..6u32 {
+            let screen = picture(640, 360);
+            let frame = enc.encode(id, &screen, true, 200_000).unwrap().unwrap();
+            let (header, data) = FrameHeader::parse(&frame.payload).unwrap();
+            let reference = soft.decode(&header, data).unwrap().unwrap().clone();
+            let started = std::time::Instant::now();
+            let Some((w, h, pixels)) = hw.decode(data).unwrap() else {
+                continue;
+            };
+            eprintln!("第 {id} 帧 {w}×{h} 解码 {:?}", started.elapsed());
+            assert_eq!((w, h), (640, 360), "要裁掉对齐的行");
+            let hw_screen = Screen::from_pixels(640, 360, pixels).unwrap();
+            let quality = psnr(&hw_screen, &reference);
+            assert!(quality > 30.0, "和软件解码的差太多：{quality}");
+        }
     }
 
     #[test]

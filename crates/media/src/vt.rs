@@ -253,7 +253,15 @@ fn check(status: OSStatus, what: &str) -> Result<(), String> {
 // ───────────────────────────── 编码 ─────────────────────────────
 
 /// 编码回调放结果的地方（编码器自己持有，地址固定）。
-type EncodeSlot = Mutex<Option<Result<(Vec<u8>, bool), String>>>;
+/// 一帧的编码结果：Annex B 码流和是否关键帧。
+type Encoded = Result<(Vec<u8>, bool), String>;
+
+/// 编码输出回调把结果放进这里，编码线程等它（不调用 CompleteFrames，见 [`VtEncoder::encode`]）。
+#[derive(Default)]
+struct EncodeSlot {
+    result: Mutex<Option<Encoded>>,
+    ready: std::sync::Condvar,
+}
 
 /// 一个硬件编码会话。
 pub struct VtEncoder {
@@ -278,6 +286,9 @@ impl std::fmt::Debug for VtEncoder {
 // SAFETY: VideoToolbox 会话和像素缓冲可以在线程之间移动；实际只在编码线程上使用。
 unsafe impl Send for VtEncoder {}
 
+/// 等编码输出回调最多这么久。
+const OUTPUT_WAIT: std::time::Duration = std::time::Duration::from_millis(300);
+
 /// 编码输出回调：取出码流（AVCC → Annex B），判断是否关键帧，放进 `refcon` 指向的槽。
 unsafe extern "C" fn on_encoded(
     refcon: *mut c_void,
@@ -288,15 +299,19 @@ unsafe extern "C" fn on_encoded(
 ) {
     // SAFETY: refcon 是编码器里 Box<EncodeSlot> 的地址，编码器活着时一直有效。
     let slot = unsafe { &*refcon.cast::<EncodeSlot>() };
-    let result = if status != 0 || sample.is_null() {
+    let result = if status != 0 {
         Err(format!("编码失败（OSStatus {status}）"))
+    } else if sample.is_null() {
+        // 码率控制丢了这一帧：没有画面
+        Ok((Vec::new(), false))
     } else {
         // SAFETY: sample 在回调期间有效；只读取其中的数据。
         unsafe { read_sample(sample) }
     };
-    if let Ok(mut s) = slot.lock() {
+    if let Ok(mut s) = slot.result.lock() {
         *s = Some(result);
     }
+    slot.ready.notify_all();
 }
 
 /// 从编码输出里读出 Annex B 码流和关键帧标志。
@@ -337,7 +352,9 @@ unsafe fn read_sample(sample: CFTypeRef) -> Result<(Vec<u8>, bool), String> {
         }
         let refs: Vec<&[u8]> = params.iter().map(Vec::as_slice).collect();
         let data = annexb::from_avcc(&avcc, &refs).ok_or_else(|| "编码输出格式不对".to_owned())?;
-        Ok((data, key))
+        // 是不是关键帧以码流为准（有 IDR 片），附件只用来决定要不要带上 SPS/PPS
+        let idr = annexb::has_idr(&data);
+        Ok((data, idr))
     }
 }
 
@@ -346,7 +363,7 @@ impl VtEncoder {
     pub fn open(width: u32, height: u32, fps: u32, bps: u64) -> Result<Self, String> {
         let w = i32::try_from(width).map_err(|_| "画面太大".to_owned())?;
         let h = i32::try_from(height).map_err(|_| "画面太大".to_owned())?;
-        let slot: Box<EncodeSlot> = Box::new(Mutex::new(None));
+        let slot: Box<EncodeSlot> = Box::default();
         // SAFETY: 键是系统常量；kCFBooleanTrue 是系统常量。
         let spec = dict1(
             unsafe { kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder },
@@ -500,10 +517,10 @@ impl VtEncoder {
                 kCFBooleanTrue
             })
         });
-        if let Ok(mut s) = self.slot.lock() {
+        if let Ok(mut s) = self.slot.result.lock() {
             *s = None;
         }
-        // SAFETY: 会话、像素缓冲有效；属性字典在调用期间有效；CompleteFrames 返回前输出回调已执行。
+        // SAFETY: 会话、像素缓冲有效；属性字典在调用期间有效。
         unsafe {
             let pts = CMTimeMake(self.frame, self.fps);
             let duration = CMTimeMake(1, self.fps);
@@ -520,13 +537,30 @@ impl VtEncoder {
                 ),
                 "编码",
             )?;
-            check(
-                VTCompressionSessionCompleteFrames(self.session, kCMTimeInvalid),
-                "完成编码",
-            )?;
         }
         self.frame = self.frame.saturating_add(1);
-        match self.slot.lock().ok().and_then(|mut s| s.take()) {
+        // 等输出回调，不调用 CompleteFrames：每帧都“完成”会结束当前的参考帧序列，
+        // 编码器下一帧又从关键帧开始（实测 Intel Mac 上每帧都是关键帧、200 KB、5 帧/秒）。
+        // 实时模式、不重排帧时编码器编完就回调；等不到才强制完成（会多一个关键帧，但不会卡住）。
+        let waited = self.slot.result.lock().ok().and_then(|guard| {
+            self.slot
+                .ready
+                .wait_timeout_while(guard, OUTPUT_WAIT, |r| r.is_none())
+                .ok()
+                .and_then(|(mut r, _)| r.take())
+        });
+        let waited = match waited {
+            Some(r) => Some(r),
+            None => {
+                // SAFETY: 会话有效；返回前输出回调已执行。
+                check(
+                    unsafe { VTCompressionSessionCompleteFrames(self.session, kCMTimeInvalid) },
+                    "完成编码",
+                )?;
+                self.slot.result.lock().ok().and_then(|mut s| s.take())
+            }
+        };
+        match waited {
             Some(result) => result,
             // 编码器丢了这一帧（码率控制）：当作没有画面
             None => Ok((Vec::new(), false)),

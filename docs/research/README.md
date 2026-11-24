@@ -54,10 +54,13 @@
 | 静止后补清晰（最多约 8 帧残差） | ✅ | `media/lib.rs` | |
 | 块编码（对照组，渐进无损） | ✅ | `core/codec.rs` | 只在仿真里做对照 |
 | 硬件编码：Windows Media Foundation（异步硬件 MFT） | ✅ | `media/mf.rs` | 失败自动回退 OpenH264；CI 验证不崩，真机速度待测 |
+| 硬件编码器拿到所在显卡的 D3D11 设备（按 LUID 找卡），打开时试编一帧，不行再不给设备试 | ✅ | `media/mf.rs` | AMD 的编码器要设备才打得开；双显卡笔记本选对卡 |
+| 硬件解码：Windows（系统 H.264 解码器，有显卡走 DXVA，否则 CPU 并如实标注） | ✅ | `media/mf.rs`、`media/color.rs` | NV12 → RGB 整数转换，裁掉 16 对齐的行 |
+| 编码耗时拆开：颜色转换 / 编码器本身，统计行按秒平均 | ✅ | `media/lib.rs`、`net/host.rs` | 真机测试用它定位瓶颈 |
 | 硬件编解码：macOS VideoToolbox | ✅ | `media/vt.rs`、`media/annexb.rs` | Mac CI 实机编解码通过；失败回退软件 |
 | 硬件编码：Linux VA-API | ⬜ | | |
 | 详情面板显示双方编解码器（硬件/软件） | ✅ | `client/gui/state.rs` | |
-| 编解码挪到独立线程 | ⬜ | | |
+| 编解码在独立线程（编码线程、解码线程） | ✅ | `net/host.rs`、`net/controller.rs` | |
 | AV1、HEVC、4:4:4 文字清晰度、4K/8K | ⬜ | | |
 | 发布版运行时下载 Cisco OpenH264 二进制 | ⬜ | | |
 

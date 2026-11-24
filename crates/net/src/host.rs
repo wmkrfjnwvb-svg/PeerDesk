@@ -203,6 +203,7 @@ type EncodeDone = (
     FrameJob,
     Result<(Option<EncodedFrame>, bool), peerdesk_core::Error>,
     u64,
+    u64,
 );
 
 /// 启动编码线程。编码要好几毫秒到几十毫秒，放在会话循环里会让输入和反馈排队等它。
@@ -228,7 +229,8 @@ fn spawn_encoder(
                     *b = name;
                 }
             }
-            if done_tx.send((job, result, took)).is_err() {
+            let convert = encoder.convert_micros();
+            if done_tx.send((job, result, took, convert)).is_err() {
                 break;
             }
         }
@@ -393,6 +395,8 @@ pub async fn serve(
     stats_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut last_stats = media.stats();
     let mut last_encode_us = 0u64;
+    // 这一秒里编码和颜色转换的总耗时、帧数（统计行用平均值，单帧的值跳得厉害）
+    let mut window = (0u64, 0u64, 0u64);
 
     let end = loop {
         tokio::select! {
@@ -502,12 +506,13 @@ pub async fn serve(
             // 编码线程交回一帧：切片发出。
             done = encoded_rx.recv() => {
                 encoding = false;
-                let (job, result, took) = match done {
+                let (job, result, took, convert) = match done {
                     Some(done) => done,
                     None => break "编码线程结束".to_owned(),
                 };
                 media.set_encode_time(took);
                 last_encode_us = took;
+                window = (window.0.saturating_add(took), window.1.saturating_add(convert), window.2 + 1);
                 media.set_max_payload(link.max_payload());
                 let out = match result.and_then(|(encoded, refine)| media.finish_frame(link.now(), &job, encoded, refine)) {
                     Ok(out) => out,
@@ -525,15 +530,22 @@ pub async fn serve(
             }
             _ = stats_tick.tick() => {
                 let now = media.stats();
+                // 这一秒的平均编码耗时；这一秒没编码（画面静止）时沿用上一帧的
+                let (encode_us, convert_us) = match window {
+                    (sum, conv, n) if n > 0 => (sum / n, conv / n),
+                    _ => (last_encode_us, 0),
+                };
+                window = (0, 0, 0);
                 crate::note!(info, target: "peerdesk::stats",
-                    "发送 帧 {} 关键帧 {} 画面 {} kbps 线上 {} kbps 目标 {} kbps 帧率上限 {} 编码 {} ms 在途 {} KB 丢失 {} 重传 {} RTT {} ms 估计器 {} 纠错 {}‰ 画像 {}",
+                    "发送 帧 {} 关键帧 {} 画面 {} kbps 线上 {} kbps 目标 {} kbps 帧率上限 {} 编码 {} ms（其中颜色转换 {} ms） 在途 {} KB 丢失 {} 重传 {} RTT {} ms 估计器 {} 纠错 {}‰ 画像 {}",
                     now.frames.saturating_sub(last_stats.frames),
                     now.keyframes.saturating_sub(last_stats.keyframes),
                     now.video_bytes.saturating_sub(last_stats.video_bytes) * 8 / 1000,
                     now.wire_bytes.saturating_sub(last_stats.wire_bytes) * 8 / 1000,
                     media.rate_bps() / 1000,
                     media.fps(),
-                    last_encode_us / 1000,
+                    encode_us / 1000,
+                    convert_us / 1000,
                     media.in_flight() / 1024,
                     now.lost.saturating_sub(last_stats.lost),
                     now.retransmitted.saturating_sub(last_stats.retransmitted),
@@ -549,7 +561,7 @@ pub async fn serve(
                         height: screen_size.1,
                         fps: u16::try_from(now.frames.saturating_sub(last_stats.frames)).unwrap_or(u16::MAX),
                         fps_cap: u16::try_from(media.fps()).unwrap_or(u16::MAX),
-                        encode_ms: u16::try_from(last_encode_us / 1000).unwrap_or(u16::MAX),
+                        encode_ms: u16::try_from(encode_us / 1000).unwrap_or(u16::MAX),
                         target_kbps: u32::try_from(media.rate_bps() / 1000).unwrap_or(u32::MAX),
                         sent_kbps: u32::try_from(now.video_bytes.saturating_sub(last_stats.video_bytes) * 8 / 1000).unwrap_or(u32::MAX),
                         fec_permille: media.fec_permille(),
@@ -568,7 +580,7 @@ pub async fn serve(
                 let Some(screen) = source.capture() else {
                     // 画面来源结束：正在编的那一帧编完发出去再结束。
                     let last = if encoding { encoded_rx.recv().await } else { None };
-                    let last = last.and_then(|(job, r, _)| r.ok().map(|(e, f)| (job, e, f)));
+                    let last = last.and_then(|(job, r, _, _)| r.ok().map(|(e, f)| (job, e, f)));
                     media.set_max_payload(link.max_payload());
                     let out = last.map(|(job, e, f)| media.finish_frame(link.now(), &job, e, f).unwrap_or_default());
                     out.unwrap_or_default().iter().for_each(|o| drop(link.send_flags(Channel::Video, o.flags, &o.body)));

@@ -451,14 +451,8 @@ impl Viewer {
     }
 
     fn forward_input(&mut self, ctx: &egui::Context, picture: Option<Rect>) {
-        let (mut events, modifiers, focused, pointer) = ctx.input(|i| {
-            (
-                i.events.clone(),
-                i.modifiers,
-                i.focused,
-                i.pointer.latest_pos(),
-            )
-        });
+        let (mut events, modifiers, pointer) =
+            ctx.input(|i| (i.events.clone(), i.modifiers, i.pointer.latest_pos()));
         // 指针在助手、菜单、详情窗口上时，移动、按下和滚轮是给它们的，不能再发给远程
         // （否则点助手的按钮，助手下面的远程画面也被点了）。抬起照常发，远程不会卡在按下状态。
         let over_ui = |pos: egui::Pos2| {
@@ -489,18 +483,8 @@ impl Viewer {
             for event in translated.events {
                 let _ = self.handle.send(event);
             }
-            // 允许输入法：组字窗口跟着指针。
-            if focused {
-                if let Some(rect) = picture {
-                    let at = pointer.unwrap_or(rect.min);
-                    ctx.output_mut(|o| {
-                        o.ime = Some(egui::output::IMEOutput {
-                            rect,
-                            cursor_rect: Rect::from_min_size(at, vec2(1.0, 16.0)),
-                        });
-                    });
-                }
-            }
+            // 不打开本机输入法：按键原样发给远程，由远程自己的输入法处理（和 ToDesk、Parsec 一样）。
+            // 以前打开本机输入法在本机组字再发文字，结果在远程画面上打字会弹出本机的候选窗。
         }
     }
 }
