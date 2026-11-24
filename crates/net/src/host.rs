@@ -115,7 +115,7 @@ pub struct HostOptions {
     pub audio: Option<crate::audio::CaptureHandle>,
     /// 本机电脑名：握手时告诉控制端，显示在对方的设备列表里。空表示不发。
     pub name: String,
-    /// 发送节奏（实验，见 [`peerdesk_core::pacer`]）。默认按环境变量 `PEERDESK_PACE`。
+    /// 发送节奏（见 [`peerdesk_core::pacer`]）。默认打开，环境变量 `PEERDESK_PACE=0` 关掉。
     pub pacing: bool,
 }
 
@@ -602,6 +602,9 @@ pub async fn serve(
                     }
                 };
                 pending_change |= changed;
+                if changed {
+                    media.screen_changed(link.now());
+                }
                 // 每一轮都检查迟迟没有确认的帧（不能只在编帧时查：关键帧没确认时根本不编帧）
                 media.expire_unacked(link.now());
                 // 在途数据超过上限：这一帧不编，变化攒着，等确认之后编最新的画面。

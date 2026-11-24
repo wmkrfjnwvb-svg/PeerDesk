@@ -42,6 +42,7 @@ pub mod proto;
 pub mod region;
 pub mod relay;
 pub mod rs;
+pub mod scale;
 pub mod scenario;
 pub mod screen;
 pub mod session;

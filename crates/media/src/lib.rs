@@ -26,6 +26,7 @@ pub mod gpu;
 mod vaapi;
 use openh264::OpenH264API;
 use peerdesk_core::error::Error;
+use peerdesk_core::scale::scaled_size;
 use peerdesk_core::screen::Screen;
 use peerdesk_core::video::{Codec, EncodedFrame, FrameHeader, VideoDecoder, VideoEncoder};
 
@@ -456,6 +457,8 @@ pub struct H264Encoder {
     unasked_keys: u32,
     /// 用软件编码的原因（打不开硬件编码器，或硬件中途出错），显示在详情面板里。
     soft_reason: Option<String>,
+    /// 按源画面的多少编码（千分比，见 [`VideoEncoder::set_scale`]）。
+    scale_permille: u16,
     /// 交给硬件编码器、还没取回的帧：每帧是否要求了关键帧（按顺序；异步编码器会攒帧）。
     hw_sent: std::collections::VecDeque<bool>,
 }
@@ -511,6 +514,7 @@ impl H264Encoder {
             convert_us: 0,
             unasked_keys: 0,
             soft_reason: None,
+            scale_permille: peerdesk_core::scale::FULL_PERMILLE,
             hw_sent: std::collections::VecDeque::new(),
         }
     }
@@ -787,7 +791,8 @@ impl VideoEncoder for H264Encoder {
         changed: bool,
         budget: usize,
     ) -> Result<Option<EncodedFrame>, Error> {
-        let size = (screen.width(), screen.height());
+        // 编码尺寸：发送端按网络定的比例（见 peerdesk_core::scale）；帧头写的就是这个尺寸
+        let size = scaled_size(screen.width(), screen.height(), self.scale_permille);
         // 按“上一次编出来的尺寸”判断，和用的是硬件还是软件编码器无关
         let fresh = self.encoded_size != Some(size);
         if !fresh && !changed && !self.force_key {
@@ -809,6 +814,13 @@ impl VideoEncoder for H264Encoder {
             self.still = 0;
         }
         let converting = std::time::Instant::now();
+        let shrunk;
+        let screen = if size == (screen.width(), screen.height()) {
+            screen
+        } else {
+            shrunk = screen.downscale(size.0, size.1)?;
+            &shrunk
+        };
         let (w, h, pixels) = even_pixels(screen);
         color::rgb_to_i420(
             &pixels,
@@ -878,6 +890,14 @@ impl VideoEncoder for H264Encoder {
 
     fn backend(&self) -> String {
         self.backend_name()
+    }
+
+    fn set_scale(&mut self, permille: u16) {
+        // 比例变了：尺寸变了要出关键帧；画面不动时也要编这一帧（例如升回原尺寸），所以先要求关键帧
+        if permille != self.scale_permille && self.encoded_size.is_some() {
+            self.force_key = true;
+        }
+        self.scale_permille = permille;
     }
 }
 

@@ -63,6 +63,82 @@ impl Screen {
         &self.pixels
     }
 
+    /// 缩小到 `width`×`height`：每个目标像素取它覆盖的源像素的平均（面积平均，缩小时最不容易出锯齿和闪烁）。
+    /// 目标比源大的方向按源尺寸算（不放大）。尺寸为 0 时出错。
+    pub fn downscale(&self, width: u16, height: u16) -> Result<Screen, crate::Error> {
+        if width == 0 || height == 0 {
+            return Err(crate::Error::InvalidArgument("缩放后的尺寸不能为 0"));
+        }
+        let (dw, dh) = (width.min(self.width), height.min(self.height));
+        let (sw, sh) = (usize::from(self.width), usize::from(self.height));
+        let (dwu, dhu) = (usize::from(dw), usize::from(dh));
+        let mut out = Vec::with_capacity(dwu * dhu);
+        for dy in 0..dhu {
+            let (y0, y1) = (dy * sh / dhu, ((dy + 1) * sh / dhu).max(dy * sh / dhu + 1));
+            for dx in 0..dwu {
+                let (x0, x1) = (dx * sw / dwu, ((dx + 1) * sw / dwu).max(dx * sw / dwu + 1));
+                let (mut r, mut g, mut b, mut n) = (0u64, 0u64, 0u64, 0u64);
+                for y in y0..y1 {
+                    for &p in self
+                        .pixels
+                        .get(y * sw + x0..y * sw + x1)
+                        .unwrap_or_default()
+                    {
+                        r += u64::from((p >> 16) & 0xff);
+                        g += u64::from((p >> 8) & 0xff);
+                        b += u64::from(p & 0xff);
+                        n += 1;
+                    }
+                }
+                let n = n.max(1);
+                let avg = |v: u64| u32::try_from((v + n / 2) / n).unwrap_or(0xff);
+                out.push((avg(r) << 16) | (avg(g) << 8) | avg(b));
+            }
+        }
+        Screen::from_pixels(dw, dh, out)
+    }
+
+    /// 双线性放大到 `width`×`height`（和显卡按“线性过滤”拉伸显示的效果相当）。仿真里把缩小编码的画面
+    /// 放回源尺寸、和源画面比画质用。尺寸为 0 或画面为空时出错。
+    pub fn upscale(&self, width: u16, height: u16) -> Result<Screen, crate::Error> {
+        if width == 0 || height == 0 || self.pixels.is_empty() {
+            return Err(crate::Error::InvalidArgument("缩放后的尺寸不能为 0"));
+        }
+        let (sw, sh) = (u64::from(self.width), u64::from(self.height));
+        let (dw, dh) = (u64::from(width), u64::from(height));
+        // 源坐标（按 1/256 像素）：目标像素中心对到源像素中心
+        let src = |d: u64, s: u64, dn: u64| -> (u64, u64, u64) {
+            let pos = ((2 * d + 1) * s * 256 / (2 * dn)).saturating_sub(128);
+            let i = (pos / 256).min(s - 1);
+            (i, (i + 1).min(s - 1), pos % 256)
+        };
+        let px = |x: u64, y: u64| {
+            usize::try_from(y * sw + x)
+                .ok()
+                .and_then(|i| self.pixels.get(i))
+                .copied()
+                .unwrap_or(0)
+        };
+        let mut out = Vec::with_capacity(usize::from(width) * usize::from(height));
+        for dy in 0..dh {
+            let (y0, y1, fy) = src(dy, sh, dh);
+            for dx in 0..dw {
+                let (x0, x1, fx) = src(dx, sw, dw);
+                let (a, b, c, d) = (px(x0, y0), px(x1, y0), px(x0, y1), px(x1, y1));
+                let mut v = 0u32;
+                for shift in [16u32, 8, 0] {
+                    let ch = |p: u32| u64::from((p >> shift) & 0xff);
+                    let top = ch(a) * (256 - fx) + ch(b) * fx;
+                    let bottom = ch(c) * (256 - fx) + ch(d) * fx;
+                    let mixed = (top * (256 - fy) + bottom * fy + 32_768) / 65_536;
+                    v |= u32::try_from(mixed.min(255)).unwrap_or(255) << shift;
+                }
+                out.push(v);
+            }
+        }
+        Screen::from_pixels(width, height, out)
+    }
+
     /// 一行里从 `x` 开始的 `len` 个像素；越界部分被截掉。
     #[must_use]
     pub fn row(&self, x: u16, y: u16, len: u16) -> &[u32] {
@@ -286,6 +362,32 @@ impl SyntheticDesktop {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn downscale_averages_and_upscale_restores_flat_areas() {
+        // 2×2 的格子缩成 1×1：取平均
+        let checker =
+            Screen::from_pixels(2, 2, vec![0x00_00_00, 0xff_ff_ff, 0xff_ff_ff, 0x00_00_00])
+                .unwrap();
+        assert_eq!(checker.downscale(1, 1).unwrap().pixels(), &[0x80_80_80]);
+        // 不放大；尺寸为 0 出错
+        assert_eq!(checker.downscale(4, 4).unwrap().width(), 2);
+        assert!(checker.downscale(0, 1).is_err());
+        // 非整数比例：每个源像素都算进去
+        let wide = Screen::new(5, 3, 0x12_34_56);
+        let small = wide.downscale(2, 2).unwrap();
+        assert!(small.pixels().iter().all(|p| *p == 0x12_34_56));
+        // 纯色放大还是纯色；左右两半不同颜色放大后边缘过渡、两端保持原色
+        let up = small.upscale(7, 5).unwrap();
+        assert!(up.pixels().iter().all(|p| *p == 0x12_34_56));
+        let halves = Screen::from_pixels(2, 1, vec![0x00_00_00, 0xff_ff_ff]).unwrap();
+        let line = halves.upscale(8, 1).unwrap();
+        assert_eq!(line.pixels().first(), Some(&0));
+        assert_eq!(line.pixels().last(), Some(&0xff_ff_ff));
+        assert!(line.pixels().windows(2).all(|w| w[0] <= w[1]), "单调过渡");
+        assert!(halves.upscale(0, 1).is_err());
+        assert!(Screen::new(0, 0, 0).upscale(2, 2).is_err());
+    }
     use super::*;
 
     #[test]

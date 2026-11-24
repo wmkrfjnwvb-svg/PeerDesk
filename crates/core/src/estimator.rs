@@ -425,13 +425,16 @@ impl RateEstimator for ClassicV1 {
         let hold = obs.rtt_us.max(100_000);
         if congested {
             if self.last_decrease.is_none_or(|t| now.since(t) >= hold) {
-                let base = if recv_bps > 0 {
-                    self.rate_bps.min(recv_bps)
+                // 和 WebRTC GCC 一样：降到实测送达速率的一定比例，已经比它低就不再降。
+                // 以前是“当前码率和送达速率取小再打折”，每个往返都在已经很低的码率上再打折：
+                // 400 kbps 的链路上送达一直是 470 kbps，码率却一路降到底线 100 kbps，
+                // 重传额度跟着只剩不到一个包，大关键帧永远补不齐（仿真和真实二进制都是 0 帧）。
+                let target = if recv_bps > 0 {
+                    recv_bps.saturating_mul(u64::from(p.decrease_permille)) / 1000
                 } else {
-                    self.rate_bps
+                    self.rate_bps.saturating_mul(u64::from(p.decrease_permille)) / 1000
                 };
-                self.rate_bps = (base.saturating_mul(u64::from(p.decrease_permille)) / 1000)
-                    .clamp(self.min_bps, self.max_bps);
+                self.rate_bps = self.rate_bps.min(target).clamp(self.min_bps, self.max_bps);
                 self.last_decrease = Some(now);
             }
             return;

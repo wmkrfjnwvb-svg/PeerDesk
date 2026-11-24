@@ -318,3 +318,25 @@ fn office_on_a_varying_cellular_link() {
         ..Scenario::new("varying-cellular", office())
     });
 }
+
+/// 很窄的链路（400 kbps，排队上限 200 ms，像差的蜂窝网或限速的公司网络）上打字：
+/// 真实二进制在这样的限速上曾经 8 秒 0 帧（720p 满屏文字的关键帧约 150 KB，光传就要 3 秒，
+/// 浅缓冲又让突发大量丢包）。第一幅画面必须 2 秒内出来，之后不能长时间冻结。
+#[test]
+fn typing_on_a_very_narrow_link() {
+    compare(&Scenario {
+        network: vec![(
+            0,
+            Link {
+                rate_bps: Some(400_000),
+                delay_us: 20_000,
+                max_queue_us: 200_000,
+                ..Link::lan()
+            },
+        )],
+        ..Scenario::new(
+            "very-narrow",
+            vec![phase(Action::Typing, 120), phase(Action::Idle, 60)],
+        )
+    });
+}

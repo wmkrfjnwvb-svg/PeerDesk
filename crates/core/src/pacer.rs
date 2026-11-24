@@ -1,4 +1,4 @@
-//! 发送节奏（pacing）：大帧的分片按估计带宽的 [`PACE_FACTOR`] 倍匀速发出，而不是一次全部发出。
+//! 发送节奏（pacing）：大帧的分片按估计带宽的 [`PACE_FACTOR_PERMILLE`]（千分比）倍匀速发出，而不是一次全部发出。
 //!
 //! 为什么：瓶颈的缓冲区很小（400 kbps、排队 200 ms 时只有约 10 KB），一个 96 KB 的关键帧整帧突发，
 //! 八成以上在瓶颈被丢；QUIC 不重传数据报，靠我们自己的重传又受码率限制，结果画面一直出不来
@@ -9,18 +9,25 @@
 //! 正常带宽上一帧在预算之内，几乎都在突发额度里直接发出，行为和原来一样。
 //! 重传的分片插到队首：接收端正在等它们。
 //!
-//! **状态：实验，默认关闭**（`PEERDESK_PACE=1` 打开）。2026-11-23 实测：
-//! - 真实二进制、400 kbps（tbf 限速，排队 200 ms 或 1 秒）：96 KB 的首帧不开时 10 秒送不到、往返 0.5–2 秒
-//!   （缓冲区被突发塞满）；打开后能送到，往返 16–47 ms。
-//! - 仿真门槛：按估计带宽的 1.25 倍发时 8 个场景过 6 个（窄带宽看视频最长等 1.47 秒、
-//!   变化的蜂窝链路有一次停下后 0.5 秒内没变清晰）；改成按“估计和接收速率取大”发时仿真全过，
-//!   但真实 400 kbps 又送不到（接收速率按短窗口算，突发时偏高）。仿真的瓶颈模型和真实限速器在这一点上不一致，
-//!   要先校准仿真器，再定默认值。
+//! **状态：默认打开，按估计带宽的 2.5 倍发（和 WebRTC 的 pacing factor 一样）**（`PEERDESK_PACE=0` 关掉）。
+//! 2026-11-24 校准（`scripts/pace-lab.sh`：真实二进制、tbf 限速的回环；仿真：`crates/e2e`），
+//! 同时修了码率估计降过头和重传判重（见 `estimator.rs`、`media.rs`），加了半分辨率起步（`scale.rs`）：
+//! - 真实二进制：400 kbps 最长停顿 3.8 → 2.0 秒，5 Mbps 441 → 225 ms，1.5 Mbps（缓冲 60 ms）700 → 439 ms；
+//!   第一幅画面基本不变（20 Mbps 62 → 78 ms）。
+//! - 仿真 10 个场景全部达标，瓶颈排队丢包几乎都降到 0；窄带宽看视频最长等待 868 → 147 ms；
+//!   代价是局域网第一幅画面 0 → 26 ms、快速升带宽的场景 6 → 150 ms。
+//! - 之前按 1.25 倍发时自己限制自己（估计靠包串测，按估计发又测不出更高），两边不能同时变好。
 
-/// 发送节奏是否打开（实验开关 `PEERDESK_PACE=1`）。
+/// 发送节奏是否打开：默认打开，`PEERDESK_PACE=0` 关掉（对照用）。
 #[must_use]
 pub fn enabled() -> bool {
-    std::env::var_os("PEERDESK_PACE").is_some_and(|v| v == "1")
+    enabled_from(std::env::var_os("PEERDESK_PACE").as_deref())
+}
+
+/// 按环境变量的值判断：只有 `0` 表示关。
+#[must_use]
+pub fn enabled_from(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_none_or(|v| v != "0")
 }
 
 /// 交给 [`Pacer`] 的速率：打开时是估计带宽，关闭时不限速。
@@ -34,12 +41,30 @@ pub fn rate_for(enabled: bool, rate_bps: u64) -> u64 {
 }
 
 use std::collections::VecDeque;
+use std::sync::OnceLock;
 
 use crate::media::Outgoing;
 use crate::time::Time;
 
-/// 发送速率是估计带宽的多少倍（千分比）。1.25 倍：估计偏低时还能逐渐探上去，又不至于很快挤满缓冲区。
-pub const PACE_FACTOR_PERMILLE: u64 = 1250;
+/// 发送速率是估计带宽的多少倍（千分比）。2.5 倍（WebRTC 同值）：估计偏低时很快探上去，大帧又不会整帧突发挤爆瓶颈缓冲区。
+pub const PACE_FACTOR_PERMILLE: u64 = 2500;
+/// 实际用的倍数：默认 [`PACE_FACTOR_PERMILLE`]；校准时（`scripts/pace-lab.sh`）用 `PEERDESK_PACE_FACTOR`
+/// （千分比，1000–5000）改。
+#[must_use]
+pub fn factor_permille() -> u64 {
+    static FACTOR: OnceLock<u64> = OnceLock::new();
+    *FACTOR.get_or_init(|| factor_from(std::env::var_os("PEERDESK_PACE_FACTOR").as_deref()))
+}
+
+/// 从环境变量的值得到倍数；没有或不合理时用默认值。
+#[must_use]
+pub fn factor_from(value: Option<&std::ffi::OsStr>) -> u64 {
+    value
+        .and_then(|v| v.to_str()?.trim().parse::<u64>().ok())
+        .filter(|f| (1000..=5000).contains(f))
+        .unwrap_or(PACE_FACTOR_PERMILLE)
+}
+
 /// 允许的突发：这么长时间的发送量。
 pub const BURST_US: u64 = 10_000;
 /// 突发至少允许这么多个包（包串测速需要几个背靠背的包）。
@@ -103,7 +128,7 @@ impl Pacer {
     }
 
     fn pace_bps(rate_bps: u64) -> u64 {
-        rate_bps.saturating_mul(PACE_FACTOR_PERMILLE) / 1000
+        rate_bps.saturating_mul(factor_permille()) / 1000
     }
 
     fn burst_bytes(rate_bps: u64) -> i64 {
@@ -156,6 +181,19 @@ impl Pacer {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn factor_from_environment() {
+        use std::ffi::OsStr;
+        assert_eq!(factor_from(None), PACE_FACTOR_PERMILLE);
+        assert_eq!(factor_from(Some(OsStr::new("2500"))), 2500);
+        assert_eq!(factor_from(Some(OsStr::new("9000"))), PACE_FACTOR_PERMILLE);
+        assert_eq!(factor_from(Some(OsStr::new("快"))), PACE_FACTOR_PERMILLE);
+        assert!(factor_permille() >= 1000);
+        assert!(enabled_from(None));
+        assert!(enabled_from(Some(OsStr::new("1"))));
+        assert!(!enabled_from(Some(OsStr::new("0"))));
+    }
     use super::*;
 
     fn pkt(n: usize) -> Vec<Outgoing> {
@@ -178,7 +216,7 @@ mod tests {
 
     #[test]
     fn large_frames_are_spread_at_the_pace_rate() {
-        // 400 kbps：发送速率 500 kbps，突发额度 4 个包；96 个 1000 字节的包约 1.5 秒发完
+        // 400 kbps：发送速率 1 Mbps（2.5 倍），突发额度 4 个包；96 个 1000 字节的包约 0.77 秒发完
         let rate = 400_000;
         // 起步额度也只是一个突发的量，不会一下全发
         let mut p = Pacer::new(Time(0));
@@ -193,7 +231,7 @@ mod tests {
         }
         assert_eq!(sent, 96);
         let secs = now.micros() as f64 / 1e6;
-        assert!((1.4..1.7).contains(&secs), "用了 {secs} 秒");
+        assert!((0.7..0.85).contains(&secs), "用了 {secs} 秒");
         assert_eq!(p.queued_bytes(), 0);
     }
 
@@ -222,8 +260,8 @@ mod tests {
         fresh.push(pkt(1));
         fresh.tokens = 1;
         assert_eq!(fresh.next_due(Time(5), 1), Some(Time(5)));
-        // 1 Mbps（发送 1.25 Mbps）发 4000 字节要 25.6 ms
-        assert!(p.busy(1_000_000, 20_000) && !p.busy(1_000_000, 30_000));
+        // 1 Mbps（发送 2.5 Mbps）发 4000 字节要 12.8 ms
+        assert!(p.busy(1_000_000, 10_000) && !p.busy(1_000_000, 15_000));
         let now = Time(1_000_000);
         let out = p.pop_ready(now, 1_000_000);
         assert_eq!(out.first().map(|o| o.flags), Some(250));

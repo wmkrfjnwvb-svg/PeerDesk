@@ -163,8 +163,19 @@ fn view_a_host_send_input_and_get_kicked() {
         assert!(Instant::now() < deadline);
         std::thread::sleep(Duration::from_millis(10));
     };
-    assert_eq!(image.size, [1280, 720]);
-    assert_eq!(v.frames().size(), [1280, 720]);
+    // 第一幅画面可能是半分辨率（带宽未知时先出画面，见 peerdesk_core::scale），回环上很快升回原尺寸
+    assert!(image.size == [1280, 720] || image.size == [640, 360], "{:?}", image.size);
+    let full = loop {
+        if v.frames().size() == [1280, 720] {
+            break true;
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        let _ = v.frames().take();
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(full, "回环上要升回原尺寸：{:?}", v.frames().size());
     assert!(v.frames().frames() >= 1);
     assert!(repaints.load(Ordering::Relaxed) >= 1);
 

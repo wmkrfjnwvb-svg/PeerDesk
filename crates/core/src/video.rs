@@ -135,6 +135,10 @@ pub trait VideoEncoder: Send {
     /// 画面静止之后是否还要继续编（补清晰度）。为真时即使画面没变，发送端也要按时调用 [`Self::encode`]。
     fn wants_refine(&self) -> bool;
 
+    /// 按源画面的多少（千分比，1000 为原尺寸）编码。由发送端按网络决定（见 [`crate::media::MediaSender`]）；
+    /// 尺寸变了的那一帧是关键帧。不支持缩放的编码器忽略。
+    fn set_scale(&mut self, _permille: u16) {}
+
     /// 现在用的编码器（“详情”面板、日志用）。
     fn backend(&self) -> String {
         format!("{:?}", self.codec())

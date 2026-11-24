@@ -129,7 +129,7 @@ pub struct Scenario {
     pub seed: u64,
     /// 带宽估计器。
     pub estimator: EstimatorKind,
-    /// 发送节奏（实验，见 [`peerdesk_core::pacer`]）。默认按环境变量 `PEERDESK_PACE`。
+    /// 发送节奏（见 [`peerdesk_core::pacer`]）。默认打开，环境变量 `PEERDESK_PACE=0` 关掉。
     pub pacing: bool,
     /// 纠错方式。默认 RS（新版本之间）；`PEERDESK_FEC=xor` 对照。
     pub fec: peerdesk_core::transport::Fec,
@@ -266,10 +266,16 @@ impl FeatureRow {
     }
 }
 
-/// 亮度 PSNR（dB）。尺寸不同时返回 0。
+/// 亮度 PSNR（dB）。`a` 比 `b` 小时（缩小编码）先放大到 `b` 的尺寸；画面为空时返回 0。
 #[must_use]
 pub fn luma_psnr(a: &Screen, b: &Screen) -> f64 {
-    if (a.width(), a.height()) != (b.width(), b.height()) || a.pixels().is_empty() {
+    // 缩小编码的画面：像控制端显示时一样拉伸回 b 的尺寸再比（缩小损失的清晰度如实算进去）
+    if (a.width(), a.height()) != (b.width(), b.height()) {
+        return a
+            .upscale(b.width(), b.height())
+            .map_or(0.0, |up| luma_psnr(&up, b));
+    }
+    if a.pixels().is_empty() {
         return 0.0;
     }
     let luma = |p: u32| {
@@ -399,6 +405,10 @@ pub fn run(s: &Scenario) -> Result<Outcome, Error> {
                 waiting_since = Some(now);
             }
             pending |= changed;
+            // 和产品一样：画面变了就告诉发送端（编不编这一帧另说），判断画面是不是停下了
+            if changed {
+                tx.screen_changed(now);
+            }
             // 在途数据超过上限，或上一帧还没发完（发送队列最多放一帧）：这一帧不编，
             // 变化攒着，等发完、确认之后编最新的画面。
             if (pending || tx.wants_frame())
@@ -632,7 +642,10 @@ mod tests {
         assert_eq!(percentile(&[], 50), 0);
         let a = Screen::new(4, 4, 0);
         assert!((luma_psnr(&a, &a) - 99.0).abs() < 1e-9);
-        assert!(luma_psnr(&a, &Screen::new(2, 2, 0)).abs() < 1e-9);
+        // 小的画面放大后再比（缩小编码）；空画面为 0
+        assert!((luma_psnr(&Screen::new(2, 2, 0), &a) - 99.0).abs() < 1e-9);
+        assert!(luma_psnr(&Screen::new(0, 0, 0), &a).abs() < 1e-9);
+        assert!(luma_psnr(&Screen::new(0, 0, 0), &Screen::new(0, 0, 0)).abs() < 1e-9);
         assert_eq!(CodecKind::Tile.name(), "tile");
     }
 

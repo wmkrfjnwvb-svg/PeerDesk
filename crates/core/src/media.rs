@@ -14,6 +14,7 @@ use crate::error::Error;
 use crate::estimator::{EstimatorKind, Extension, Observation, RateEstimator, ReceiverMetrics};
 use crate::governor::FpsGovernor;
 use crate::proto::{VideoHeader, MAX_DATAGRAM};
+use crate::scale::ScalePolicy;
 use crate::screen::Screen;
 use crate::time::Time;
 use crate::transport::{
@@ -173,6 +174,8 @@ pub struct FrameJob {
     pub lost: Vec<u32>,
     /// 上次之后最新的确认 `(floor, mask)`。
     pub feedback: Option<(u32, u32)>,
+    /// 按源画面的多少编码（千分比）。
+    pub scale_permille: u16,
 }
 
 /// 在编码器所在的地方执行一个任务。返回编码结果，以及之后画面不变时还要不要继续交画面（补清晰、恢复）。
@@ -188,6 +191,7 @@ pub fn encode_job(
     if let Some((floor, mask)) = job.feedback {
         encoder.on_feedback(floor, mask);
     }
+    encoder.set_scale(job.scale_permille);
     let encoded = encoder.encode(job.frame_id, screen, changed, job.budget)?;
     Ok((encoded, encoder.wants_refine()))
 }
@@ -225,6 +229,12 @@ pub struct MediaSender {
     governor: FpsGovernor,
     /// 下一次 [`Self::finish_frame`] 用的编码时间（微秒），由编码线程报告。
     encode_us: u64,
+    /// 编码分辨率（只对 H.264；见 [`crate::scale`]）。
+    scale: ScalePolicy,
+    /// 画面停下后决定升回原尺寸：要编一帧（原尺寸的关键帧）。
+    scale_up: bool,
+    /// 最近发出的关键帧：(帧号, 发出时间)。
+    key_sent: Option<(u32, Time)>,
 }
 
 impl std::fmt::Debug for MediaSender {
@@ -272,6 +282,13 @@ impl MediaSender {
             fec: Fec::Xor,
             governor: FpsGovernor::new(cfg.fps),
             encode_us: 0,
+            scale_up: false,
+            key_sent: None,
+            scale: if codec == Codec::H264 {
+                ScalePolicy::new()
+            } else {
+                ScalePolicy::full()
+            },
         }
     }
 
@@ -333,8 +350,24 @@ impl MediaSender {
             .map(|(_, _, bytes)| *bytes)
             .sum();
         // 最近的关键帧还没确认：之后的帧都依赖它，发了也解不了，先等它送到。
-        let key_pending = self.unacked.iter().any(|(id, _, _)| *id == self.last_key);
-        recent > by_rate.max(floor) || key_pending
+        recent > by_rate.max(floor) || self.key_pending()
+    }
+
+    /// 采集到的画面变了（编码器在别的线程时由会话循环调用；[`Self::on_frame`] 自己会调）。
+    /// 用来判断画面是不是停下了（见 [`crate::scale`]）。
+    pub fn screen_changed(&mut self, now: Time) {
+        self.scale.on_change(now);
+    }
+
+    /// 最近的关键帧还没确认。
+    fn key_pending(&self) -> bool {
+        self.unacked.iter().any(|(id, _, _)| *id == self.last_key)
+    }
+
+    /// 现在按源画面的多少编码（千分比）。
+    #[must_use]
+    pub const fn scale_permille(&self) -> u16 {
+        self.scale.permille()
     }
 
     /// 画面没变时还要不要按时交来（编码器在补清晰或要恢复）。
@@ -344,7 +377,7 @@ impl MediaSender {
             .encoder
             .as_ref()
             .map_or(self.refine, |e| e.wants_refine());
-        encoder || !self.notes.0.is_empty()
+        encoder || !self.notes.0.is_empty() || self.scale_up
     }
 
     /// 网络画像。
@@ -396,6 +429,9 @@ impl MediaSender {
         changed: bool,
         rtt_us: u64,
     ) -> Result<Vec<Outgoing>, Error> {
+        if changed {
+            self.screen_changed(now);
+        }
         let job = self.start_frame(now, rtt_us);
         let mut encoder = self.encoder.take().ok_or(Error::InvalidArgument(
             "编码器不在这里：用 start_frame / finish_frame",
@@ -421,11 +457,15 @@ impl MediaSender {
         }
         self.expire_unacked(now);
         let (lost, feedback) = std::mem::take(&mut self.notes);
+        let key_pending = self.key_pending();
+        let scale_permille = self.scale.decide(now, self.rate.rate_bps(), key_pending);
+        self.scale_up = false;
         FrameJob {
             frame_id: self.last_frame.wrapping_add(1).max(1),
             budget: self.frame_budget(),
             lost,
             feedback,
+            scale_permille,
         }
     }
 
@@ -474,6 +514,13 @@ impl MediaSender {
         };
         self.governor
             .on_frame(now, encode_us, encoded.payload.len(), job.budget);
+        if encoded.key {
+            self.key_sent = Some((job.frame_id, now));
+            self.scale.on_keyframe(
+                job.scale_permille,
+                u64::try_from(encoded.payload.len()).unwrap_or(u64::MAX),
+            );
+        }
         let frame_id = job.frame_id;
         // 关键帧参考自己；其余参考上一帧（视频编码的增量帧依赖它）。
         let ref_frame = if encoded.key || self.codec == Codec::Tile {
@@ -551,10 +598,12 @@ impl MediaSender {
             if resent_bytes >= allowance.max(1) {
                 break;
             }
+            // 上次重传之后，要等它排完队、到达、接收端再报告，才算真的又丢了：往返时间加上当前排队延迟。
+            // 只按往返时间算时，排队 200 ms 的窄链路上重传还在队里就又被要一次，带宽全被重复包占了。
             let again = self
                 .resent
                 .get(&(frame, frag))
-                .is_none_or(|at| now.since(*at) >= self.rtt_us.max(1));
+                .is_none_or(|at| now.since(*at) >= self.resend_after_us());
             let packet = self
                 .recent
                 .iter()
@@ -577,6 +626,14 @@ impl MediaSender {
             .wire_bytes
             .saturating_add(u64::try_from(wire).unwrap_or(u64::MAX));
         Ok(out)
+    }
+
+    /// 同一个分片两次重传至少隔多久：往返时间加上最近报告的排队延迟。
+    fn resend_after_us(&self) -> u64 {
+        let queue = self
+            .last_obs
+            .map_or(0, |o| u64::from(o.feedback.queue_delay_us));
+        self.rtt_us.saturating_add(queue).max(1)
     }
 
     /// 还没确认的字节数。
@@ -644,8 +701,13 @@ impl MediaSender {
         };
         self.rate.on_observation(now, &obs);
         self.last_obs = Some(obs);
-        self.acknowledge(feedback);
+        self.acknowledge(now, feedback);
         self.adapt_profile(feedback.loss_permille);
+        // 画面停下了：半分辨率时在后台送原尺寸的关键帧（补清晰）
+        let key_pending = self.key_pending();
+        if self.scale.on_idle(now, self.rate.rate_bps(), key_pending) {
+            self.scale_up = true;
+        }
     }
 
     /// 会话开始时按往返时间选的画像不知道是不是 Wi-Fi：往返短就选“稳定”（不带纠错、把 2% 丢包当拥塞）。
@@ -671,7 +733,7 @@ impl MediaSender {
         self.observe(now, feedback, Extension::default());
     }
 
-    fn acknowledge(&mut self, feedback: &Feedback) {
+    fn acknowledge(&mut self, now: Time, feedback: &Feedback) {
         match self.encoder.as_mut() {
             Some(encoder) => encoder.on_feedback(feedback.floor, feedback.delivered),
             None => self.notes.1 = Some((feedback.floor, feedback.delivered)),
@@ -685,6 +747,13 @@ impl MediaSender {
             let delivered = age < 32 && feedback.delivered >> age & 1 == 1;
             if !delivered {
                 self.lost(id);
+            }
+            // 关键帧送到了：从发出到确认用了多久，是这条链路真实速度的直接测量（见 crate::scale）
+            if let Some((_, sent)) = self.key_sent.filter(|(key, _)| *key == id) {
+                if delivered {
+                    self.scale.on_key_delivered(now.since(sent));
+                }
+                self.key_sent = None;
             }
         }
     }

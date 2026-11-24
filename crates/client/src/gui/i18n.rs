@@ -369,6 +369,10 @@ pub struct Strings {
     pub devices_hint: &'static str,
     /// 删除记录
     pub forget: &'static str,
+    /// 设备列表里的“文件传输”按钮。
+    pub file_transfer: &'static str,
+    /// 点了“文件传输”之后的提示。
+    pub files_after_connect: &'static str,
     /// 助手：助手。
     pub assistant: &'static str,
     /// 助手：开始菜单。
@@ -588,6 +592,8 @@ pub const ZH: Strings = Strings {
     recent_hint: "单击填入，双击直接连接",
     devices_hint: "连接过的设备会出现在这里",
     forget: "删除",
+    file_transfer: "文件传输",
+    files_after_connect: "连接这台设备后会自动打开文件传输（需要时输入密码）",
     clip_remote_too_large: "对方复制的内容太大（{mb} MB），没有同步过来；文件超过 20 MB 请用文件传输",
     assistant: "助手",
     sc_start: "开始菜单",
@@ -790,6 +796,8 @@ pub const EN: Strings = Strings {
     recent_hint: "Click to fill in, double-click to connect",
     devices_hint: "Devices you have connected to",
     forget: "Remove",
+    file_transfer: "File transfer",
+    files_after_connect: "File transfer opens once you connect to this device (enter the password if asked)",
     clip_remote_too_large: "Content copied on the remote ({mb} MB) is too large to sync; use file transfer for files over 20 MB",
     assistant: "Assistant",
     sc_start: "Start menu",

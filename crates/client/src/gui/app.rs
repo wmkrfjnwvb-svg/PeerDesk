@@ -116,6 +116,8 @@ struct App {
     views: Vec<(Viewer, Option<(String, String)>)>,
     /// 文件管理窗口。
     files: super::files_window::FilesWindow,
+    /// 在设备列表里点了“文件传输”的设备地址：连上之后自动打开它的文件管理。
+    files_after: Option<String>,
     serial: u64,
     status: Status,
     selftest: bool,
@@ -186,7 +188,7 @@ impl App {
         let fingerprint = Identity::load_or_create(&data_dir)
             .map(|id| to_hex(&id.fingerprint()))
             .map_err(|e| format!("{}：{e}", s.err_identity));
-        let (password, status) = match password::generate() {
+        let (password, status) = match password::load_or_create(&data_dir) {
             Ok(p) => (p, Status::info(s.ready)),
             Err(e) => (String::new(), Status::error(e)),
         };
@@ -237,6 +239,7 @@ impl App {
                 w.open = std::env::var_os("PEERDESK_GUI_FILES").is_some();
                 w
             },
+            files_after: None,
             serial: 0,
             status,
             selftest: std::env::var_os(SELFTEST_ENV).is_some(),
@@ -662,7 +665,11 @@ impl App {
                 self.copy(ui, &password, s.password);
             }
             if icon_button(ui, icon::ARROWS_CLOCKWISE, s.new_password).clicked() {
-                match password::generate() {
+                // 用户主动换：生成并保存（重启后还是这个）
+                match password::generate().and_then(|pw| {
+                    password::save(&self.data_dir, &pw)?;
+                    Ok(pw)
+                }) {
                     Ok(pw) => {
                         if let Some(host) = &self.host {
                             host.set_password(&pw);
@@ -870,6 +877,7 @@ impl App {
         }
         let mut connect = None;
         let mut forget = None;
+        let mut files = None;
         card(ui, p, |ui| {
             for (i, item) in items.iter().enumerate() {
                 if i > 0 {
@@ -892,6 +900,10 @@ impl App {
                         if icon_button(ui, icon::TRASH, s.forget).clicked() {
                             forget = Some(item.addr.clone());
                         }
+                        // 文件传输：先连上这台设备，连上后自动打开文件管理
+                        if icon_button(ui, icon::FOLDER_OPEN, s.file_transfer).clicked() {
+                            files = Some(item.clone());
+                        }
                         if primary_button(ui, p, s.connect_this, 88.0, true).clicked() {
                             connect = Some(item.clone());
                         }
@@ -903,6 +915,11 @@ impl App {
             if let Err(e) = self.recent.forget(&addr) {
                 self.status = Status::error(e.to_string());
             }
+        }
+        if let Some(item) = files {
+            self.files_after = Some(item.addr.clone());
+            self.status = Status::info(s.files_after_connect);
+            connect = Some(item);
         }
         if let Some(item) = connect {
             // 回到首页、填好表单：可能要输入密码
@@ -1291,10 +1308,6 @@ impl App {
             }
             ui.add_space(2.0);
         }
-        // 文件管理：单独的窗口
-        if nav_item(ui, p, icon::FOLDER_OPEN, "文件", self.files.open).clicked() {
-            self.files.open = true;
-        }
         ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
             ui.add_space(14.0);
             let (text, color) = if !self.server.is_set() {
@@ -1430,18 +1443,28 @@ impl eframe::App for App {
         let s = self.s;
         let mut remembered = Vec::new();
         let mut open_files = None;
+        let mut files_after = self.files_after.take();
         self.views.retain_mut(|(viewer, remember)| {
             let outcome = viewer.show(ctx, s);
             if outcome.open_files {
                 open_files = Some(viewer.title().to_owned());
             }
             if outcome.connected {
+                // 从设备列表点的“文件传输”：连上了就打开这台设备的文件管理
+                if remember
+                    .as_ref()
+                    .is_some_and(|(addr, _)| files_after.as_deref() == Some(addr.as_str()))
+                {
+                    open_files = Some(viewer.title().to_owned());
+                    files_after = None;
+                }
                 if let Some((addr, pin)) = remember.take() {
                     remembered.push((addr, pin, outcome.peer.0, outcome.peer.1));
                 }
             }
             outcome.open
         });
+        self.files_after = files_after;
         // 文件管理：在当前的远程会话上浏览、传文件
         if let Some(title) = open_files {
             self.files.open_for(&title);
