@@ -32,18 +32,20 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter, IDXGIFactory1};
 use windows::Win32::Media::MediaFoundation::{
-    eAVEncCommonRateControlMode_CBR, eAVEncH264VProfile_Base, CODECAPI_AVEncCommonMeanBitRate,
+    eAVEncCommonRateControlMode_CBR, eAVEncH264VProfile_Base, eAVScenarioInfo_DisplayRemoting,
+    CODECAPI_AVDecVideoAcceleration_H264, CODECAPI_AVEncCommonMeanBitRate,
     CODECAPI_AVEncCommonRateControlMode, CODECAPI_AVEncMPVDefaultBPictureCount,
     CODECAPI_AVEncMPVGOPSize, CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVLowLatencyMode,
-    ICodecAPI, IMFActivate, IMFMediaEventGenerator, IMFMediaType, IMFSample, IMFTransform,
-    METransformHaveOutput, METransformNeedInput, MFCreateMediaType, MFCreateMemoryBuffer,
-    MFCreateSample, MFMediaType_Video, MFSampleExtension_CleanPoint, MFStartup, MFTEnumEx,
-    MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoInterlace_Progressive, MFSTARTUP_NOSOCKET,
-    MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER,
+    CODECAPI_AVScenarioInfo, ICodecAPI, IMFActivate, IMFMediaEventGenerator, IMFMediaType,
+    IMFSample, IMFTransform, METransformDrainComplete, METransformHaveOutput, METransformNeedInput,
+    MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video,
+    MFSampleExtension_CleanPoint, MFStartup, MFTEnumEx, MFVideoFormat_H264, MFVideoFormat_NV12,
+    MFVideoInterlace_Progressive, MFSTARTUP_NOSOCKET, MFT_CATEGORY_VIDEO_ENCODER,
+    MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER, MFT_MESSAGE_COMMAND_DRAIN,
     MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_OF_STREAM,
     MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
     MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES, MFT_OUTPUT_STREAM_PROVIDES_SAMPLES,
-    MFT_REGISTER_TYPE_INFO, MF_EVENT_FLAG_NO_WAIT, MF_E_NO_EVENTS_AVAILABLE,
+    MFT_REGISTER_TYPE_INFO, MF_EVENT_FLAG_NO_WAIT, MF_E_NOTACCEPTING, MF_E_NO_EVENTS_AVAILABLE,
     MF_E_TRANSFORM_STREAM_CHANGE, MF_LOW_LATENCY, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE,
     MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MPEG2_PROFILE,
     MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION,
@@ -58,9 +60,14 @@ use windows::Win32::System::Com::{
 };
 use windows::Win32::System::Variant::VARIANT;
 
-/// 等一个事件（要输入 / 有输出）最多这么久。第一帧硬件要初始化，给长一点。
+/// 第一帧等编码器要输入最多这么久（硬件要初始化）。
 const FIRST_WAIT: Duration = Duration::from_secs(3);
-const WAIT: Duration = Duration::from_millis(500);
+/// 编码器这么久没有任何进展（不要输入、不交帧）才算卡住。
+const STALL: Duration = Duration::from_secs(2);
+/// 交帧之后等编好的帧最多这么久（等不到下次再取，不算出错）。
+const OUTPUT_WAIT: Duration = Duration::from_millis(20);
+/// 排空最多等这么久。
+const DRAIN_WAIT: Duration = Duration::from_millis(500);
 
 fn err(what: &str, e: &windows::core::Error) -> String {
     format!("{what}：{e}")
@@ -166,6 +173,10 @@ pub struct MfEncoder {
     frame: i64,
     /// 编码器要了几次输入还没给。
     need_input: u32,
+    /// 编码器交出的帧（按顺序；硬件编码器可能攒几帧才交出，交出时可能一次好几帧）。
+    ready: std::collections::VecDeque<(Vec<u8>, bool)>,
+    /// 最近一次有进展（编码器要输入或交出帧）的时刻：长时间没有进展才算编码器卡住。
+    progress_at: Instant,
     bps: u64,
     provides_samples: bool,
     output_size: u32,
@@ -287,8 +298,15 @@ impl MfEncoder {
         black.resize(w * h + w * h / 2, 128);
         let bps = self.bps;
         let name = self.name.clone();
-        self.encode(&black, bps, true)
-            .map_err(|e| format!("{name}：试编一帧失败：{e}"))?;
+        let got = self.encode(&black, bps, true).and_then(|got| match got {
+            Some(_) => Ok(()),
+            // 攒着：让它交出来，确认真的编得出（刚打开时这样做不影响之后）
+            None => self
+                .drain()
+                .and_then(|()| self.poll()?.map(drop).ok_or_else(|| "交不出帧".to_owned())),
+        });
+        got.map_err(|e| format!("{name}：试编一帧失败：{e}"))?;
+        self.ready.clear();
         Ok(self)
     }
 
@@ -353,6 +371,11 @@ impl MfEncoder {
                 let _ = c.SetValue(&CODECAPI_AVEncMPVDefaultBPictureCount, &VARIANT::from(0u32));
                 // 不按固定间隔出关键帧：需要时（丢包、换尺寸）我们强制
                 let _ = c.SetValue(&CODECAPI_AVEncMPVGOPSize, &VARIANT::from(u32::MAX));
+                // 场景：远程桌面（Sunshine 用 FFmpeg 的 MF 编码器时也这么设）
+                let _ = c.SetValue(
+                    &CODECAPI_AVScenarioInfo,
+                    &VARIANT::from(u32::try_from(eAVScenarioInfo_DisplayRemoting.0).unwrap_or(1)),
+                );
             }
             let out = media_type(&MFVideoFormat_H264, width, height, fps)?;
             out.SetUINT32(&MF_MT_AVG_BITRATE, u32::try_from(bps).unwrap_or(u32::MAX))
@@ -395,6 +418,8 @@ impl MfEncoder {
                 height,
                 frame: 0,
                 need_input: 0,
+                ready: std::collections::VecDeque::new(),
+                progress_at: Instant::now(),
                 bps,
                 provides_samples: provides,
                 output_size: info.cbSize.max(width.saturating_mul(height)),
@@ -413,32 +438,6 @@ impl MfEncoder {
     #[must_use]
     pub const fn size(&self) -> (u32, u32) {
         (self.width, self.height)
-    }
-
-    /// 取一个事件；没有时等，最多 `limit`。返回事件类型。
-    fn next_event(&self, limit: Duration) -> Result<i32, String> {
-        let started = Instant::now();
-        loop {
-            // SAFETY: 不等待地取事件；没有事件时返回 MF_E_NO_EVENTS_AVAILABLE。
-            match unsafe { self.events.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
-                Ok(event) => {
-                    // SAFETY: 事件对象有效。
-                    let kind = unsafe { event.GetType() }.map_err(|e| err("事件类型", &e))?;
-                    return Ok(i32::try_from(kind).unwrap_or(-1));
-                }
-                Err(e) if e.code() == MF_E_NO_EVENTS_AVAILABLE => {
-                    if started.elapsed() > limit {
-                        return Err(format!(
-                            "{} 没有响应（等了 {} ms）",
-                            self.name,
-                            limit.as_millis()
-                        ));
-                    }
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-                Err(e) => return Err(err("取事件", &e)),
-            }
-        }
     }
 
     fn set_bitrate(&mut self, bps: u64) {
@@ -564,12 +563,60 @@ impl MfEncoder {
     }
 
     /// 编一帧 NV12。`force_key` 时编关键帧。
+    /// 收下编码器发来的所有事件（不等）：要输入就记下，有输出就取出来排队。返回是否排空了（DrainComplete）。
+    fn pump(&mut self) -> Result<bool, String> {
+        let mut drained = false;
+        loop {
+            // SAFETY: 不等待地取事件；没有事件时返回 MF_E_NO_EVENTS_AVAILABLE。
+            let kind = match unsafe { self.events.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
+                // SAFETY: 事件对象有效。
+                Ok(event) => unsafe { event.GetType() }.map_err(|e| err("事件类型", &e))?,
+                Err(e) if e.code() == MF_E_NO_EVENTS_AVAILABLE => return Ok(drained),
+                Err(e) => return Err(err("取事件", &e)),
+            };
+            let kind = i32::try_from(kind).unwrap_or(-1);
+            if kind == METransformNeedInput.0 {
+                self.need_input = self.need_input.saturating_add(1);
+                self.progress_at = Instant::now();
+            } else if kind == METransformHaveOutput.0 {
+                let frame = self.output()?;
+                self.ready.push_back(frame);
+                self.progress_at = Instant::now();
+            } else if kind == METransformDrainComplete.0 {
+                drained = true;
+            }
+        }
+    }
+
+    /// 等事件，直到 `done` 为真或者过了 `limit`；编码器很久没有任何进展时报错（卡住了）。
+    fn pump_until(&mut self, limit: Duration, done: impl Fn(&Self) -> bool) -> Result<(), String> {
+        let started = Instant::now();
+        loop {
+            let _ = self.pump()?;
+            if done(self) || started.elapsed() >= limit {
+                break;
+            }
+            if self.progress_at.elapsed() > STALL {
+                return Err(format!(
+                    "{} 没有响应（{} 秒没有任何进展）",
+                    self.name,
+                    STALL.as_secs()
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        Ok(())
+    }
+
+    /// 交一帧 NV12，取回一个编好的帧（码流和是否关键帧）。**异步**（和 FFmpeg、Chromium 一样）：
+    /// 编码器要输入时才交；编好的帧随时取，可能是之前交的；还没有就返回 `None`，之后用 [`Self::poll`]。
+    /// 不再一帧一帧等结果：硬件编码器常常攒一两帧，同步等必然超时、然后整个改用软件编码。
     pub fn encode(
         &mut self,
         nv12: &[u8],
         bps: u64,
         force_key: bool,
-    ) -> Result<(Vec<u8>, bool), String> {
+    ) -> Result<Option<(Vec<u8>, bool)>, String> {
         self.set_bitrate(bps);
         if force_key {
             if let Some(c) = &self.codec {
@@ -578,31 +625,44 @@ impl MfEncoder {
                     unsafe { c.SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &VARIANT::from(1u32)) };
             }
         }
-        let limit = if self.frame == 0 { FIRST_WAIT } else { WAIT };
-        // 等编码器要输入
-        while self.need_input == 0 {
-            let kind = self.next_event(limit)?;
-            if kind == METransformNeedInput.0 {
-                self.need_input = self.need_input.saturating_add(1);
-            } else if kind == METransformHaveOutput.0 {
-                // 上一帧多出来的输出（不该有）：丢掉
-                let _ = self.output()?;
-            }
+        // 等编码器要输入（第一帧硬件要初始化，给长一点）
+        let limit = if self.frame == 0 { FIRST_WAIT } else { STALL };
+        self.pump_until(limit, |e| e.need_input > 0)?;
+        if self.need_input == 0 {
+            return Err(format!("{} 一直不要输入", self.name));
         }
         let sample = self.input_sample(nv12)?;
         // SAFETY: 样本有效。
-        unsafe { self.transform.ProcessInput(0, &sample, 0) }.map_err(|e| err("送入画面", &e))?;
-        self.need_input = self.need_input.saturating_sub(1);
-        // 等这一帧的输出
-        loop {
-            let kind = self.next_event(limit)?;
-            if kind == METransformHaveOutput.0 {
-                return self.output();
-            }
-            if kind == METransformNeedInput.0 {
-                self.need_input = self.need_input.saturating_add(1);
-            }
+        match unsafe { self.transform.ProcessInput(0, &sample, 0) } {
+            Ok(()) => self.need_input = self.need_input.saturating_sub(1),
+            // 编码器还没准备好收：这一帧不编（下一帧再说），不算出错
+            Err(e) if e.code() == MF_E_NOTACCEPTING => {}
+            Err(e) => return Err(err("送入画面", &e)),
         }
+        // 编好的帧一般马上就到：等一小会儿（低延迟），等不到下次再取
+        self.pump_until(OUTPUT_WAIT, |e| !e.ready.is_empty())?;
+        Ok(self.ready.pop_front())
+    }
+
+    /// 取走一个编好的帧（不等）。
+    pub fn poll(&mut self) -> Result<Option<(Vec<u8>, bool)>, String> {
+        let _ = self.pump()?;
+        Ok(self.ready.pop_front())
+    }
+
+    /// 让编码器交出攒着的帧（画面停下后用；和 FFmpeg 结束时一样发 DRAIN，等 DrainComplete）。
+    pub fn drain(&mut self) -> Result<(), String> {
+        // SAFETY: 对象有效。
+        unsafe { self.transform.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0) }
+            .map_err(|e| err("排空", &e))?;
+        let started = Instant::now();
+        while started.elapsed() < DRAIN_WAIT {
+            if self.pump()? {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        Ok(())
     }
 }
 
@@ -667,6 +727,11 @@ impl MfDecoder {
             if let Ok(attrs) = transform.GetAttributes() {
                 let _ = attrs.SetUINT32(&MF_LOW_LATENCY, 1);
                 aware = attrs.GetUINT32(&MF_SA_D3D11_AWARE).is_ok_and(|v| v != 0);
+            }
+            // 微软文档：低延迟解码（不攒帧，解出就交）；明确打开硬件加速
+            if let Ok(c) = transform.cast::<ICodecAPI>() {
+                let _ = c.SetValue(&CODECAPI_AVLowLatencyMode, &VARIANT::from(true));
+                let _ = c.SetValue(&CODECAPI_AVDecVideoAcceleration_H264, &VARIANT::from(1u32));
             }
             // 有 D3D11 设备才是显卡解码；给不了就在 CPU 上解（照样能用，名称里写明）
             let d3d = if aware {

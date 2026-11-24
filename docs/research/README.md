@@ -53,7 +53,9 @@
 | 整数系数的 RGB→YUV 转换 | ✅ | `media/color.rs` | 与 openh264 逐字节一致 |
 | 静止后补清晰（最多约 8 帧残差） | ✅ | `media/lib.rs` | |
 | 块编码（对照组，渐进无损） | ✅ | `core/codec.rs` | 只在仿真里做对照 |
-| 硬件编码：Windows Media Foundation（异步硬件 MFT） | ✅ | `media/mf.rs` | 失败自动回退 OpenH264；CI 验证不崩，真机速度待测 |
+| 硬件编码：Windows Media Foundation（异步硬件 MFT） | ✅ | `media/mf.rs` | 和 FFmpeg/Chromium 一样事件驱动：要输入才交、有输出就取、不一帧一帧等；2 秒没进展才算卡住；CBR、无 B 帧、低延迟、场景=远程桌面。之前同步等结果（硬件攒帧必超时→整个改软件）。真机待测 |
+| 零拷贝：显卡上 BGRA→NV12（着色器）直接喂编码器、解码出的纹理直接显示 | ⬜ | | Sunshine、Moonlight 的做法；现在要在内存和显卡之间来回拷两次、CPU 转颜色 |
+| 硬件编解码：Linux（VA-API / NVENC） | ⬜ | | 候选：FFmpeg（LGPL，动态链接，Sunshine 用）或 cros-libva（BSD-3，纯 Rust） |
 | 硬件编码器拿到所在显卡的 D3D11 设备（按 LUID 找卡），打开时试编一帧，不行再不给设备试 | ✅ | `media/mf.rs` | AMD 的编码器要设备才打得开；双显卡笔记本选对卡 |
 | 硬件解码：Windows（系统 H.264 解码器，有显卡走 DXVA，否则 CPU 并如实标注） | ✅ | `media/mf.rs`、`media/color.rs` | NV12 → RGB 整数转换，裁掉 16 对齐的行 |
 | 编码耗时拆开：颜色转换 / 编码器本身，统计行按秒平均 | ✅ | `media/lib.rs`、`net/host.rs` | 真机测试用它定位瓶颈 |

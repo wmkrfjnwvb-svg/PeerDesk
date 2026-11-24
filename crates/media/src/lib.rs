@@ -361,8 +361,13 @@ impl HardwareEncoder for mf::MfEncoder {
         bps: u64,
         force_key: bool,
     ) -> Result<Option<(Vec<u8>, bool)>, String> {
-        // Media Foundation 这边是一帧一帧等结果的（同步）
-        mf::MfEncoder::encode(self, nv12, bps, force_key).map(Some)
+        mf::MfEncoder::encode(self, nv12, bps, force_key)
+    }
+    fn poll(&mut self) -> Result<Option<(Vec<u8>, bool)>, String> {
+        mf::MfEncoder::poll(self)
+    }
+    fn drain(&mut self) -> Result<(), String> {
+        mf::MfEncoder::drain(self)
     }
 }
 
@@ -1415,16 +1420,25 @@ mod tests {
                 let (w, _, pixels) = even_pixels(&screen);
                 color::rgb_to_i420(&pixels, w, &mut y, &mut u, &mut v);
                 color::i420_to_nv12(&y, &u, &v, &mut nv12);
+                // 异步：交 5 帧，取回多少算多少，最后让编码器交出攒着的；第一帧是关键帧，软件解码接得上
+                let mut got = Vec::new();
                 for i in 0..5 {
-                    let (data, key) = hw.encode(&nv12, 2_000_000, i == 0).unwrap().unwrap();
-                    assert!(i > 0 || key, "第一帧要是关键帧");
+                    got.extend(hw.encode(&nv12, 2_000_000, i == 0).unwrap());
+                }
+                hw.drain().unwrap();
+                while let Some(frame) = hw.poll().unwrap() {
+                    got.push(frame);
+                }
+                assert!(!got.is_empty(), "编码器一帧都没交出");
+                assert!(got[0].1, "第一帧要是关键帧");
+                for (data, key) in &got {
                     let header = FrameHeader {
                         codec: Codec::H264,
-                        key,
+                        key: *key,
                         width: 640,
                         height: 360,
                     };
-                    let _ = dec.decode(&header, &data).unwrap();
+                    let _ = dec.decode(&header, data).unwrap();
                 }
                 log::info!("硬件编码器可用：{}", hw.name());
             }
@@ -1616,5 +1630,31 @@ mod tests {
         // Timeout：720p 编码 10 秒没有结束（卡住了）；Disconnected：编码线程 panic 了
         let (took, sizes) = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
         assert!(sizes.iter().all(|s| *s > 0), "{took:?} {sizes:?}");
+    }
+}
+
+/// Windows 的系统 H.264 解码器只对“和 Main 兼容”的码流用显卡（DXVA）：Baseline 要带
+/// constraint_set1_flag（受约束的 Baseline），否则悄悄用 CPU 解。确认我们编出来的码流是这样。
+#[cfg(test)]
+mod sps_profile {
+    #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
+    use super::*;
+
+    #[test]
+    fn openh264_output_is_constrained_baseline() {
+        let mut enc = H264Encoder::new(30).with_hardware(|_, _, _, _| Err("只测软件".into()));
+        let screen = Screen::new(320, 192, 0x0012_3456);
+        let f = enc.encode(1, &screen, true, 50_000).unwrap().unwrap();
+        let (_, data) = FrameHeader::parse(&f.payload).unwrap();
+        let sps = annexb::nal_units(data)
+            .into_iter()
+            .find(|n| n.first().map(|b| b & 0x1f) == Some(7))
+            .unwrap();
+        assert_eq!(sps[1], 66, "Baseline");
+        assert_ne!(
+            sps[2] & 0b0100_0000,
+            0,
+            "constraint_set1_flag：和 Main 兼容"
+        );
     }
 }
