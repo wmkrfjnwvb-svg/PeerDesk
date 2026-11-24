@@ -404,7 +404,7 @@ fn agent_says_why_it_stopped() {
     // 端口被别的程序占着：被控起不来，代理说明原因
     let busy = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
     let port = busy.local_addr().unwrap().port();
-    // Windows 上同一个 UDP 端口可以重复绑定，被控照样起来：最多等 15 秒后让它停下，不能卡住测试
+    // Windows、macOS 上同一个 UDP 端口可以重复绑定，被控照样起来：最多等 15 秒后让它停下，不能卡住测试
     let stop = Arc::new(AtomicBool::new(false));
     let timer = {
         let stop = Arc::clone(&stop);
@@ -419,10 +419,10 @@ fn agent_says_why_it_stopped() {
     let result = run_agent(&base, &agent_dir(&base), port, &stop);
     stop.store(true, Ordering::Relaxed);
     timer.join().unwrap();
-    // Linux、macOS：端口冲突，被控起不来，代理说明原因
-    #[cfg(not(windows))]
+    // Linux：端口冲突，被控起不来，代理说明原因（Windows、macOS 允许重复绑定，只要求能停下）
+    #[cfg(target_os = "linux")]
     assert!(!result.unwrap_err().is_empty());
-    #[cfg(windows)]
+    #[cfg(not(target_os = "linux"))]
     let _ = result;
     assert!(!read_status(&base).unwrap().running);
     // 状态目录写不了：只记日志，照样说明原因

@@ -1490,7 +1490,15 @@ mod tests {
         // A 下线后再开一个被控端：问不到节点列表，用缓存里的 B
         a_node.close();
         drop(rt);
-        let b = TestServer::start(&b_id, b_addr).unwrap();
+        // 同一个端口马上重开：Windows 上刚关的端口要过一会儿才放出来
+        let b = (0..50)
+            .find_map(|_| {
+                TestServer::start(&b_id, b_addr).ok().or_else(|| {
+                    std::thread::sleep(Duration::from_millis(100));
+                    None
+                })
+            })
+            .unwrap();
         let host_rt = runtime().unwrap();
         let host = host_rt.block_on(async {
             Arc::new(
