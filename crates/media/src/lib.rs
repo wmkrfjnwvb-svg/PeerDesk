@@ -62,6 +62,15 @@ pub const BIG_FRAME_US: u64 = ContentPolicy::OFFICE.big_frame_us;
 const MIN_QP: u8 = qp::MIN_QP;
 /// 估计画面变了多少时每隔多少像素抽一个（横竖都是）：720p 约 3600 个，几乎不花时间。
 const SAMPLE_STEP: usize = 16;
+/// 抽样点细节量的底数：平坦的地方变了也要编一点。也是“按细节”和“按点数”之间的折中：底数越大越接近只数点数。
+/// 2026-11 微软轨迹 12 条 × 3 个种子（冻结 / 最长等待平均 / 停下后最差 PSNR）：只数点数 145 / 642 ms / 27.3 dB；
+/// 底数 8 77 / 366 ms / 25.8 dB；24 95 / 392 ms / 26.8 dB；64 112 / 447 ms / 26.7 dB。取 24：清晰度最后让步。
+const DETAIL_FLOOR: u32 = 24;
+
+/// 近似亮度（0–255）：(2R + 5G + B) / 8。
+fn luma(p: u32) -> u32 {
+    ((p >> 16 & 0xff) * 2 + (p >> 8 & 0xff) * 5 + (p & 0xff)) / 8
+}
 
 fn codec_error(what: &'static str) -> impl Fn(openh264::Error) -> Error {
     move |_| Error::Inconsistent(what)
@@ -700,22 +709,34 @@ impl H264Encoder {
     fn changed_permille(&mut self, screen: &Screen) -> u64 {
         let width = usize::from(screen.width());
         let size = (screen.width(), screen.height());
-        let now: Vec<u32> = screen
-            .pixels()
-            .chunks(width.max(1))
-            .step_by(SAMPLE_STEP)
-            .flat_map(|row| row.iter().step_by(SAMPLE_STEP).copied())
-            .collect();
+        let pixels = screen.pixels();
+        let rows: Vec<&[u32]> = pixels.chunks(width.max(1)).collect();
+        // 每个抽样点：像素值，和它在新画面里的细节量（和右边、下边像素的亮度差，加一个底数）
+        let mut now = Vec::with_capacity(self.samples.len());
+        let mut detail = Vec::with_capacity(self.samples.len());
+        for (y, row) in rows.iter().enumerate().step_by(SAMPLE_STEP) {
+            let below = rows.get(y.saturating_add(1));
+            for (x, p) in row.iter().enumerate().step_by(SAMPLE_STEP) {
+                let l = luma(*p);
+                let right = row.get(x.saturating_add(1)).map_or(l, |q| luma(*q));
+                let down = below.and_then(|r| r.get(x)).map_or(l, |q| luma(*q));
+                now.push(*p);
+                detail.push(l.abs_diff(right) + l.abs_diff(down) + DETAIL_FLOOR);
+            }
+        }
+        // 按细节加权的变化比例：编码出来的大小大致按细节分布（关键帧的大小估计也是整幅画面的细节），
+        // 只数变了几个点会把“文字密集的弹窗盖在白底上”估得很小（弹窗占 36%，变了的点只有 19%，按点数估计
+        // 比实际小 5 倍以上，2026-11 微软轨迹里切换窗口的帧在 1 Mbps 上编出 89–125 KB）
         let changed = if size == self.sampled && now.len() == self.samples.len() {
-            let differ = now
+            let total: u64 = detail.iter().map(|d| u64::from(*d)).sum();
+            let differ: u64 = now
                 .iter()
                 .zip(&self.samples)
-                .filter(|(a, b)| a != b)
-                .count();
-            u64::try_from(differ)
-                .unwrap_or(u64::MAX)
-                .saturating_mul(1000)
-                / u64::try_from(now.len()).unwrap_or(u64::MAX).max(1)
+                .zip(&detail)
+                .filter(|((a, b), _)| a != b)
+                .map(|(_, d)| u64::from(*d))
+                .sum();
+            differ.saturating_mul(1000) / total.max(1)
         } else {
             1000
         };
