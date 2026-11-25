@@ -24,8 +24,12 @@ const IDLE_TIMEOUT_MS: u32 = 10_000;
 const MAX_UDP_PAYLOAD: u16 = 1400;
 /// 保活间隔。
 const KEEP_ALIVE: Duration = Duration::from_secs(2);
-/// 数据报收发缓冲。发送缓冲满时最旧的数据报被丢弃，符合“新帧优先”。
+/// 数据报接收缓冲：应用读得慢时最旧的数据报被丢弃。
 const DATAGRAM_BUFFER: usize = 4 * 1024 * 1024;
+/// 数据报发送缓冲。QUIC 层不限速（见 [`crate::safety`]）时数据报交过去就发出，这里不该积压；
+/// 万一积压（安全网拦住了），最多积这么多，满了丢最旧的（新帧优先），不让本机排出几秒的队。
+/// 以前是 4 MB：1.5 Mbps 下能积 20 秒（K-pipeline.md P1）。
+const DATAGRAM_SEND_BUFFER: usize = 512 * 1024;
 
 fn tls_suite(suite: Suite) -> Option<SupportedCipherSuite> {
     match suite {
@@ -85,20 +89,21 @@ fn transport() -> Arc<quinn::TransportConfig> {
         // 常常被丢（对方还没打开 NAT 或还没接上中继），这样约 0.3 秒就重发，而不是约 1 秒。
         .initial_rtt(INITIAL_RTT)
         .datagram_receive_buffer_size(Some(DATAGRAM_BUFFER))
-        .datagram_send_buffer_size(DATAGRAM_BUFFER)
+        .datagram_send_buffer_size(DATAGRAM_SEND_BUFFER)
         .mtu_discovery_config(Some(mtu))
         .congestion_controller_factory(congestion(std::env::var("PEERDESK_CC").ok().as_deref()));
     Arc::new(transport)
 }
 
-/// QUIC 层的拥塞控制。画面和输入的码率由我们自己的实时层决定，这里只是安全网。
-/// 默认 BBR：实验（scripts/e2e-live.sh，25 ms 延迟、2% 丢包、画面大量变化）里 Cubic 和 NewReno
-/// 把随机丢包当拥塞，8 秒一帧都没送到；BBR 不看丢包，送到了。`PEERDESK_CC` 可换成 cubic、newreno 做对照。
+/// QUIC 层的拥塞控制。画面和输入的码率由我们自己的实时层决定，这里只是安全网（见 [`crate::safety`]）。
+/// 以前默认 BBR（Cubic、NewReno 把随机丢包当拥塞，8 秒一帧都没送到），但 BBR 会和媒体层的码率控制打架
+/// （K-pipeline.md P1）。`PEERDESK_CC` 可换成 bbr、cubic、newreno 做对照。
 fn congestion(name: Option<&str>) -> Arc<dyn quinn::congestion::ControllerFactory + Send + Sync> {
     match name {
+        Some("bbr") => Arc::new(quinn::congestion::BbrConfig::default()),
         Some("cubic") => Arc::new(quinn::congestion::CubicConfig::default()),
         Some("newreno") => Arc::new(quinn::congestion::NewRenoConfig::default()),
-        Some(_) | None => Arc::new(quinn::congestion::BbrConfig::default()),
+        Some(_) | None => Arc::new(crate::safety::SafetyNetConfig),
     }
 }
 

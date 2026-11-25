@@ -49,6 +49,7 @@ pub mod node;
 pub mod portmap;
 pub mod punch;
 pub mod rendezvous;
+pub mod safety;
 pub mod service;
 pub mod sidechannel;
 pub mod stream;

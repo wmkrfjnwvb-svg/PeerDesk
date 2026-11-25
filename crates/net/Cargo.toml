@@ -19,6 +19,8 @@ log = "0.4"
 peerdesk-core.workspace = true
 peerdesk-media = { workspace = true, optional = true }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+# 自己实现 QUIC 的拥塞控制接口要用到它的往返时间类型（quinn 没有转出），版本跟 quinn 一致
+quinn-proto = { version = "0.11", default-features = false }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "macros", "io-util"] }

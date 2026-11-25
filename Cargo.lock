@@ -2725,6 +2725,7 @@ dependencies = [
  "peerdesk-core",
  "peerdesk-media",
  "quinn",
+ "quinn-proto",
  "rcgen",
  "ring",
  "rustls",
