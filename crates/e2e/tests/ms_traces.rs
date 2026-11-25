@@ -7,7 +7,7 @@ use peerdesk_core::adaptive::Profile;
 use peerdesk_core::sim::Link;
 use peerdesk_e2e::{run, Action, ContentPolicy, EstimatorKind, Outcome, Phase, Scenario};
 
-const TRACES: [(&str, &str); 8] = [
+const TRACES: [(&str, &str); 12] = [
     ("ms-09401", include_str!("../traces/ms-09401.csv")),
     ("ms-02626", include_str!("../traces/ms-02626.csv")),
     ("ms-02605", include_str!("../traces/ms-02605.csv")),
@@ -16,6 +16,10 @@ const TRACES: [(&str, &str); 8] = [
     ("ms-05729", include_str!("../traces/ms-05729.csv")),
     ("ms-02560", include_str!("../traces/ms-02560.csv")),
     ("ms-09261", include_str!("../traces/ms-09261.csv")),
+    ("ms-02651", include_str!("../traces/ms-02651.csv")),
+    ("ms-05719", include_str!("../traces/ms-05719.csv")),
+    ("ms-09217", include_str!("../traces/ms-09217.csv")),
+    ("ms-02703", include_str!("../traces/ms-02703.csv")),
 ];
 
 /// 轨迹文件 → 仿真网络：每一行“毫秒,带宽 bps,丢包千分比”是从这一刻起的链路。
@@ -104,37 +108,65 @@ fn microsoft_traces() {
     println!("| 轨迹 | 冻结（>200 ms） | 最长等待 ms | 平均延迟 ms | 停下后最慢变清晰 ms | 停下后最差 PSNR | 首帧 ms | 关键帧 |");
     println!("|---|---|---|---|---|---|---|---|");
     let only = std::env::var("PEERDESK_TRACES").unwrap_or_default();
+    // 每条轨迹用几个随机种子各跑一遍（种子决定抖动、丢包和桌面内容）：单次结果对时序很敏感，
+    // 改动前后的比较看全部轨迹、全部种子的合计（PEERDESK_SEEDS，默认 1）
+    let seeds = std::env::var("PEERDESK_SEEDS")
+        .ok()
+        .and_then(|n| n.parse::<u64>().ok())
+        .unwrap_or(1)
+        .max(1);
+    let (mut runs, mut freezes, mut unsharp, mut wait_sum, mut wait_max) =
+        (0u32, 0u32, 0u32, 0.0, 0.0f64);
     for (name, csv) in TRACES {
         if !only.is_empty() && !only.split(',').any(|t| t == name) {
             continue;
         }
-        // 测量时可以用 PEERDESK_ESTIMATOR（legacy、v1、gcc）换估计器对比
-        let estimator = std::env::var("PEERDESK_ESTIMATOR")
-            .ok()
-            .and_then(|n| EstimatorKind::parse(&n))
-            .unwrap_or(EstimatorKind::ClassicV1);
-        let o = run(&Scenario {
-            network: network(csv),
-            profile: Profile::WIRELESS,
-            estimator,
-            start_bps: ContentPolicy::OFFICE.start_bps,
-            ..Scenario::new(name, workload())
-        })
-        .unwrap();
-        for line in &o.trace {
-            eprintln!("{line}");
-        }
-        println!("{}", row(name, &o));
-        if std::env::var_os("PEERDESK_SAVE").is_some() {
-            peerdesk_e2e::report::save(std::path::Path::new("../../target/e2e-ms"), &o).unwrap();
-        }
-        if std::env::var_os("PEERDESK_DETAIL").is_some() {
-            println!(
-                "  网络丢 {}，排队丢 {}，跳过 {}，坏帧 {}，恢复 {}",
-                o.net.lost, o.net.queue_dropped, o.skipped, o.bad, o.recoveries
-            );
+        for seed in 1..=seeds {
+            // 测量时可以用 PEERDESK_ESTIMATOR（legacy、v1、gcc）换估计器对比
+            let estimator = std::env::var("PEERDESK_ESTIMATOR")
+                .ok()
+                .and_then(|n| EstimatorKind::parse(&n))
+                .unwrap_or(EstimatorKind::ClassicV1);
+            let o = run(&Scenario {
+                network: network(csv),
+                profile: Profile::WIRELESS,
+                estimator,
+                start_bps: ContentPolicy::OFFICE.start_bps,
+                seed,
+                ..Scenario::new(name, workload())
+            })
+            .unwrap();
+            runs += 1;
+            freezes += o.freezes;
+            wait_sum += o.max_wait_ms;
+            wait_max = wait_max.max(o.max_wait_ms);
+            unsharp += u32::from(row(name, &o).contains("未清晰"));
+            let name = if seeds > 1 {
+                format!("{name}#{seed}")
+            } else {
+                name.to_owned()
+            };
+            let name = name.as_str();
+            for line in &o.trace {
+                eprintln!("{line}");
+            }
+            println!("{}", row(name, &o));
+            if std::env::var_os("PEERDESK_SAVE").is_some() {
+                peerdesk_e2e::report::save(std::path::Path::new("../../target/e2e-ms"), &o)
+                    .unwrap();
+            }
+            if std::env::var_os("PEERDESK_DETAIL").is_some() {
+                println!(
+                    "  网络丢 {}，排队丢 {}，跳过 {}，坏帧 {}，恢复 {}",
+                    o.net.lost, o.net.queue_dropped, o.skipped, o.bad, o.recoveries
+                );
+            }
         }
     }
+    println!(
+        "合计 {runs} 次：冻结 {freezes} 次，最长等待平均 {:.0} ms、最大 {wait_max:.0} ms，停下后没变清晰 {unsharp} 次",
+        wait_sum / f64::from(runs.max(1))
+    );
 }
 
 /// 回归门槛（每次 CI 都跑）：三条有代表性的真实轨迹，指标不许比上次收紧时的结果差（留两成余量）。
