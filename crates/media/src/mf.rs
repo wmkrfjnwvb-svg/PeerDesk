@@ -34,17 +34,18 @@ use windows::Win32::Graphics::Direct3D11::{
 use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter, IDXGIFactory1};
 use windows::Win32::Media::MediaFoundation::{
     eAVEncCommonRateControlMode_CBR, eAVEncH264VProfile_Base, eAVScenarioInfo_DisplayRemoting,
-    CODECAPI_AVDecVideoAcceleration_H264, CODECAPI_AVEncCommonMeanBitRate,
-    CODECAPI_AVEncCommonRateControlMode, CODECAPI_AVEncMPVDefaultBPictureCount,
-    CODECAPI_AVEncMPVGOPSize, CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVLowLatencyMode,
-    CODECAPI_AVScenarioInfo, ICodecAPI, IMFActivate, IMFMediaEventGenerator, IMFMediaType,
-    IMFSample, IMFTransform, METransformDrainComplete, METransformHaveOutput, METransformNeedInput,
-    MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video,
-    MFSampleExtension_CleanPoint, MFSampleExtension_Discontinuity, MFStartup, MFTEnumEx,
-    MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoInterlace_Progressive, MFSTARTUP_NOSOCKET,
-    MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER,
-    MFT_MESSAGE_COMMAND_DRAIN, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
-    MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
+    CODECAPI_AVDecVideoAcceleration_H264, CODECAPI_AVEncCommonBufferSize,
+    CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncCommonRateControlMode,
+    CODECAPI_AVEncMPVDefaultBPictureCount, CODECAPI_AVEncMPVGOPSize,
+    CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVLowLatencyMode, CODECAPI_AVScenarioInfo,
+    ICodecAPI, IMFActivate, IMFMediaEventGenerator, IMFMediaType, IMFSample, IMFTransform,
+    METransformDrainComplete, METransformHaveOutput, METransformNeedInput, MFCreateMediaType,
+    MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video, MFSampleExtension_CleanPoint,
+    MFSampleExtension_Discontinuity, MFStartup, MFTEnumEx, MFVideoFormat_H264, MFVideoFormat_NV12,
+    MFVideoInterlace_Progressive, MFSTARTUP_NOSOCKET, MFT_CATEGORY_VIDEO_ENCODER,
+    MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER, MFT_MESSAGE_COMMAND_DRAIN,
+    MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_OF_STREAM,
+    MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
     MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES, MFT_OUTPUT_STREAM_PROVIDES_SAMPLES,
     MFT_REGISTER_TYPE_INFO, MF_EVENT_FLAG_NO_WAIT, MF_E_NOTACCEPTING, MF_E_NO_EVENTS_AVAILABLE,
     MF_E_TRANSFORM_STREAM_CHANGE, MF_LOW_LATENCY, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE,
@@ -383,6 +384,12 @@ impl MfEncoder {
                     &CODECAPI_AVScenarioInfo,
                     &VARIANT::from(u32::try_from(eAVScenarioInfo_DisplayRemoting.0).unwrap_or(1)),
                 );
+                // 码控缓冲 100 ms（大帧规则，见 set_bitrate）：开编之前设，运行中改不改得动看编码器
+                let buffer = bps.saturating_mul(crate::BIG_FRAME_US) / 1_000_000;
+                let _ = c.SetValue(
+                    &CODECAPI_AVEncCommonBufferSize,
+                    &VARIANT::from(u32::try_from(buffer).unwrap_or(u32::MAX)),
+                );
             }
             let out = media_type(&MFVideoFormat_H264, width, height, fps)?;
             out.SetUINT32(&MF_MT_AVG_BITRATE, u32::try_from(bps).unwrap_or(u32::MAX))
@@ -466,6 +473,18 @@ impl MfEncoder {
             {
                 self.bps = bps;
             }
+            // 大帧规则（见 crate::BIG_FRAME_US）：码控缓冲只放 100 ms 按平均码率能发的量（一帧缓冲的码控，
+            // Sunshine 的 FFmpeg 路径 rc_buffer_size = 码率 / 帧率）。关键帧、整屏变化时编码器自己把 QP 提上去，
+            // 先发粗的、之后补清晰。不设时默认缓冲约 1 秒，窄带上一个关键帧能有几十 KB。
+            // 有的编码器运行中不接受改（文档没写是否动态），失败时保持原来的缓冲，不影响编码。
+            let buffer = bps.saturating_mul(crate::BIG_FRAME_US) / 1_000_000;
+            // SAFETY: 接口有效，VARIANT 是本地值。
+            let _ = unsafe {
+                c.SetValue(
+                    &CODECAPI_AVEncCommonBufferSize,
+                    &VARIANT::from(u32::try_from(buffer).unwrap_or(u32::MAX)),
+                )
+            };
         }
     }
 

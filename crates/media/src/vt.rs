@@ -734,16 +734,26 @@ impl VtEncoder {
         {
             self.bps = bps;
         }
-        // 和 WebRTC 一样：每秒最多平均码率的 1.5 倍（大帧不至于把链路塞爆）
+        // 两个限制（字节数、秒数成对）：
+        // - 和 WebRTC 一样，每秒最多平均码率的 1.5 倍（大帧不至于把链路塞爆）；
+        // - 大帧规则（见 crate::BIG_FRAME_US）：任意 100 ms 里不超过这 100 ms 按平均码率能发的量——
+        //   一帧缓冲的码控（Sunshine 的 NVENC 路径 vbvBufferSize = 码率 / 帧率）。关键帧、整屏变化时
+        //   VideoToolbox 自己把 QP 提上去，先发粗的、之后补清晰；只有 1 秒的限制时 400 kbps 上一个关键帧能有 70 KB。
         let bytes = number_i64(i64::try_from(bps.saturating_mul(3) / 16).unwrap_or(i64::MAX));
         let second = number_f64(1.0);
-        let values = [bytes.0, second.0];
-        // SAFETY: 数组在调用期间有效；数组持有两个数字；会话有效。
+        let window_us = crate::BIG_FRAME_US;
+        let window_bytes = number_i64(
+            i64::try_from(bps.saturating_mul(window_us) / 8_000_000).unwrap_or(i64::MAX),
+        );
+        let window =
+            number_f64(f64::from(u32::try_from(window_us).unwrap_or(u32::MAX)) / 1_000_000.0);
+        let values = [bytes.0, second.0, window_bytes.0, window.0];
+        // SAFETY: 数组在调用期间有效；数组持有四个数字（两对字节数、秒数）；会话有效。
         unsafe {
             let limits = Owned(CFArrayCreate(
                 std::ptr::null(),
                 values.as_ptr(),
-                2,
+                4,
                 std::ptr::addr_of!(kCFTypeArrayCallBacks).cast(),
             ));
             let _ = VTSessionSetProperty(

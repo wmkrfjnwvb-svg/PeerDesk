@@ -2343,6 +2343,60 @@ mod tests {
             .is_some());
     }
 
+    /// 实机（macOS VideoToolbox、Windows Media Foundation）：低码率下 720p 文字画面的关键帧要装进大帧规则的
+    /// 时限（[`BIG_FRAME_US`] 按码率能发的量），允许超出到 4 倍；同时打出高码率时的大小对照。
+    /// 硬件编码器靠码控缓冲（VideoToolbox 的 100 ms `DataRateLimits`、Media Foundation 的 `AVEncCommonBufferSize`）
+    /// 自己把 QP 提上去。没有硬件编码器（CI 的 Windows 虚拟机）时说明原因、跳过。
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn hardware_keyframe_fits_the_big_frame_window() {
+        // 白底、一行行“字”（深色小块）：接近真实的办公桌面
+        let mut screen = Screen::new(1280, 720, 0x00f0_f0f0);
+        for row in 0..40u16 {
+            for col in 0..150u16 {
+                if (u32::from(row) * 7 + u32::from(col) * 13) % 5 != 0 {
+                    screen.fill(20 + col * 8, 12 + row * 17, 5, 9, 0x0020_2020);
+                }
+            }
+        }
+        let (mut y, mut u, mut v, mut nv12) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let (w, _, pixels) = even_pixels(&screen);
+        color::rgb_to_i420(&pixels, w, &mut y, &mut u, &mut v);
+        color::i420_to_nv12(&y, &u, &v, &mut nv12);
+        let mut first_key = |bps: u64| -> Option<(String, usize)> {
+            let mut hw = match open_system_hardware(1280, 720, 30, bps) {
+                Ok(hw) => hw,
+                Err(why) => {
+                    eprintln!("没有硬件编码器，跳过：{why}");
+                    return None;
+                }
+            };
+            let mut got = Vec::new();
+            for i in 0..3 {
+                got.extend(hw.encode(&nv12, bps, i == 0).unwrap());
+            }
+            hw.drain().unwrap();
+            while let Some(frame) = hw.poll().unwrap() {
+                got.push(frame);
+            }
+            let (data, key) = got.first().expect("编码器一帧都没交出").clone();
+            assert!(key, "第一帧要是关键帧");
+            Some((hw.name().to_owned(), data.len()))
+        };
+        let Some((name, low)) = first_key(300_000) else {
+            return;
+        };
+        let high = first_key(20_000_000).map_or(0, |(_, b)| b);
+        let window = usize::try_from(300_000 * BIG_FRAME_US / 8_000_000).unwrap();
+        eprintln!(
+            "{name}：720p 文字画面关键帧 300 kbps 时 {low} 字节（100 ms 的量 {window} 字节），20 Mbps 时 {high} 字节"
+        );
+        assert!(
+            low <= window * 4,
+            "{name}：300 kbps 时关键帧 {low} 字节，超过 100 ms 的量 {window} 的 4 倍"
+        );
+    }
+
     /// Windows 实机：系统 H.264 解码器解 OpenH264 的码流（验证 NV12 读取、对齐裁剪、颜色），
     /// 连着解几帧；尺寸不是 16 的倍数（360 行 → 解码器输出 368 行）。打不开时要给出原因。
     #[cfg(windows)]
