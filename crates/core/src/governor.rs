@@ -36,6 +36,8 @@ pub struct FpsGovernor {
     last_frame: Option<Time>,
     /// 正在编的这一帧什么时候开始的（[`Self::on_start`]）。
     frame_start: Option<Time>,
+    /// 从什么时候起帧率已经在最低档、编出来的帧还是装不进预算（再往下只能降分辨率，见 [`Self::overflowing_for`]）。
+    overflow_since: Option<Time>,
     /// 最近一次换档的说明（诊断日志用，取走后清空）。
     change: Option<String>,
 }
@@ -52,6 +54,7 @@ impl FpsGovernor {
             calm_since: None,
             last_frame: None,
             frame_start: None,
+            overflow_since: None,
             change: None,
         }
     }
@@ -86,6 +89,12 @@ impl FpsGovernor {
         let interval = 1_000_000 / u64::from(self.fps);
         let cpu_busy = encode_us.saturating_mul(1000) > interval.saturating_mul(CPU_BUSY_PERMILLE);
         let over = budget > 0 && size > budget.saturating_mul(OVER_BUDGET_TIMES);
+        // 帧率到底了还装不进：记下从什么时候开始的（适配处理器据此决定是否降分辨率）
+        if over && self.at_floor() {
+            self.overflow_since.get_or_insert(now);
+        } else if !over {
+            self.overflow_since = None;
+        }
         let easy = encode_us.saturating_mul(1000) < interval.saturating_mul(CPU_EASY_PERMILLE)
             && size <= budget;
         if cpu_busy || over {
@@ -132,6 +141,23 @@ impl FpsGovernor {
         self.fps
     }
 
+    /// 帧率是不是已经在最低档。
+    #[must_use]
+    pub fn at_floor(&self) -> bool {
+        self.step(false) == self.fps
+    }
+
+    /// 帧率已经在最低档、帧还一直装不进预算多久了（微秒）；不是这种情况为 0。
+    #[must_use]
+    pub fn overflowing_for(&self, now: Time) -> u64 {
+        self.overflow_since.map_or(0, |t| now.since(t))
+    }
+
+    /// 已经按“装不进”采取了措施（降了分辨率）：重新计时。
+    pub const fn reset_overflow(&mut self) {
+        self.overflow_since = None;
+    }
+
     /// 取走最近一次换档的说明（诊断日志用）。
     pub fn take_change(&mut self) -> Option<String> {
         self.change.take()
@@ -152,6 +178,32 @@ impl FpsGovernor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overflow_at_the_floor_is_timed_for_the_resolution_decision() {
+        let mut g = FpsGovernor::new(30);
+        let mut t = Time::ZERO;
+        // 一直装不进：一档档降到最低（5 帧），降到底之前不计时
+        while !g.at_floor() {
+            assert_eq!(g.overflowing_for(t), 0);
+            t = t.plus(100_000);
+            g.on_frame(t, 1_000, 10_000, 1_000);
+        }
+        assert_eq!(g.fps(), 5);
+        t = t.plus(200_000);
+        g.on_frame(t, 1_000, 10_000, 1_000);
+        let since = t;
+        t = t.plus(1_000_000);
+        g.on_frame(t, 1_000, 10_000, 1_000);
+        assert_eq!(g.overflowing_for(t), t.since(since));
+        // 有一帧装得下：重新计时
+        g.on_frame(t.plus(200_000), 1_000, 500, 1_000);
+        assert_eq!(g.overflowing_for(t.plus(300_000)), 0);
+        g.on_frame(t.plus(400_000), 1_000, 10_000, 1_000);
+        assert!(g.overflowing_for(t.plus(500_000)) > 0);
+        g.reset_overflow();
+        assert_eq!(g.overflowing_for(t.plus(500_000)), 0);
+    }
 
     #[test]
     fn frame_interval_counts_from_when_the_frame_started() {

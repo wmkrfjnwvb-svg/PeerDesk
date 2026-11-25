@@ -40,6 +40,8 @@ pub struct ScalePolicy {
     since: Option<Time>,
     /// 画面上一次变化的时间（不是编帧的时间：窄带宽上画面在变时也会因为在途上限、降帧率而一阵子不编帧）。
     last_change: Option<Time>,
+    /// 因为“帧率到底了还装不进”降下来的（[`Self::down`]）：画面停下之前不按估计升回去，免得来回切。
+    held: bool,
 }
 
 impl Default for ScalePolicy {
@@ -58,6 +60,7 @@ impl ScalePolicy {
             delivered_bps: None,
             since: None,
             last_change: None,
+            held: false,
         }
     }
 
@@ -70,6 +73,7 @@ impl ScalePolicy {
             delivered_bps: None,
             since: None,
             last_change: None,
+            held: false,
         }
     }
 
@@ -96,9 +100,10 @@ impl ScalePolicy {
     /// （没送到之前不知道链路真实的速度，也不能再塞一个大关键帧）。
     pub fn decide(&mut self, now: Time, rate_bps: u64, key_pending: bool) -> u16 {
         self.since.get_or_insert(now);
-        if self
-            .full_transfer_us(rate_bps, key_pending)
-            .is_some_and(|t| t <= UP_WITHIN_US)
+        if !self.held
+            && self
+                .full_transfer_us(rate_bps, key_pending)
+                .is_some_and(|t| t <= UP_WITHIN_US)
         {
             self.permille = FULL_PERMILLE;
             self.since = Some(now);
@@ -124,9 +129,24 @@ impl ScalePolicy {
         {
             self.permille = FULL_PERMILLE;
             self.since = Some(now);
+            self.held = false;
             return true;
         }
         false
+    }
+
+    /// 最后手段：帧率已经降到最低、画面还是装不进预算，原尺寸降到 [`START_PERMILLE`]（CLAUDE.md：
+    /// 降级顺序画质 → 帧率 → 分辨率，降分辨率是最后手段、先接后断——接收端一直显示旧画面，
+    /// 新尺寸的关键帧到了才换）。画面停下后由 [`Self::on_idle`] 升回原尺寸、补清晰。
+    /// 返回是否真的降了（已经不是原尺寸时不再降）。
+    pub fn down(&mut self, now: Time) -> bool {
+        if self.permille < FULL_PERMILLE {
+            return false;
+        }
+        self.permille = START_PERMILLE;
+        self.since = Some(now);
+        self.held = true;
+        true
     }
 
     /// 推算按原尺寸出关键帧要传多久（微秒）。已经是原尺寸、有关键帧没送到、还没有这个比例的关键帧时为 `None`。
@@ -274,6 +294,23 @@ mod tests {
         assert!(p.on_idle(Time(700_000), 400_000, false));
         assert_eq!(p.permille(), FULL_PERMILLE);
         assert!(!p.on_idle(Time(2_000_000), 400_000, false), "已经是原尺寸");
+    }
+
+    #[test]
+    fn last_resort_down_holds_until_the_screen_stops() {
+        let mut p = ScalePolicy::full();
+        assert!(p.down(Time(0)));
+        assert_eq!(p.permille(), START_PERMILLE);
+        assert!(!p.down(Time(1)), "已经降过了");
+        // 画面还在变：哪怕估计原尺寸关键帧送得完，也不按估计升回去（免得来回切）
+        p.on_keyframe(START_PERMILLE, 1_000);
+        p.on_key_delivered(10_000);
+        p.on_change(Time(10_000));
+        assert_eq!(p.decide(Time(20_000), 10_000_000, false), START_PERMILLE);
+        // 画面停下：升回原尺寸，之后照常
+        assert!(p.on_idle(Time(600_000), 10_000_000, false));
+        assert_eq!(p.permille(), FULL_PERMILLE);
+        assert!(p.down(Time(700_000)));
     }
 
     #[test]

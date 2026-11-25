@@ -291,6 +291,9 @@ fn prepare(encoder: &mut dyn VideoEncoder, job: &FrameJob) {
     encoder.set_view(job.view);
 }
 
+/// 帧率已经在最低档、帧还一直装不进预算这么久（微秒）就降分辨率（最后手段）。
+const OVERFLOW_DOWN_US: u64 = 2_000_000;
+
 /// 画面发送端。
 ///
 /// 两种用法：
@@ -744,6 +747,19 @@ impl MediaSender {
             .on_frame(now, encode_us, encoded.payload.len(), job.budget);
         if let Some(change) = self.governor.take_change() {
             self.event(change);
+        }
+        // 适配的最后一步：帧率已经到底、一直装不进预算 → 降分辨率（画面停下后升回、补清晰）
+        if self.governor.overflowing_for(now) >= OVERFLOW_DOWN_US && self.scale.down(now) {
+            self.governor.reset_overflow();
+            self.event(format!(
+                "编码分辨率 1000‰ → {}‰：帧率已经降到最低（{} 帧），画面还是装不进预算 {} 秒（这帧 {} 字节，预算 {}）；\
+                 降分辨率是最后手段，画面停下后升回原尺寸",
+                self.scale.permille(),
+                self.governor.fps(),
+                OVERFLOW_DOWN_US / 1_000_000,
+                encoded.payload.len(),
+                job.budget
+            ));
         }
         if encoded.key {
             self.key_sent = Some((job.frame_id, now));
