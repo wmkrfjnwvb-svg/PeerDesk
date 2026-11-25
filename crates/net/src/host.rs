@@ -416,6 +416,8 @@ pub async fn serve(
     );
     crate::note!(info, "内容策略：{}", opts.policy.name);
     media.set_reports(caps.has(Caps::TRANSPORT_CC));
+    // 画面静止时定期探测链路（对端能测填充包的包串速率时）
+    media.set_idle_probe(caps.has(Caps::PROBE_TRAIN));
     // 双方都支持 RS 纠错时用它（老版本只认异或）
     media.set_fec(if caps.has(Caps::FEC_RS) {
         Fec::Rs

@@ -298,6 +298,15 @@ fn prepare(encoder: &mut dyn VideoEncoder, job: &FrameJob) {
     encoder.set_rate_stale(job.rate_stale);
 }
 
+/// 静止时的探测（见 [`MediaSender::set_idle_probe`]）：停下多久之后第一次探（微秒），之后间隔翻倍，最长这么久。
+const IDLE_PROBE_FIRST_US: u64 = 2_000_000;
+const IDLE_PROBE_MAX_GAP_US: u64 = 30_000_000;
+/// 一次探测几个包（每个约 1200 字节）、按当前码率的几倍发（能测到这么高的容量）。
+const IDLE_PROBE_PACKETS: u32 = 8;
+const IDLE_PROBE_SCALE: u64 = 4;
+/// 静止探测的组号从这里起（和网络控制器的探测组号分开）。
+const IDLE_PROBE_ID_BASE: u32 = 0x8000_0000;
+
 /// 帧率已经在最低档、帧还一直装不进预算这么久（微秒）就降分辨率（最后手段）。
 const OVERFLOW_DOWN_US: u64 = 2_000_000;
 
@@ -352,6 +361,13 @@ pub struct MediaSender {
     events: Vec<String>,
     /// 用到达报告（双方都支持、估计器要它）。
     reports: bool,
+    /// 静止时探测（见 [`Self::set_idle_probe`]）：下一次探测的时刻、到下一次的间隔、等结果的那一组。
+    idle_probe: bool,
+    next_probe: Option<Time>,
+    probe_gap: u64,
+    probing: Option<u32>,
+    probes: u32,
+    pending_probe: Option<ProbeCluster>,
     /// 发出的包，等到达报告对账（见 [`crate::cc::report`]）。
     history: SendHistory,
 }
@@ -408,6 +424,12 @@ impl MediaSender {
             view: None,
             events: Vec::new(),
             reports: false,
+            idle_probe: false,
+            next_probe: None,
+            probe_gap: IDLE_PROBE_FIRST_US.saturating_mul(2),
+            probing: None,
+            probes: 0,
+            pending_probe: None,
             history: SendHistory::new(),
             scale: if codec == Codec::H264 {
                 ScalePolicy::new()
@@ -473,15 +495,42 @@ impl MediaSender {
         if self.reports {
             self.rate.on_tick(now);
         }
+        if self.idle_probe && self.next_probe.is_some_and(|t| now >= t) {
+            self.probes = self.probes.wrapping_add(1);
+            let id = IDLE_PROBE_ID_BASE | (self.probes & !IDLE_PROBE_ID_BASE);
+            self.pending_probe = Some(ProbeCluster {
+                id,
+                target_bps: self
+                    .rate
+                    .rate_bps()
+                    .saturating_mul(IDLE_PROBE_SCALE)
+                    .clamp(self.cfg.min_bps, self.cfg.max_bps),
+                packets: IDLE_PROBE_PACKETS,
+            });
+            self.probing = Some(id);
+            self.next_probe = Some(now.plus(self.probe_gap));
+            self.probe_gap = self.probe_gap.saturating_mul(2).min(IDLE_PROBE_MAX_GAP_US);
+        }
+    }
+
+    /// 画面静止时定期探测链路（对端支持 [`crate::proto::Caps::PROBE_TRAIN`]、估计器要时打开）：停下 2 秒后
+    /// 发一组几个填充包，之后间隔翻倍（4、8、16 秒），最长 30 秒一次。接收端测包串速率随反馈带回，链路明显变差时
+    /// 按它降码率。2 秒而不是 1 秒：操作之间停 1 秒很常见，那时探测只有扰动（微软轨迹 ms-05729 最长卡顿 304 → 496 ms，
+    /// 一次也没触发降码率）；2 秒时 8 条轨迹和不探测逐项相同，e2e drop-while-idle 最长等待 820 → 651 ms。
+    /// 为什么：经典算法只靠视频帧测容量，静止时链路变差了不知道，一动就按老码率编大帧（e2e drop-while-idle：
+    /// 20 → 2 Mbps 时切窗口的帧 222 KB、等了 1.2 秒）。WebRTC 应用受限时每 5 秒探一次；这里开头密、之后退避，
+    /// 一小时的静止约 1 MB（中继流量是成本）。
+    pub fn set_idle_probe(&mut self, on: bool) {
+        self.idle_probe = on && self.rate.wants_idle_probe();
     }
 
     /// 取走要发的探测组（交给节奏器）。
     pub fn take_probes(&mut self) -> Vec<ProbeCluster> {
+        let mut out: Vec<ProbeCluster> = self.pending_probe.take().into_iter().collect();
         if self.reports {
-            self.rate.take_probes()
-        } else {
-            Vec::new()
+            out.extend(self.rate.take_probes());
         }
+        out
     }
 
     /// 节奏器的发送速率：网络控制器给的（目标的 1.1 倍）；老的估计器按老规则（`legacy_pacing` 是
@@ -766,6 +815,10 @@ impl MediaSender {
         let Some(encoded) = encoded else {
             return Ok(Vec::new());
         };
+        // 发了一帧：静止探测从头排（停下 2 秒后第一次），之前那一组的结果不再认（包串速率可能是这一帧的）
+        self.next_probe = Some(now.plus(IDLE_PROBE_FIRST_US));
+        self.probe_gap = IDLE_PROBE_FIRST_US.saturating_mul(2);
+        self.probing = None;
         self.governor.on_frame(
             now,
             encode_us,
@@ -1020,6 +1073,24 @@ impl MediaSender {
             rtt_us: self.rtt_us,
             in_flight: self.in_flight(),
         };
+        // 静止时的探测有了结果（探测之后没发过帧：这个包串速率就是探测组的）
+        if self
+            .probing
+            .take_if(|_| ext.train_bytes_per_s > 0)
+            .is_some()
+        {
+            let capacity = u64::from(ext.train_bytes_per_s).saturating_mul(8);
+            let from = self.rate.rate_bps();
+            self.rate.on_idle_probe(now, capacity);
+            if self.rate.rate_bps() != from {
+                self.event(format!(
+                    "码率 {} → {} kbps：画面静止时探测测得链路容量 {} kbps",
+                    from / 1000,
+                    self.rate.rate_bps() / 1000,
+                    capacity / 1000
+                ));
+            }
+        }
         self.rate.on_observation(now, &obs);
         let delivered_bps = u64::from(feedback.recv_bytes_per_s).saturating_mul(8);
         if ext.train_bytes_per_s > 0 || delivered_bps.saturating_mul(2) >= self.rate.rate_bps() {
@@ -2142,6 +2213,74 @@ mod tests {
                 .pixels()[0],
             6
         );
+    }
+
+    #[test]
+    fn idle_probes_back_off_and_their_result_sets_the_rate() {
+        let mut tx = MediaSender::new(cfg(), Box::new(FakeEncoder::default()));
+        tx.set_idle_probe(true);
+        // 还没发过帧：不探
+        tx.on_tick(Time(5_000_000));
+        assert!(tx.take_probes().is_empty());
+        let screen = Screen::new(64, 64, 1);
+        assert!(!tx
+            .on_frame(Time(0), &screen, true, 10_000)
+            .unwrap()
+            .is_empty());
+        // 停下不到 2 秒不探；2 秒探第一次（按码率的 4 倍发）
+        tx.on_tick(Time(1_900_000));
+        assert!(tx.take_probes().is_empty());
+        tx.on_tick(Time(2_000_000));
+        let first = tx.take_probes();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].id, IDLE_PROBE_ID_BASE | 1);
+        assert_eq!(
+            first[0].target_bps,
+            (tx.rate_bps() * IDLE_PROBE_SCALE).min(cfg().max_bps)
+        );
+        // 结果：测得 320 kbps（不到起步码率 1 Mbps 的一半）→ 码率按它降，写明原因
+        tx.observe(
+            Time(2_050_000),
+            &Feedback::default(),
+            Extension {
+                train_bytes_per_s: 40_000,
+                ..Extension::default()
+            },
+        );
+        assert_eq!(tx.rate_bps(), 288_000);
+        assert!(tx.take_events().iter().any(|e| e.contains("静止时探测")));
+        // 间隔翻倍：下一次在 4 秒后，再下一次 8 秒后
+        tx.on_tick(Time(5_900_000));
+        assert!(tx.take_probes().is_empty());
+        tx.on_tick(Time(6_000_000));
+        assert_eq!(tx.take_probes().len(), 1);
+        tx.on_tick(Time(13_900_000));
+        assert!(tx.take_probes().is_empty());
+        tx.on_tick(Time(14_000_000));
+        assert_eq!(tx.take_probes().len(), 1);
+        // 发了帧：从头排；探测之后发过帧，之后的包串速率不算探测结果
+        tx.on_frame(Time(14_100_000), &Screen::new(64, 64, 2), true, 10_000)
+            .unwrap();
+        let rate = tx.rate_bps();
+        tx.observe(
+            Time(14_200_000),
+            &Feedback::default(),
+            Extension {
+                train_bytes_per_s: 10_000,
+                ..Extension::default()
+            },
+        );
+        assert_eq!(tx.rate_bps(), rate);
+        tx.on_tick(Time(16_000_000));
+        assert!(tx.take_probes().is_empty());
+        tx.on_tick(Time(16_100_000));
+        assert_eq!(tx.take_probes().len(), 1);
+        // 对端不支持：不探
+        let mut off = MediaSender::new(cfg(), Box::new(FakeEncoder::default()));
+        off.set_idle_probe(false);
+        off.on_frame(Time(0), &screen, true, 10_000).unwrap();
+        off.on_tick(Time(5_000_000));
+        assert!(off.take_probes().is_empty());
     }
 
     #[test]

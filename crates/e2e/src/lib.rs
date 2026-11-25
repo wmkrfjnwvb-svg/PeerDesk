@@ -402,6 +402,8 @@ pub fn run(s: &Scenario) -> Result<Outcome, Error> {
     // 网络控制器要到达报告时两端都打开（产品里由握手的 TRANSPORT_CC 决定）
     tx.set_reports(true);
     rx.set_reports(tx.reports());
+    // 静止时探测（产品里由握手的 PROBE_TRAIN 决定；新版本之间都打开）
+    tx.set_idle_probe(true);
     let mut net: Net<Vec<u8>> = Net::new(s.seed);
     let mut network = s.network.clone();
     network.sort_by_key(|(t, _)| *t);

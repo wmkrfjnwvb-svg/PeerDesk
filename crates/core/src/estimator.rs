@@ -307,6 +307,15 @@ pub trait RateEstimator: Send + std::fmt::Debug {
         Vec::new()
     }
 
+    /// 画面静止时要不要定期探测链路（见 [`crate::media::MediaSender::set_idle_probe`]）。经典算法要：
+    /// 它只靠视频帧的包串测容量，静止时没有帧就不知道链路变了。网络控制器（gcc）有自己的应用受限探测。
+    fn wants_idle_probe(&self) -> bool {
+        false
+    }
+
+    /// 静止时的探测测得链路容量 `capacity_bps`：按它调码率（链路在静止时变差就降下来，变好就升上去）。
+    fn on_idle_probe(&mut self, _now: Time, _capacity_bps: u64) {}
+
     /// 一行状态（诊断日志用）。
     fn state_line(&self) -> Option<String> {
         None
@@ -556,6 +565,31 @@ impl ClassicV1 {
 impl RateEstimator for ClassicV1 {
     fn name(&self) -> &'static str {
         "classic-v1"
+    }
+
+    fn wants_idle_probe(&self) -> bool {
+        true
+    }
+
+    fn on_idle_probe(&mut self, now: Time, capacity_bps: u64) {
+        self.capacity = Some((capacity_bps, now));
+        let from = self.rate_bps;
+        // 只降、而且要明显低（不到当前码率的一半）才降：链路在静止时变差了，下一帧要按它编。不按它升：
+        // 几个包测的包串在波动、有丢包的链路上有噪声，按它升码率实测更卡（微软轨迹 ms-05729 卡顿 7 → 13 次）；
+        // 升交给有真实流量时的正常爬升（WebRTC 也是靠延迟信号降，探测只用来往上试）。
+        let target = capacity_bps.saturating_mul(u64::from(self.profile.safety_permille)) / 1000;
+        if target.saturating_mul(2) < from {
+            self.rate_bps = target.clamp(self.min_bps, self.max_bps);
+        }
+        if self.rate_bps != from && self.notes.len() < MAX_NOTES {
+            self.notes.push(format!(
+                "码率 {} → {} kbps：静止时探测测得容量 {} kbps",
+                from / 1000,
+                self.rate_bps / 1000,
+                capacity_bps / 1000
+            ));
+            self.noted_bps = self.rate_bps;
+        }
     }
 
     fn rate_bps(&self) -> u64 {
@@ -818,6 +852,30 @@ mod tests {
         assert_eq!(m.report().train_bytes_per_s, 0);
         // 探测包不进延迟趋势
         assert_eq!(m.report().groups, 0);
+    }
+
+    #[test]
+    fn an_idle_probe_moves_the_rate_to_the_measured_capacity() {
+        let mut v = ClassicV1::new(Profile::STABLE, 17_000_000, 100_000, 30_000_000);
+        assert!(v.wants_idle_probe());
+        // 静止时链路降到 2 Mbps：直接降到它的九成
+        v.on_idle_probe(Time(0), 2_000_000);
+        assert_eq!(v.rate_bps(), 1_800_000);
+        assert!(v.take_notes().iter().any(|n| n.contains("静止时探测")));
+        // 变好了（测得 20 Mbps）：不按它升（升交给有真实流量时的爬升）
+        v.on_idle_probe(Time(1), 20_000_000);
+        assert_eq!(v.rate_bps(), 1_800_000);
+        // 只低一点（不到一半才降）：不动，不写说明
+        let mut same = ClassicV1::new(Profile::STABLE, 1_500_000, 100_000, 30_000_000);
+        same.on_idle_probe(Time(0), 1_000_000);
+        assert_eq!(same.rate_bps(), 1_500_000);
+        assert!(same.take_notes().is_empty());
+        // 老的估计器不做
+        let mut legacy =
+            EstimatorKind::Legacy.build(Profile::STABLE, 4_000_000, 100_000, 30_000_000);
+        assert!(!legacy.wants_idle_probe());
+        legacy.on_idle_probe(Time(0), 1);
+        assert_eq!(legacy.rate_bps(), 4_000_000);
     }
 
     #[test]

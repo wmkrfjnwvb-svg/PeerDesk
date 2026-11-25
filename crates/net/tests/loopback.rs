@@ -19,6 +19,27 @@ use peerdesk_net::host::{self, HostOptions, InputSink};
 use peerdesk_net::{bench, Identity, Link, NetError, Node};
 use tokio::sync::mpsc;
 
+/// 测试失败时看得到会话日志（编码器换了哪个、出了什么帧）：日志写到 stderr，测试框架只在失败时打出来。
+struct StderrLog;
+
+impl log::Log for StderrLog {
+    fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+        true
+    }
+    fn log(&self, record: &log::Record<'_>) {
+        eprintln!("{} {}", record.level(), record.args());
+    }
+    fn flush(&self) {}
+}
+
+static LOG: StderrLog = StderrLog;
+
+fn show_logs() {
+    if log::set_logger(&LOG).is_ok() {
+        log::set_max_level(log::LevelFilter::Info);
+    }
+}
+
 fn any() -> SocketAddr {
     ([127, 0, 0, 1], 0).into()
 }
@@ -84,6 +105,7 @@ async fn links(p: &Pair) -> (Link, Link) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn full_session_video_input_and_files() {
+    show_logs();
     let policy = Policy::recommended();
     let p = pair(&policy, &policy);
     let (host_link, ctrl_link) = links(&p).await;
@@ -175,7 +197,12 @@ async fn full_session_video_input_and_files() {
     assert_eq!(host_report.end, "对端结束会话");
 
     // 画面：H.264 是有损的，观看端最终看到的与被控端的桌面在亮度上足够接近
-    let seen = report.screen.clone().unwrap();
+    let seen = report.screen.clone().unwrap_or_else(|| {
+        panic!(
+            "没有画面：送达 {}；被控端发出 {} 帧、{} 字节",
+            report.frames_delivered, host_report.frames_sent, host_report.video_bytes
+        )
+    });
     assert_eq!((seen.width(), seen.height()), (640, 360));
     let psnr = luma_psnr(&seen, &mirror.lock().unwrap());
     // 这里只验证链路：内容对上了就行。CPU 很忙时（调试构建、并行测试）反馈会迟到，
@@ -822,6 +849,7 @@ impl host::ScreenSource for GpuSource {
 /// （这里没有硬件编码器：软件编码读回一次 NV12），控制端看到原尺寸的画面。
 #[tokio::test(flavor = "multi_thread")]
 async fn gpu_frames_are_captured_at_the_encode_size() {
+    show_logs();
     let policy = Policy::recommended();
     let p = pair(&policy, &policy);
     let (host_link, ctrl_link) = links(&p).await;
@@ -858,11 +886,18 @@ async fn gpu_frames_are_captured_at_the_encode_size() {
     )
     .await
     .unwrap();
-    let _ = host_task.await.unwrap().unwrap();
+    let host_report = host_task.await.unwrap().unwrap();
     let asked = targets.lock().unwrap().clone();
     assert_eq!(asked.first(), Some(&(320, 180)), "开始半分辨率：{asked:?}");
     assert!(asked.contains(&(640, 360)), "之后原尺寸：{asked:?}");
-    assert!(report.frames_delivered > 5, "{}", report.frames_delivered);
+    assert!(
+        report.frames_delivered > 5,
+        "送达 {}；被控端发出 {} 帧、{} 字节，结束：{}",
+        report.frames_delivered,
+        host_report.frames_sent,
+        host_report.video_bytes,
+        host_report.end
+    );
     let seen = report.screen.unwrap();
     assert_eq!((seen.width(), seen.height()), (640, 360));
 }
