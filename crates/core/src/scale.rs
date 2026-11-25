@@ -26,7 +26,15 @@ pub const UP_WITHIN_US: u64 = 650_000;
 /// 画面停下这么久之后（微秒），可以在后台慢慢送原尺寸的关键帧：画面本来就不动，慢一点不造成卡顿。
 pub const IDLE_AFTER_US: u64 = 500_000;
 /// 画面停下时：原尺寸关键帧在这么长时间内送得完就升（微秒）。“静止后必须补清晰”，半分辨率的字看不清。
+/// 只在停够 [`LONG_IDLE_US`]（在看内容）时允许这么长；操作之间的短暂停顿用 [`QUICK_IDLE_UP_WITHIN_US`]。
 pub const IDLE_UP_WITHIN_US: u64 = 5_000_000;
+/// 停了这么久（微秒）算在看内容：升回原尺寸的关键帧可以慢慢送。
+pub const LONG_IDLE_US: u64 = 3_000_000;
+/// 短暂停顿时：原尺寸关键帧要在这么长时间内送得完才升（微秒）。停 1 秒就接着操作很常见，升级关键帧
+/// 没送完，下一次操作的帧只能排在它后面：微软轨迹 ms-09261（约 340 kbps）上打字等了 1019 ms。
+/// 5 秒 → 1.5 秒：8 条轨迹卡顿 61 → 45 次、最长卡顿平均 836 → 452 ms（ms-02626 7 次 → 0、ms-09261 13 次 → 2），
+/// 代价是极窄链路上短暂停顿时字留在半分辨率（这三条停下后最差 PSNR 低 1–2 dB，本来也都没补清晰）。
+pub const QUICK_IDLE_UP_WITHIN_US: u64 = 1_500_000;
 
 /// 编码分辨率的决定。不做 IO，时间由调用方传入。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,13 +127,16 @@ impl ScalePolicy {
     /// 画面停下时调用（例如每次收到反馈）：停够了、原尺寸关键帧也送得完，就升回原尺寸。
     /// 返回真表示要编一帧（调用方让编码器出原尺寸的关键帧）。
     pub fn on_idle(&mut self, now: Time, rate_bps: u64, key_pending: bool) -> bool {
-        let idle = self
-            .last_change
-            .is_some_and(|t| now.since(t) >= IDLE_AFTER_US);
-        if idle
+        let still = self.last_change.map(|t| now.since(t));
+        let within = if still.is_some_and(|t| t >= LONG_IDLE_US) {
+            IDLE_UP_WITHIN_US
+        } else {
+            QUICK_IDLE_UP_WITHIN_US
+        };
+        if still.is_some_and(|t| t >= IDLE_AFTER_US)
             && self
                 .full_transfer_us(rate_bps, key_pending)
-                .is_some_and(|t| t <= IDLE_UP_WITHIN_US)
+                .is_some_and(|t| t <= within)
         {
             self.permille = FULL_PERMILLE;
             self.since = Some(now);
@@ -290,10 +301,19 @@ mod tests {
         assert_eq!(p.decide(Time(100_000), 400_000, false), START_PERMILLE);
         assert!(!p.on_idle(Time(300_000), 400_000, false), "停得还不够久");
         assert!(!p.on_idle(Time(700_000), 400_000, true), "关键帧还没送到");
-        assert!(!p.on_idle(Time(700_000), 100_000, false), "10 秒送不完");
-        assert!(p.on_idle(Time(700_000), 400_000, false));
+        // 短暂停顿：要 2.4 秒的关键帧不升（接着操作的帧会排在它后面），1.5 秒内送得完的才升
+        assert!(!p.on_idle(Time(700_000), 400_000, false), "短暂停顿");
+        let mut quick = p.clone();
+        quick.on_key_delivered(200_000);
+        assert!(quick.on_idle(Time(700_000), 1_000_000, false), "1 秒送得完");
+        // 停够 3 秒（在看内容）：5 秒内送得完就升；10 秒的不升
+        assert!(
+            !p.on_idle(Time(LONG_IDLE_US), 100_000, false),
+            "10 秒送不完"
+        );
+        assert!(p.on_idle(Time(LONG_IDLE_US), 400_000, false));
         assert_eq!(p.permille(), FULL_PERMILLE);
-        assert!(!p.on_idle(Time(2_000_000), 400_000, false), "已经是原尺寸");
+        assert!(!p.on_idle(Time(4_000_000), 400_000, false), "已经是原尺寸");
     }
 
     #[test]
