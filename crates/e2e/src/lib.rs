@@ -630,7 +630,14 @@ pub fn run(s: &Scenario) -> Result<Outcome, Error> {
                         .unwrap_or(now);
                     acc.latencies.push(now.since(at));
                     acc.shown += 1;
-                    if let Some(since) = waiting_since.take() {
+                    // 等待到“包含这次变化的画面”显示出来才算结束：采集时间早于变化的帧（例如变化之前编的补清晰帧
+                    // 还在路上）显示出来时，用户看到的还是旧画面。以前任何一帧显示就算结束，切换窗口时一个 100 KB 的帧
+                    // 要传 700 ms，前面一个补清晰帧先到，就只记了 169 ms（2026-11 微软轨迹 ms-09401 实测）。
+                    let done = waiting_since.filter(|since| at >= *since);
+                    if done.is_some() {
+                        waiting_since = None;
+                    }
+                    if let Some(since) = done {
                         let wait = now.since(since);
                         // 第一幅画面单独记（会话开始时的等待），不算卡顿。
                         if first_picture.is_none() {
