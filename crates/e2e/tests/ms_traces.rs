@@ -179,51 +179,57 @@ fn microsoft_traces() {
     );
 }
 
-/// 回归门槛（每次 CI 都跑）：三条有代表性的真实轨迹，指标不许比上次收紧时的结果差（留两成余量）。
-/// 数字只升不降：改进之后把门槛收紧。
+/// 回归门槛（每次 CI 都跑）：三条有代表性的真实轨迹，每条用 3 个随机种子各跑一遍，按合计判断
+/// （单个种子的结果对时序很敏感，同一条轨迹换个种子卡顿能差几倍，见 `docs/research/L-framework.md` 6.2）。
+/// 指标不许比收紧时的结果差（留两成余量）。数字只升不降：改进之后把门槛收紧。
 #[test]
 fn microsoft_traces_do_not_regress() {
-    // (轨迹, 冻结次数上限, 最长等待上限 ms, 首帧上限 ms)。发布构建（CI 的端到端任务，720p）和调试构建
-    // （覆盖率任务，画面 480×272，数字不一样）各有一套，都按各自的实测值留两成余量。
-    // 2026-11-25 收紧（软件编码改成逐帧 QP 控制、大帧规则 100 ms 之后）
+    // (轨迹, 3 次冻结合计上限, 3 次最长等待的平均上限 ms, 首帧上限 ms)。发布构建（CI 的端到端任务，720p）和
+    // 调试构建（覆盖率任务，画面 480×272，数字不一样）各有一套。
+    // 2026-11-25 按改正后的等待统计（显示出包含变化的画面才算等完）重定，取补清晰上限前后两次实测里更严的那个加两成。
     let gates = if cfg!(debug_assertions) {
         [
-            ("ms-09401", 2, 260.0, 100.0),  // 实测 1 次 / 215 ms / 82 ms
-            ("ms-02560", 2, 310.0, 45.0),   // 实测 1 次 / 255 ms / 34 ms
-            ("ms-05729", 16, 420.0, 100.0), // 实测 14 次 / 351 ms / 84 ms（冻结次数沿用原门槛，不放宽）
+            ("ms-09401", 4, 252.0, 99.0),   // 实测 3 次 / 210 ms / 82 ms
+            ("ms-02560", 4, 267.0, 41.0),   // 实测 3 次 / 222 ms / 34 ms
+            ("ms-05729", 22, 468.0, 101.0), // 实测 18 次 / 390 ms / 84 ms
         ]
     } else {
         [
-            ("ms-09401", 4, 550.0, 130.0), // 0.5–1.5 Mbps 变化：实测 3 次 / 457 ms / 107 ms（原 4 / 1519 / 526）
-            ("ms-02560", 11, 350.0, 45.0), // 8 Mbps、12% 丢包：实测 9 次 / 290 ms / 36 ms（原 19 / 322 / 66）
-            ("ms-05729", 9, 370.0, 135.0), // 1 Mbps、20% 丢包：实测 7 次 / 304 ms / 110 ms（原 13 / 1531 / 558）
+            ("ms-09401", 12, 892.0, 128.0), // 0.5–1.5 Mbps 变化：实测 10 次 / 743 ms / 107 ms（补清晰上限前 20 次 / 780 ms）
+            ("ms-02560", 2, 257.0, 45.0),   // 8 Mbps、12% 丢包：实测 1 次 / 214 ms / 37 ms
+            ("ms-05729", 54, 1086.0, 132.0), // 1 Mbps、20% 丢包：实测 52 次 / 905 ms / 110 ms（补清晰上限前 45 次 / 929 ms）
         ]
     };
-    for (name, freezes, max_wait, first) in gates {
+    for (name, freezes, mean_wait, first) in gates {
         let csv = TRACES.iter().find(|(n, _)| *n == name).unwrap().1;
-        let o = run(&Scenario {
-            network: network(csv),
-            profile: Profile::WIRELESS,
-            estimator: EstimatorKind::ClassicV1,
-            start_bps: ContentPolicy::OFFICE.start_bps,
-            ..Scenario::new(name, workload())
-        })
-        .unwrap();
-        println!("{}", row(name, &o));
-        let first_ms = o.first_picture_ms.unwrap_or(f64::INFINITY);
+        let (mut total_freezes, mut wait_sum, mut first_max) = (0u32, 0.0f64, 0.0f64);
+        for seed in 1..=3 {
+            let o = run(&Scenario {
+                network: network(csv),
+                profile: Profile::WIRELESS,
+                estimator: EstimatorKind::ClassicV1,
+                start_bps: ContentPolicy::OFFICE.start_bps,
+                seed,
+                ..Scenario::new(name, workload())
+            })
+            .unwrap();
+            println!("{}", row(&format!("{name}#{seed}"), &o));
+            total_freezes += o.freezes;
+            wait_sum += o.max_wait_ms;
+            first_max = first_max.max(o.first_picture_ms.unwrap_or(f64::INFINITY));
+        }
+        let mean = wait_sum / 3.0;
         assert!(
-            o.freezes <= freezes,
-            "{name}：冻结 {} 次，门槛 {freezes}",
-            o.freezes
+            total_freezes <= freezes,
+            "{name}：3 次冻结合计 {total_freezes} 次，门槛 {freezes}"
         );
         assert!(
-            o.max_wait_ms <= max_wait,
-            "{name}：最长等待 {:.0} ms，门槛 {max_wait}",
-            o.max_wait_ms
+            mean <= mean_wait,
+            "{name}：3 次最长等待平均 {mean:.0} ms，门槛 {mean_wait}"
         );
         assert!(
-            first_ms <= first,
-            "{name}：首帧 {first_ms:.0} ms，门槛 {first}"
+            first_max <= first,
+            "{name}：首帧最慢 {first_max:.0} ms，门槛 {first}"
         );
     }
 }
