@@ -91,10 +91,8 @@ impl SafetyWindow {
             .filter(|(r, at)| *r >= rate && now.saturating_duration_since(*at) < RATE_MEMORY);
         self.best = keep.or(Some((rate, now)));
         let best = self.best.map_or(0, |(r, _)| r);
-        let bdp = u64::try_from(
-            u128::from(best).saturating_mul(self.srtt.as_micros()) / 1_000_000,
-        )
-        .unwrap_or(u64::MAX);
+        let bdp = u64::try_from(u128::from(best).saturating_mul(self.srtt.as_micros()) / 1_000_000)
+            .unwrap_or(u64::MAX);
         self.window = bdp
             .saturating_mul(BDP_MULTIPLE)
             .clamp(MIN_WINDOW, MAX_WINDOW);
@@ -177,7 +175,13 @@ mod tests {
     const MS: Duration = Duration::from_millis(1);
 
     /// 按 `bps` 送达 `secs` 秒，往返 `rtt`；返回最后的时刻。
-    fn deliver(w: &mut SafetyWindow, start: Instant, bps: u64, rtt: Duration, secs: u64) -> Instant {
+    fn deliver(
+        w: &mut SafetyWindow,
+        start: Instant,
+        bps: u64,
+        rtt: Duration,
+        secs: u64,
+    ) -> Instant {
         let mut now = start;
         for _ in 0..secs * 100 {
             now += 10 * MS;

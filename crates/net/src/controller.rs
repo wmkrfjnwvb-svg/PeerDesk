@@ -399,6 +399,8 @@ pub async fn run(
     let fec_name = if caps.has(Caps::FEC_RS) { "RS" } else { "XOR" };
     let mut media = MediaReceiver::detached(link.now(), opts.deadline_us);
     media.set_keyframe_grace(caps.common(Caps::H264) == Caps::H264);
+    // 双方都支持时在反馈里带到达报告（发送端的网络控制器用）
+    media.set_reports(caps.has(Caps::TRANSPORT_CC));
     // 详情面板：本机到路由器的往返在后台测；被控端的状态和画面尺寸随时更新
     let router_ms = Arc::new(std::sync::atomic::AtomicU32::new(u32::MAX));
     let router_task = opts

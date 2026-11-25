@@ -21,6 +21,7 @@ pub mod audio;
 pub mod auth;
 pub mod billing;
 pub mod browse;
+pub mod cc;
 pub mod clipboard;
 pub mod cluster;
 pub mod codec;

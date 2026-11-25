@@ -108,15 +108,26 @@ fn microsoft_traces() {
         if !only.is_empty() && !only.split(',').any(|t| t == name) {
             continue;
         }
+        // 测量时可以用 PEERDESK_ESTIMATOR（legacy、v1、gcc）换估计器对比
+        let estimator = std::env::var("PEERDESK_ESTIMATOR")
+            .ok()
+            .and_then(|n| EstimatorKind::parse(&n))
+            .unwrap_or(EstimatorKind::ClassicV1);
         let o = run(&Scenario {
             network: network(csv),
             profile: Profile::WIRELESS,
-            estimator: EstimatorKind::ClassicV1,
+            estimator,
             start_bps: 1_000_000,
             ..Scenario::new(name, workload())
         })
         .unwrap();
+        for line in &o.trace {
+            eprintln!("{line}");
+        }
         println!("{}", row(name, &o));
+        if std::env::var_os("PEERDESK_SAVE").is_some() {
+            peerdesk_e2e::report::save(std::path::Path::new("../../target/e2e-ms"), &o).unwrap();
+        }
         if std::env::var_os("PEERDESK_DETAIL").is_some() {
             println!(
                 "  网络丢 {}，排队丢 {}，跳过 {}，坏帧 {}，恢复 {}",

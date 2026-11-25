@@ -531,11 +531,11 @@ impl Link {
 
     /// 在某个通道上发送一个数据报。不等待：发送缓冲满时最旧的数据报被丢弃。
     pub fn send(&self, channel: Channel, payload: &[u8]) -> Result<(), NetError> {
-        self.send_flags(channel, 0, payload)
+        self.send_flags(channel, 0, payload).map(drop)
     }
 
-    /// 同 [`Link::send`]，并设置包头里的标志位。
-    pub fn send_flags(&self, channel: Channel, flags: u8, payload: &[u8]) -> Result<(), NetError> {
+    /// 同 [`Link::send`]，并设置包头里的标志位。返回包头里的序号（发送端的到达报告对账用）。
+    pub fn send_flags(&self, channel: Channel, flags: u8, payload: &[u8]) -> Result<u32, NetError> {
         let seq = self
             .seq
             .get(usize::from(channel.id()))
@@ -547,7 +547,8 @@ impl Link {
             seq,
             send_time: self.now(),
         };
-        self.send_raw(encode_datagram(&header, payload)?)
+        self.send_raw(encode_datagram(&header, payload)?)?;
+        Ok(seq)
     }
 
     /// 原样发送一个数据报，不加包头。正常代码用 [`Link::send`]；

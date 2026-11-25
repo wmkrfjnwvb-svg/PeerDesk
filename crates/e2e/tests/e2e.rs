@@ -123,7 +123,11 @@ fn finish(o: &Outcome) {
 
 /// 用产品默认的估计器（卡门槛）和另一个估计器（对照，只报告）各跑一遍。
 fn compare(s: &Scenario) {
-    for estimator in [EstimatorKind::Legacy, EstimatorKind::ClassicV1] {
+    for estimator in [
+        EstimatorKind::Legacy,
+        EstimatorKind::ClassicV1,
+        EstimatorKind::GccV1,
+    ] {
         let o = run(&Scenario {
             estimator,
             ..s.clone()

@@ -9,7 +9,11 @@
 //! 正常带宽上一帧在预算之内，几乎都在突发额度里直接发出，行为和原来一样。
 //! 重传的分片插到队首：接收端正在等它们。
 //!
-//! **状态：默认关**（`PEERDESK_PACE=1` 打开，打开时按估计带宽的 2.5 倍发，和 WebRTC 的 pacing factor 一样）。
+//! **新的网络控制器（[`crate::cc`]）下一直打开**：节奏速率由它给（目标码率的 1.1 倍，WebRTC 的做法），
+//! 节奏器是唯一出口，探测包也由它按探测组的速率发出（[`Pacer::push_probe`]）。
+//!
+//! 下面是老的码率估计（`classic-v1`、`legacy`）下的情况，那时默认关
+//! （`PEERDESK_PACE=1` 打开，打开时按估计带宽的 2.5 倍发）。
 //! 2026-11-24 校准，两边的证据不一致，所以不默认打开：
 //! - 真实二进制、tbf 限速的回环（`scripts/pace-lab.sh`，没有随机丢包和抖动）：2.5 倍时 400 kbps 最长停顿
 //!   3.8 → 2.0 秒，5 Mbps 441 → 225 ms，1.5 Mbps（缓冲 60 ms）700 → 439 ms。
@@ -35,11 +39,11 @@ pub fn enabled_from(value: Option<&std::ffi::OsStr>) -> bool {
     value.is_some_and(|v| v == "1")
 }
 
-/// 交给 [`Pacer`] 的速率：打开时是估计带宽，关闭时不限速。
+/// 老的码率估计下交给 [`Pacer`] 的发送速率：打开时是估计带宽乘 [`factor_permille`]，关闭时不限速。
 #[must_use]
 pub fn rate_for(enabled: bool, rate_bps: u64) -> u64 {
     if enabled {
-        rate_bps
+        rate_bps.saturating_mul(factor_permille()) / 1000
     } else {
         u64::MAX
     }
@@ -48,8 +52,14 @@ pub fn rate_for(enabled: bool, rate_bps: u64) -> u64 {
 use std::collections::VecDeque;
 use std::sync::OnceLock;
 
+use crate::cc::probe::{ProbeCluster, PROBE_PACKET_BYTES};
+use crate::cc::report::PacketKind;
 use crate::media::Outgoing;
+use crate::proto::HEADER_LEN;
 use crate::time::Time;
+
+/// 数据报标志位：填充包（探测用），接收端只记到达时间、丢弃内容。
+pub const FLAG_PADDING: u8 = 2;
 
 /// 发送速率是估计带宽的多少倍（千分比）。2.5 倍（WebRTC 同值）：估计偏低时很快探上去，大帧又不会整帧突发挤爆瓶颈缓冲区。
 pub const PACE_FACTOR_PERMILLE: u64 = 2500;
@@ -77,13 +87,15 @@ pub const MIN_BURST_PACKETS: u64 = 4;
 /// 一个包按这么大估计突发额度的下限。
 const PACKET_BYTES: u64 = 1200;
 
-/// 视频分片的发送队列加令牌桶。
+/// 视频分片的发送队列加令牌桶；探测组按自己的速率插在前面发。
 #[derive(Debug, Clone)]
 pub struct Pacer {
     queue: VecDeque<Outgoing>,
     /// 当前可发的字节数（可以为负：一个包超出额度时先发出，欠的下次补）。
     tokens: i64,
     last: Time,
+    /// 要发的探测组：(组, 已发几个, 下一个什么时候发)。发探测时画面分片先等着（一组约 15 ms）。
+    probes: VecDeque<(ProbeCluster, u32, Option<Time>)>,
 }
 
 impl Pacer {
@@ -94,7 +106,43 @@ impl Pacer {
             queue: VecDeque::new(),
             tokens: i64::MAX,
             last: now,
+            probes: VecDeque::new(),
         }
+    }
+
+    /// 排一组探测（按组的速率发填充包）。
+    pub fn push_probe(&mut self, cluster: ProbeCluster) {
+        self.probes.push_back((cluster, 0, None));
+    }
+
+    /// 发出到期的探测包；探测还没发完时返回 `true`（画面分片先不发）。
+    fn pop_probes(&mut self, now: Time, out: &mut Vec<Outgoing>) -> bool {
+        while let Some((cluster, sent, next)) = self.probes.front_mut() {
+            let gap =
+                u64::from(PROBE_PACKET_BYTES).saturating_mul(8_000_000) / cluster.target_bps.max(1);
+            let mut due = next.unwrap_or(now);
+            while *sent < cluster.packets && due <= now {
+                out.push(Outgoing {
+                    flags: FLAG_PADDING,
+                    body: vec![
+                        0;
+                        usize::try_from(PROBE_PACKET_BYTES)
+                            .unwrap_or(0)
+                            .saturating_sub(HEADER_LEN)
+                    ],
+                    kind: PacketKind::Probe(cluster.id),
+                    fragment: None,
+                });
+                *sent += 1;
+                due = due.plus(gap.max(1));
+            }
+            if *sent < cluster.packets {
+                *next = Some(due);
+                return true;
+            }
+            self.probes.pop_front();
+        }
+        false
     }
 
     /// 一帧的分片排到队尾。
@@ -109,10 +157,10 @@ impl Pacer {
         }
     }
 
-    /// 队列空了。
+    /// 队列空了（也没有要发的探测）。
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.queue.is_empty()
+        self.queue.is_empty() && self.probes.is_empty()
     }
 
     /// 队列里的东西按 `rate_bps` 发完要超过 `interval_us`：这时不该再编新的一帧（发送队列最多放约一帧），
@@ -122,8 +170,15 @@ impl Pacer {
         let bits = u64::try_from(self.queued_bytes())
             .unwrap_or(u64::MAX)
             .saturating_mul(8);
-        let drain_us = bits.saturating_mul(1_000_000) / Self::pace_bps(rate_bps).max(1);
+        let drain_us = bits.saturating_mul(1_000_000) / rate_bps.max(1);
         drain_us > interval_us
+    }
+
+    /// 只留下 `keep` 说还要发的包（丢掉已经有定论的帧的包），返回丢了几个。
+    pub fn retain(&mut self, mut keep: impl FnMut(&Outgoing) -> bool) -> usize {
+        let before = self.queue.len();
+        self.queue.retain(|o| keep(o));
+        before - self.queue.len()
     }
 
     /// 排队的字节数。
@@ -132,18 +187,14 @@ impl Pacer {
         self.queue.iter().map(|o| o.body.len()).sum()
     }
 
-    fn pace_bps(rate_bps: u64) -> u64 {
-        rate_bps.saturating_mul(factor_permille()) / 1000
-    }
-
     fn burst_bytes(rate_bps: u64) -> i64 {
-        let by_time = Self::pace_bps(rate_bps).saturating_mul(BURST_US) / 8_000_000;
+        let by_time = rate_bps.saturating_mul(BURST_US) / 8_000_000;
         i64::try_from(by_time.max(MIN_BURST_PACKETS * PACKET_BYTES)).unwrap_or(i64::MAX)
     }
 
     fn refill(&mut self, now: Time, rate_bps: u64) {
         let cap = Self::burst_bytes(rate_bps);
-        let earned = Self::pace_bps(rate_bps).saturating_mul(now.since(self.last)) / 8_000_000;
+        let earned = rate_bps.saturating_mul(now.since(self.last)) / 8_000_000;
         self.tokens = self
             .tokens
             .saturating_add(i64::try_from(earned).unwrap_or(i64::MAX))
@@ -151,10 +202,13 @@ impl Pacer {
         self.last = now;
     }
 
-    /// 取出现在可以发的分片。
+    /// 取出现在可以发的分片（`rate_bps` 是发送速率）。有探测组时先发探测包。
     pub fn pop_ready(&mut self, now: Time, rate_bps: u64) -> Vec<Outgoing> {
         self.refill(now, rate_bps);
         let mut out = Vec::new();
+        if self.pop_probes(now, &mut out) {
+            return out;
+        }
         while self.tokens > 0 {
             let Some(o) = self.queue.pop_front() else {
                 break;
@@ -167,9 +221,12 @@ impl Pacer {
         out
     }
 
-    /// 下一个分片什么时候能发；队列空时为 `None`。
+    /// 下一个分片（或探测包）什么时候能发；都空时为 `None`。
     #[must_use]
     pub fn next_due(&self, now: Time, rate_bps: u64) -> Option<Time> {
+        if let Some((_, _, next)) = self.probes.front() {
+            return Some(next.unwrap_or(now).max(now));
+        }
         if self.queue.is_empty() {
             return None;
         }
@@ -178,7 +235,7 @@ impl Pacer {
         }
         let deficit =
             u64::try_from(self.tokens.saturating_neg().saturating_add(1)).unwrap_or(u64::MAX);
-        let bps = Self::pace_bps(rate_bps).max(1);
+        let bps = rate_bps.max(1);
         let wait = deficit.saturating_mul(8_000_000).div_ceil(bps);
         Some(self.last.plus(wait.max(1)))
     }
@@ -206,6 +263,8 @@ mod tests {
             .map(|i| Outgoing {
                 flags: u8::try_from(i % 200).unwrap(),
                 body: vec![0; 1000],
+                kind: PacketKind::Media,
+                fragment: None,
             })
             .collect()
     }
@@ -222,7 +281,7 @@ mod tests {
     #[test]
     fn large_frames_are_spread_at_the_pace_rate() {
         // 400 kbps：发送速率 1 Mbps（2.5 倍），突发额度 4 个包；96 个 1000 字节的包约 0.77 秒发完
-        let rate = 400_000;
+        let rate = rate_for(true, 400_000);
         // 起步额度也只是一个突发的量，不会一下全发
         let mut p = Pacer::new(Time(0));
         p.push(pkt(96));
@@ -245,7 +304,7 @@ mod tests {
         let mut p = Pacer::new(Time(0));
         p.push(pkt(500));
         assert_eq!(p.pop_ready(Time(0), rate_for(false, 400_000)).len(), 500);
-        assert_eq!(rate_for(true, 400_000), 400_000);
+        assert_eq!(rate_for(true, 400_000), 400_000 * factor_permille() / 1000);
         let _ = enabled();
     }
 
@@ -266,9 +325,48 @@ mod tests {
         fresh.tokens = 1;
         assert_eq!(fresh.next_due(Time(5), 1), Some(Time(5)));
         // 1 Mbps（发送 2.5 Mbps）发 4000 字节要 12.8 ms
-        assert!(p.busy(1_000_000, 10_000) && !p.busy(1_000_000, 15_000));
+        let rate = rate_for(true, 1_000_000);
+        assert!(p.busy(rate, 10_000) && !p.busy(rate, 15_000));
         let now = Time(1_000_000);
-        let out = p.pop_ready(now, 1_000_000);
+        let out = p.pop_ready(now, rate);
         assert_eq!(out.first().map(|o| o.flags), Some(250));
+    }
+
+    #[test]
+    fn probes_go_first_at_their_own_rate() {
+        let mut p = Pacer::new(Time(0));
+        p.push(pkt(3));
+        let cluster = ProbeCluster {
+            id: 7,
+            target_bps: 9_600_000,
+            packets: 5,
+        };
+        p.push_probe(cluster);
+        assert_eq!(p.next_due(Time(0), 1_000_000), Some(Time(0)));
+        // 9.6 Mbps、1200 字节：每 1 ms 一个
+        let out = p.pop_ready(Time(0), 100_000_000);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].kind, PacketKind::Probe(7));
+        assert_eq!(out[0].flags, FLAG_PADDING);
+        assert_eq!(out[0].body.len() + HEADER_LEN, 1200);
+        assert_eq!(p.next_due(Time(0), 1_000_000), Some(Time(1_000)));
+        assert_eq!(
+            p.pop_ready(Time(2_500), 100_000_000).len(),
+            2,
+            "1 ms、2 ms 到期的两个"
+        );
+        let rest = p.pop_ready(Time(10_000), 100_000_000);
+        // 探测发完，接着发画面分片
+        assert_eq!(
+            rest.iter()
+                .filter(|o| o.kind == PacketKind::Probe(7))
+                .count(),
+            2
+        );
+        assert_eq!(
+            rest.iter().filter(|o| o.kind == PacketKind::Media).count(),
+            3
+        );
+        assert!(p.next_due(Time(10_000), 1_000_000).is_none());
     }
 }

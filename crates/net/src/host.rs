@@ -155,18 +155,23 @@ impl HostOptions {
     }
 }
 
-/// 把发送队列里现在可以发的视频分片发出去（关闭发送节奏时一次发空）。
+/// 把发送队列里现在可以发的视频分片（和探测包）发出去。节奏器是唯一出口：发送速率由网络控制器给
+/// （老的估计器按 `PEERDESK_PACE` 开关）。每个发出的包记进发送历史，等到达报告对账。
 fn send_paced(
     link: &Link,
     pacer: &mut peerdesk_core::pacer::Pacer,
     pacing: bool,
-    rate_bps: u64,
+    media: &mut MediaSender,
 ) -> Result<(), NetError> {
-    pacer
-        .pop_ready(link.now(), peerdesk_core::pacer::rate_for(pacing, rate_bps))
-        .iter()
-        .try_for_each(|o| link.send_flags(Channel::Video, o.flags, &o.body))
+    for o in pacer.pop_ready(link.now(), media.pacing_bps(pacing)) {
+        let seq = link.send_flags(Channel::Video, o.flags, &o.body)?;
+        media.on_packet_sent(link.now(), seq, &o);
+    }
+    Ok(())
 }
+
+/// 网络控制器的定时任务间隔（WebRTC GoogCC 的 `kUpdateIntervalMs`）。
+const CC_TICK: Duration = Duration::from_millis(25);
 
 /// 被控端会话的结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -374,6 +379,18 @@ pub async fn serve(
     let router_task =
         send_stats.then(|| tokio::spawn(crate::gateway::watch_router(Arc::clone(&router_ms))));
     let mut screen_size = (0u16, 0u16);
+    // 实验开关：PEERDESK_ESTIMATOR=legacy、v1 或 gcc 选估计器，默认用产品默认的那个。
+    // 要到达报告的估计器（gcc）对端也得支持，老版本对端退回 v1。
+    let wanted = std::env::var("PEERDESK_ESTIMATOR")
+        .ok()
+        .and_then(|name| EstimatorKind::parse(&name))
+        .unwrap_or(EstimatorKind::PRODUCT);
+    let estimator = if wanted == EstimatorKind::GccV1 && !caps.has(Caps::TRANSPORT_CC) {
+        crate::note!(info, "对方版本不支持到达报告，码率估计改用 classic-v1");
+        EstimatorKind::ClassicV1
+    } else {
+        wanted
+    };
     let mut media = MediaSender::detached(
         SenderConfig {
             fps: opts.fps,
@@ -383,14 +400,11 @@ pub async fn serve(
             profile: Profile::select(rtt_us, false, false),
             deadline_us: FRAME_DEADLINE_US,
             max_payload: link.max_payload(),
-            // 实验开关：PEERDESK_ESTIMATOR=legacy 或 v1 选估计器，默认用产品默认的那个。
-            estimator: std::env::var("PEERDESK_ESTIMATOR")
-                .ok()
-                .and_then(|name| EstimatorKind::parse(&name))
-                .unwrap_or(EstimatorKind::PRODUCT),
+            estimator,
         },
         codec,
     );
+    media.set_reports(caps.has(Caps::TRANSPORT_CC));
     // 双方都支持 RS 纠错时用它（老版本只认异或）
     media.set_fec(if caps.has(Caps::FEC_RS) {
         Fec::Rs
@@ -413,6 +427,8 @@ pub async fn serve(
     let pacing = opts.pacing;
     let mut pacer = peerdesk_core::pacer::Pacer::new(link.now());
     let mut pace_tick = tokio::time::interval(Duration::from_millis(2));
+    let mut cc_tick = tokio::time::interval(CC_TICK);
+    cc_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     pace_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     stats_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut last_stats = media.stats();
@@ -451,8 +467,10 @@ pub async fn serve(
                     // 控制通道的数据报是观看端的反馈：哪些帧到了、链路有没有积压。
                     Channel::Control => match media.on_feedback_datagram(link.now(), &payload) {
                         Ok(again) => {
+                            // 已经有定论的帧（送到了、或接收端放弃了）的包不再发
+                            pacer.retain(|o| media.wanted(o));
                             pacer.push_front(again);
-                            if let Err(e) = send_paced(&link, &mut pacer, pacing, media.rate_bps()) { break e.to_string(); }
+                            if let Err(e) = send_paced(&link, &mut pacer, pacing, &mut media) { break e.to_string(); }
                         }
                         Err(_) => bad_datagrams = bad_datagrams.saturating_add(1),
                     },
@@ -566,11 +584,19 @@ pub async fn serve(
                     continue;
                 }
                 pacer.push(out);
-                if let Err(e) = send_paced(&link, &mut pacer, pacing, media.rate_bps()) { break e.to_string(); }
+                if let Err(e) = send_paced(&link, &mut pacer, pacing, &mut media) { break e.to_string(); }
                 tracer.record(link.now(), trace, Stage::FrameSent, u64::from(media.stats().frames));
             }
+            _ = cc_tick.tick() => {
+                // 网络控制器的定时任务：应用受限的预算、定期探测；要探测时交给节奏器发
+                media.on_tick(link.now());
+                for cluster in media.take_probes() {
+                    pacer.push_probe(cluster);
+                }
+                if let Err(e) = send_paced(&link, &mut pacer, pacing, &mut media) { break e.to_string(); }
+            }
             _ = pace_tick.tick(), if !pacer.is_empty() => {
-                if let Err(e) = send_paced(&link, &mut pacer, pacing, media.rate_bps()) { break e.to_string(); }
+                if let Err(e) = send_paced(&link, &mut pacer, pacing, &mut media) { break e.to_string(); }
             }
             _ = stats_tick.tick() => {
                 let now = media.stats();
@@ -617,7 +643,9 @@ pub async fn serve(
                     now.resend_capped.saturating_sub(last_stats.resend_capped),
                     now.lost.saturating_sub(last_stats.lost),
                 );
-                if let Some(o) = media.last_observation() {
+                if let Some(line) = media.controller_line() {
+                    crate::note!(info, target: "peerdesk::stats", "{line}");
+                } else if let Some(o) = media.last_observation() {
                     crate::note!(info, target: "peerdesk::stats",
                         "码率估计 最近反馈：排队 {} ms，延迟趋势 {} ms，丢包 {}‰，送达 {} kbps，包串测速 {} kbps",
                         o.feedback.queue_delay_us / 1000,
@@ -696,7 +724,7 @@ pub async fn serve(
                     source.set_target_size(target);
                 }
                 // 在途数据超过上限：这一帧不编，变化攒着，等确认之后编最新的画面。
-                if encoding || pacer.busy(peerdesk_core::pacer::rate_for(pacing, media.rate_bps()), 1_000_000 / u64::from(opts.fps.max(1))) || media.in_flight_full(link.now()) || !media.due(link.now()) || (!pending_change && !media.wants_frame()) {
+                if encoding || pacer.busy(media.pacing_bps(pacing), 1_000_000 / u64::from(opts.fps.max(1))) || media.in_flight_full(link.now()) || !media.due(link.now()) || (!pending_change && !media.wants_frame()) {
                     continue;
                 }
                 let rtt = u64::try_from(link.rtt().as_micros()).unwrap_or(u64::MAX);

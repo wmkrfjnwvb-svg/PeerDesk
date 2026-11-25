@@ -16,6 +16,9 @@
 //! 以后的 AI 模型也实现 [`RateEstimator`]，在同一套端到端测试里和经典算法比较。
 
 use crate::adaptive::{Feedback, Profile, RateController};
+use crate::cc::probe::ProbeCluster;
+use crate::cc::report::{PacketResult, SentPacket};
+use crate::cc::Gcc;
 use crate::error::Error;
 use crate::time::Time;
 use crate::wire::{Reader, Writer};
@@ -230,6 +233,109 @@ pub trait RateEstimator: Send + std::fmt::Debug {
     fn take_notes(&mut self) -> Vec<String> {
         Vec::new()
     }
+
+    /// 用发送端的到达报告（[`crate::cc`]）：要接收端发到达报告、发送端记发送历史。
+    fn uses_reports(&self) -> bool {
+        false
+    }
+
+    /// 发出了一个包（含重传、探测）。
+    fn on_sent(&mut self, _now: Time, _packet: &SentPacket) {}
+
+    /// 一份到达报告（已对账）。
+    fn on_report(&mut self, _now: Time, _packets: &[PacketResult], _rtt_us: u64) {}
+
+    /// 定时调用（约 25 ms）。
+    fn on_tick(&mut self, _now: Time) {}
+
+    /// 节奏器的发送速率；`None` 表示按老规则（见 [`crate::pacer::rate_for`]）。
+    fn pacing_bps(&self) -> Option<u64> {
+        None
+    }
+
+    /// 取走要发的探测组。
+    fn take_probes(&mut self) -> Vec<ProbeCluster> {
+        Vec::new()
+    }
+
+    /// 一行状态（诊断日志用）。
+    fn state_line(&self) -> Option<String> {
+        None
+    }
+}
+
+/// 照 WebRTC GoogCC 组织的网络控制器（见 [`crate::cc`]）。
+#[derive(Debug, Clone)]
+pub struct GccV1 {
+    gcc: Gcc,
+    profile: Profile,
+    /// 会话开始时探测（按起始码率的 3、6 倍）。
+    probe_at_start: bool,
+}
+
+impl GccV1 {
+    /// 创建。
+    #[must_use]
+    pub fn new(profile: Profile, start_bps: u64, min_bps: u64, max_bps: u64) -> Self {
+        Self {
+            gcc: Gcc::new(start_bps, min_bps, max_bps),
+            profile,
+            probe_at_start: false,
+        }
+    }
+}
+
+impl RateEstimator for GccV1 {
+    fn name(&self) -> &'static str {
+        "gcc-v1"
+    }
+
+    fn rate_bps(&self) -> u64 {
+        self.gcc.target_bps()
+    }
+
+    /// 接收端算的排队延迟、趋势、包串都不用：网络判断只看到达报告。
+    fn on_observation(&mut self, _now: Time, _obs: &Observation) {}
+
+    fn profile(&self) -> &Profile {
+        &self.profile
+    }
+
+    fn set_profile(&mut self, profile: Profile) {
+        self.profile = profile;
+    }
+
+    fn take_notes(&mut self) -> Vec<String> {
+        self.gcc.take_notes()
+    }
+
+    fn uses_reports(&self) -> bool {
+        true
+    }
+
+    fn on_sent(&mut self, now: Time, packet: &SentPacket) {
+        self.gcc.on_sent(now, packet);
+    }
+
+    fn on_report(&mut self, now: Time, packets: &[PacketResult], rtt_us: u64) {
+        self.gcc.on_report(now, packets, rtt_us);
+    }
+
+    fn on_tick(&mut self, now: Time) {
+        self.gcc.on_tick(now, self.probe_at_start);
+    }
+
+    fn pacing_bps(&self) -> Option<u64> {
+        Some(self.gcc.pacing_bps())
+    }
+
+    fn take_probes(&mut self) -> Vec<ProbeCluster> {
+        self.gcc.take_probes()
+    }
+
+    fn state_line(&self) -> Option<String> {
+        Some(self.gcc.state_line())
+    }
 }
 
 /// 选哪个估计器。
@@ -239,6 +345,8 @@ pub enum EstimatorKind {
     Legacy,
     /// 传输算法 v1。
     ClassicV1,
+    /// 照 WebRTC GoogCC 的网络控制器（发送端到达报告，见 [`crate::cc`]）。对端也要支持到达报告。
+    GccV1,
 }
 
 impl EstimatorKind {
@@ -254,6 +362,7 @@ impl EstimatorKind {
         match name {
             "legacy" => Some(Self::Legacy),
             "v1" | "classic-v1" => Some(Self::ClassicV1),
+            "gcc" | "gcc-v1" => Some(Self::GccV1),
             _ => None,
         }
     }
@@ -272,6 +381,7 @@ impl EstimatorKind {
                 profile, start_bps, min_bps, max_bps,
             ))),
             Self::ClassicV1 => Box::new(ClassicV1::new(profile, start_bps, min_bps, max_bps)),
+            Self::GccV1 => Box::new(GccV1::new(profile, start_bps, min_bps, max_bps)),
         }
     }
 }

@@ -279,6 +279,8 @@ impl Caps {
     pub const FILE_BROWSE: Caps = Caps(1 << 21);
     /// 控制端告诉被控端自己显示画面的区域有多大（像素），被控端按这个大小编码（见 [`crate::scale::fit`]）。
     pub const VIEW_SIZE: Caps = Caps(1 << 22);
+    /// 发送端的网络控制器（见 [`crate::cc`]）：接收端在反馈里发到达报告、能收探测的填充包。
+    pub const TRANSPORT_CC: Caps = Caps(1 << 23);
 
     // 第 24–26 位不是能力，是被控端在 Accept 里告诉控制端自己的系统（见 [`PeerOs`]），
     // 控制端据此把快捷键里的 Ctrl 换成 Cmd 等。老版本只看能力位，会忽略这几位。
@@ -311,7 +313,8 @@ impl Caps {
             | Self::FEC_RS.0
             | Self::HOST_STATS.0
             | Self::FILE_BROWSE.0
-            | Self::VIEW_SIZE.0,
+            | Self::VIEW_SIZE.0
+            | Self::TRANSPORT_CC.0,
     );
 
     /// 并集。

@@ -10,10 +10,13 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use crate::adaptive::{DelayTracker, DeliveryLog, Feedback, Profile};
+use crate::cc::probe::ProbeCluster;
+use crate::cc::report::{ArrivalRecorder, ArrivalReport, PacketKind, SendHistory, SentPacket};
 use crate::error::Error;
 use crate::estimator::{EstimatorKind, Extension, Observation, RateEstimator, ReceiverMetrics};
 use crate::frame::{Frame, Picture};
 use crate::governor::FpsGovernor;
+use crate::pacer::FLAG_PADDING;
 use crate::proto::{VideoHeader, MAX_DATAGRAM};
 use crate::scale::ScalePolicy;
 use crate::screen::Screen;
@@ -61,6 +64,65 @@ pub fn encode_feedback(feedback: &Feedback, ext: &Extension, nacks: &[(u32, u16)
 
 /// 解析出的反馈数据报：基本反馈、扩展测量、重传请求。
 pub type DecodedFeedback = (Feedback, Extension, Vec<(u32, u16)>);
+
+/// 反馈数据报（双方都支持到达报告时，见 [`crate::proto::Caps::TRANSPORT_CC`]）：
+/// [`Feedback`]、重传请求个数（可以为 0）和请求、有没有到达报告（0/1）、到达报告。
+/// 接收端算的排队延迟、趋势、包串（[`Extension`]）不再发：网络判断都在发送端（见 [`crate::cc`]）。
+#[must_use]
+pub fn encode_feedback_v2(
+    feedback: &Feedback,
+    nacks: &[(u32, u16)],
+    report: Option<&ArrivalReport>,
+) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.bytes(&feedback.encode());
+    let nacks = nacks.get(..MAX_NACKS.min(nacks.len())).unwrap_or_default();
+    w.u8(u8::try_from(nacks.len()).unwrap_or(u8::MAX));
+    for (frame, frag) in nacks {
+        w.u32(*frame).u16(*frag);
+    }
+    match report {
+        Some(r) => {
+            w.u8(1);
+            r.encode(&mut w);
+        }
+        None => {
+            w.u8(0);
+        }
+    }
+    w.into_vec()
+}
+
+/// 解析出的反馈数据报（带到达报告的格式）。
+pub type DecodedFeedbackV2 = (Feedback, Vec<(u32, u16)>, Option<ArrivalReport>);
+
+/// 解析带到达报告的反馈数据报（见 [`encode_feedback_v2`]）。
+pub fn decode_feedback_v2(buf: &[u8]) -> Result<DecodedFeedbackV2, Error> {
+    let (head, rest) = buf
+        .split_at_checked(Feedback::LEN)
+        .ok_or(Error::Truncated {
+            need: Feedback::LEN,
+            have: buf.len(),
+        })?;
+    let feedback = Feedback::decode(head)?;
+    let mut r = Reader::new(rest);
+    let count = usize::from(r.u8()?);
+    if count > MAX_NACKS {
+        return Err(Error::TooManyItems {
+            len: count,
+            max: MAX_NACKS,
+        });
+    }
+    let nacks = (0..count)
+        .map(|_| Ok((r.u32()?, r.u16()?)))
+        .collect::<Result<Vec<_>, Error>>()?;
+    let report = match r.u8()? {
+        0 => None,
+        _ => Some(ArrivalReport::decode(&mut r)?),
+    };
+    r.finish()?;
+    Ok((feedback, nacks, report))
+}
 
 /// 解析反馈数据报。
 pub fn decode_feedback(buf: &[u8]) -> Result<DecodedFeedback, Error> {
@@ -138,10 +200,26 @@ impl Default for SenderConfig {
 /// 一个要发出的视频数据报（不含数据报头）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Outgoing {
-    /// 数据报标志位（校验分片带 [`FLAG_PARITY`]）。
+    /// 数据报标志位（校验分片带 [`FLAG_PARITY`]，探测的填充包带 [`crate::pacer::FLAG_PADDING`]）。
     pub flags: u8,
     /// 载荷：分片头加分片数据。
     pub body: Vec<u8>,
+    /// 种类（发出时记进发送历史，见 [`crate::cc::report`]）。
+    pub kind: PacketKind,
+    /// 属于哪一帧的哪个分片 `(帧号, 分片序号)`（校验分片是组号）；探测的填充包没有。
+    /// 节奏器据此丢掉已经有定论的帧的包，重传据此记“实际发出”的时间。
+    pub fragment: Option<(u32, u16)>,
+}
+
+/// 留着重传的一帧数据分片。
+#[derive(Debug, Clone)]
+struct Kept {
+    frame: u32,
+    packets: Vec<Outgoing>,
+    /// 原包从节奏器实际发出的时间（`None`：还在排队）。还在排队的不重传：接收端只知道“没收到”，
+    /// 不知道它还没发（窄带宽上一个大关键帧要分几秒发完）；刚发出的也不重传：它还在路上。
+    /// 照 WebRTC `RtpPacketHistory`：还在等发送的包不响应重传请求，上次实际发出后一个往返之内也不响应。
+    sent: Vec<Option<Time>>,
 }
 
 /// 发送端的计数。
@@ -163,10 +241,12 @@ pub struct SenderStats {
     pub profile_switches: u32,
     /// 收到的重传请求（分片数）。
     pub nack_requests: u32,
-    /// 重传请求里因为“刚重传过、可能还在路上”而没有再发的分片数。
+    /// 重传请求里因为“刚发过（原包或重传）、可能还在路上”而没有再发的分片数。
     pub resend_skipped: u32,
     /// 因为一轮重传额度用完而没有发的分片数。
     pub resend_capped: u32,
+    /// 重传请求里这个分片（原包或上一份重传）还在节奏器里排队、所以没有再排一份的分片数。
+    pub resend_unsent: u32,
 }
 
 /// 交给编码器的一帧任务。编码可以在别的线程上做：任务里带着上次之后发送端判定的丢失和收到的确认，
@@ -231,10 +311,13 @@ pub struct MediaSender {
     last_frame: u32,
     last_key: u32,
     stats: SenderStats,
-    /// 最近发出的帧的数据分片，留着重传：(帧号, 发出时间, 数据分片)。
-    recent: VecDeque<(u32, Time, Vec<Outgoing>)>,
-    /// 每个分片上次重传的时间：一个往返之内不重复重传。
-    resent: BTreeMap<(u32, u16), Time>,
+    /// 还没有定论的帧的数据分片，留着重传。
+    recent: VecDeque<Kept>,
+    /// 每个分片的重传状态：`None` 还在节奏器里排队（不再排第二份），`Some(t)` 在 `t` 实际发出
+    /// （之后一个往返加排队之内不重复重传）。照 WebRTC `RtpPacketHistory`：按实际发出的时间算，
+    /// 不按交给节奏器的时间算——节奏器排一秒的时候，按交出时间算会每个往返再塞一份同样的包，
+    /// 节奏器里全是重复的重传（2026-11 微软轨迹 ms-05729 实测：关键帧早送到了，节奏器里还有 164 KB 重传）。
+    resent: BTreeMap<(u32, u16), Option<Time>>,
     rtt_us: u64,
     last_obs: Option<Observation>,
     /// 连续有丢包的反馈次数（决定要不要换成“无线”画像）。
@@ -254,6 +337,10 @@ pub struct MediaSender {
     view: Option<(u16, u16)>,
     /// 各模块的决定和原因，等会话取走写日志（见 [`Self::take_events`]）。
     events: Vec<String>,
+    /// 用到达报告（双方都支持、估计器要它）。
+    reports: bool,
+    /// 发出的包，等到达报告对账（见 [`crate::cc::report`]）。
+    history: SendHistory,
 }
 
 impl std::fmt::Debug for MediaSender {
@@ -305,6 +392,8 @@ impl MediaSender {
             key_sent: None,
             view: None,
             events: Vec::new(),
+            reports: false,
+            history: SendHistory::new(),
             scale: if codec == Codec::H264 {
                 ScalePolicy::new()
             } else {
@@ -317,6 +406,83 @@ impl MediaSender {
     #[must_use]
     pub const fn codec(&self) -> Codec {
         self.codec
+    }
+
+    /// 打开到达报告（握手时双方都支持 [`crate::proto::Caps::TRANSPORT_CC`]）。估计器不用报告时不打开。
+    pub fn set_reports(&mut self, on: bool) {
+        self.reports = on && self.rate.uses_reports();
+    }
+
+    /// 用到达报告。
+    #[must_use]
+    pub const fn reports(&self) -> bool {
+        self.reports
+    }
+
+    /// 一个数据报交给了网络（`seq` 是数据报头里的序号）。到达报告据此对账。
+    pub fn on_packet_sent(&mut self, now: Time, seq: u32, out: &Outgoing) {
+        match (out.kind, out.fragment) {
+            (PacketKind::Retransmit, Some(key)) => {
+                if let Some(state) = self.resent.get_mut(&key) {
+                    *state = Some(now);
+                }
+            }
+            // 原包（数据分片；校验分片的序号是组号，不记）
+            (PacketKind::Media, Some((frame, index))) if out.flags & FLAG_PARITY == 0 => {
+                if let Some(sent) = self
+                    .recent
+                    .iter_mut()
+                    .find(|k| k.frame == frame)
+                    .and_then(|k| k.sent.get_mut(usize::from(index)))
+                {
+                    *sent = Some(now);
+                }
+            }
+            (PacketKind::Media | PacketKind::Retransmit | PacketKind::Probe(_), _) => {}
+        }
+        if !self.reports {
+            return;
+        }
+        let packet = SentPacket {
+            seq,
+            send_time: now,
+            size: u32::try_from(out.body.len().saturating_add(HEADER_LEN)).unwrap_or(u32::MAX),
+            kind: out.kind,
+        };
+        self.history.on_sent(packet);
+        self.rate.on_sent(now, &packet);
+    }
+
+    /// 定时调用（约 25 ms）：网络控制器的定时任务（应用受限的预算、定期探测）。
+    pub fn on_tick(&mut self, now: Time) {
+        if self.reports {
+            self.rate.on_tick(now);
+        }
+    }
+
+    /// 取走要发的探测组（交给节奏器）。
+    pub fn take_probes(&mut self) -> Vec<ProbeCluster> {
+        if self.reports {
+            self.rate.take_probes()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// 节奏器的发送速率：网络控制器给的（目标的 1.1 倍）；老的估计器按老规则（`legacy_pacing` 是
+    /// `PEERDESK_PACE` 开关，见 [`crate::pacer::rate_for`]）。
+    #[must_use]
+    pub fn pacing_bps(&self, legacy_pacing: bool) -> u64 {
+        self.rate
+            .pacing_bps()
+            .filter(|_| self.reports)
+            .unwrap_or_else(|| crate::pacer::rate_for(legacy_pacing, self.rate.rate_bps()))
+    }
+
+    /// 网络控制器的一行状态（诊断日志用；老的估计器没有）。
+    #[must_use]
+    pub fn controller_line(&self) -> Option<String> {
+        self.rate.state_line().filter(|_| self.reports)
     }
 
     /// 当前码率。
@@ -401,7 +567,17 @@ impl MediaSender {
     }
 
     /// 最近的关键帧还没确认。
-    fn key_pending(&self) -> bool {
+    /// 节奏器里的这个包还要不要发：它的帧已经有定论（送到了，或接收端已经放弃）就不发了，
+    /// 免得节奏器一直在发没用的包、把新画面挡在后面（会话在每份反馈之后清一次节奏器）。
+    #[must_use]
+    pub fn wanted(&self, out: &Outgoing) -> bool {
+        out.fragment
+            .is_none_or(|(frame, _)| self.unacked.iter().any(|(id, _, _)| *id == frame))
+    }
+
+    /// 最近的关键帧还没确认（之后的帧都依赖它）。
+    #[must_use]
+    pub fn key_pending(&self) -> bool {
         self.unacked.iter().any(|(id, _, _)| *id == self.last_key)
     }
 
@@ -483,17 +659,22 @@ impl MediaSender {
     /// 开始一帧：判定超时丢失，分配帧号和字节预算，带上要交给编码器的通知。
     pub fn start_frame(&mut self, now: Time, rtt_us: u64) -> FrameJob {
         self.rtt_us = rtt_us;
-        // 过了截止时间的帧不再重传。
+        self.expire_unacked(now);
+        // 只给还没有定论的帧留着重传（接收端可能还在收）；已确认、已判丢的不再重传，由接收端的
+        // 重传请求和“不再接受的帧号”决定什么时候停。不按“编出来多久”判断：节奏器要把一个大关键帧
+        // 分一秒多发完（1 Mbps 传 120 KB），按 250 ms 截止的话关键帧尾部丢的包永远补不上，
+        // 接收端等不齐只能作废，发送端再发一个同样大的关键帧（2026-11 微软轨迹 ms-05729 实测如此）。
+        // WebRTC 的重传缓存也是按“实际发出之后”保留（`RtpPacketHistory`：至少 1 秒、3 个往返）。
+        let oldest = self.unacked.front().map(|(id, _, _)| *id);
         while self
             .recent
             .front()
-            .is_some_and(|(_, at, _)| now.since(*at) > self.cfg.deadline_us)
+            .is_some_and(|k| oldest.is_none_or(|o| k.frame < o))
         {
-            if let Some((id, _, _)) = self.recent.pop_front() {
-                self.resent.retain(|(frame, _), _| *frame != id);
+            if let Some(k) = self.recent.pop_front() {
+                self.resent.retain(|(frame, _), _| *frame != k.frame);
             }
         }
-        self.expire_unacked(now);
         let (lost, feedback) = std::mem::take(&mut self.notes);
         let key_pending = self.key_pending();
         let before = self.scale.permille();
@@ -599,14 +780,16 @@ impl MediaSender {
                 Outgoing {
                     flags: if p.parity { FLAG_PARITY } else { 0 },
                     body: body.into_vec(),
+                    kind: PacketKind::Media,
+                    fragment: Some((p.header.frame_id, p.header.frag_index)),
                 }
             })
             .collect();
-        self.recent.push_back((
-            frame_id,
-            now,
-            out.get(..data_count).unwrap_or_default().to_vec(),
-        ));
+        self.recent.push_back(Kept {
+            frame: frame_id,
+            packets: out.get(..data_count).unwrap_or_default().to_vec(),
+            sent: vec![None; data_count],
+        });
         self.last_frame = frame_id;
         if encoded.key {
             self.last_key = frame_id;
@@ -630,7 +813,17 @@ impl MediaSender {
 
     /// 收到一个反馈数据报。返回要重传的分片。
     pub fn on_feedback_datagram(&mut self, now: Time, buf: &[u8]) -> Result<Vec<Outgoing>, Error> {
-        let (feedback, ext, nacks) = decode_feedback(buf)?;
+        let (feedback, ext, nacks, report) = if self.reports {
+            let (f, n, r) = decode_feedback_v2(buf)?;
+            (f, Extension::default(), n, r)
+        } else {
+            let (f, e, n) = decode_feedback(buf)?;
+            (f, e, n, None)
+        };
+        if let Some(report) = report {
+            let results = self.history.resolve(&report);
+            self.rate.on_report(now, &results, self.rtt_us);
+        }
         self.observe(now, &feedback, ext);
         // 接收端还在为这些帧要重传：它们在路上、在进展，不能按超时判丢（判丢就要重发关键帧）。
         for (id, at, _) in &mut self.unacked {
@@ -655,25 +848,34 @@ impl MediaSender {
                     .saturating_add(u32::try_from(nacks.len() - i).unwrap_or(u32::MAX));
                 break;
             }
-            // 上次重传之后，要等它排完队、到达、接收端再报告，才算真的又丢了：往返时间加上当前排队延迟。
-            // 只按往返时间算时，排队 200 ms 的窄链路上重传还在队里就又被要一次，带宽全被重复包占了。
-            let again = self
-                .resent
-                .get(&(frame, frag))
-                .is_none_or(|at| now.since(*at) >= self.resend_after_us());
-            let packet = self
-                .recent
-                .iter()
-                .find(|(id, _, _)| *id == frame)
-                .and_then(|(_, _, packets)| packets.get(usize::from(frag)));
-            if !again {
-                self.stats.resend_skipped = self.stats.resend_skipped.saturating_add(1);
-            }
+            // 这个分片上次实际发出的时间（原包或重传）：`None` 是还在节奏器里排队（原包没发、
+            // 或上一份重传没发），不再排一份。发出之后，要等它排完队、到达、接收端再报告，才算真的
+            // 又丢了：往返时间加上当前排队延迟（从实际发出算起）。
+            let kept = self.recent.iter().find(|k| k.frame == frame);
+            let last_sent = match self.resent.get(&(frame, frag)) {
+                Some(state) => *state,
+                None => kept.and_then(|k| k.sent.get(usize::from(frag)).copied().flatten()),
+            };
+            let packet = kept.and_then(|k| k.packets.get(usize::from(frag)));
+            let again = match last_sent {
+                None => {
+                    self.stats.resend_unsent = self.stats.resend_unsent.saturating_add(1);
+                    false
+                }
+                Some(at) if now.since(at) < self.resend_after_us() => {
+                    self.stats.resend_skipped = self.stats.resend_skipped.saturating_add(1);
+                    false
+                }
+                Some(_) => true,
+            };
             if let Some(packet) = packet.filter(|_| again) {
                 resent_bytes = resent_bytes
                     .saturating_add(u64::try_from(packet.body.len()).unwrap_or(u64::MAX));
-                out.push(packet.clone());
-                self.resent.insert((frame, frag), now);
+                out.push(Outgoing {
+                    kind: PacketKind::Retransmit,
+                    ..packet.clone()
+                });
+                self.resent.insert((frame, frag), None);
             }
         }
         self.stats.retransmitted = self
@@ -946,6 +1148,9 @@ pub struct MediaReceiver {
     decoded: Option<u32>,
     stats: ReceiverStats,
     last_feedback: Option<Feedback>,
+    /// 发到达报告（双方都支持 [`crate::proto::Caps::TRANSPORT_CC`]）。
+    reports: bool,
+    arrivals: ArrivalRecorder,
 }
 
 impl std::fmt::Debug for MediaReceiver {
@@ -979,7 +1184,14 @@ impl MediaReceiver {
             decoded: None,
             stats: ReceiverStats::default(),
             last_feedback: None,
+            reports: false,
+            arrivals: ArrivalRecorder::new(),
         }
+    }
+
+    /// 打开到达报告（握手时双方都支持 [`crate::proto::Caps::TRANSPORT_CC`]）。
+    pub fn set_reports(&mut self, on: bool) {
+        self.reports = on;
     }
 
     /// 计数。
@@ -1090,6 +1302,13 @@ impl MediaReceiver {
         body: &[u8],
     ) -> Result<Option<DecodeJob>, Error> {
         self.tracker.on_packet(now, send_time, seq, body.len());
+        if self.reports {
+            self.arrivals.on_packet(now, seq);
+        }
+        // 探测用的填充包：只记到达时间
+        if flags & FLAG_PADDING != 0 {
+            return Ok(None);
+        }
         let mut r = Reader::new(body);
         let header = VideoHeader::decode(&mut r)?;
         self.metrics
@@ -1156,6 +1375,10 @@ impl MediaReceiver {
             .stats
             .nacks_sent
             .saturating_add(u32::try_from(nacks.len()).unwrap_or(u32::MAX));
+        if self.reports {
+            let report = self.arrivals.report();
+            return encode_feedback_v2(&feedback, &nacks, report.as_ref());
+        }
         encode_feedback(&feedback, &self.metrics.report(), &nacks)
     }
 
@@ -1567,19 +1790,56 @@ mod tests {
         assert!(!rx.wants_nack(Time(1_000)), "刚缺：可能只是乱序");
         assert!(rx.wants_nack(Time(20_000)));
         let fb = rx.feedback_datagram(Time(20_000));
-        let again = tx.on_feedback_datagram(Time(20_100), &fb).unwrap();
-        assert_eq!(again, vec![out[1].clone()], "只重传缺的那一片");
-        // 一个往返之内再要：不重复发
+        // 原包还在节奏器里没发（接收端只是还没收到）：不重传
+        assert!(tx
+            .on_feedback_datagram(Time(20_050), &fb)
+            .unwrap()
+            .is_empty());
+        assert_eq!(tx.stats().resend_unsent, 1);
+        // 节奏器发出了（含校验分片，不影响）；刚发出、还在路上时再要：不重传
+        for (seq, o) in (0u32..).zip(&out) {
+            tx.on_packet_sent(Time(20_000), seq, o);
+        }
         assert!(tx
             .on_feedback_datagram(Time(30_000), &fb)
+            .unwrap()
+            .is_empty());
+        // 发出后过了一个往返（40 ms）还没到：重传
+        let again = tx.on_feedback_datagram(Time(60_100), &fb).unwrap();
+        assert_eq!(
+            again,
+            vec![Outgoing {
+                kind: PacketKind::Retransmit,
+                ..out[1].clone()
+            }],
+            "只重传缺的那一片，标成重传"
+        );
+        // 重传还没发出去时再要：不重复排
+        assert!(tx
+            .on_feedback_datagram(Time(60_200), &fb)
             .unwrap()
             .is_empty());
         assert_eq!(tx.stats().retransmitted, 1);
         // 重传到了：整帧收齐、显示
         let shown = deliver(&mut rx, Time(60_000), &again, |_| false);
         assert_eq!(shown, vec![(1, 3)]);
-        // 过了一个往返还缺（假设重传也丢了）：可以再发
-        assert_eq!(tx.on_feedback_datagram(Time(70_000), &fb).unwrap().len(), 1);
+        // 重传还在节奏器里没发出去：过了一个往返再要也不排第二份
+        assert!(tx
+            .on_feedback_datagram(Time(70_000), &fb)
+            .unwrap()
+            .is_empty());
+        // 节奏器发出了；从实际发出算过了一个往返还缺（假设重传也丢了）：可以再发
+        for o in &again {
+            tx.on_packet_sent(Time(70_000), 9, o);
+        }
+        assert!(tx
+            .on_feedback_datagram(Time(80_000), &fb)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            tx.on_feedback_datagram(Time(120_000), &fb).unwrap().len(),
+            1
+        );
         // 过了截止时间：不再保留，不重传
         let _ = tx
             .on_frame(Time(400_000), &Screen::new(16, 16, 4), true, 40_000)

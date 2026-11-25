@@ -133,6 +133,9 @@ pub struct Scenario {
     pub pacing: bool,
     /// 纠错方式。默认 RS（新版本之间）；`PEERDESK_FEC=xor` 对照。
     pub fec: peerdesk_core::transport::Fec,
+    /// 调试：把发送端各模块的决定、每秒的网络控制状态、因为哪个闸门没编帧打到标准错误。
+    /// 默认按环境变量 `PEERDESK_EVENTS` 打开。
+    pub trace: bool,
 }
 
 impl Scenario {
@@ -155,6 +158,7 @@ impl Scenario {
             estimator: EstimatorKind::PRODUCT,
             pacing: peerdesk_core::pacer::enabled(),
             fec: fec_from(std::env::var_os("PEERDESK_FEC").as_deref()),
+            trace: std::env::var_os("PEERDESK_EVENTS").is_some(),
         }
     }
 }
@@ -191,6 +195,8 @@ pub struct PhaseResult {
 pub struct Outcome {
     /// 场景名。
     pub name: String,
+    /// 调试记录（[`Scenario::trace`] 打开时）：发送端各模块的决定、每秒的状态。
+    pub trace: Vec<String>,
     /// 编码器。
     pub codec: CodecKind,
     /// 每个阶段。
@@ -334,6 +340,36 @@ impl PhaseAcc {
 
 /// 运行一个场景。
 #[allow(clippy::too_many_lines)]
+/// 和产品（`peerdesk_net::host` 的 `send_paced`）一样：节奏器是唯一出口，发出的包记进发送历史。
+fn send_ready(
+    pacer: &mut peerdesk_core::pacer::Pacer,
+    tx: &mut MediaSender,
+    pacing: bool,
+    net: &mut Net<Vec<u8>>,
+    now: Time,
+    seq: &mut u32,
+    bytes: &mut u64,
+) -> Result<(), Error> {
+    for o in pacer.pop_ready(now, tx.pacing_bps(pacing)) {
+        let header = Header {
+            channel: Channel::Video,
+            flags: o.flags,
+            conn_id: 0,
+            seq: *seq,
+            send_time: now,
+        };
+        tx.on_packet_sent(now, *seq, &o);
+        *seq = seq.wrapping_add(1);
+        let datagram = encode_datagram(&header, &o.body)?;
+        *bytes = bytes.saturating_add(u64::try_from(datagram.len()).unwrap_or(u64::MAX));
+        net.send(HOST, VIEWER, datagram.len(), datagram);
+    }
+    Ok(())
+}
+
+/// 网络控制器的定时任务间隔（和产品一样 25 ms）。
+const CC_TICK_US: u64 = 25_000;
+
 pub fn run(s: &Scenario) -> Result<Outcome, Error> {
     if s.fps == 0 || s.phases.is_empty() {
         return Err(Error::InvalidArgument("帧率和阶段都不能为空"));
@@ -354,6 +390,9 @@ pub fn run(s: &Scenario) -> Result<Outcome, Error> {
     rx.set_keyframe_grace(s.codec == CodecKind::H264);
     rx.set_fec(s.fec);
     tx.set_fec(s.fec);
+    // 网络控制器要到达报告时两端都打开（产品里由握手的 TRANSPORT_CC 决定）
+    tx.set_reports(true);
+    rx.set_reports(tx.reports());
     let mut net: Net<Vec<u8>> = Net::new(s.seed);
     let mut network = s.network.clone();
     network.sort_by_key(|(t, _)| *t);
@@ -367,6 +406,10 @@ pub fn run(s: &Scenario) -> Result<Outcome, Error> {
     let (mut seq, mut fb_seq) = (0u32, 0u32);
     let mut overall_wait = 0u64;
     let mut features = Vec::new();
+    let trace_events = s.trace;
+    let mut trace = Vec::new();
+    // 调试：每秒里因为哪个闸门没编帧（等关键帧、在途满、节奏器忙）
+    let mut gate = (0u32, 0u32, 0u32);
     // 源画面变了、控制端还没看到新画面：从哪个时刻开始等的。
     let mut waiting_since: Option<Time> = None;
     // 会话开始到看到第一幅画面用了多久。
@@ -378,6 +421,7 @@ pub fn run(s: &Scenario) -> Result<Outcome, Error> {
 
     let mut now = Time::ZERO;
     let mut next_feedback = Time(FEEDBACK_US);
+    let mut next_tick = Time::ZERO;
     let mut pacer = peerdesk_core::pacer::Pacer::new(Time(0));
     let pacing = s.pacing;
     for phase in &s.phases {
@@ -411,12 +455,21 @@ pub fn run(s: &Scenario) -> Result<Outcome, Error> {
             }
             // 在途数据超过上限，或上一帧还没发完（发送队列最多放一帧）：这一帧不编，
             // 变化攒着，等发完、确认之后编最新的画面。
+            // 和产品一样每一轮都检查迟迟没有结论的帧（整个关键帧都被瓶颈丢掉时，接收端不知道有这一帧，
+            // 只能靠发送端超时判丢；只在编帧时检查的话，等关键帧时不编帧，就永远等下去）。
+            tx.expire_unacked(now);
+            if trace_events && (pending || tx.wants_frame()) && tx.due(now) {
+                if tx.key_pending() {
+                    gate.0 += 1;
+                } else if tx.in_flight_full(now) {
+                    gate.1 += 1;
+                } else if pacer.busy(tx.pacing_bps(pacing), 1_000_000 / u64::from(s.fps.max(1))) {
+                    gate.2 += 1;
+                }
+            }
             if (pending || tx.wants_frame())
                 && !tx.in_flight_full(now)
-                && !pacer.busy(
-                    peerdesk_core::pacer::rate_for(pacing, tx.rate_bps()),
-                    1_000_000 / u64::from(s.fps.max(1)),
-                )
+                && !pacer.busy(tx.pacing_bps(pacing), 1_000_000 / u64::from(s.fps.max(1)))
                 && tx.due(now)
             {
                 let rtt = link.delay_us.saturating_mul(2).saturating_add(1_000);
@@ -427,29 +480,23 @@ pub fn run(s: &Scenario) -> Result<Outcome, Error> {
                 }
                 // 和产品一样经发送节奏控制发出（见 peerdesk_core::pacer）
                 pacer.push(out);
-                for o in pacer.pop_ready(now, peerdesk_core::pacer::rate_for(pacing, tx.rate_bps()))
-                {
-                    let header = Header {
-                        channel: Channel::Video,
-                        flags: o.flags,
-                        conn_id: 0,
-                        seq,
-                        send_time: now,
-                    };
-                    seq = seq.wrapping_add(1);
-                    let datagram = encode_datagram(&header, &o.body)?;
-                    acc.bytes = acc
-                        .bytes
-                        .saturating_add(u64::try_from(datagram.len()).unwrap_or(u64::MAX));
-                    net.send(HOST, VIEWER, datagram.len(), datagram);
-                }
+                send_ready(
+                    &mut pacer,
+                    &mut tx,
+                    pacing,
+                    &mut net,
+                    now,
+                    &mut seq,
+                    &mut acc.bytes,
+                )?;
             }
             // 这一帧的时间内：投递数据报、发反馈。
             loop {
                 let next = [
                     net.peek_time(),
                     Some(next_feedback),
-                    pacer.next_due(now, peerdesk_core::pacer::rate_for(pacing, tx.rate_bps())),
+                    Some(next_tick),
+                    pacer.next_due(now, tx.pacing_bps(pacing)),
                 ]
                 .into_iter()
                 .flatten()
@@ -458,22 +505,44 @@ pub fn run(s: &Scenario) -> Result<Outcome, Error> {
                 let Some(when) = next else { break };
                 net.advance_to(when);
                 now = when;
-                for o in pacer.pop_ready(now, peerdesk_core::pacer::rate_for(pacing, tx.rate_bps()))
-                {
-                    let header = Header {
-                        channel: Channel::Video,
-                        flags: o.flags,
-                        conn_id: 0,
-                        seq,
-                        send_time: now,
-                    };
-                    seq = seq.wrapping_add(1);
-                    let datagram = encode_datagram(&header, &o.body)?;
-                    acc.bytes = acc
-                        .bytes
-                        .saturating_add(u64::try_from(datagram.len()).unwrap_or(u64::MAX));
-                    net.send(HOST, VIEWER, datagram.len(), datagram);
+                if next_tick <= now {
+                    tx.on_tick(now);
+                    for cluster in tx.take_probes() {
+                        pacer.push_probe(cluster);
+                    }
+                    next_tick = now.plus(CC_TICK_US);
+                    if trace_events && now.micros() % 1_000_000 < CC_TICK_US {
+                        {
+                            let line = tx
+                                .controller_line()
+                                .unwrap_or_else(|| format!("码率 {} kbps", tx.rate_bps() / 1000));
+                            trace.push(format!(
+                                "[{:>6} ms] {line}；节奏器排队 {} B，在途 {} B；这一秒不编：等关键帧 {}、在途满 {}、节奏器忙 {}",
+                                now.micros() / 1000,
+                                pacer.queued_bytes(),
+                                tx.in_flight(),
+                                gate.0,
+                                gate.1,
+                                gate.2
+                            ));
+                            gate = (0, 0, 0);
+                            let st = tx.stats();
+                            trace.push(format!(
+                                "           发送端累计：帧 {}，关键帧 {}，判丢 {}，重传 {}（重传请求 {}，没到时间跳过 {}，原包没发 {}，超额没发 {}）",
+                                st.frames, st.keyframes, st.lost, st.retransmitted, st.nack_requests, st.resend_skipped, st.resend_unsent, st.resend_capped
+                            ));
+                        }
+                    }
                 }
+                send_ready(
+                    &mut pacer,
+                    &mut tx,
+                    pacing,
+                    &mut net,
+                    now,
+                    &mut seq,
+                    &mut acc.bytes,
+                )?;
                 if next_feedback <= now {
                     let fb = rx.feedback_datagram(now);
                     let header = Header {
@@ -495,23 +564,22 @@ pub fn run(s: &Scenario) -> Result<Outcome, Error> {
                     };
                     if d.to == HOST {
                         // 反馈；顺便按请求重传丢了的分片。
-                        pacer.push_front(tx.on_feedback_datagram(now, body).unwrap_or_default());
-                        for o in pacer
-                            .pop_ready(now, peerdesk_core::pacer::rate_for(pacing, tx.rate_bps()))
-                        {
-                            let header = Header {
-                                channel: Channel::Video,
-                                flags: o.flags,
-                                conn_id: 0,
-                                seq,
-                                send_time: now,
-                            };
-                            seq = seq.wrapping_add(1);
-                            let datagram = encode_datagram(&header, &o.body)?;
-                            acc.bytes = acc
-                                .bytes
-                                .saturating_add(u64::try_from(datagram.len()).unwrap_or(u64::MAX));
-                            net.send(HOST, VIEWER, datagram.len(), datagram);
+                        let again = tx.on_feedback_datagram(now, body).unwrap_or_default();
+                        pacer.retain(|o| tx.wanted(o));
+                        pacer.push_front(again);
+                        send_ready(
+                            &mut pacer,
+                            &mut tx,
+                            pacing,
+                            &mut net,
+                            now,
+                            &mut seq,
+                            &mut acc.bytes,
+                        )?;
+                        if trace_events {
+                            for e in tx.take_events() {
+                                trace.push(format!("[{:>6} ms] {e}", now.micros() / 1000));
+                            }
                         }
                         if let Some(obs) = tx.last_observation() {
                             features.push(FeatureRow {
@@ -609,6 +677,7 @@ pub fn run(s: &Scenario) -> Result<Outcome, Error> {
         freezes: overall_freezes,
         estimator: tx.estimator(),
         features,
+        trace,
     })
 }
 
@@ -673,6 +742,8 @@ mod tests {
             ],
         );
         s.pacing = true;
+        s.trace = true;
+        s.estimator = EstimatorKind::GccV1;
         s.start_bps = 500_000;
         s.network = vec![(
             0,
