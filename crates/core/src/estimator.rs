@@ -495,6 +495,9 @@ pub struct ClassicV1 {
     /// 码率变化说明（取走后清空）和上次写说明时的码率（升码率累计超过一定比例才写一次）。
     notes: Vec<String>,
     noted_bps: u64,
+    /// 固有丢包率（千分比 × 1000，慢速平均）：随机丢包（Wi-Fi 干扰、链路本身）的底，高出它的丢包才算拥塞
+    /// （WebRTC `LossBasedBweV2` 的“固有丢包”）。
+    inherent_loss: u64,
 }
 
 /// 门限的上下界（0.1 毫秒）和调整速度（每毫秒千万分之一）：WebRTC 的 6–600 毫秒、k_up 0.0087、k_down 0.039。
@@ -524,6 +527,7 @@ impl ClassicV1 {
             notes: Vec::new(),
             noted_bps: start_bps,
             usage: Usage::Normal,
+            inherent_loss: 0,
         }
     }
 
@@ -624,8 +628,12 @@ impl RateEstimator for ClassicV1 {
         // 拥塞：趋势过载，或者排队已经很高（趋势线可能还没攒够点）。
         // 丢包只有在排队也在涨时才算拥塞；单独的随机丢包交给纠错和重传，不降码率。
         let queue_high = fb.queue_delay_us > p.high_delay_us;
-        let lossy_and_queued =
-            fb.loss_permille > p.loss_permille && fb.queue_delay_us > p.low_delay_us;
+        // 固有丢包慢慢跟（每份反馈 1/128，反馈 20 ms 一次时约 2.5 秒）
+        let loss = u64::from(fb.loss_permille).saturating_mul(1000);
+        self.inherent_loss = self.inherent_loss - self.inherent_loss / 128 + loss / 128;
+        let inherent = u16::try_from(self.inherent_loss / 1000).unwrap_or(u16::MAX);
+        let lossy_and_queued = fb.loss_permille > p.loss_permille.saturating_add(inherent)
+            && fb.queue_delay_us > p.low_delay_us;
         let congested = self.usage == Usage::Over || queue_high || lossy_and_queued;
         // 一个往返（至少 100 ms）之内只降一次：同一次拥塞的反馈会连着来好几条。
         let hold = obs.rtt_us.max(100_000);
@@ -955,6 +963,32 @@ mod tests {
         assert!(v.rate_bps() > 40_000_000, "{}", v.rate_bps());
         assert!(v.rate_bps() <= 45_000_000);
         assert_eq!(v.usage(), Usage::Normal);
+    }
+
+    #[test]
+    fn steady_random_loss_becomes_the_inherent_floor_and_only_loss_above_it_cuts() {
+        let mut v = ClassicV1::new(Profile::WIRELESS, 1_000_000, 100_000, 100_000_000);
+        let normal = Extension {
+            groups: 10,
+            ..Extension::default()
+        };
+        // 一开始：20% 丢包 + 少量排队（一帧自己的突发）就算拥塞，降
+        v.on_observation(Time(20_000), &obs(fb(10_000, 200, 125_000), normal));
+        assert!(v.rate_bps() < 1_000_000);
+        // 链路一直是 20% 的随机丢包：固有丢包跟上来之后，同样的丢包不再降码率
+        let mut t = 20_000;
+        for _ in 0..1000 {
+            t += 20_000;
+            v.on_observation(Time(t), &obs(fb(0, 200, 125_000), normal));
+        }
+        let before = v.rate_bps();
+        t += 200_000;
+        v.on_observation(Time(t), &obs(fb(10_000, 200, 125_000), normal));
+        assert_eq!(v.rate_bps(), before, "随机丢包不降码率");
+        // 丢包明显高出固有丢包、又在排队：拥塞，降
+        t += 200_000;
+        v.on_observation(Time(t), &obs(fb(10_000, 400, 125_000), normal));
+        assert!(v.rate_bps() < before);
     }
 
     #[test]
