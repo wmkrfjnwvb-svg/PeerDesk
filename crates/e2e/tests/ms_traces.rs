@@ -5,7 +5,7 @@
 
 use peerdesk_core::adaptive::Profile;
 use peerdesk_core::sim::Link;
-use peerdesk_e2e::{run, Action, EstimatorKind, Outcome, Phase, Scenario};
+use peerdesk_e2e::{run, Action, ContentPolicy, EstimatorKind, Outcome, Phase, Scenario};
 
 const TRACES: [(&str, &str); 8] = [
     ("ms-09401", include_str!("../traces/ms-09401.csv")),
@@ -117,7 +117,7 @@ fn microsoft_traces() {
             network: network(csv),
             profile: Profile::WIRELESS,
             estimator,
-            start_bps: 1_000_000,
+            start_bps: ContentPolicy::OFFICE.start_bps,
             ..Scenario::new(name, workload())
         })
         .unwrap();
@@ -163,7 +163,7 @@ fn microsoft_traces_do_not_regress() {
             network: network(csv),
             profile: Profile::WIRELESS,
             estimator: EstimatorKind::ClassicV1,
-            start_bps: 1_000_000,
+            start_bps: ContentPolicy::OFFICE.start_bps,
             ..Scenario::new(name, workload())
         })
         .unwrap();

@@ -12,6 +12,9 @@ pub struct ContentPolicy {
     pub name: &'static str,
     /// 帧率档位，从高到低：帧率调节只在这些档位里升降，最后一档是下限。
     pub fps_steps: &'static [u32],
+    /// 起步码率（bps）：连接时还不知道链路多快，第一个关键帧按它编；之后按第一个关键帧的包串测得的
+    /// 容量很快升上去（快链路上几百毫秒内）。
+    pub start_bps: u64,
     /// 码率上限（bps）。
     pub max_bps: u64,
     /// 编码器的 QP 上限：大帧最多粗到哪（之后补清晰）。H.264 最大 51。
@@ -29,6 +32,11 @@ impl ContentPolicy {
     pub const OFFICE: Self = Self {
         name: "办公",
         fps_steps: &[60, 30, 20, 15, 10, 8, 5],
+        // 1 Mbps（原来 4 Mbps）：窄带上按 4 Mbps 编第一个关键帧，微软 8 条真实轨迹首帧平均 935 ms、最慢 2.2 秒；
+        // 1 Mbps 时平均 295 ms，卡顿也最少（500 kbps 首帧 74 ms 但卡顿多，2 Mbps 556 ms）；快链路上没有代价
+        // （第一个关键帧的包串测出容量，很快升上去；e2e 局域网第一秒 PSNR 43.1 → 45.4 dB）。
+        // 先探测再编第一帧、或者和第一帧并行探测，实测都不如它（docs/research/L-framework.md T7）。
+        start_bps: 1_000_000,
         max_bps: 30_000_000,
         max_qp: 51,
         big_frame_us: 100_000,

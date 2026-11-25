@@ -84,6 +84,10 @@ pub struct ReceiverMetrics {
     /// 回归用的点：(到达时间毫秒, 平滑后的累加延迟微秒)。
     points: Vec<(i64, i64)>,
     max_train: u32,
+    /// 正在收的探测组（起步探测的填充包，见 [`crate::proto::Caps::PROBE_TRAIN`]）：(组号, 首包到达, 末包到达, 包数, 字节数)。
+    probe: Option<(u32, Time, Time, u32, u64)>,
+    /// 上次报告时这一组有几个包（没有新包进来就结束这一组，不重复报告旧结果）。
+    probe_reported: u32,
 }
 
 impl ReceiverMetrics {
@@ -97,6 +101,8 @@ impl ReceiverMetrics {
             smoothed: 0,
             points: Vec::new(),
             max_train: 0,
+            probe: None,
+            probe_reported: 0,
         }
     }
 
@@ -136,15 +142,57 @@ impl ReceiverMetrics {
         });
     }
 
-    fn finish(&mut self, g: Group) {
-        // 包串速率：首包到达之后的字节 ÷ 首尾到达间隔。
-        let span = g.last_arrival.since(g.first_arrival);
-        if g.packets >= MIN_TRAIN_PACKETS && span > 0 {
-            let after_first =
-                g.bytes.saturating_mul(u64::from(g.packets - 1)) / u64::from(g.packets);
+    /// 收到探测组 `id` 的一个填充包。探测包不进延迟趋势（它们背靠背发出，只用来测包串速率）。
+    pub fn on_probe(&mut self, now: Time, id: u32, bytes: usize) {
+        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+        match self.probe.as_mut() {
+            Some((g, _, last, packets, total)) if *g == id => {
+                *last = now;
+                *packets = packets.saturating_add(1);
+                *total = total.saturating_add(bytes);
+            }
+            Some(_) | None => {
+                self.finish_probe();
+                self.probe = Some((id, now, now, 1, bytes));
+            }
+        }
+    }
+
+    /// 结算正在收的探测组。
+    fn finish_probe(&mut self) {
+        if let Some((_, first, last, packets, bytes)) = self.probe.take() {
+            self.train(first, last, packets, bytes);
+        }
+        self.probe_reported = 0;
+    }
+
+    /// 报告时：探测组不用等整组收完（窄带上一组要传一两百毫秒，反馈每几十毫秒一次），够包数就先报告，
+    /// 组留着、后面的包接着累计；上次报告之后没有新包进来，这一组就结束了。
+    fn report_probe(&mut self) {
+        let Some((_, first, last, packets, bytes)) = self.probe else {
+            return;
+        };
+        if packets == self.probe_reported {
+            self.probe = None;
+            self.probe_reported = 0;
+        } else if packets >= MIN_TRAIN_PACKETS {
+            self.train(first, last, packets, bytes);
+            self.probe_reported = packets;
+        }
+    }
+
+    /// 包串速率：首包到达之后的字节 ÷ 首尾到达间隔。
+    fn train(&mut self, first: Time, last: Time, packets: u32, bytes: u64) {
+        let span = last.since(first);
+        if packets >= MIN_TRAIN_PACKETS && span > 0 {
+            let after_first = bytes.saturating_mul(u64::from(packets - 1)) / u64::from(packets);
             let rate = after_first.saturating_mul(1_000_000) / span;
             self.max_train = self.max_train.max(u32::try_from(rate).unwrap_or(u32::MAX));
         }
+    }
+
+    fn finish(&mut self, g: Group) {
+        self.train(g.first_arrival, g.last_arrival, g.packets, g.bytes);
         // 延迟趋势：和上一组比较。
         if let Some(prev) = self.previous {
             let signed = |t: Time| i64::try_from(t.micros()).unwrap_or(i64::MAX);
@@ -165,6 +213,7 @@ impl ReceiverMetrics {
 
     /// 生成这段时间的扩展测量，并开始下一段（包串速率清零，趋势线保留）。
     pub fn report(&mut self) -> Extension {
+        self.report_probe();
         let slope_milli = slope_per_mille(&self.points);
         let n = i64::try_from(self.points.len()).unwrap_or(0);
         // 修正趋势 = 斜率 × 分组数（上限 60）× 4，单位毫秒（WebRTC 的定义，斜率无量纲）。
@@ -735,6 +784,40 @@ mod tests {
         let mut few = ReceiverMetrics::new();
         feed(&mut few, 5, 2, 33_000, 1_000, 0);
         assert_eq!(few.report().train_bytes_per_s, 0);
+    }
+
+    #[test]
+    fn probe_trains_are_measured_per_cluster_even_before_they_finish() {
+        let mut m = ReceiverMetrics::new();
+        // 起步探测、4 Mbps 的瓶颈（1200 字节 2.4 ms）：报告时还没收完、够 3 个包就能测
+        for i in 0..5u64 {
+            m.on_probe(Time(1_000 + i * 2_400), 9, 1200);
+        }
+        let ext = m.report();
+        assert!(
+            (450_000..=550_000).contains(&ext.train_bytes_per_s),
+            "{ext:?}"
+        );
+        // 后面的包接着累计；没有新包进来的那次报告结束这一组，不重复报告
+        m.on_probe(Time(13_000), 9, 1200);
+        assert!(m.report().train_bytes_per_s > 0);
+        assert_eq!(m.report().train_bytes_per_s, 0);
+        // 窄带：每次报告之间只到一个包，攒够 3 个才报
+        let mut narrow = ReceiverMetrics::new();
+        narrow.on_probe(Time(0), 3, 1200);
+        assert_eq!(narrow.report().train_bytes_per_s, 0);
+        narrow.on_probe(Time(24_000), 3, 1200);
+        assert_eq!(narrow.report().train_bytes_per_s, 0);
+        narrow.on_probe(Time(48_000), 3, 1200);
+        let rate = narrow.report().train_bytes_per_s;
+        assert!((45_000..=55_000).contains(&rate), "{rate}");
+        // 换了组：上一组先结算；包太少的组不测
+        m.on_probe(Time(50_000), 1, 1200);
+        m.on_probe(Time(51_000), 1, 1200);
+        m.on_probe(Time(60_000), 2, 1200);
+        assert_eq!(m.report().train_bytes_per_s, 0);
+        // 探测包不进延迟趋势
+        assert_eq!(m.report().groups, 0);
     }
 
     #[test]

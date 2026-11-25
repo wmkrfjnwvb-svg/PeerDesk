@@ -58,7 +58,7 @@ use crate::media::Outgoing;
 use crate::proto::HEADER_LEN;
 use crate::time::Time;
 
-/// 数据报标志位：填充包（探测用），接收端只记到达时间、丢弃内容。
+/// 数据报标志位：填充包（探测用），开头 4 字节是探测组号（小端），其余内容丢弃。
 pub const FLAG_PADDING: u8 = 2;
 
 /// 发送速率是估计带宽的多少倍（千分比）。2.5 倍（WebRTC 同值）：估计偏低时很快探上去，大帧又不会整帧突发挤爆瓶颈缓冲区。
@@ -122,14 +122,19 @@ impl Pacer {
                 u64::from(PROBE_PACKET_BYTES).saturating_mul(8_000_000) / cluster.target_bps.max(1);
             let mut due = next.unwrap_or(now);
             while *sent < cluster.packets && due <= now {
+                // 开头 4 字节是组号（接收端按组测包串速率，见 Caps::PROBE_TRAIN），其余填 0
+                let mut body = vec![
+                    0;
+                    usize::try_from(PROBE_PACKET_BYTES)
+                        .unwrap_or(0)
+                        .saturating_sub(HEADER_LEN)
+                ];
+                for (b, v) in body.iter_mut().zip(cluster.id.to_le_bytes()) {
+                    *b = v;
+                }
                 out.push(Outgoing {
                     flags: FLAG_PADDING,
-                    body: vec![
-                        0;
-                        usize::try_from(PROBE_PACKET_BYTES)
-                            .unwrap_or(0)
-                            .saturating_sub(HEADER_LEN)
-                    ],
+                    body,
                     kind: PacketKind::Probe(cluster.id),
                     fragment: None,
                 });
@@ -348,6 +353,8 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].kind, PacketKind::Probe(7));
         assert_eq!(out[0].flags, FLAG_PADDING);
+        // 开头 4 字节是组号（接收端按组测包串速率）
+        assert_eq!(out[0].body[..4], 7u32.to_le_bytes());
         assert_eq!(out[0].body.len() + HEADER_LEN, 1200);
         assert_eq!(p.next_due(Time(0), 1_000_000), Some(Time(1_000)));
         assert_eq!(

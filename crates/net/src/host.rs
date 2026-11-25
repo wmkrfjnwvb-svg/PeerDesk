@@ -67,8 +67,8 @@ pub trait ScreenSource: Send {
     }
 }
 
-/// 起始码率：没有历史数据时从这里起步。
-pub const DEFAULT_START_BPS: u64 = 4_000_000;
+/// 起始码率（办公策略的值，为什么见 [`ContentPolicy::OFFICE`]）。
+pub const DEFAULT_START_BPS: u64 = ContentPolicy::OFFICE.start_bps;
 /// 码率上限（办公策略的值）。
 pub const DEFAULT_MAX_BPS: u64 = ContentPolicy::OFFICE.max_bps;
 /// 码率下限。

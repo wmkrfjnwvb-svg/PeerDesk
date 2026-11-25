@@ -188,7 +188,7 @@ impl Default for SenderConfig {
     fn default() -> Self {
         Self {
             fps: 30,
-            start_bps: 4_000_000,
+            start_bps: ContentPolicy::OFFICE.start_bps,
             min_bps: 100_000,
             max_bps: ContentPolicy::OFFICE.max_bps,
             profile: Profile::STABLE,
@@ -1354,8 +1354,12 @@ impl MediaReceiver {
         if self.reports {
             self.arrivals.on_packet(now, seq);
         }
-        // 探测用的填充包：只记到达时间
+        // 探测用的填充包：记到达时间；开头 4 字节是组号，按组测包串速率（起步探测，见 Caps::PROBE_TRAIN）
         if flags & FLAG_PADDING != 0 {
+            if let Some(id) = body.first_chunk::<4>() {
+                self.metrics
+                    .on_probe(now, u32::from_le_bytes(*id), body.len());
+            }
             return Ok(None);
         }
         let mut r = Reader::new(body);

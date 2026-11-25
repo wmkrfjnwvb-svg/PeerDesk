@@ -281,6 +281,10 @@ impl Caps {
     pub const VIEW_SIZE: Caps = Caps(1 << 22);
     /// 发送端的网络控制器（见 [`crate::cc`]）：接收端在反馈里发到达报告、能收探测的填充包。
     pub const TRANSPORT_CC: Caps = Caps(1 << 23);
+    /// 接收端按组测填充包的包串速率（包里带组号）、随反馈带回：给以后画面静止时的低成本探测用（链路在静止时
+    /// 变差，发送端要能察觉，见 #26）。接收端先支持、先发出去，发送端开始探测时用户手上的版本已经能配合。
+    /// 起步探测实测不如保守的起步码率，没用它（docs/research/L-framework.md T7）。
+    pub const PROBE_TRAIN: Caps = Caps(1 << 24);
 
     // 第 24–26 位不是能力，是被控端在 Accept 里告诉控制端自己的系统（见 [`PeerOs`]），
     // 控制端据此把快捷键里的 Ctrl 换成 Cmd 等。老版本只看能力位，会忽略这几位。
@@ -314,7 +318,8 @@ impl Caps {
             | Self::HOST_STATS.0
             | Self::FILE_BROWSE.0
             | Self::VIEW_SIZE.0
-            | Self::TRANSPORT_CC.0,
+            | Self::TRANSPORT_CC.0
+            | Self::PROBE_TRAIN.0,
     );
 
     /// 并集。

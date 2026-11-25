@@ -159,7 +159,7 @@ impl Scenario {
             phases,
             network: vec![(0, Link::lan())],
             profile: Profile::STABLE,
-            start_bps: 4_000_000,
+            start_bps: ContentPolicy::OFFICE.start_bps,
             max_bps: 30_000_000,
             seed: 1,
             estimator: EstimatorKind::PRODUCT,
