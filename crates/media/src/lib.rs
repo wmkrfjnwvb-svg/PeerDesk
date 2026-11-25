@@ -587,6 +587,8 @@ pub struct H264Encoder {
     /// 上一次编的画面的抽样（每 [`SAMPLE_STEP`] 像素取一个），估计画面变了多少。
     samples: Vec<u32>,
     sampled: (u16, u16),
+    /// 编码器现在用的每层固定 QP（没变就不再设，省一次取参数、设参数）。
+    layer_qp: Option<u8>,
 }
 
 /// 硬件编码这一步的结果。
@@ -661,6 +663,7 @@ impl H264Encoder {
             big_frame_us: BIG_FRAME_US,
             samples: Vec::new(),
             sampled: (0, 0),
+            layer_qp: None,
         }
     }
 
@@ -1001,10 +1004,16 @@ impl H264Encoder {
         if self.force_key && !fresh {
             enc.force_intra_frame();
         }
-        // 画面变了多少（CPU 画面按抽样估计；显卡画面不读回来比，不知道）
+        // 画面变了多少（CPU 画面按抽样估计；显卡画面不读回来比，不知道）。只有静止后第一帧变化要用；
+        // 其余的帧只在关键帧时记一次抽样（作比较的基准），省掉每帧的抽样。
+        let first_change = !fresh && !self.force_key && changed && !self.qp.changing();
         let area = match input {
-            Input::Rgb(screen) => Some(self.changed_permille(screen)),
-            Input::Gpu(_) => None,
+            Input::Rgb(screen) if first_change => Some(self.changed_permille(screen)),
+            Input::Rgb(screen) if fresh || self.force_key || !changed => {
+                let _ = self.changed_permille(screen);
+                None
+            }
+            Input::Rgb(_) | Input::Gpu(_) => None,
         };
         let yuv = YUVSlices::new(
             (&self.planes.0, &self.planes.1, &self.planes.2),
@@ -1046,8 +1055,11 @@ impl H264Encoder {
             // 跟不跟得上，算进去的话每次新开编码器都像 CPU 过载（实测 100 帧时被降到 50 帧）。
             encoding = std::time::Instant::now();
         }
-        if !fresh || qp != DEFAULT_LAYER_QP {
-            set_layer_qp(&mut enc, qp);
+        if fresh {
+            self.layer_qp = Some(DEFAULT_LAYER_QP);
+        }
+        if self.layer_qp != Some(qp) && set_layer_qp(&mut enc, qp) {
+            self.layer_qp = Some(qp);
         }
         let (key, data) = enc
             .encode(&yuv)

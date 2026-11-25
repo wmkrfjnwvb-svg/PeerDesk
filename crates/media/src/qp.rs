@@ -107,6 +107,12 @@ impl QpControl {
         self.qp
     }
 
+    /// 上一帧是不是“画面在变”的增量帧（是的话这一帧按上一帧的大小修正，不用估计变化面积）。
+    #[must_use]
+    pub fn changing(&self) -> bool {
+        matches!(self.last, Some((_, _, Kind::Change)))
+    }
+
     /// 补清晰补完了没有（QP 到了最小值）。
     #[must_use]
     pub fn converged(&self) -> bool {

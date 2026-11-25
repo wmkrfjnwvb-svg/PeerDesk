@@ -182,14 +182,18 @@ async fn full_session_video_input_and_files() {
     // 码率会被压低、画质跟着降，所以门槛放宽；画质由确定性的端到端测试（crates/e2e）把关。
     assert!(psnr > 20.0, "观看端画面与被控端对不上：{psnr:.1} dB");
     // 桌面变了 20 次；编码器忙时期间的变化合并成最新的一帧（不排队），所以帧数可能少于 20。
-    assert!(host_report.frames_sent >= 5, "{}", host_report.frames_sent);
+    // 回环上码率够，变化的帧已经按最小 QP 编，画面停下后没有可补的（不再发补清晰的帧；原来会再补 12 帧，
+    // 下限按那时的帧数定的）。覆盖率插桩的构建里颜色转换一帧要 8 ms（100 帧的间隔才 10 ms），
+    // 并行跑测试时只编出 4 帧（2026-11 实测）。
+    assert!(host_report.frames_sent >= 3, "{}", host_report.frames_sent);
     // 桌面静止后不再发帧：帧数远少于 1.5 秒 × 100 帧每秒
     // （机器很慢时个别帧会被判定超时而重发，所以留一些余量。）
     assert!(host_report.frames_sent < 60, "{}", host_report.frames_sent);
     // 视频编码丢了一帧就要等关键帧，CPU 很忙时可能有个别帧没显示。
     assert!(report.frames_delivered <= u64::from(host_report.frames_sent));
     assert!(
-        report.frames_delivered >= 10,
+        report.frames_delivered >= 3
+            && report.frames_delivered + 2 >= u64::from(host_report.frames_sent),
         "送到 {}，发出 {}",
         report.frames_delivered,
         host_report.frames_sent
