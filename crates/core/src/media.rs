@@ -1432,6 +1432,93 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
     use super::*;
 
+    /// 每帧都比预算大得多的编码器（满屏视频、窄带宽）。
+    struct HugeEncoder;
+
+    impl VideoEncoder for HugeEncoder {
+        fn codec(&self) -> Codec {
+            Codec::H264
+        }
+        fn encode(
+            &mut self,
+            _id: u32,
+            s: &Screen,
+            _changed: bool,
+            _budget: usize,
+        ) -> Result<Option<EncodedFrame>, Error> {
+            let header = FrameHeader {
+                codec: Codec::H264,
+                key: false,
+                width: s.width(),
+                height: s.height(),
+            };
+            Ok(Some(EncodedFrame {
+                payload: header.frame(&[0u8; 20_000]),
+                key: false,
+            }))
+        }
+        fn on_feedback(&mut self, _floor: u32, _mask: u32) {}
+        fn on_lost(&mut self, _frame_id: u32) {}
+        fn wants_refine(&self) -> bool {
+            false
+        }
+    }
+
+    /// 适配的最后一步：帧率降到最低（5 帧）之后还一直装不进预算 2 秒，降分辨率，说明原因。
+    #[test]
+    fn content_that_never_fits_drops_resolution_as_the_last_resort() {
+        let mut tx = MediaSender::new(
+            SenderConfig {
+                start_bps: 200_000,
+                min_bps: 200_000,
+                max_bps: 200_000,
+                ..cfg()
+            },
+            Box::new(HugeEncoder),
+        );
+        tx.scale = ScalePolicy::full();
+        let mut t = Time::ZERO;
+        let mut events = Vec::new();
+        for i in 0..600u32 {
+            t = t.plus(33_334);
+            if tx.due(t) {
+                let _ = tx
+                    .on_frame(t, &Screen::new(16, 16, i), true, 40_000)
+                    .unwrap();
+            }
+            events.extend(tx.take_events());
+            if tx.scale.permille() < crate::scale::FULL_PERMILLE {
+                break;
+            }
+        }
+        assert_eq!(tx.fps(), 5, "先把帧率降到最低");
+        assert_eq!(tx.scale.permille(), crate::scale::START_PERMILLE);
+        assert!(
+            events.iter().any(|e| e.contains("降分辨率是最后手段")),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn too_many_nacks_in_a_v2_feedback_are_rejected() {
+        let fb = Feedback {
+            floor: 1,
+            delivered: 1,
+            loss_permille: 0,
+            queue_delay_us: 0,
+            recv_bytes_per_s: 0,
+        };
+        let mut buf = encode_feedback_v2(&fb, &[], None);
+        // 数据报头之后第一个字节是重传请求的个数：改成超过上限
+        if let Some(count) = buf.get_mut(Feedback::LEN) {
+            *count = u8::try_from(MAX_NACKS + 1).unwrap();
+        }
+        assert!(matches!(
+            decode_feedback_v2(&buf),
+            Err(Error::TooManyItems { .. })
+        ));
+    }
+
     #[test]
     fn a_new_view_size_asks_for_a_frame() {
         let mut tx = MediaSender::detached(SenderConfig::default(), Codec::H264);

@@ -479,7 +479,7 @@ pub fn run(s: &Scenario) -> Result<Outcome, Error> {
                     captured.push(now);
                     if trace_events {
                         let bytes: usize = out.iter().map(|o| o.body.len()).sum();
-                        if bytes > 8_000 {
+                        if bytes > 4_000 {
                             trace.push(format!(
                                 "[{:>6} ms] 大帧 {bytes} B（关键帧累计 {}），码率 {} kbps",
                                 now.micros() / 1000,
