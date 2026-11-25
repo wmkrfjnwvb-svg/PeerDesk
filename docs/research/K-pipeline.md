@@ -232,6 +232,28 @@
 链条：CPU 缩放慢 → 帧率降到 5 → 每秒两三帧（应用受限）→ 一帧突发的尾巴让“排队”超过 12 ms → 按两三帧的送达速率 × 0.85 降码率
 → 100 kbps、每帧额度两三 KB → 糊；接着包串测速读到几 Gbps → 码率跳到 30 Mbps → 大帧 → 再降。
 
+### P15 采集到编码整条在 CPU 上走，业内是全程在显卡上（2026-11-25 调研）
+
+我们现在（Mac 和 Windows 一样）一帧全屏要在 CPU 上过 4–5 遍：系统给的 BGRA 拷成我们的 RGB（每采一帧都做，`platform/src/macos.rs:477`、
+`windows.rs:361–392` 先从显存拷回内存）→ 整幅复制一份交给编码线程 → CPU 缩放 → CPU 转 YUV → 拷进编码器缓冲（Windows 编码器再传回显卡）。
+业内是 0 遍：
+
+| 平台 | 业内做法 | 来源 |
+|---|---|---|
+| Mac | ScreenCaptureKit 直接输出 `420v`（NV12、视频范围），宽高设成编码尺寸（偶数），缩放和颜色转换由系统在显卡上做；输出的缓冲区（显存）原样交给 `VTCompressionSessionEncodeFrame`，不拷贝 | 苹果 WWDC22 10155（“硬件加速的采集、缩放、像素和颜色格式转换”，编码用 420v、显示用 BGRA）；Chromium `content/browser/media/capture/screen_capture_kit_device_mac.mm`（420v、`CreateEvenSize`、系统缩放）；FFmpeg `videotoolboxenc.c`（硬件帧直接 `CFRetain` 交给编码器） |
+| Windows | 桌面复制拿到纹理 → 显卡内拷一份 → `ID3D11VideoProcessor`（或着色器）在显卡上转 NV12 并缩放 → NV12 纹理经 `IMFDXGIDeviceManager` + `MFCreateDXGISurfaceBuffer` 交给硬件编码器；采集、转换、编码同一块显卡 | 微软 Learn：Desktop Duplication、Video Processor MFT、`MFCreateDXGISurfaceBuffer`、硬件 MFT；Sunshine `src/platform/windows/display_vram.cpp`（着色器转 NV12、缩放）；Chromium `media_foundation_video_encode_accelerator_win.cc`（适配器不一致才退回内存拷贝） |
+| 软件编码兜底（OpenH264） | 只在最后读回一次：已经是编码尺寸的 NV12 拷回内存、拆成 I420，不在 CPU 上转颜色和缩放 | 同上（推荐做法） |
+| 控制端显示 | 解码出来的 NV12 纹理直接用着色器画，不拷回内存转 RGBA | 待办 #22 |
+
+**为什么要缩放、缩到多大**（调研结论，部分来源只拿到摘要，标“待核实”）：
+- 主流远程桌面不在被控端按控制端窗口缩放：Chrome 远程桌面、Parsec、微软远程桌面、Sunshine 是**把被控端的显示分辨率改成控制端要的**
+  （物理屏上不方便改时用虚拟显示器），或者**按原分辨率传、控制端显卡缩放**（Parsec 文档称不为客户端缩小，待核实）。
+- “逻辑分辨率”：Retina 屏 2880×1800 像素、逻辑上是 1440×900 点。ScreenCaptureKit 的 `captureResolution = .nominal` 就是按逻辑分辨率采
+  （一个点一个像素），WebRTC 的屏幕采集用的就是它；Chromium 按物理像素采、再让系统缩到要的尺寸。
+- “多端视频、直播用的”是 simulcast / SVC：同一画面编几路不同分辨率给不同接收端，一对一远程用不上。
+- 文字画面的业内原则（W3C `contentHint` 的 `text` / `detail`）：保分辨率、先降帧率。
+- 我们 0.65 倍、非整数比例的 CPU 缩放（1872×1170）是两头都不占：又慢，又让文字边缘变糊。
+
 ## 4. 业内是怎么分模块的（摘要）
 
 **WebRTC（发送端）**：GoogCC 是协调者，下面每个子模块单一职责——ALR 检测（发送量 vs 估计）、已确认速率估计、
