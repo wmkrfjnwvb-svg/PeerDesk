@@ -68,6 +68,16 @@ fn workload() -> Vec<Phase> {
     office.iter().chain(office.iter()).copied().collect()
 }
 
+/// 停下（第一段之后的空闲段）结束时最差的画质。
+fn idle_psnr(o: &Outcome) -> f64 {
+    o.phases
+        .iter()
+        .filter(|ph| ph.action == Action::Idle)
+        .skip(1)
+        .map(|ph| ph.end_psnr)
+        .fold(f64::INFINITY, f64::min)
+}
+
 fn row(name: &str, o: &Outcome) -> String {
     let shown: Vec<_> = o.phases.iter().filter(|ph| ph.frames_shown > 0).collect();
     let lat = shown.iter().map(|ph| ph.latency_ms.0).sum::<f64>() / shown.len().max(1) as f64;
@@ -86,10 +96,7 @@ fn row(name: &str, o: &Outcome) -> String {
             idle.iter().filter_map(|ph| ph.sharp_ms).fold(0.0, f64::max)
         )
     };
-    let psnr = idle
-        .iter()
-        .map(|ph| ph.end_psnr)
-        .fold(f64::INFINITY, f64::min);
+    let psnr = idle_psnr(o);
     format!(
         "| {name} | {} | {:.0} | {:.0} | {} | {psnr:.1} | {} | {} |",
         o.freezes,
@@ -115,8 +122,8 @@ fn microsoft_traces() {
         .and_then(|n| n.parse::<u64>().ok())
         .unwrap_or(1)
         .max(1);
-    let (mut runs, mut freezes, mut unsharp, mut wait_sum, mut wait_max) =
-        (0u32, 0u32, 0u32, 0.0, 0.0f64);
+    let (mut runs, mut freezes, mut unsharp, mut wait_sum, mut wait_max, mut psnr_sum) =
+        (0u32, 0u32, 0u32, 0.0, 0.0f64, 0.0f64);
     for (name, csv) in TRACES {
         if !only.is_empty() && !only.split(',').any(|t| t == name) {
             continue;
@@ -140,6 +147,7 @@ fn microsoft_traces() {
             freezes += o.freezes;
             wait_sum += o.max_wait_ms;
             wait_max = wait_max.max(o.max_wait_ms);
+            psnr_sum += idle_psnr(&o);
             unsharp += u32::from(row(name, &o).contains("未清晰"));
             let name = if seeds > 1 {
                 format!("{name}#{seed}")
@@ -164,8 +172,10 @@ fn microsoft_traces() {
         }
     }
     println!(
-        "合计 {runs} 次：冻结 {freezes} 次，最长等待平均 {:.0} ms、最大 {wait_max:.0} ms，停下后没变清晰 {unsharp} 次",
-        wait_sum / f64::from(runs.max(1))
+        "合计 {runs} 次：冻结 {freezes} 次，最长等待平均 {:.0} ms、最大 {wait_max:.0} ms，停下后没变清晰 {unsharp} 次，\
+         停下后最差 PSNR 平均 {:.1} dB",
+        wait_sum / f64::from(runs.max(1)),
+        psnr_sum / f64::from(runs.max(1))
     );
 }
 

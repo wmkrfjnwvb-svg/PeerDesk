@@ -16,7 +16,8 @@
 //!   （Chromium 按“更新面积”判断大帧）。不知道面积时用上一次画面在变时的 QP，不用补清晰补到的低 QP
 //!   （否则整屏切换按 QP 12 编，实测 49 KB；高熵内容甚至超出 openh264 的码流缓冲、编码失败）。
 //! - **画面停下（补清晰）**：每帧把 QP 降一点，降多少按估计让这一帧的补充量不超过一帧的预算，一直补到最小 QP
-//!   （Chromium：补到量化值最小为止）。
+//!   （Chromium：补到量化值最小为止）；但降一步的量超过链路约 200 ms 能传的（大帧时限的 2 倍）就停：窄带上
+//!   低 QP 降一步就是几十 KB，传几秒，用户一动新画面就排在它后面。
 
 /// 最小 QP：补清晰补到这里为止（再小几乎看不出区别，白费流量）。
 pub const MIN_QP: u8 = 12;
@@ -43,6 +44,10 @@ pub const LARGE_CHANGE_PERMILLE: u64 = 500;
 const OVERSHOOT_TIMES: u64 = 2;
 /// 补清晰时一帧的补充量最多是预算的几倍：1 倍，补清晰正好用满链路；再多会占满在途上限，画面一动新帧就得排在补清晰的帧后面。
 const REFINE_BUDGET_FACTOR: u64 = 1;
+/// 补清晰降一个 QP 的估计补充量超过大帧时限的这么多倍就不再降（停在当前清晰度）。
+/// 以前预算再小也“至少降 1”：QP 越低降一步越贵（整幅画面重编，降一步约多出关键帧的十分之一），窄带上
+/// 一帧补清晰编出 35–40 KB（107–161 kbps 的链路要传两三秒，2026-11 微软轨迹实测），这时用户一动，新画面就排在它后面。
+pub const REFINE_STEP_KEY_TIMES: u64 = 2;
 
 /// 这一帧是哪种。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,14 +140,14 @@ impl QpControl {
     }
 
     /// 从当前 QP `now` 往下补清晰，按预算 `budget` 字节一帧能补到多少：补充量约等于“整幅画面从 now 到 q
-    /// 多出来的大小”，至少降 1。
-    fn refine_floor(&self, now: u8, budget: u64, pixels: u64) -> u8 {
+    /// 多出来的大小”，至少降 1——除非降一步的补充量就超过 `step_cap`（链路一次装不下这么大的一帧，停在 now）。
+    fn refine_floor(&self, now: u8, budget: u64, pixels: u64, step_cap: u64) -> u8 {
         let mut q = now;
         while q > MIN_QP {
             let more = self
                 .key_bytes(pixels, q - 1)
                 .saturating_sub(self.key_bytes(pixels, now));
-            if more > budget && q < now {
+            if more > step_cap || more > budget && q < now {
                 break;
             }
             q -= 1;
@@ -222,12 +227,13 @@ impl QpControl {
                     },
                 };
                 // 比当前画面的 QP 低：静止的部分也会跟着重编（等于补清晰），只能低到预算补得动的程度
-                q.max(self.refine_floor(now, target, pixels))
+                q.max(self.refine_floor(now, target, pixels, u64::MAX))
             }
             Kind::Refine => self.refine_floor(
                 self.qp.unwrap_or(BASE_QP),
                 target.saturating_mul(REFINE_BUDGET_FACTOR),
                 pixels,
+                key_allowed.saturating_mul(REFINE_STEP_KEY_TIMES),
             ),
         };
         qp.clamp(MIN_QP, self.max_qp)
@@ -318,14 +324,14 @@ mod tests {
         c.on_frame(Kind::Key, 14_000, 51, P720);
         assert!(!c.converged());
         // 预算很小：每帧至少降 1；预算大：一次降很多
-        let small = c.next(Kind::Refine, 500, 0, P720, None);
+        let small = c.next(Kind::Refine, 500, u64::MAX, P720, None);
         assert_eq!(small, 50);
-        let big = c.next(Kind::Refine, 1_000_000, 0, P720, None);
+        let big = c.next(Kind::Refine, 1_000_000, u64::MAX, P720, None);
         assert_eq!(big, MIN_QP);
         // 一直补：QP 单调降到最小
         let mut last = 51;
         for _ in 0..200 {
-            let q = c.next(Kind::Refine, 2_000, 0, P720, None);
+            let q = c.next(Kind::Refine, 2_000, u64::MAX, P720, None);
             assert!(q <= last);
             c.on_frame(Kind::Refine, 2_000, q, P720);
             last = q;
@@ -348,6 +354,24 @@ mod tests {
         c.on_frame(Kind::Refine, 10, 20, P720);
         assert_eq!(c.next(Kind::Change, 1_000, 10_000, P720, None), 33);
         assert_eq!(QpControl::default().qp(), None);
+    }
+
+    #[test]
+    fn refine_stops_where_one_step_would_take_the_link_too_long() {
+        let mut c = QpControl::new(MAX_QP);
+        c.on_frame(Kind::Key, 14_000, 40, P720);
+        // 窄带（大帧时限 500 字节，约 40 kbps）：降一步要多出约 1.5 KB，链路一次装不下，停在 40
+        let step = c.key_bytes(P720, 39) - c.key_bytes(P720, 40);
+        assert!(step > 500 * REFINE_STEP_KEY_TIMES, "{step}");
+        assert_eq!(c.next(Kind::Refine, 100, 500, P720, None), 40);
+        // 时限够装下这一步：照常至少降 1
+        assert_eq!(c.next(Kind::Refine, 500, step, P720, None), 39);
+        // 宽带：一直补到最小 QP
+        for _ in 0..100 {
+            let q = c.next(Kind::Refine, 20_000, 1_000_000, P720, None);
+            c.on_frame(Kind::Refine, 20_000, q, P720);
+        }
+        assert!(c.converged());
     }
 
     #[test]

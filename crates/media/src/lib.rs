@@ -1126,8 +1126,10 @@ impl H264Encoder {
         let target = u64::try_from(budget).unwrap_or(u64::MAX);
         let key_allowed = if self.big_frame_us == 0 {
             u64::MAX
-        } else if self.rate_stale {
-            // 码率估计过期：静止时链路可能已经变差，不多押，最多一帧的预算（之后补清晰）
+        } else if self.rate_stale && kind != qp::Kind::Refine {
+            // 码率估计过期：静止时链路可能已经变差，不多押，最多一帧的预算（之后补清晰）。补清晰不在此列：
+            // 它按一帧的预算一点点补，时限只用来限制单步不超过链路约 200 ms 的量（见 qp::REFINE_STEP_KEY_TIMES），
+            // 停下两秒后估计就算过期，按一帧预算限的话补清晰几乎停住（微软轨迹停下后的画质 43 → 34 dB）
             target
         } else {
             self.bps.saturating_mul(self.big_frame_us) / 8_000_000
@@ -1136,6 +1138,13 @@ impl H264Encoder {
             .coarse_qp
             .take()
             .unwrap_or_else(|| self.qp.next(kind, target, key_allowed, pixels, area));
+        // 补清晰补不动了（降一步的量链路一次装不下，见 qp::REFINE_STEP_KEY_TIMES）：这个码率下就算补完，
+        // 不再编（否则画面不动也一直按同一个 QP 编空帧）。画面再变时重新开始补。
+        if kind == qp::Kind::Refine && !fresh && self.qp.qp().is_some_and(|now| qp >= now) {
+            self.refine_left = 0;
+            self.inner = Some((size.0, size.1, enc));
+            return Ok(None);
+        }
         // 新开的编码器第一帧只能按默认 QP（26）编，除非先编一次让它初始化：openh264 的 Rust 封装到第一次
         // 编码时才真正初始化编码器，之前取不到、也改不了参数。只有要明显更粗（窄带宽上的大帧规则）时才多编
         // 这一次；要更细或差不多时就按 26 编，之后补清晰补上（局域网上省掉一次编码：会话开头本来就忙）。
