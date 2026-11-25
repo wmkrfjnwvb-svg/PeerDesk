@@ -40,6 +40,7 @@ pub mod input;
 pub mod media;
 pub mod pacer;
 pub mod paths;
+pub mod policy;
 pub mod probe;
 pub mod proto;
 pub mod region;

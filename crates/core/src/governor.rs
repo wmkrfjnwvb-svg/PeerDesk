@@ -11,10 +11,9 @@
 //! 不做 IO，时间由调用方传入。
 
 use crate::cpu::{CpuOveruse, Verdict};
+use crate::policy::ContentPolicy;
 use crate::time::Time;
 
-/// 帧率档位（从高到低）。
-const STEPS: [u32; 7] = [60, 30, 20, 15, 10, 8, 5];
 /// 连续多少帧装不进才降一档。
 const DOWN_AFTER: u32 = 3;
 /// 连续装得下多久（微秒）才升一档。按时间而不是帧数：远程桌面多数时候画面不动、每秒只有几帧，
@@ -27,6 +26,8 @@ const OVER_BUDGET_TIMES: usize = 2;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FpsGovernor {
     max_fps: u32,
+    /// 帧率档位（从高到低，来自内容策略）。
+    steps: &'static [u32],
     /// “装得进预算”允许的帧率。
     fit_fps: u32,
     /// CPU 允许的帧率。
@@ -45,12 +46,19 @@ pub struct FpsGovernor {
 }
 
 impl FpsGovernor {
-    /// 创建，从 `max_fps` 开始。
+    /// 创建，从 `max_fps` 开始，档位按办公策略。
     #[must_use]
     pub fn new(max_fps: u32) -> Self {
+        Self::with_policy(max_fps, &ContentPolicy::OFFICE)
+    }
+
+    /// 创建，从 `max_fps` 开始，档位按内容策略 `policy`。
+    #[must_use]
+    pub fn with_policy(max_fps: u32, policy: &ContentPolicy) -> Self {
         let max_fps = max_fps.max(1);
         Self {
             max_fps,
+            steps: policy.fps_steps,
             fit_fps: max_fps,
             cpu_fps: max_fps,
             cpu: CpuOveruse::new(),
@@ -198,7 +206,7 @@ impl FpsGovernor {
 
     /// `fps` 相邻的档位，不超过上限。
     fn step_from(&self, fps: u32, up: bool) -> u32 {
-        let allowed = STEPS.iter().copied().filter(|f| *f <= self.max_fps);
+        let allowed = self.steps.iter().copied().filter(|f| *f <= self.max_fps);
         let next = if up {
             allowed.filter(|f| *f > fps).min()
         } else {
@@ -333,6 +341,16 @@ mod tests {
         odd.on_frame(Time::ZERO, 0, false, 1, 10);
         odd.on_frame(Time::ZERO.plus(UP_AFTER_US), 0, false, 1, 10);
         assert_eq!(odd.fps(), 24);
+        // 档位来自内容策略：例如高帧率的档位表，144 帧装不进时降到 120，而不是办公的档位
+        let fast = ContentPolicy {
+            fps_steps: &[144, 120, 60],
+            ..ContentPolicy::OFFICE
+        };
+        let mut game = FpsGovernor::with_policy(144, &fast);
+        for _ in 0..3 {
+            game.on_frame(Time::ZERO, 0, false, 99, 10);
+        }
+        assert_eq!(game.fps(), 120);
         // 预算为 0（不知道）时不算超
         let mut zero = FpsGovernor::new(30);
         for _ in 0..10 {

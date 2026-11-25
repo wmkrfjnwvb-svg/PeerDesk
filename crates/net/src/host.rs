@@ -12,6 +12,7 @@ use peerdesk_core::file::FileMsg;
 use peerdesk_core::frame::Frame;
 use peerdesk_core::input::{InputEvent, InputReceiver, KeyState};
 use peerdesk_core::media::{encode_job, FrameJob, MediaSender, SenderConfig};
+use peerdesk_core::policy::ContentPolicy;
 use peerdesk_core::proto::{Caps, Channel, Control, RejectReason};
 use peerdesk_core::session::{Session, SessionConfig, State};
 use peerdesk_core::trace::{Stage, TraceId, Tracer};
@@ -68,8 +69,8 @@ pub trait ScreenSource: Send {
 
 /// 起始码率：没有历史数据时从这里起步。
 pub const DEFAULT_START_BPS: u64 = 4_000_000;
-/// 码率上限。
-pub const DEFAULT_MAX_BPS: u64 = 30_000_000;
+/// 码率上限（办公策略的值）。
+pub const DEFAULT_MAX_BPS: u64 = ContentPolicy::OFFICE.max_bps;
 /// 码率下限。
 const MIN_BPS: u64 = 100_000;
 /// 一帧在接收端从首个分片到收齐允许的时间，也是发送端判定丢失的基准（微秒）。
@@ -132,6 +133,8 @@ pub struct HostOptions {
     pub name: String,
     /// 发送节奏（实验，见 [`peerdesk_core::pacer`]）。默认关，环境变量 `PEERDESK_PACE=1` 打开。
     pub pacing: bool,
+    /// 内容策略（帧率档位、QP 上限、大帧时限等，见 [`peerdesk_core::policy`]）。现在只有办公。
+    pub policy: ContentPolicy,
 }
 
 impl HostOptions {
@@ -151,6 +154,7 @@ impl HostOptions {
             audio: None,
             name: String::new(),
             pacing: peerdesk_core::pacer::enabled(),
+            policy: ContentPolicy::OFFICE,
         }
     }
 }
@@ -376,7 +380,7 @@ pub async fn serve(
     let rtt_us = u64::try_from(link.rtt().as_micros()).unwrap_or(u64::MAX);
     // 两端都支持 H.264 就用它，否则用块编码。
     let encoder: Box<dyn VideoEncoder> = if caps.common(Caps::H264) == Caps::H264 {
-        Box::new(H264Encoder::with_max_bps(opts.fps, opts.max_bps))
+        Box::new(H264Encoder::with_max_bps(opts.fps, opts.max_bps).with_policy(&opts.policy))
     } else {
         Box::new(TileEncoder::new())
     };
@@ -406,9 +410,11 @@ pub async fn serve(
             deadline_us: FRAME_DEADLINE_US,
             max_payload: link.max_payload(),
             estimator,
+            policy: opts.policy,
         },
         codec,
     );
+    crate::note!(info, "内容策略：{}", opts.policy.name);
     media.set_reports(caps.has(Caps::TRANSPORT_CC));
     // 双方都支持 RS 纠错时用它（老版本只认异或）
     media.set_fec(if caps.has(Caps::FEC_RS) {

@@ -16,6 +16,7 @@ use peerdesk_core::adaptive::Profile;
 use peerdesk_core::error::Error;
 pub use peerdesk_core::estimator::EstimatorKind;
 use peerdesk_core::media::{MediaReceiver, MediaSender, SenderConfig};
+pub use peerdesk_core::policy::ContentPolicy;
 use peerdesk_core::proto::{decode_datagram, encode_datagram, Channel, Header};
 use peerdesk_core::screen::Screen;
 use peerdesk_core::sim::{Link, Net, NetStats};
@@ -63,11 +64,15 @@ impl CodecKind {
         }
     }
 
-    fn make(self, fps: u32, max_bps: u64) -> Result<Codecs, Error> {
+    fn make(self, fps: u32, max_bps: u64, policy: &ContentPolicy) -> Result<Codecs, Error> {
         Ok(match self {
             CodecKind::Tile => (Box::new(TileEncoder::new()), Box::new(TileDecoder::new())),
             CodecKind::H264 => (
-                Box::new(H264Encoder::with_max_bps(fps, max_bps).with_hardware(software_only)),
+                Box::new(
+                    H264Encoder::with_max_bps(fps, max_bps)
+                        .with_policy(policy)
+                        .with_hardware(software_only),
+                ),
                 Box::new(H264Decoder::new()?),
             ),
         })
@@ -136,6 +141,8 @@ pub struct Scenario {
     /// 调试：把发送端各模块的决定、每秒的网络控制状态、因为哪个闸门没编帧打到标准错误。
     /// 默认按环境变量 `PEERDESK_EVENTS` 打开。
     pub trace: bool,
+    /// 内容策略（现在只有办公；以后的游戏、电影模式各加场景守住）。
+    pub policy: ContentPolicy,
 }
 
 impl Scenario {
@@ -159,6 +166,7 @@ impl Scenario {
             pacing: peerdesk_core::pacer::enabled(),
             fec: fec_from(std::env::var_os("PEERDESK_FEC").as_deref()),
             trace: std::env::var_os("PEERDESK_EVENTS").is_some(),
+            policy: ContentPolicy::OFFICE,
         }
     }
 }
@@ -376,13 +384,14 @@ pub fn run(s: &Scenario) -> Result<Outcome, Error> {
     }
     let interval = 1_000_000 / u64::from(s.fps);
     let mut desk = RealisticDesktop::new(s.width, s.height, s.seed)?;
-    let (encoder, decoder) = s.codec.make(s.fps, s.max_bps)?;
+    let (encoder, decoder) = s.codec.make(s.fps, s.max_bps, &s.policy)?;
     let cfg = SenderConfig {
         fps: s.fps,
         start_bps: s.start_bps,
         max_bps: s.max_bps,
         profile: s.profile,
         estimator: s.estimator,
+        policy: s.policy,
         ..SenderConfig::default()
     };
     let mut tx = MediaSender::new(cfg, encoder);

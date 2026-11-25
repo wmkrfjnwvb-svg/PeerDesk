@@ -28,6 +28,7 @@ mod vaapi;
 use openh264::OpenH264API;
 use peerdesk_core::error::Error;
 use peerdesk_core::frame::{Frame, GpuFrame, GpuHandle, Nv12, Picture};
+use peerdesk_core::policy::ContentPolicy;
 use peerdesk_core::scale::encode_size;
 use peerdesk_core::screen::Screen;
 use peerdesk_core::video::{
@@ -43,12 +44,13 @@ const MIN_BPS: u64 = 64_000;
 /// 码率上限的默认值。
 pub const DEFAULT_MAX_BPS: u64 = 50_000_000;
 /// 大帧规则默认的时限（微秒）：关键帧、大面积变化要在这么久里按目标码率发得完，发不完就粗编、之后补清晰
-/// （照 Chromium 远程桌面 `ShouldDropQualityForLargeFrame`，它用一帧间隔；办公策略，以后收进 `ContentPolicy`）。
+/// （照 Chromium 远程桌面 `ShouldDropQualityForLargeFrame`，它用一帧间隔）。办公策略的值（[`ContentPolicy::OFFICE`]）；
+/// 硬件编码器的码控缓冲（VideoToolbox `DataRateLimits`、Media Foundation `AVEncCommonBufferSize`）也按它设。
 ///
 /// 为什么 100 ms（2026-11 微软 8 条真实轨迹实测，经典估计器）：200 ms 正好压在“卡顿”的门限上，
 /// 再加传输延迟就超过 200 ms，ms-09401 卡顿 7 次；50 ms 太粗，窄带上关键帧反复补；100 ms 时
 /// 三条门槛轨迹最长等待 1519→457、1531→304、322→290 ms，首帧快 4–5 倍，卡顿也少了。
-pub const BIG_FRAME_US: u64 = 100_000;
+pub const BIG_FRAME_US: u64 = ContentPolicy::OFFICE.big_frame_us;
 /// 最小 QP：补清晰时能达到的画质上限。
 const MIN_QP: u8 = qp::MIN_QP;
 /// 估计画面变了多少时每隔多少像素抽一个（横竖都是）：720p 约 3600 个，几乎不花时间。
@@ -716,6 +718,13 @@ impl H264Encoder {
     pub fn with_max_qp(mut self, qp: u8) -> Self {
         self.qp = qp::QpControl::new(qp);
         self
+    }
+
+    /// 按内容策略设 QP 上限和大帧时限（见 [`ContentPolicy`]）。
+    #[must_use]
+    pub fn with_policy(self, policy: &ContentPolicy) -> Self {
+        self.with_max_qp(policy.max_qp)
+            .with_big_frame_us(policy.big_frame_us)
     }
 
     /// 指定打开硬件编码器的函数（测试用假的编码器）。

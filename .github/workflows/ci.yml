@@ -65,6 +65,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # 一个测试程序失败也接着跑完其他的：一次运行看到所有平台问题，不用反复重跑。
       - run: cargo test --workspace --no-fail-fast
+      # 硬件编码器的测量（关键帧大小、码率上限设没设上）：测试通过时输出被吞掉，单独再跑一次写进运行摘要
+      - name: Hardware encoder measurements
+        shell: bash
+        run: |
+          cargo test -p peerdesk-media --lib keyframe -- --nocapture --test-threads 1 2>&1 \
+            | grep -E "VideoToolbox|Media Foundation|没有硬件编码器|打不开" | tee -a "$GITHUB_STEP_SUMMARY" || true
       - run: cargo build --release -p peerdesk -p peerdesk-server
       - name: Smoke test the binaries
         shell: bash

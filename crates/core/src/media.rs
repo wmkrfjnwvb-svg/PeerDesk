@@ -17,6 +17,7 @@ use crate::estimator::{EstimatorKind, Extension, Observation, RateEstimator, Rec
 use crate::frame::{Frame, Picture};
 use crate::governor::FpsGovernor;
 use crate::pacer::FLAG_PADDING;
+use crate::policy::ContentPolicy;
 use crate::proto::{VideoHeader, MAX_DATAGRAM};
 use crate::scale::ScalePolicy;
 use crate::screen::Screen;
@@ -179,6 +180,8 @@ pub struct SenderConfig {
     pub max_payload: usize,
     /// 带宽估计器。
     pub estimator: EstimatorKind,
+    /// 内容策略（帧率档位、码率过期阈值等，见 [`crate::policy`]）。
+    pub policy: ContentPolicy,
 }
 
 impl Default for SenderConfig {
@@ -187,12 +190,13 @@ impl Default for SenderConfig {
             fps: 30,
             start_bps: 4_000_000,
             min_bps: 100_000,
-            max_bps: 30_000_000,
+            max_bps: ContentPolicy::OFFICE.max_bps,
             profile: Profile::STABLE,
             // 要留够时间给丢失的分片重传一次（大约一个往返）。
             deadline_us: 250_000,
             max_payload: MAX_DATAGRAM - HEADER_LEN,
             estimator: EstimatorKind::PRODUCT,
+            policy: ContentPolicy::OFFICE,
         }
     }
 }
@@ -297,12 +301,6 @@ fn prepare(encoder: &mut dyn VideoEncoder, job: &FrameJob) {
 /// 帧率已经在最低档、帧还一直装不进预算这么久（微秒）就降分辨率（最后手段）。
 const OVERFLOW_DOWN_US: u64 = 2_000_000;
 
-/// 码率估计多久没被证实就算过期（微秒）：之后的大帧不按大帧时限放宽（见 [`VideoEncoder::set_rate_stale`]）。
-/// 证实 = 接收端测到包串速率，或者送达速率到了估计的一半（链路真的在承载这个速率）。
-/// 2 秒而不是 1 秒：操作之间停 1 秒很常见，链路 1 秒里变差的机会很小，而每次停顿后第一帧都要先粗后清；
-/// 1 秒时办公负载的每次停顿都触发（微软轨迹 ms-05729 上改变了之后的丢包时序）。
-const RATE_STALE_AFTER_US: u64 = 2_000_000;
-
 /// 画面发送端。
 ///
 /// 两种用法：
@@ -332,7 +330,7 @@ pub struct MediaSender {
     resent: BTreeMap<(u32, u16), Option<Time>>,
     rtt_us: u64,
     last_obs: Option<Observation>,
-    /// 最近一次测量证实码率估计的时刻（见 [`RATE_STALE_AFTER_US`]）。
+    /// 最近一次测量证实码率估计的时刻（见 [`Self::rate_stale`]）。
     rate_seen: Option<Time>,
     /// 连续有丢包的反馈次数（决定要不要换成“无线”画像）。
     lossy_feedbacks: u32,
@@ -402,7 +400,7 @@ impl MediaSender {
             rate_seen: None,
             lossy_feedbacks: 0,
             fec: Fec::Xor,
-            governor: FpsGovernor::new(cfg.fps),
+            governor: FpsGovernor::with_policy(cfg.fps, &cfg.policy),
             encode_us: 0,
             encode_hw: false,
             scale_up: false,
@@ -717,11 +715,12 @@ impl MediaSender {
         }
     }
 
-    /// 码率估计过期了：证实过、但已经超过 [`RATE_STALE_AFTER_US`] 没再证实。会话开头还没证实过的不算
-    /// （起步码率怎么定是启动探测的事）。
+    /// 码率估计过期了：证实过、但已经超过策略的 `rate_stale_after_us` 没再证实。证实 = 接收端测到包串速率，
+    /// 或者送达速率到了估计的一半（链路真的在承载这个速率）。会话开头还没证实过的不算（起步码率怎么定是
+    /// 启动探测的事）。
     fn rate_stale(&self, now: Time) -> bool {
         self.rate_seen
-            .is_some_and(|t| now.since(t) > RATE_STALE_AFTER_US)
+            .is_some_and(|t| now.since(t) > self.cfg.policy.rate_stale_after_us)
     }
 
     /// 迟迟等不到反馈的帧按丢失处理。会话循环每一轮都要调用（不能只在编下一帧时检查）：
