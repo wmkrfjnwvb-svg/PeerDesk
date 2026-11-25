@@ -67,7 +67,15 @@ extern "C" {
         count: isize,
         callbacks: *const c_void,
     ) -> CFTypeRef;
+    fn CFStringCreateWithCString(
+        allocator: CFTypeRef,
+        c_str: *const std::ffi::c_char,
+        encoding: u32,
+    ) -> CFTypeRef;
 }
+
+/// `kCFStringEncodingUTF8`
+const CF_UTF8: u32 = 0x0800_0100;
 
 #[link(name = "CoreMedia", kind = "framework")]
 extern "C" {
@@ -254,6 +262,12 @@ fn number_f64(v: f64) -> Owned {
 fn number_i64(v: i64) -> Owned {
     // SAFETY: 同上（64 位）。
     Owned(unsafe { CFNumberCreate(std::ptr::null(), CF_SINT64, std::ptr::from_ref(&v).cast()) })
+}
+
+/// 按名字造一个 CFString（新系统才有的属性键：不链接符号，老系统上启动不会因为找不到符号失败）。
+fn cf_string(name: &std::ffi::CStr) -> Owned {
+    // SAFETY: name 是以 0 结尾的 UTF-8 字符串，调用期间有效；CFStringCreateWithCString 复制它。
+    Owned(unsafe { CFStringCreateWithCString(std::ptr::null(), name.as_ptr(), CF_UTF8) })
 }
 
 /// 一个键值对的字典。
@@ -788,6 +802,16 @@ impl VtEncoder {
                 limits.0,
             )
         }
+    }
+
+    /// 设每帧最低 QP（`kVTCompressionPropertyKey_MinAllowedFrameQP`，macOS 13 起有）：码控不能把帧编得比它更细，
+    /// 用来限住窄带上关键帧的大小。键按名字在运行时造（见 [`cf_string`]）。返回系统的结果码（0 成功；系统不支持时
+    /// 是 `kVTPropertyNotSupportedErr`）。
+    pub fn set_min_frame_qp(&mut self, qp: u8) -> i32 {
+        let key = cf_string(c"MinAllowedFrameQP");
+        let value = number_i32(i32::from(qp));
+        // SAFETY: 会话有效；键和值是刚创建的对象，调用期间有效。
+        unsafe { VTSessionSetProperty(self.session, key.0, value.0) }
     }
 
     /// 最近一次设码率上限的结果码（0 成功）。

@@ -758,6 +758,12 @@ impl H264Encoder {
     /// 取回了一个硬件编好的帧：对上它交的时候是否要求了关键帧，检查“没要求却是关键帧”。
     fn hardware_output(&mut self, data: Vec<u8>, key: bool, fresh: bool) -> Hw {
         let asked = self.hw_sent.pop_front().unwrap_or(true);
+        // 要了关键帧、编码器却交出空帧（码率控制把它丢了：2026-11-25 CI 实测 VideoToolbox 低延迟码控
+        // 300 kbps 时丢掉了强制要的关键帧）：要求还没满足，下一帧接着要；否则接收端一直等不到关键帧。
+        if asked && data.is_empty() && !self.force_key {
+            log::info!("视频编码：硬件编码器丢掉了要求的关键帧（码率控制），下一帧再要");
+            self.force_key = true;
+        }
         // 没要求却一直出关键帧：每帧都是整幅画面（几百 KB），码率和帧率都垮掉，画面忽糊忽清。
         // 这是用法或编码器的问题，记日志说明，改用软件编码（这一帧本身是完整的关键帧，照常发出）。
         self.unasked_keys = if key && !asked {
@@ -1497,6 +1503,8 @@ mod tests {
         ready: Option<(Vec<u8>, bool)>,
         /// 取攒着的帧时出错。
         poll_error: bool,
+        /// 码控丢掉前几个要求的关键帧（输出空帧，像 VideoToolbox 低延迟码控在窄带上那样）。
+        drop_keys: u32,
     }
 
     impl HardwareEncoder for FakeHw {
@@ -1522,6 +1530,10 @@ mod tests {
             );
             // 关键帧要求必须传到
             assert!(self.frames > 1 || force_key);
+            if force_key && self.drop_keys > 0 {
+                self.drop_keys -= 1;
+                return Ok(Some((Vec::new(), false)));
+            }
             let screen = picture(
                 u16::try_from(self.size.0).unwrap(),
                 u16::try_from(self.size.1).unwrap(),
@@ -1563,6 +1575,7 @@ mod tests {
             held: None,
             ready: None,
             poll_error: false,
+            drop_keys: 0,
         }))
     }
 
@@ -1582,6 +1595,7 @@ mod tests {
             held: None,
             ready: None,
             poll_error: false,
+            drop_keys: 0,
         }))
     }
 
@@ -1627,6 +1641,7 @@ mod tests {
             held: None,
             ready: None,
             poll_error: false,
+            drop_keys: 0,
         }))
     }
 
@@ -1646,6 +1661,7 @@ mod tests {
             held: None,
             ready: None,
             poll_error: true,
+            drop_keys: 0,
         }))
     }
 
@@ -2057,6 +2073,7 @@ mod tests {
             held: None,
             ready: None,
             poll_error: false,
+            drop_keys: 0,
         }))
     }
 
@@ -2510,6 +2527,52 @@ mod tests {
         }
     }
 
+    /// macOS 实机测量：300 kbps 下编 90 帧（第 0、30、60 帧要关键帧），看码率控制丢了哪些帧、要的关键帧出没出来、
+    /// 每帧最低 QP（`MinAllowedFrameQP`）能不能把关键帧压小。低延迟码控开、关各量一遍。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn vt_keyframe_rate_control_and_qp_floor() {
+        let nv12 = text_nv12();
+        let bps = 300_000u64;
+        for low_latency in [true, false] {
+            for floor in [None, Some(30u8), Some(40), Some(48)] {
+                let opts = vt::VtOptions {
+                    low_latency,
+                    ..vt::VtOptions::DEFAULT
+                };
+                let mut enc = match vt::VtEncoder::open_with(1280, 720, 30, bps, opts) {
+                    Ok(enc) => enc,
+                    Err(why) => {
+                        eprintln!("VideoToolbox 低延迟码控 {low_latency}：打不开（{why}）");
+                        continue;
+                    }
+                };
+                let status = floor.map(|q| enc.set_min_frame_qp(q));
+                for i in 0..90 {
+                    enc.submit(&nv12, bps, i % 30 == 0).unwrap();
+                }
+                let out = enc.flush().unwrap();
+                let (mut dropped, mut keys, mut total) = (Vec::new(), Vec::new(), 0usize);
+                for (i, one) in out.iter().enumerate() {
+                    let (data, key) = one.as_ref().unwrap();
+                    total += data.len();
+                    if data.is_empty() {
+                        dropped.push(i);
+                    }
+                    if *key {
+                        keys.push((i, data.len()));
+                    }
+                }
+                eprintln!(
+                    "VideoToolbox 300 kbps 90 帧（第 0/30/60 帧要关键帧），低延迟码控 {low_latency}，最低 QP {floor:?}\
+                     （设置结果 {status:?}）：交出 {} 帧，丢 {} 帧 {dropped:?}，关键帧（帧号, 字节）{keys:?}，共 {total} 字节",
+                    out.len(),
+                    dropped.len()
+                );
+            }
+        }
+    }
+
     /// Windows 实机：系统 H.264 解码器解 OpenH264 的码流（验证 NV12 读取、对齐裁剪、颜色），
     /// 连着解几帧；尺寸不是 16 的倍数（360 行 → 解码器输出 368 行）。打不开时要给出原因。
     #[cfg(windows)]
@@ -2754,6 +2817,38 @@ mod tests {
             enc.timing().key_reason,
             "整屏变化编出来远超大帧时限，按实际大小重编成关键帧"
         );
+    }
+
+    /// 硬件编码器的码控丢掉了要求的关键帧（交出空帧）：下一帧接着要，直到真的出了关键帧。
+    #[test]
+    fn a_keyframe_dropped_by_hardware_rate_control_is_asked_again() {
+        fn dropping(
+            w: u32,
+            h: u32,
+            fps: u32,
+            _bps: u64,
+        ) -> Result<Box<dyn HardwareEncoder>, String> {
+            Ok(Box::new(FakeHw {
+                size: (w, h),
+                frames: 0,
+                fail_at: 0,
+                soft: H264Encoder::new(fps).with_hardware(fake_none),
+                always_key: false,
+                hold_back: false,
+                held: None,
+                ready: None,
+                poll_error: false,
+                drop_keys: 2,
+            }))
+        }
+        let mut enc = H264Encoder::new(30).with_hardware(dropping);
+        let screen = picture(64, 64);
+        // 第一帧（要关键帧）被丢、第二帧又要也被丢，第三帧出来的是关键帧
+        assert!(enc.encode(1, &screen, true, 10_000).unwrap().is_none());
+        assert!(enc.wants_refine(), "还要接着编");
+        assert!(enc.encode(2, &screen, false, 10_000).unwrap().is_none());
+        let third = enc.encode(3, &screen, false, 10_000).unwrap().unwrap();
+        assert!(third.key);
     }
 
     /// 720p 连续编码几帧：不能卡住，也不能 panic。在单独的线程里跑，10 秒没结束就判失败，
