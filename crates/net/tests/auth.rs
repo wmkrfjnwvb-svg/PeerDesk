@@ -40,7 +40,7 @@ impl InputSink for Count {
 }
 struct Null;
 impl ScreenSink for Null {
-    fn present(&mut self, _: &peerdesk_core::screen::Screen) {}
+    fn present(&mut self, _: &peerdesk_core::frame::Picture) {}
 }
 
 fn cfg(id: &Identity, auth: Auth) -> SessionConfig {

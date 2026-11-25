@@ -12,6 +12,7 @@ use std::collections::{BTreeMap, VecDeque};
 use crate::adaptive::{DelayTracker, DeliveryLog, Feedback, Profile};
 use crate::error::Error;
 use crate::estimator::{EstimatorKind, Extension, Observation, RateEstimator, ReceiverMetrics};
+use crate::frame::{Frame, Picture};
 use crate::governor::FpsGovernor;
 use crate::proto::{VideoHeader, MAX_DATAGRAM};
 use crate::scale::ScalePolicy;
@@ -190,9 +191,16 @@ pub struct FrameJob {
 pub fn encode_job(
     encoder: &mut dyn VideoEncoder,
     job: &FrameJob,
-    screen: &Screen,
+    frame: &Frame,
     changed: bool,
 ) -> Result<(Option<EncodedFrame>, bool), Error> {
+    prepare(encoder, job);
+    let encoded = encoder.encode_frame(job.frame_id, frame, changed, job.budget)?;
+    Ok((encoded, encoder.wants_refine()))
+}
+
+/// 编码前把任务里的丢帧、确认、比例、控制端窗口交给编码器。
+fn prepare(encoder: &mut dyn VideoEncoder, job: &FrameJob) {
     for id in &job.lost {
         encoder.on_lost(*id);
     }
@@ -201,8 +209,6 @@ pub fn encode_job(
     }
     encoder.set_scale(job.scale_permille);
     encoder.set_view(job.view);
-    let encoded = encoder.encode(job.frame_id, screen, changed, job.budget)?;
-    Ok((encoded, encoder.wants_refine()))
 }
 
 /// 画面发送端。
@@ -374,6 +380,12 @@ impl MediaSender {
         self.scale.on_change(now);
     }
 
+    /// 原始画面尺寸为 `native` 时现在该按多大编码（采集端能在显卡上缩放时按它采，见 [`crate::scale::encode_size`]）。
+    #[must_use]
+    pub fn encode_size(&self, native: (u16, u16)) -> (u16, u16) {
+        crate::scale::encode_size(native, self.scale.permille(), self.view)
+    }
+
     /// 控制端报告了显示画面的区域（像素）；`(0, 0)` 或 `None` 表示不限（例如“原始大小”）。
     pub fn set_view(&mut self, view: Option<(u16, u16)>) {
         let view = view.filter(|(w, h)| *w > 0 && *h > 0);
@@ -459,7 +471,10 @@ impl MediaSender {
         let mut encoder = self.encoder.take().ok_or(Error::InvalidArgument(
             "编码器不在这里：用 start_frame / finish_frame",
         ))?;
-        let result = encode_job(encoder.as_mut(), &job, screen, changed);
+        prepare(encoder.as_mut(), &job);
+        let result = encoder
+            .encode(job.frame_id, screen, changed, job.budget)
+            .map(|encoded| (encoded, encoder.wants_refine()));
         self.encoder = Some(encoder);
         let (encoded, refine) = result?;
         self.finish_frame(now, &job, encoded, refine)
@@ -897,16 +912,16 @@ impl DecodeWorker {
         self.decoder.backend()
     }
 
-    /// 解一帧。返回解出的画面（`None` 表示这一帧没有新画面）；失败或因为等关键帧而没解时返回错误。
-    pub fn decode(&mut self, job: &DecodeJob) -> Result<Option<Screen>, Error> {
+    /// 解一帧。返回要显示的画面（`None` 表示这一帧没有新画面）；失败或因为等关键帧而没解时返回错误。
+    pub fn decode(&mut self, job: &DecodeJob) -> Result<Option<Picture>, Error> {
         let independent = job.header.key || job.header.codec == Codec::Tile;
         if self.broken && !independent {
             return Err(Error::Inconsistent("之前的帧解码失败，等关键帧"));
         }
-        match self.decoder.decode(&job.header, &job.data) {
-            Ok(screen) => {
+        match self.decoder.decode_picture(&job.header, &job.data) {
+            Ok(picture) => {
                 self.broken = false;
-                Ok(screen.cloned())
+                Ok(picture)
             }
             Err(e) => {
                 self.broken = true;
@@ -1191,6 +1206,21 @@ mod tests {
         tx.set_view(Some((0, 0)));
         assert!(tx.wants_frame(), "原始大小：不限");
         assert_eq!(tx.start_frame(Time(1), 10_000).view, None);
+    }
+
+    /// 编码尺寸：开始半分辨率时放进控制端窗口；原尺寸时不看窗口。
+    #[test]
+    fn encode_size_follows_scale_and_view() {
+        let mut tx = MediaSender::detached(SenderConfig::default(), Codec::H264);
+        tx.set_view(Some((800, 400)));
+        assert_eq!(
+            tx.encode_size((2880, 1800)),
+            (640, 400),
+            "半分辨率 1440×900 再放进窗口"
+        );
+        let mut full = MediaSender::detached(SenderConfig::default(), Codec::Tile);
+        full.set_view(Some((800, 400)));
+        assert_eq!(full.encode_size((2880, 1800)), (2880, 1800));
     }
     use crate::video::{EncodedFrame, TileDecoder, TileEncoder};
 
@@ -1569,7 +1599,8 @@ mod tests {
         let mut encoder = FakeEncoder::default();
         let screen = Screen::new(16, 16, 1);
         let job = remote.start_frame(Time::ZERO, 50_000);
-        let (encoded, refine) = encode_job(&mut encoder, &job, &screen, true).unwrap();
+        let (encoded, refine) =
+            encode_job(&mut encoder, &job, &Frame::rgb(screen.clone()), true).unwrap();
         assert!(!remote
             .finish_frame(Time::ZERO, &job, encoded, refine)
             .unwrap()
@@ -1603,7 +1634,8 @@ mod tests {
             let screen = Screen::new(16, 16, color);
             let a = local.on_frame(t, &screen, true, 10_000).unwrap();
             let job = remote.start_frame(t, 10_000);
-            let (encoded, refine) = encode_job(&mut encoder, &job, &screen, true).unwrap();
+            let (encoded, refine) =
+                encode_job(&mut encoder, &job, &Frame::rgb(screen.clone()), true).unwrap();
             let b = remote.finish_frame(t, &job, encoded, refine).unwrap();
             assert_eq!(a, b, "两种用法发出的数据报一样");
         }
@@ -1622,8 +1654,13 @@ mod tests {
             (job.lost.clone(), job.feedback),
             (vec![3], Some((3, 0b110)))
         );
-        let (encoded, refine) =
-            encode_job(&mut encoder, &job, &Screen::new(16, 16, 3), false).unwrap();
+        let (encoded, refine) = encode_job(
+            &mut encoder,
+            &job,
+            &Frame::rgb(Screen::new(16, 16, 3)),
+            false,
+        )
+        .unwrap();
         assert!(encoded.unwrap().key, "编码器收到了丢失通知，出关键帧");
         assert!(remote
             .finish_frame(Time(110_000), &job, None, refine)
@@ -1659,7 +1696,16 @@ mod tests {
         let key = step(&mut tx, &mut rx, 1, 0);
         let bad = step(&mut tx, &mut rx, 0x00de_ad00, 1);
         let next = step(&mut tx, &mut rx, 3, 2);
-        assert_eq!(worker.decode(&key[0]).unwrap().unwrap().pixels()[0], 1);
+        assert_eq!(
+            worker
+                .decode(&key[0])
+                .unwrap()
+                .unwrap()
+                .to_screen()
+                .unwrap()
+                .pixels()[0],
+            1
+        );
         rx.decode_succeeded();
         assert!(worker.decode(&bad[0]).is_err());
         rx.decode_failed();
@@ -1686,7 +1732,16 @@ mod tests {
         let fb = rx.feedback(Time(5));
         tx.on_feedback(Time(5), &fb);
         let key = step(&mut tx, &mut rx, 6, 6);
-        assert_eq!(worker.decode(&key[0]).unwrap().unwrap().pixels()[0], 6);
+        assert_eq!(
+            worker
+                .decode(&key[0])
+                .unwrap()
+                .unwrap()
+                .to_screen()
+                .unwrap()
+                .pixels()[0],
+            6
+        );
     }
 
     #[test]

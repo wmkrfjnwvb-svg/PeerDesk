@@ -170,7 +170,7 @@ mod tests {
     fn session(sources: &Sources) -> Result<u16, String> {
         let (mut source, mut sink) = sources.open(record())?;
         sink.inject(&InputEvent::ReleaseAll);
-        Ok(source.capture().unwrap().width())
+        Ok(source.frame().unwrap().size().0)
     }
 
     #[test]

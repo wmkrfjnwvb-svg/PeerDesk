@@ -9,10 +9,10 @@ use peerdesk_core::auth::{Auth, Limiter};
 use peerdesk_core::crypto::Suite;
 use peerdesk_core::estimator::EstimatorKind;
 use peerdesk_core::file::FileMsg;
+use peerdesk_core::frame::Frame;
 use peerdesk_core::input::{InputEvent, InputReceiver, KeyState};
 use peerdesk_core::media::{encode_job, FrameJob, MediaSender, SenderConfig};
 use peerdesk_core::proto::{Caps, Channel, Control, RejectReason};
-use peerdesk_core::screen::Screen;
 use peerdesk_core::session::{Session, SessionConfig, State};
 use peerdesk_core::trace::{Stage, TraceId, Tracer};
 use peerdesk_core::transport::Fec;
@@ -41,8 +41,18 @@ pub trait ScreenSource: Send {
     /// 取当前画面。返回 `None` 表示没有更多画面，会话结束。
     ///
     /// 真实采集应当在自己的线程里进行，这里只交出最新的一幅，不能阻塞：
-    /// 会话循环同时在处理输入，阻塞会让操作变卡。
-    fn capture(&mut self) -> Option<&Screen>;
+    /// 会话循环同时在处理输入，阻塞会让操作变卡。能在显卡上缩放、转颜色的来源交 [`Frame::Gpu`]
+    /// （按 [`Self::set_target_size`] 的尺寸），其他交 [`Frame::Rgb`]。
+    fn frame(&mut self) -> Option<Frame>;
+
+    /// 原始画面的尺寸（像素，例如 Retina 屏 2880×1800）；不知道时为 `None`（按交来的画面尺寸算）。
+    fn native_size(&self) -> Option<(u16, u16)> {
+        None
+    }
+
+    /// 要按多大采：编码尺寸（发送端按网络和控制端窗口定，见 `peerdesk_core::scale::encode_size`）。
+    /// 能在采集时缩放的来源（显卡）照做，之后交来的画面就是这个尺寸；不能的忽略，由编码器缩放。
+    fn set_target_size(&mut self, _size: (u16, u16)) {}
 
     /// 画面内容的变化计数：内容每变一次加一。没变时会话直接跳过编码，省下整屏比较的 CPU。
     /// 返回 `None` 表示来源不知道（合成画面、测试），会话每次都自己比较。
@@ -202,7 +212,7 @@ pub(crate) fn control_reader(mut recv: quinn::RecvStream) -> mpsc::Receiver<Cont
 }
 
 /// 编码线程的任务：一帧任务、画面、画面是否变了。
-type EncodeJob = (FrameJob, Screen, bool);
+type EncodeJob = (FrameJob, Frame, bool);
 /// 编码线程交回的结果。
 type EncodeDone = (
     FrameJob,
@@ -224,9 +234,9 @@ fn spawn_encoder(
     let (jobs, job_rx) = std::sync::mpsc::channel::<EncodeJob>();
     let (done_tx, done_rx) = mpsc::unbounded_channel();
     std::thread::spawn(move || {
-        while let Ok((job, screen, changed)) = job_rx.recv() {
+        while let Ok((job, frame, changed)) = job_rx.recv() {
             let started = std::time::Instant::now();
-            let result = encode_job(encoder.as_mut(), &job, &screen, changed);
+            let result = encode_job(encoder.as_mut(), &job, &frame, changed);
             let took = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
             // 编码器可能中途从硬件换成软件：每帧记下现在用的是哪个
             let name = encoder.backend();
@@ -390,7 +400,9 @@ pub async fn serve(
     let mut encoded_rx = encoded_rx;
     // 判断画面变没变：来源会报告变化计数时用它；否则和上一幅比较。
     let mut last_seq: Option<u64> = None;
-    let mut last_screen: Option<Screen> = None;
+    let mut last_screen: Option<Frame> = None;
+    // 告诉采集端的编码尺寸（变了才再告诉）
+    let mut target_size: Option<(u16, u16)> = None;
     // 编码线程正在编一帧时不再派新的；这期间画面变了先记下，编完再编最新的那一幅（不排队）。
     let mut encoding = false;
     let mut pending_change = false;
@@ -644,7 +656,7 @@ pub async fn serve(
             _ = ticker.tick() => {
                 // 先取变化计数再取画面：中间变了的话，下一帧会再编一次，不会漏。
                 let seq = source.change_seq();
-                let Some(screen) = source.capture() else {
+                let Some(frame) = source.frame() else {
                     // 画面来源结束：正在编的那一帧编完发出去再结束。
                     let last = if encoding { encoded_rx.recv().await } else { None };
                     let last = last.and_then(|(job, r, _, _, _)| r.ok().map(|(e, f)| (job, e, f)));
@@ -653,13 +665,13 @@ pub async fn serve(
                     out.unwrap_or_default().iter().for_each(|o| drop(link.send_flags(Channel::Video, o.flags, &o.body)));
                     break "画面来源结束".to_owned();
                 };
-                screen_size = (screen.width(), screen.height());
+                screen_size = frame.size();
                 let changed = match seq {
                     Some(seq) => last_seq.replace(seq) != Some(seq),
                     None => {
-                        let changed = last_screen.as_ref() != Some(screen);
+                        let changed = !last_screen.as_ref().is_some_and(|l| l.same_content(&frame));
                         if changed {
-                            last_screen = Some(screen.clone());
+                            last_screen = Some(frame.clone());
                         }
                         changed
                     }
@@ -676,13 +688,20 @@ pub async fn serve(
                     u16::try_from(packed >> 16).unwrap_or(0),
                     u16::try_from(packed & 0xffff).unwrap_or(0),
                 )));
+                // 编码尺寸告诉采集端：能在显卡上缩放的来源之后就按它采（变了才告诉）
+                let target = peerdesk_core::scale::even_size(
+                    media.encode_size(source.native_size().unwrap_or(screen_size)),
+                );
+                if target_size.replace(target) != Some(target) {
+                    source.set_target_size(target);
+                }
                 // 在途数据超过上限：这一帧不编，变化攒着，等确认之后编最新的画面。
                 if encoding || pacer.busy(peerdesk_core::pacer::rate_for(pacing, media.rate_bps()), 1_000_000 / u64::from(opts.fps.max(1))) || media.in_flight_full(link.now()) || !media.due(link.now()) || (!pending_change && !media.wants_frame()) {
                     continue;
                 }
                 let rtt = u64::try_from(link.rtt().as_micros()).unwrap_or(u64::MAX);
                 let job = media.start_frame(link.now(), rtt);
-                if jobs.send((job, screen.clone(), std::mem::take(&mut pending_change))).is_err() {
+                if jobs.send((job, frame, std::mem::take(&mut pending_change))).is_err() {
                     break "编码线程结束".to_owned();
                 }
                 encoding = true;

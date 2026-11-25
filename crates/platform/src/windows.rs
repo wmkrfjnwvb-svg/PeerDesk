@@ -19,6 +19,7 @@ use std::collections::HashSet;
 use std::sync::Once;
 use std::time::{Duration, Instant};
 
+use peerdesk_core::frame::Frame;
 use peerdesk_core::input::InputEvent;
 use peerdesk_core::screen::Screen;
 use peerdesk_net::host::InputSink;
@@ -509,7 +510,7 @@ impl Grabber for DxgiGrabber {
         Ok(self.pending != Pending::Nothing)
     }
 
-    fn grab(&mut self, spare: Option<Screen>) -> Result<Screen, PlatformError> {
+    fn grab(&mut self, spare: Option<Screen>) -> Result<Frame, PlatformError> {
         let pending = std::mem::replace(&mut self.pending, Pending::Nothing);
         let screen = match pending {
             Pending::Staged(w, h) => self.read_staged(w, h, spare)?,
@@ -517,7 +518,7 @@ impl Grabber for DxgiGrabber {
             Pending::Nothing => return Err(E::Os("没有可读的画面".into())),
         };
         self.first = false;
-        Ok(screen)
+        Ok(Frame::rgb(screen))
     }
 }
 

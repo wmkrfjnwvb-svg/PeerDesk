@@ -3,6 +3,7 @@
 
 use std::time::{Duration, Instant};
 
+use peerdesk_core::frame::Picture;
 use peerdesk_core::proto::PeerOs;
 
 use super::assistant::{os_label, Shortcut};
@@ -42,6 +43,10 @@ pub struct Viewer {
     handle: ViewHandle,
     phase: ViewPhase,
     texture: Option<TextureHandle>,
+    /// NV12 画面用显卡转颜色显示（见 [`super::yuv`]）。
+    yuv: super::yuv::YuvView,
+    /// 现在显示的是 `yuv` 里的画面（不是 `texture`）。
+    showing_yuv: bool,
     size: [u16; 2],
     input: InputState,
     overlay: bool,
@@ -80,6 +85,8 @@ impl Viewer {
             handle,
             phase: ViewPhase::Connecting,
             texture: None,
+            yuv: super::yuv::YuvView::default(),
+            showing_yuv: false,
             size: [0, 0],
             input: InputState::new(),
             // 截图用：PEERDESK_GUI_DETAILS=1 一打开就显示详情面板
@@ -155,16 +162,27 @@ impl Viewer {
             outcome.peer = (self.peer_os, self.peer_name.clone());
         }
         // 只有新画面到了才上传纹理。
-        if let Some(image) = self.handle.frames().take() {
-            self.size = [
-                u16::try_from(image.size[0]).unwrap_or(u16::MAX),
-                u16::try_from(image.size[1]).unwrap_or(u16::MAX),
-            ];
-            match &mut self.texture {
-                Some(texture) => texture.set(image, TextureOptions::LINEAR),
-                None => {
-                    self.texture =
-                        Some(ctx.load_texture("remote-screen", image, TextureOptions::LINEAR))
+        if let Some(picture) = self.handle.frames().take() {
+            let (w, h) = picture.size();
+            self.size = [w, h];
+            // NV12 交给显卡转颜色；显卡用不了（OpenGL 太老）时才在 CPU 上转（日志写明原因）
+            let cpu = match picture {
+                Picture::Nv12(frame) if self.yuv.failed().is_none() => {
+                    self.yuv.set(frame);
+                    self.showing_yuv = true;
+                    None
+                }
+                Picture::Nv12(_) | Picture::Rgb(_) => picture.to_screen().ok(),
+            };
+            if let Some(screen) = cpu {
+                self.showing_yuv = false;
+                let image = super::session::to_color_image(&screen);
+                match &mut self.texture {
+                    Some(texture) => texture.set(image, TextureOptions::LINEAR),
+                    None => {
+                        self.texture =
+                            Some(ctx.load_texture("remote-screen", image, TextureOptions::LINEAR))
+                    }
                 }
             }
         }
@@ -409,7 +427,11 @@ impl Viewer {
                     ctx.request_repaint_after(super::viewsize::SETTLE);
                 }
                 let painter = ui.painter();
-                if let Some(texture) = &self.texture {
+                if self.showing_yuv {
+                    let rect = fit(avail, self.size, ctx.pixels_per_point(), self.original);
+                    self.yuv.paint(painter, rect);
+                    picture = Some(rect);
+                } else if let Some(texture) = &self.texture {
                     let rect = fit(avail, self.size, ctx.pixels_per_point(), self.original);
                     let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
                     painter.image(texture.id(), rect, uv, Color32::WHITE);
@@ -432,7 +454,9 @@ impl Viewer {
                 }
 
                 // 重连中：盖一层提示，画面停在最后一帧。
-                if matches!(self.phase, ViewPhase::Reconnecting { .. }) && self.texture.is_some() {
+                if matches!(self.phase, ViewPhase::Reconnecting { .. })
+                    && (self.showing_yuv || self.texture.is_some())
+                {
                     let _ = painter.text(
                         avail.center(),
                         Align2::CENTER_CENTER,

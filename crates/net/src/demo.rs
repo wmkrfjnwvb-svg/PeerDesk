@@ -2,6 +2,7 @@
 
 use std::sync::{Arc, Mutex, PoisonError};
 
+use peerdesk_core::frame::{Frame, Picture};
 use peerdesk_core::screen::{Screen, SyntheticDesktop, Workload};
 
 use crate::controller::ScreenSink;
@@ -69,8 +70,9 @@ impl DemoDesktop {
     }
 }
 
-impl ScreenSource for DemoDesktop {
-    fn capture(&mut self) -> Option<&Screen> {
+impl DemoDesktop {
+    /// 走一步，取当前画面；取满 `limit` 次之后为 `None`。
+    pub fn capture(&mut self) -> Option<&Screen> {
         if self.limit.is_some_and(|limit| self.step >= limit) {
             return None;
         }
@@ -81,6 +83,12 @@ impl ScreenSource for DemoDesktop {
             .unwrap_or_else(PoisonError::into_inner)
             .clone_from(self.desktop.screen());
         Some(self.desktop.screen())
+    }
+}
+
+impl ScreenSource for DemoDesktop {
+    fn frame(&mut self) -> Option<Frame> {
+        self.capture().map(|s| Frame::rgb(s.clone()))
     }
 }
 
@@ -105,7 +113,7 @@ impl CountSink {
 }
 
 impl ScreenSink for CountSink {
-    fn present(&mut self, _screen: &Screen) {
+    fn present(&mut self, _picture: &Picture) {
         let mut count = self.count.lock().unwrap_or_else(PoisonError::into_inner);
         *count = count.saturating_add(1);
     }
@@ -171,8 +179,9 @@ mod tests {
     fn count_sink_counts() {
         let sink = CountSink::new();
         let mut writer = sink.clone();
-        writer.present(&Screen::new(1, 1, 0));
-        writer.present(&Screen::new(1, 1, 0));
+        let one = Picture::Rgb(Arc::new(Screen::new(1, 1, 0)));
+        writer.present(&one);
+        writer.present(&one);
         assert_eq!(sink.count(), 2);
     }
 

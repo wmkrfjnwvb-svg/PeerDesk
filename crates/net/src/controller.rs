@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use peerdesk_core::crypto::Suite;
 use peerdesk_core::file::FileMeta;
+use peerdesk_core::frame::Picture;
 use peerdesk_core::input::{InputEvent, InputSender};
 use peerdesk_core::media::{DecodeJob, DecodeWorker, MediaReceiver};
 use peerdesk_core::proto::{Caps, Channel, Control, RejectReason};
@@ -31,8 +32,8 @@ const SILENCE_LOST_US: u64 = 3_000_000;
 
 /// 画面去向。窗口显示实现这个接口。
 pub trait ScreenSink: Send {
-    /// 画面有更新。`screen` 是解码后的完整画面。
-    fn present(&mut self, screen: &Screen);
+    /// 画面有更新。`picture` 是解码器给的格式（NV12 或 RGB）：界面把 NV12 交给显卡转颜色。
+    fn present(&mut self, picture: &Picture);
 }
 
 /// 要上传的文件。
@@ -230,7 +231,7 @@ pub struct ControllerReport {
 
 /// 解码线程交回的结果：帧号和解出的画面。
 /// 解码结果：帧号、画面、解码耗时（微秒）。
-type Decoded = (u32, Result<Option<Screen>, peerdesk_core::Error>, u64);
+type Decoded = (u32, Result<Option<Picture>, peerdesk_core::Error>, u64);
 
 /// 启动解码线程。解码一帧要好几毫秒到几十毫秒，放在会话循环里会让本地的键鼠输入排队等它。
 /// 任务通道关闭（会话结束）时线程退出。
@@ -412,7 +413,8 @@ pub async fn run(
         peerdesk_core::transport::Fec::Xor
     });
     let (decode_jobs, mut decoded_rx) = spawn_decoder(decoder, Arc::clone(&decoder_name));
-    let mut last_screen: Option<Screen> = None;
+    // 最后一幅画面（会话结束时转成 RGB 交给报告，测试据此核对内容）
+    let mut last_picture: Option<Picture> = None;
     // 反馈只在有新情况时发；什么都没发生时每秒一次，证明自己还在。
     let mut video_since_feedback = 0u32;
     let mut reported_floor = 0u32;
@@ -437,10 +439,10 @@ pub async fn run(
             () = &mut time_limit, if !time_up => time_up = true,
             // 解码线程交回一帧：显示。
             done = decoded_rx.recv() => match done {
-                Some((frame_id, Ok(Some(screen)), took)) => {
+                Some((frame_id, Ok(Some(picture)), took)) => {
                     window.decode_us = window.decode_us.max(took);
                     window.decode.add(took);
-                    shown_size = (screen.width(), screen.height());
+                    shown_size = picture.size();
                     media.decode_succeeded();
                     let now = link.now();
                     window.frames = window.frames.saturating_add(1);
@@ -459,9 +461,9 @@ pub async fn run(
                     }
                     tracer.record(link.now(), trace, Stage::FrameDelivered, u64::from(frame_id));
                     let presenting = std::time::Instant::now();
-                    sink.present(&screen);
+                    sink.present(&picture);
                     window.present.add(u64::try_from(presenting.elapsed().as_micros()).unwrap_or(u64::MAX));
-                    last_screen = Some(screen);
+                    last_picture = Some(picture);
                 }
                 Some((_, Ok(None), _)) => {}
                 Some((_, Err(_), _)) => media.decode_failed(),
@@ -743,7 +745,7 @@ pub async fn run(
         video_bytes: media.stats().video_bytes,
         bad_frames: u64::from(media.stats().bad),
         recovered: stats.recovered,
-        screen: last_screen,
+        screen: last_picture.and_then(|p| p.to_screen().ok()),
         bad_datagrams,
         input_sent,
         input_unacked: sender.pending(),

@@ -9,6 +9,7 @@
 
 use crate::codec;
 use crate::error::Error;
+use crate::frame::{Frame, Picture};
 use crate::screen::Screen;
 use crate::wire::{Reader, Writer};
 
@@ -126,6 +127,26 @@ pub trait VideoEncoder: Send {
         budget: usize,
     ) -> Result<Option<EncodedFrame>, Error>;
 
+    /// 编一帧 [`Frame`]：CPU 画面交给 [`Self::encode`]；显卡画面只有能直接用它的编码器才支持
+    /// （默认报错，不悄悄在 CPU 上转换）。
+    ///
+    /// # Errors
+    /// 编码出错，或者这个编码器不能用显卡画面。
+    fn encode_frame(
+        &mut self,
+        frame_id: u32,
+        frame: &Frame,
+        changed: bool,
+        budget: usize,
+    ) -> Result<Option<EncodedFrame>, Error> {
+        match frame {
+            Frame::Rgb(screen) => self.encode(frame_id, screen, changed, budget),
+            Frame::Gpu(_) => Err(Error::InvalidArgument(
+                "这个编码器不能直接用显卡画面（对方版本太旧、不支持 H.264？）",
+            )),
+        }
+    }
+
     /// 接收端的确认：帧号不大于 `floor` 的帧都有了定论，`mask` 的第 i 位表示第 `floor - i` 帧已送达。
     fn on_feedback(&mut self, floor: u32, mask: u32);
 
@@ -188,6 +209,21 @@ pub trait VideoDecoder: Send {
 
     /// 最近解出的画面。
     fn screen(&self) -> Option<&Screen>;
+
+    /// 解一帧，交出要显示的画面：能给 NV12 的解码器直接给（界面在显卡上转颜色，CPU 不转），
+    /// 其他给 RGB。默认按 [`Self::decode`] 的 RGB 结果。
+    ///
+    /// # Errors
+    /// 同 [`Self::decode`]。
+    fn decode_picture(
+        &mut self,
+        header: &FrameHeader,
+        data: &[u8],
+    ) -> Result<Option<Picture>, Error> {
+        Ok(self
+            .decode(header, data)?
+            .map(|s| Picture::Rgb(std::sync::Arc::new(s.clone()))))
+    }
 
     /// 现在用的解码器（“详情”面板、日志用）。
     fn backend(&self) -> String {
@@ -307,6 +343,18 @@ impl VideoDecoder for TileDecoder {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
     use super::*;
+
+    /// 默认的 `encode_frame`：CPU 画面照常编；显卡画面报错，不悄悄在 CPU 上转换。
+    #[test]
+    fn default_encode_frame_takes_cpu_frames_only() {
+        use crate::frame::{Frame, Nv12, TestGpuFrame};
+        let mut enc = TileEncoder::default();
+        let rgb = Frame::rgb(Screen::new(32, 32, 0x10_2030));
+        assert!(enc.encode_frame(1, &rgb, true, 100_000).unwrap().is_some());
+        let nv12 = Nv12::new(2, 2, vec![16; 6]).unwrap();
+        let gpu = Frame::Gpu(std::sync::Arc::new(TestGpuFrame::new(nv12)));
+        assert!(enc.encode_frame(2, &gpu, true, 100_000).is_err());
+    }
 
     #[test]
     fn header_round_trip_and_rejects_garbage() {

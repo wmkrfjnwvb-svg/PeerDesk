@@ -79,7 +79,7 @@ fn capture_returns_the_desktop() {
         return;
     };
     let primary = &list[0];
-    let screen = cap.capture().expect("应当有画面").clone();
+    let screen = cap.snapshot().expect("应当有画面");
     println!("画面 {}x{}", screen.width(), screen.height());
     assert_eq!(
         (u32::from(screen.width()), u32::from(screen.height())),
@@ -185,7 +185,7 @@ mod x11 {
     }
 
     fn pixel_at(cap: &mut ScreenCapture, x: u16, y: u16) -> u32 {
-        cap.capture().unwrap().row(x, y, 1)[0]
+        cap.snapshot().unwrap().row(x, y, 1)[0]
     }
 
     #[test]
@@ -205,10 +205,10 @@ mod x11 {
 
         // 画面静止：变化计数不动
         std::thread::sleep(Duration::from_millis(500));
-        cap.capture();
+        cap.frame();
         let quiet = cap.change_seq().unwrap();
         std::thread::sleep(Duration::from_secs(1));
-        cap.capture();
+        cap.frame();
         assert_eq!(cap.change_seq(), Some(quiet), "画面没变，计数却变了");
 
         // 画面变化：计数增加，看到新颜色

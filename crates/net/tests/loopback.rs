@@ -665,9 +665,9 @@ struct Counted {
 }
 
 impl host::ScreenSource for Counted {
-    fn capture(&mut self) -> Option<&peerdesk_core::screen::Screen> {
+    fn frame(&mut self) -> Option<peerdesk_core::frame::Frame> {
         self.seq += 1;
-        self.inner.capture()
+        self.inner.frame()
     }
 
     fn change_seq(&self) -> Option<u64> {
@@ -726,9 +726,10 @@ async fn sources_with_a_change_counter_are_encoded_only_when_it_moves() {
     assert!(report.frames_delivered <= u64::from(host_report.frames_sent));
 }
 
-/// 控制端窗口只有 320×180：告诉被控端后，被控端按这个大小编码（Retina 屏在小窗口里看时不用编全尺寸）。
+/// 控制端窗口只有 320×180：被控端照样按原尺寸编码（业内做法：按原分辨率传，控制端显卡缩放，文字最清楚；
+/// 只有网络不够、按比例缩小时才放进窗口）。开始的半分辨率阶段按窗口大小编。
 #[tokio::test(flavor = "multi_thread")]
-async fn host_encodes_at_the_viewers_size() {
+async fn host_encodes_native_size_even_in_a_small_window() {
     let policy = Policy::recommended();
     let p = pair(&policy, &policy);
     let (host_link, ctrl_link) = links(&p).await;
@@ -767,5 +768,92 @@ async fn host_encodes_at_the_viewers_size() {
     .unwrap();
     let _ = host_task.await.unwrap().unwrap();
     let seen = report.screen.unwrap();
-    assert_eq!((seen.width(), seen.height()), (320, 180));
+    assert_eq!((seen.width(), seen.height()), (640, 360));
+}
+
+/// 显卡画面的来源（模拟 ScreenCaptureKit）：按会话告诉的编码尺寸交 NV12 画面，记下每次要的尺寸。
+struct GpuSource {
+    native: (u16, u16),
+    target: (u16, u16),
+    targets: Arc<Mutex<Vec<(u16, u16)>>>,
+    frames: u32,
+}
+
+impl host::ScreenSource for GpuSource {
+    fn frame(&mut self) -> Option<peerdesk_core::frame::Frame> {
+        use peerdesk_core::frame::{Frame, Nv12, TestGpuFrame};
+        self.frames += 1;
+        if self.frames > 400 {
+            return None;
+        }
+        let (w, h) = (usize::from(self.target.0), usize::from(self.target.1));
+        // 每帧亮度不同：画面一直在变
+        let luma = u8::try_from(16 + self.frames % 200).unwrap();
+        let mut data = vec![luma; w * h];
+        data.extend(std::iter::repeat_n(128u8, w * h / 2));
+        let nv12 = Nv12::new(self.target.0, self.target.1, data).unwrap();
+        Some(Frame::Gpu(Arc::new(TestGpuFrame::new(nv12))))
+    }
+
+    fn change_seq(&self) -> Option<u64> {
+        Some(u64::from(self.frames))
+    }
+
+    fn native_size(&self) -> Option<(u16, u16)> {
+        Some(self.native)
+    }
+
+    fn set_target_size(&mut self, size: (u16, u16)) {
+        self.target = size;
+        self.targets.lock().unwrap().push(size);
+    }
+}
+
+/// 显卡画面整条链路：被控端把编码尺寸告诉采集端（开始半分辨率、之后原尺寸），交来的显卡画面直接编
+/// （这里没有硬件编码器：软件编码读回一次 NV12），控制端看到原尺寸的画面。
+#[tokio::test(flavor = "multi_thread")]
+async fn gpu_frames_are_captured_at_the_encode_size() {
+    let policy = Policy::recommended();
+    let p = pair(&policy, &policy);
+    let (host_link, ctrl_link) = links(&p).await;
+    let targets = Arc::new(Mutex::new(Vec::new()));
+    let source = GpuSource {
+        native: (640, 360),
+        target: (640, 360),
+        targets: Arc::clone(&targets),
+        frames: 0,
+    };
+    let host_task = tokio::spawn(host::serve(
+        host_link,
+        HostOptions::new(session_h264(&p.host_id, &policy), 30, temp_dir("gpu")),
+        Box::new(source),
+        Box::new(Recorder::default()),
+    ));
+    let (_tx, rx) = mpsc::channel(1);
+    let report = controller::run(
+        ctrl_link,
+        ControllerOptions {
+            session: session_h264(&p.ctrl_id, &policy),
+            deadline_us: 200_000,
+            duration: Some(Duration::from_millis(1500)),
+            clipboard: None,
+            on_established: None,
+            on_link: None,
+            view: None,
+            on_quality: None,
+            audio: None,
+        },
+        Box::new(CountSink::new()),
+        rx,
+        None,
+    )
+    .await
+    .unwrap();
+    let _ = host_task.await.unwrap().unwrap();
+    let asked = targets.lock().unwrap().clone();
+    assert_eq!(asked.first(), Some(&(320, 180)), "开始半分辨率：{asked:?}");
+    assert!(asked.contains(&(640, 360)), "之后原尺寸：{asked:?}");
+    assert!(report.frames_delivered > 5, "{}", report.frames_delivered);
+    let seen = report.screen.unwrap();
+    assert_eq!((seen.width(), seen.height()), (640, 360));
 }

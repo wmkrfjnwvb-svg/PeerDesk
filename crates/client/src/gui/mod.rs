@@ -26,5 +26,6 @@ pub mod theme;
 pub mod transfers;
 mod viewer;
 pub mod viewsize;
+mod yuv;
 
 pub use app::run;

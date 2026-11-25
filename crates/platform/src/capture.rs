@@ -7,12 +7,15 @@
 //! * 帧率有上限：两次读取之间至少隔 `1 / max_fps`。等待期间发生的变化由系统累积着，到时间一次读出；
 //! * 画面缓冲区循环使用：会话换下来的旧画面还给采集线程，下一次读取直接写进去，不用每帧重新分配；
 //! * 出错时（例如 Windows 切换到安全桌面、分辨率改变）关掉重新打开，间隔逐渐拉长。
-//!   第一帧之前出错则直接报告给打开者，不重试。
+//!   第一帧之前出错则直接报告给打开者，不重试；
+//! * 能在显卡上缩放、转颜色的系统（macOS 的 ScreenCaptureKit）按会话要的编码尺寸直接交 NV12 显卡画面
+//!   （[`Frame::Gpu`]），CPU 不碰像素；内容比较不了，系统交来新画面就算变了（它只在画面变了时交）。
 
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use peerdesk_core::frame::Frame;
 use peerdesk_core::screen::Screen;
 use peerdesk_net::host::ScreenSource;
 
@@ -32,8 +35,19 @@ pub(crate) trait Grabber {
     /// 第一次调用时应当返回 `true`，让第一帧尽快到手。
     fn wait(&mut self, timeout: Duration) -> Result<bool, PlatformError>;
 
-    /// 读出当前画面。`spare` 是可以复用的旧缓冲区（尺寸可能不对）。
-    fn grab(&mut self, spare: Option<Screen>) -> Result<Screen, PlatformError>;
+    /// 读出当前画面。`spare` 是可以复用的旧缓冲区（尺寸可能不对；交显卡画面的系统用不上）。
+    fn grab(&mut self, spare: Option<Screen>) -> Result<Frame, PlatformError>;
+
+    /// 改采集尺寸（会话要的编码尺寸，偶数）。能在显卡上缩放的系统照做，之后交的画面就是这个尺寸；
+    /// 其他系统忽略（交原尺寸的 CPU 画面，由编码器缩放）。
+    fn set_target(&mut self, _size: (u16, u16)) -> Result<(), PlatformError> {
+        Ok(())
+    }
+
+    /// 原始画面尺寸（像素，例如 Retina 屏 2880×1800）；不知道时为 `None`。
+    fn native_size(&self) -> Option<(u16, u16)> {
+        None
+    }
 }
 
 /// 在采集线程上打开读取器；出错重开时会再次调用。
@@ -70,11 +84,15 @@ impl CaptureStats {
 #[derive(Debug, Default)]
 struct State {
     /// 最新的一帧。
-    latest: Option<Arc<Screen>>,
+    latest: Option<Frame>,
     /// 变化计数：`latest` 每换一次加一，第一帧是 1。
     seq: u64,
     /// 会话换下来的旧画面，采集线程拿去复用。
-    returned: Option<Arc<Screen>>,
+    returned: Option<Frame>,
+    /// 会话要的采集尺寸（编码尺寸）。
+    target: Option<(u16, u16)>,
+    /// 原始画面尺寸。
+    native: Option<(u16, u16)>,
     /// 要求采集线程退出。
     stop: bool,
     /// 第一帧之前出的错：打开失败。
@@ -123,7 +141,7 @@ impl Shared {
     }
 
     /// 放进一帧。内容和上一帧一样时不放，计数不变。返回可以复用的缓冲区。
-    fn publish(&self, screen: Screen, took: Duration) -> Option<Screen> {
+    fn publish(&self, frame: Frame, took: Duration) -> Option<Screen> {
         let previous = {
             let mut st = self.lock();
             st.stats.grabs = st.stats.grabs.saturating_add(1);
@@ -133,23 +151,29 @@ impl Shared {
             st.latest.clone()
         };
         // 比较在锁外进行：只有采集线程会改 `latest`，会话取画面不会被整屏比较挡住。
-        if previous.as_deref() == Some(&screen) {
-            return Some(screen);
+        // 显卡画面比较不了：系统交来就算变了。
+        if previous.as_ref().is_some_and(|p| p.same_content(&frame)) {
+            return reusable(frame);
         }
         drop(previous);
         let (old, returned) = {
             let mut st = self.lock();
-            let old = st.latest.replace(Arc::new(screen));
+            let old = st.latest.replace(frame);
             st.seq = st.seq.saturating_add(1);
             st.stats.frames = st.seq;
             (old, st.returned.take())
         };
         self.wake.notify_all();
         // 会话还拿着的画面不能复用；会话还回来的、或者会话根本没取过的旧画面可以。
-        [returned, old]
-            .into_iter()
-            .flatten()
-            .find_map(|a| Arc::try_unwrap(a).ok())
+        [returned, old].into_iter().flatten().find_map(reusable)
+    }
+}
+
+/// 没人再用的 CPU 画面可以复用它的缓冲区；显卡画面由系统回收。
+fn reusable(frame: Frame) -> Option<Screen> {
+    match frame {
+        Frame::Rgb(a) => Arc::try_unwrap(a).ok(),
+        Frame::Gpu(_) => None,
     }
 }
 
@@ -165,11 +189,17 @@ fn run(shared: &Shared, mut opener: Opener, interval: Duration) {
     let mut spare: Option<Screen> = None;
     let mut next = Instant::now();
     let mut failures = 0u32;
+    // 已经交给这个读取器的采集尺寸（重新打开后要再交一次）
+    let mut applied: Option<(u16, u16)> = None;
     while !shared.stopping() {
         let g = match &mut grabber {
             Some(g) => g,
             None => match opener() {
-                Ok(g) => grabber.insert(g),
+                Ok(g) => {
+                    applied = None;
+                    shared.lock().native = g.native_size();
+                    grabber.insert(g)
+                }
                 Err(e) => {
                     if !shared.on_error(e) {
                         return;
@@ -185,7 +215,14 @@ fn run(shared: &Shared, mut opener: Opener, interval: Duration) {
             shared.sleep(next - now);
             continue;
         }
-        let result = g.wait(POLL).and_then(|changed| {
+        // 会话要的采集尺寸变了：先交给系统（失败按读取出错处理：重新打开、之后再交）
+        let wanted = shared.lock().target;
+        let retarget = match wanted.filter(|_| wanted != applied) {
+            Some(size) => g.set_target(size),
+            None => Ok(()),
+        };
+        applied = wanted;
+        let result = retarget.and_then(|()| g.wait(POLL)).and_then(|changed| {
             if !changed {
                 return Ok(None);
             }
@@ -193,10 +230,10 @@ fn run(shared: &Shared, mut opener: Opener, interval: Duration) {
             g.grab(spare.take()).map(|s| Some((s, started)))
         });
         match result {
-            Ok(Some((screen, started))) => {
+            Ok(Some((frame, started))) => {
                 failures = 0;
                 next = started + interval;
-                spare = shared.publish(screen, started.elapsed());
+                spare = shared.publish(frame, started.elapsed());
             }
             Ok(None) => {}
             Err(e) => {
@@ -217,7 +254,7 @@ fn run(shared: &Shared, mut opener: Opener, interval: Duration) {
 #[derive(Debug)]
 pub struct ScreenCapture {
     shared: Arc<Shared>,
-    current: Option<Arc<Screen>>,
+    current: Option<Frame>,
     current_seq: u64,
     thread: Option<JoinHandle<()>>,
     /// 上次写诊断日志时的统计（算这一秒的增量）。
@@ -281,10 +318,9 @@ impl ScreenCapture {
     pub fn stats(&self) -> CaptureStats {
         self.shared.lock().stats.clone()
     }
-}
 
-impl ScreenSource for ScreenCapture {
-    fn capture(&mut self) -> Option<&Screen> {
+    /// 换上最新的一帧（有新的话）。
+    fn refresh(&mut self) {
         let mut st = self.shared.lock();
         let fresh = st.latest.clone().filter(|_| st.seq != self.current_seq);
         if let Some(latest) = fresh {
@@ -294,12 +330,33 @@ impl ScreenSource for ScreenCapture {
                 st.returned = old;
             }
         }
-        drop(st);
-        self.current.as_deref()
+    }
+
+    /// 最新的一帧读成 RGB 画面。显卡画面会读回内存、在 CPU 上转颜色：只给截图检查、体检和测试用，
+    /// 会话用 [`ScreenSource::frame`]。
+    pub fn snapshot(&mut self) -> Option<Screen> {
+        self.refresh();
+        self.current.as_ref().and_then(|f| f.to_screen().ok())
+    }
+}
+
+impl ScreenSource for ScreenCapture {
+    fn frame(&mut self) -> Option<Frame> {
+        self.refresh();
+        self.current.clone()
     }
 
     fn change_seq(&self) -> Option<u64> {
         Some(self.current_seq)
+    }
+
+    fn native_size(&self) -> Option<(u16, u16)> {
+        self.shared.lock().native
+    }
+
+    fn set_target_size(&mut self, size: (u16, u16)) {
+        self.shared.lock().target = Some(size);
+        self.shared.wake.notify_all();
     }
 
     fn stats_line(&mut self) -> Option<String> {
@@ -313,15 +370,22 @@ impl ScreenSource for ScreenCapture {
             .checked_div(u32::try_from(grabs).unwrap_or(u32::MAX))
             .unwrap_or_default();
         let line = format!(
-            "采集 新画面 {} 帧，读取 {} 次，读取耗时（从系统读出并转成 RGB）{:.1}/{:.1} ms；{}；出错重开 {} 次{}",
+            "采集 新画面 {} 帧，读取 {} 次，读取耗时 {:.1}/{:.1} ms；{}；出错重开 {} 次{}",
             now.frames.saturating_sub(self.reported.frames),
             grabs,
             avg.as_secs_f64() * 1000.0,
             max.as_secs_f64() * 1000.0,
-            self.current.as_deref().map_or_else(
-                || "还没有画面".to_owned(),
-                |s| format!("画面 {}×{}", s.width(), s.height())
-            ),
+            self.current
+                .as_ref()
+                .map(|f| {
+                    let (w, h) = f.size();
+                    let kind = match f {
+                        Frame::Gpu(_) => "系统在显卡上缩放、转好的 NV12，CPU 不碰像素",
+                        Frame::Rgb(_) => "从系统读出并在 CPU 上转成 RGB",
+                    };
+                    format!("画面 {w}×{h}（{kind}）")
+                })
+                .unwrap_or_default(),
             now.reopens.saturating_sub(self.reported.reopens),
             now.last_error
                 .as_ref()
@@ -346,6 +410,7 @@ impl Drop for ScreenCapture {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use peerdesk_core::frame::{Nv12, TestGpuFrame};
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -368,6 +433,12 @@ mod tests {
         color: Mutex<u32>,
         reused: AtomicU32,
         opened: AtomicU32,
+        /// 交显卡画面（按要的尺寸），不交 CPU 画面。
+        gpu: bool,
+        /// 要过的采集尺寸。
+        targets: Mutex<Vec<(u16, u16)>>,
+        /// 改尺寸失败一次。
+        target_fails: std::sync::atomic::AtomicBool,
     }
 
     struct Fake(Arc<Script>);
@@ -393,7 +464,7 @@ mod tests {
             }
         }
 
-        fn grab(&mut self, spare: Option<Screen>) -> Result<Screen, PlatformError> {
+        fn grab(&mut self, spare: Option<Screen>) -> Result<Frame, PlatformError> {
             let color = *self.0.color.lock().unwrap();
             if color == u32::MAX {
                 return Err(PlatformError::Os("读取失败".into()));
@@ -401,7 +472,34 @@ mod tests {
             if spare.is_some() {
                 self.0.reused.fetch_add(1, Ordering::Relaxed);
             }
-            Ok(Screen::new(4, 2, color))
+            if self.0.gpu {
+                let (w, h) = self
+                    .0
+                    .targets
+                    .lock()
+                    .unwrap()
+                    .last()
+                    .copied()
+                    .unwrap_or((8, 4));
+                let (wu, hu) = (usize::from(w), usize::from(h));
+                let mut data = vec![u8::try_from(color % 200 + 16).unwrap(); wu * hu];
+                data.extend(std::iter::repeat_n(128u8, wu * hu / 2));
+                let nv12 = Nv12::new(w, h, data).unwrap();
+                return Ok(Frame::Gpu(Arc::new(TestGpuFrame::new(nv12))));
+            }
+            Ok(Frame::rgb(Screen::new(4, 2, color)))
+        }
+
+        fn set_target(&mut self, size: (u16, u16)) -> Result<(), PlatformError> {
+            if self.0.target_fails.swap(false, Ordering::Relaxed) {
+                return Err(PlatformError::Os("改尺寸失败".into()));
+            }
+            self.0.targets.lock().unwrap().push(size);
+            Ok(())
+        }
+
+        fn native_size(&self) -> Option<(u16, u16)> {
+            Some((16, 8))
         }
     }
 
@@ -438,7 +536,7 @@ mod tests {
     }
 
     fn color(cap: &mut ScreenCapture) -> u32 {
-        cap.capture().unwrap().pixels()[0]
+        cap.snapshot().unwrap().pixels()[0]
     }
 
     #[test]
@@ -554,7 +652,7 @@ mod tests {
         push(&s, &(1..200).map(Step::Color).collect::<Vec<_>>());
         std::thread::sleep(Duration::from_millis(200));
         let seq = {
-            cap.capture();
+            cap.frame();
             cap.change_seq().unwrap()
         };
         assert!((2..=7).contains(&seq), "{seq}");
@@ -570,6 +668,75 @@ mod tests {
         assert!(started.elapsed() < Duration::from_millis(500));
         // 线程退出后 opener 闭包也被释放，只剩这里的一个引用
         assert_eq!(Arc::strong_count(&s), 1);
+    }
+
+    /// 显卡画面：会话要的尺寸交给系统（重新打开后再交一次），交来的画面就是这个尺寸；
+    /// 内容比较不了，系统交来就算变了；诊断日志写明 CPU 不碰像素。
+    #[test]
+    fn gpu_frames_follow_the_target_size() {
+        let s = Arc::new(Script {
+            gpu: true,
+            ..Script::default()
+        });
+        push(&s, &[Step::Color(1)]);
+        let mut cap = ScreenCapture::start(1000, opener(&s), Duration::from_secs(5)).unwrap();
+        assert_eq!(cap.native_size(), Some((16, 8)));
+        assert_eq!(
+            cap.frame().unwrap().size(),
+            (8, 4),
+            "还没要尺寸：系统默认的"
+        );
+        cap.set_target_size((6, 2));
+        push(&s, &[Step::Idle, Step::Color(1)]);
+        drain(&s);
+        let frame = cap.frame().unwrap();
+        assert!(matches!(frame, Frame::Gpu(_)));
+        assert_eq!(frame.size(), (6, 2));
+        assert_eq!(cap.change_seq(), Some(2), "同样的内容也算变了");
+        assert_eq!(*s.targets.lock().unwrap(), vec![(6, 2)]);
+        // 读成 RGB 给检查用
+        assert_eq!(cap.snapshot().unwrap().width(), 6);
+        let line = cap.stats_line().unwrap();
+        assert!(line.contains("画面 6×2（系统在显卡上缩放"), "{line}");
+        // 改尺寸失败：重新打开，再交一次
+        s.target_fails.store(true, Ordering::Relaxed);
+        cap.set_target_size((4, 2));
+        push(&s, &[Step::Idle, Step::Idle, Step::Color(2)]);
+        drain(&s);
+        std::thread::sleep(Duration::from_millis(250));
+        assert_eq!(*s.targets.lock().unwrap(), vec![(6, 2), (4, 2)]);
+        assert_eq!(s.opened.load(Ordering::Relaxed), 2);
+        assert_eq!(cap.frame().unwrap().size(), (4, 2));
+    }
+
+    /// 不能在采集时缩放的系统（X11、Windows 目前）：改尺寸什么都不做，不知道原始尺寸。
+    #[test]
+    fn grabbers_ignore_the_target_by_default() {
+        struct Plain;
+        impl Grabber for Plain {
+            fn wait(&mut self, _timeout: Duration) -> Result<bool, PlatformError> {
+                Ok(true)
+            }
+            fn grab(&mut self, _spare: Option<Screen>) -> Result<Frame, PlatformError> {
+                Ok(Frame::rgb(Screen::new(2, 2, 0)))
+            }
+        }
+        let mut g = Plain;
+        assert!(g.wait(Duration::ZERO).unwrap());
+        assert_eq!(g.grab(None).unwrap().size(), (2, 2));
+        assert!(g.set_target((2, 2)).is_ok());
+        assert_eq!(g.native_size(), None);
+    }
+
+    #[test]
+    fn cpu_frames_say_so_in_the_log() {
+        let s = script(&[Step::Color(1)]);
+        let mut cap = ScreenCapture::start(1000, opener(&s), Duration::from_secs(5)).unwrap();
+        let line = cap.stats_line().unwrap();
+        assert!(
+            line.contains("画面 4×2（从系统读出并在 CPU 上转成 RGB）"),
+            "{line}"
+        );
     }
 
     #[test]

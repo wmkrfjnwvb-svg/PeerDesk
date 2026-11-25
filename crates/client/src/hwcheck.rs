@@ -13,7 +13,6 @@ use std::time::Instant;
 use peerdesk_core::screen::Screen;
 use peerdesk_core::video::VideoEncoder;
 use peerdesk_media::{H264Encoder, HardwareEncoder};
-use peerdesk_net::host::ScreenSource;
 
 /// 编几帧。
 const FRAMES: u16 = 30;
@@ -145,7 +144,7 @@ fn grab() -> Option<Screen> {
     let mut source = crate::local::local_screen().ok()?;
     // 采集线程刚启动时可能还没有画面：最多试 40 次、每次等 50 ms
     (0..40).find_map(|_| {
-        let screen = source.capture().cloned();
+        let screen = source.frame().and_then(|f| f.to_screen().ok());
         std::thread::sleep(std::time::Duration::from_millis(
             50 * u64::from(screen.is_none()),
         ));

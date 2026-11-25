@@ -165,9 +165,9 @@ fn view_a_host_send_input_and_get_kicked() {
     };
     // 第一幅画面可能是半分辨率（带宽未知时先出画面，见 peerdesk_core::scale），回环上很快升回原尺寸
     assert!(
-        image.size == [1280, 720] || image.size == [640, 360],
+        image.size() == (1280, 720) || image.size() == (640, 360),
         "{:?}",
-        image.size
+        image.size()
     );
     let full = loop {
         if v.frames().size() == [1280, 720] {
@@ -180,20 +180,15 @@ fn view_a_host_send_input_and_get_kicked() {
         std::thread::sleep(Duration::from_millis(10));
     };
     assert!(full, "回环上要升回原尺寸：{:?}", v.frames().size());
-    // 控制端窗口变小：被控端按窗口大小编码（同一个值重复设不会再发）
+    // 控制端窗口变小：被控端照样按原尺寸编码（控制端显卡缩放；同一个值重复设不会再发）
     v.set_view((640, 360));
     v.set_view((640, 360));
-    let small = loop {
-        if v.frames().size() == [640, 360] {
-            break true;
-        }
-        if Instant::now() >= deadline + WAIT {
-            break false;
-        }
+    let until = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < until {
         let _ = v.frames().take();
+        assert_eq!(v.frames().size(), [1280, 720], "原尺寸不随窗口变");
         std::thread::sleep(Duration::from_millis(10));
-    };
-    assert!(small, "按窗口大小编码：{:?}", v.frames().size());
+    }
     assert!(v.frames().frames() >= 1);
     assert!(repaints.load(Ordering::Relaxed) >= 1);
 

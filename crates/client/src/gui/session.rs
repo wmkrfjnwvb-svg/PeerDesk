@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::{Color32, ColorImage};
 use peerdesk_core::auth::{Auth, Limiter};
 use peerdesk_core::crypto::Policy;
+use peerdesk_core::frame::{Frame, Picture};
 use peerdesk_core::input::InputEvent;
 use peerdesk_core::proto::{Caps, PeerOs};
 use peerdesk_core::screen::Screen;
@@ -265,14 +266,22 @@ struct Watched {
 }
 
 impl ScreenSource for Watched {
-    fn capture(&mut self) -> Option<&Screen> {
+    fn frame(&mut self) -> Option<Frame> {
         if let Some(emitter) = self.announce.take() {
             emitter.send(HostEvent::Established);
         }
         if self.shared.kicked.load(Ordering::Relaxed) {
             return None;
         }
-        self.inner.capture()
+        self.inner.frame()
+    }
+
+    fn native_size(&self) -> Option<(u16, u16)> {
+        self.inner.native_size()
+    }
+
+    fn set_target_size(&mut self, size: (u16, u16)) {
+        self.inner.set_target_size(size);
     }
 
     fn change_seq(&self) -> Option<u64> {
@@ -473,17 +482,17 @@ async fn host_main(
 
 // ---------------------------------------------------------------- 控制端
 
-/// 最新一帧画面，界面取走后清空。
+/// 最新一帧画面，界面取走后清空。存解码器给的格式（NV12 或 RGB），界面在显卡上转颜色。
 #[derive(Debug, Default)]
 pub struct FrameSlot {
-    image: Mutex<Option<ColorImage>>,
+    image: Mutex<Option<Picture>>,
     frames: AtomicU64,
     size: AtomicU32,
 }
 
 impl FrameSlot {
     /// 取走最新的画面（没有新画面时为 `None`）。
-    pub fn take(&self) -> Option<ColorImage> {
+    pub fn take(&self) -> Option<Picture> {
         self.image
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -501,13 +510,13 @@ impl FrameSlot {
         [u16::from_be_bytes([w0, w1]), u16::from_be_bytes([h0, h1])]
     }
 
-    fn put(&self, screen: &Screen) {
-        let image = to_color_image(screen);
-        let [w0, w1] = screen.width().to_be_bytes();
-        let [h0, h1] = screen.height().to_be_bytes();
+    fn put(&self, picture: Picture) {
+        let (w, h) = picture.size();
+        let [w0, w1] = w.to_be_bytes();
+        let [h0, h1] = h.to_be_bytes();
         self.size
             .store(u32::from_be_bytes([w0, w1, h0, h1]), Ordering::Relaxed);
-        *self.image.lock().unwrap_or_else(PoisonError::into_inner) = Some(image);
+        *self.image.lock().unwrap_or_else(PoisonError::into_inner) = Some(picture);
         self.frames.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -545,8 +554,9 @@ struct GuiSink {
 type FilesLink = Arc<Mutex<Option<Arc<peerdesk_net::Link>>>>;
 
 impl ScreenSink for GuiSink {
-    fn present(&mut self, screen: &Screen) {
-        self.slot.put(screen);
+    fn present(&mut self, picture: &Picture) {
+        // 只是多一个引用，不拷贝像素、不转颜色
+        self.slot.put(picture.clone());
         (self.repaint)();
     }
 }

@@ -48,7 +48,7 @@ impl InputSink for Null {
     fn inject(&mut self, _: &InputEvent) {}
 }
 impl ScreenSink for Null {
-    fn present(&mut self, _: &peerdesk_core::screen::Screen) {}
+    fn present(&mut self, _: &peerdesk_core::frame::Picture) {}
 }
 
 /// 持有两个端点，保证测试期间它们不被关闭。

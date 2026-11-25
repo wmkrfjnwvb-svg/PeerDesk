@@ -63,8 +63,8 @@ objc2-core-foundation = { version = "0.3", default-features = false, features = 
   "std", "CFArray", "CFBase", "CFCGTypes", "CFDictionary", "CFNumber", "CFString",
 ] }
 objc2-core-graphics = { version = "0.3", default-features = false, features = [
-  "std", "CGDirectDisplay", "CGDisplayConfiguration", "CGError", "CGEvent", "CGEventSource",
-  "CGEventTypes", "CGGeometry", "CGRemoteOperation", "CGWindow", "libc",
+  "std", "CGColorSpace", "CGDirectDisplay", "CGDisplayConfiguration", "CGDisplayStream", "CGError",
+  "CGEvent", "CGEventSource", "CGEventTypes", "CGGeometry", "CGRemoteOperation", "CGWindow", "libc",
 ] }
 objc2-core-media = { version = "0.3", default-features = false, features = [
   "std", "CMBase", "CMSampleBuffer", "CMTime", "objc2-core-video",

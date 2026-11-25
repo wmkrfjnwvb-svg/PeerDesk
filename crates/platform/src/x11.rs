@@ -14,6 +14,7 @@ use std::fmt::Display;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::time::{Duration, Instant};
 
+use peerdesk_core::frame::Frame;
 use peerdesk_core::input::InputEvent;
 use peerdesk_core::screen::Screen;
 use peerdesk_net::host::InputSink;
@@ -413,7 +414,14 @@ impl Grabber for X11Grabber {
         Ok(self.dirty)
     }
 
-    fn grab(&mut self, spare: Option<Screen>) -> Result<Screen, PlatformError> {
+    fn grab(&mut self, spare: Option<Screen>) -> Result<Frame, PlatformError> {
+        self.read(spare).map(Frame::rgb)
+    }
+}
+
+impl X11Grabber {
+    /// 读出整屏，转成 RGB 画面（X11 没有显卡缩放、转颜色的采集接口）。
+    fn read(&mut self, spare: Option<Screen>) -> Result<Screen, PlatformError> {
         // 先清掉累积的变化再读：读的过程中发生的变化会产生新的通知，不会漏掉。
         if let Some(d) = self.damage {
             self.x

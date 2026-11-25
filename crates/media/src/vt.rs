@@ -127,6 +127,9 @@ extern "C" {
 #[link(name = "CoreVideo", kind = "framework")]
 extern "C" {
     static kCVPixelBufferPixelFormatTypeKey: CFTypeRef;
+    static kCVImageBufferColorPrimaries_ITU_R_709_2: CFTypeRef;
+    static kCVImageBufferTransferFunction_ITU_R_709_2: CFTypeRef;
+    static kCVImageBufferYCbCrMatrix_ITU_R_601_4: CFTypeRef;
     fn CVPixelBufferCreate(
         allocator: CFTypeRef,
         width: usize,
@@ -165,6 +168,9 @@ extern "C" {
     static kVTCompressionPropertyKey_MaxFrameDelayCount: CFTypeRef;
     static kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration: CFTypeRef;
     static kVTCompressionPropertyKey_DataRateLimits: CFTypeRef;
+    static kVTCompressionPropertyKey_ColorPrimaries: CFTypeRef;
+    static kVTCompressionPropertyKey_TransferFunction: CFTypeRef;
+    static kVTCompressionPropertyKey_YCbCrMatrix: CFTypeRef;
     fn VTCompressionSessionGetPixelBufferPool(session: CFTypeRef) -> CFTypeRef;
     fn VTCompressionSessionCreate(
         allocator: CFTypeRef,
@@ -680,6 +686,23 @@ impl VtEncoder {
                     seconds.0,
                 );
             }
+            // 色彩标记（写进码流的 VUI）：采集端按 BT.601 有限范围转 YUV（和全链路的解码、显示一致），
+            // 原色和传递函数是 sRGB 屏幕（与 BT.709 相同）。Chromium、OBS 都显式标，不让解码端猜。
+            let _ = VTSessionSetProperty(
+                session,
+                kVTCompressionPropertyKey_ColorPrimaries,
+                kCVImageBufferColorPrimaries_ITU_R_709_2,
+            );
+            let _ = VTSessionSetProperty(
+                session,
+                kVTCompressionPropertyKey_TransferFunction,
+                kCVImageBufferTransferFunction_ITU_R_709_2,
+            );
+            let _ = VTSessionSetProperty(
+                session,
+                kVTCompressionPropertyKey_YCbCrMatrix,
+                kCVImageBufferYCbCrMatrix_ITU_R_601_4,
+            );
             let rate = number_i32(enc.fps);
             let _ =
                 VTSessionSetProperty(session, kVTCompressionPropertyKey_ExpectedFrameRate, rate.0);
@@ -790,15 +813,36 @@ impl VtEncoder {
 
     /// 交一帧 NV12 给编码器，不等结果（结果由输出回调放进队列）。
     pub fn submit(&mut self, nv12: &[u8], bps: u64, force_key: bool) -> Result<(), String> {
-        self.set_bitrate(bps);
         let pixels = self.buffer()?;
         Self::fill(pixels.0, self.width, self.height, nv12)?;
+        self.submit_image(pixels.0, bps, force_key)
+    }
+
+    /// 交一个现成的图像缓冲（`CVPixelBufferRef`，例如 ScreenCaptureKit 交来的显存画面）给编码器，不拷贝。
+    /// 苹果文档：编码器自己 retain 缓冲区，用完才放；调用方返回后可以放掉自己的引用。
+    fn submit_image(&mut self, image: CFTypeRef, bps: u64, force_key: bool) -> Result<(), String> {
+        if image.is_null() {
+            return Err("图像缓冲是空的".into());
+        }
+        // SAFETY: `image` 是调用方保证有效的 CVPixelBuffer，调用期间不释放。
+        let size = unsafe { (CVPixelBufferGetWidth(image), CVPixelBufferGetHeight(image)) };
+        let expected = (
+            usize::try_from(self.width).unwrap_or(0),
+            usize::try_from(self.height).unwrap_or(0),
+        );
+        if size != expected {
+            return Err(format!(
+                "画面 {}×{} 和编码会话 {}×{} 不一致",
+                size.0, size.1, expected.0, expected.1
+            ));
+        }
+        self.set_bitrate(bps);
         let props = force_key.then(|| {
             dict1(unsafe { kVTEncodeFrameOptionKey_ForceKeyFrame }, unsafe {
                 kCFBooleanTrue
             })
         });
-        // SAFETY: 会话、像素缓冲有效；属性字典在调用期间有效。
+        // SAFETY: 会话、图像缓冲有效；属性字典在调用期间有效。
         unsafe {
             let pts = CMTimeMake(self.frame, self.fps);
             let duration = CMTimeMake(1, self.fps);
@@ -806,7 +850,7 @@ impl VtEncoder {
             check(
                 VTCompressionSessionEncodeFrame(
                     self.session,
-                    pixels.0,
+                    image,
                     pts,
                     duration,
                     props.as_ref().map_or(std::ptr::null(), |p| p.0),
@@ -866,6 +910,23 @@ impl VtEncoder {
         force_key: bool,
     ) -> Result<Option<(Vec<u8>, bool)>, String> {
         self.submit(nv12, bps, force_key)?;
+        self.collect()
+    }
+
+    /// 编一个现成的图像缓冲（`CVPixelBufferRef`，NV12、尺寸和会话一致），取回方式同 [`Self::encode`]。
+    /// ScreenCaptureKit 交来的显存画面直接用它，不经过内存（FFmpeg 的 videotoolboxenc 也是这样交硬件帧）。
+    pub fn encode_image(
+        &mut self,
+        image: *const c_void,
+        bps: u64,
+        force_key: bool,
+    ) -> Result<Option<(Vec<u8>, bool)>, String> {
+        self.submit_image(image, bps, force_key)?;
+        self.collect()
+    }
+
+    /// 交完一帧之后取回一个编好的帧（等一小会儿）。
+    fn collect(&mut self) -> Result<Option<(Vec<u8>, bool)>, String> {
         if self.opts.complete_each_frame {
             // 只给 hw-check 对照旧做法用
             self.complete()?;

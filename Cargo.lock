@@ -2705,6 +2705,7 @@ name = "peerdesk-media"
 version = "0.1.0"
 dependencies = [
  "cros-codecs",
+ "glow",
  "log",
  "openh264",
  "openh264-sys2",

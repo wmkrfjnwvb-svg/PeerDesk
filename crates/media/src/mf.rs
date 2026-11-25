@@ -22,6 +22,7 @@ use std::mem::ManuallyDrop;
 use std::sync::Once;
 use std::time::{Duration, Instant};
 
+use peerdesk_core::frame::Nv12;
 use windows::core::Interface;
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN};
@@ -892,7 +893,20 @@ impl MfDecoder {
     }
 
     /// 解一帧（Annex B）。返回（宽, 高, `0x00RRGGBB`）；还没有画面时为 `None`。
+    /// 颜色在 CPU 上转：界面用 [`Self::decode_nv12`]，这个只给体检、测试。
     pub fn decode(&mut self, data: &[u8]) -> Result<Option<(usize, usize, Vec<u32>)>, String> {
+        Ok(self.decode_nv12(data)?.map(|nv12| {
+            let (w, h) = (usize::from(nv12.width()), usize::from(nv12.height()));
+            let (y, uv) = nv12.planes();
+            let mut rgb = Vec::new();
+            crate::color::nv12_to_rgb(y, uv, w, w, h, &mut rgb);
+            (w, h, rgb)
+        }))
+    }
+
+    /// 解一帧（Annex B），交出 NV12：显卡解出的画面拷回内存一次（只拷贝，不转颜色）。
+    /// 还没有画面时为 `None`。
+    pub fn decode_nv12(&mut self, data: &[u8]) -> Result<Option<Nv12>, String> {
         let len = u32::try_from(data.len()).map_err(|_| "数据太大".to_owned())?;
         // SAFETY: 缓冲区按长度创建；Lock 的指针在 Unlock 之前有效，拷贝长度不超过缓冲区。
         let sample = unsafe {
@@ -969,11 +983,15 @@ impl MfDecoder {
         }
     }
 
-    /// 把一帧 NV12 读出来转成 RGB。显卡上的画面由 2D 缓冲区接口拷回内存。
-    fn read(&self, sample: &IMFSample) -> Result<(usize, usize, Vec<u32>), String> {
+    /// 把一帧 NV12 读出来（只拷贝，不转颜色）。显卡上的画面由 2D 缓冲区接口拷回内存。
+    fn read(&self, sample: &IMFSample) -> Result<Nv12, String> {
         let (w, h) = self.shown;
+        let size = (
+            u16::try_from(w).map_err(|_| "画面太大".to_owned())?,
+            u16::try_from(h).map_err(|_| "画面太大".to_owned())?,
+        );
         let rows = self.coded.1;
-        let mut rgb = Vec::new();
+        let picture;
         // SAFETY: Lock/Lock2D 返回的指针在对应的 Unlock 之前有效，读取长度按缓冲区实际长度截断。
         unsafe {
             let buffer = sample
@@ -989,7 +1007,7 @@ impl MfDecoder {
                 let total = pitch * rows * 3 / 2;
                 let bytes = std::slice::from_raw_parts(ptr, total);
                 let (y, uv) = bytes.split_at((pitch * rows).min(total));
-                crate::color::nv12_to_rgb(y, uv, pitch, w, h, &mut rgb);
+                picture = Nv12::from_planes(size.0, size.1, y, pitch, uv, pitch);
                 let _ = two_d.Unlock2D();
             } else {
                 let mut ptr: *mut u8 = std::ptr::null_mut();
@@ -1000,17 +1018,17 @@ impl MfDecoder {
                 let bytes = std::slice::from_raw_parts(ptr, usize::try_from(len).unwrap_or(0));
                 let split = (self.stride * rows).min(bytes.len());
                 let (y, uv) = bytes.split_at(split);
-                crate::color::nv12_to_rgb(y, uv, self.stride, w, h, &mut rgb);
+                picture = Nv12::from_planes(size.0, size.1, y, self.stride, uv, self.stride);
                 let _ = buffer.Unlock();
             }
         }
-        Ok((w, h, rgb))
+        picture.map_err(|e| format!("画面尺寸不对：{e}"))
     }
 }
 
 /// 取一次输出的结果。
 enum Step {
-    Frame((usize, usize, Vec<u32>)),
+    Frame(Nv12),
     Changed,
     NeedInput,
 }

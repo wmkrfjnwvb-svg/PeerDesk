@@ -166,7 +166,7 @@ mod tests {
     fn opens_or_explains_why_not() {
         check_local_in(std::path::Path::new("")).unwrap();
         let mut screen = local_screen().unwrap();
-        assert!(screen.capture().is_some());
+        assert!(screen.frame().is_some());
 
         let tap = Arc::new(Tap::default());
         assert!(tap.last().is_none());

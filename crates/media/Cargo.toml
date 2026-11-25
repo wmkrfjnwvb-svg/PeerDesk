@@ -12,6 +12,8 @@ openh264 = { version = "0.9.10", default-features = false }
 openh264-sys2 = { version = "0.9.10", default-features = false }
 opus = "0.4"
 log = "0.4"
+# 控制端用显卡显示 NV12（和界面 eframe 用的是同一个 glow）
+glow = "0.16"
 
 # Windows：Media Foundation 硬件 H.264 编码（NVENC / QSV / AMF 都以 MFT 的形式注册）。
 [target.'cfg(windows)'.dependencies]

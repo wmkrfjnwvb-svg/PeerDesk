@@ -26,7 +26,8 @@ pub mod gpu;
 mod vaapi;
 use openh264::OpenH264API;
 use peerdesk_core::error::Error;
-use peerdesk_core::scale::{fit, scaled_size};
+use peerdesk_core::frame::{Frame, GpuFrame, GpuHandle, Nv12, Picture};
+use peerdesk_core::scale::encode_size;
 use peerdesk_core::screen::Screen;
 use peerdesk_core::video::{
     Codec, EncodeTiming, EncodedFrame, FrameHeader, VideoDecoder, VideoEncoder,
@@ -145,6 +146,7 @@ fn even_pixels(screen: &Screen) -> (usize, usize, Vec<u32>) {
     (ew, eh, out)
 }
 
+pub mod gl;
 #[cfg(windows)]
 mod mf;
 #[cfg(target_os = "macos")]
@@ -166,6 +168,24 @@ impl HardwareEncoder for vt::VtEncoder {
     ) -> Result<Option<(Vec<u8>, bool)>, String> {
         vt::VtEncoder::encode(self, nv12, bps, force_key)
     }
+    fn accepts(&self, handle: &GpuHandle) -> bool {
+        matches!(handle, GpuHandle::CvPixelBuffer(p) if !p.is_null())
+    }
+    fn encode_gpu(
+        &mut self,
+        frame: &dyn GpuFrame,
+        bps: u64,
+        force_key: bool,
+    ) -> Result<Option<(Vec<u8>, bool)>, String> {
+        match frame.handle() {
+            GpuHandle::CvPixelBuffer(image) => {
+                vt::VtEncoder::encode_image(self, image, bps, force_key)
+            }
+            GpuHandle::D3d11Texture { .. } | GpuHandle::None => {
+                Err("VideoToolbox 只认 CVPixelBuffer".into())
+            }
+        }
+    }
     fn poll(&mut self) -> Result<Option<(Vec<u8>, bool)>, String> {
         vt::VtEncoder::poll(self)
     }
@@ -183,6 +203,20 @@ pub trait HardwareDecoder: Send + std::fmt::Debug {
     /// # Errors
     /// 解码出错：调用方改用软件解码。
     fn decode(&mut self, data: &[u8]) -> Result<Option<(usize, usize, Vec<u32>)>, String>;
+
+    /// 解一帧，交出 NV12（解码器本来就出 NV12：只拷贝，不在 CPU 上转颜色，界面在显卡上转）。
+    /// 返回 `Ok(None)` 的情况同 [`Self::decode`]。默认不支持（交 RGB 的解码器，例如 macOS 直接出 BGRA）。
+    ///
+    /// # Errors
+    /// 不支持，或解码出错。
+    fn decode_nv12(&mut self, _data: &[u8]) -> Result<Option<Nv12>, String> {
+        Err("这个解码器不出 NV12".into())
+    }
+
+    /// 能用 [`Self::decode_nv12`]。
+    fn gives_nv12(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -202,6 +236,12 @@ impl HardwareDecoder for mf::MfDecoder {
     }
     fn decode(&mut self, data: &[u8]) -> Result<Option<(usize, usize, Vec<u32>)>, String> {
         mf::MfDecoder::decode(self, data)
+    }
+    fn decode_nv12(&mut self, data: &[u8]) -> Result<Option<Nv12>, String> {
+        mf::MfDecoder::decode_nv12(self, data)
+    }
+    fn gives_nv12(&self) -> bool {
+        true
     }
 }
 
@@ -305,6 +345,45 @@ impl VideoDecoder for AutoH264Decoder {
         self.screen.as_ref().or_else(|| self.soft.screen())
     }
 
+    fn decode_picture(
+        &mut self,
+        header: &FrameHeader,
+        data: &[u8],
+    ) -> Result<Option<Picture>, Error> {
+        if let Some(hw) = self.hw.as_mut().filter(|h| h.gives_nv12()) {
+            match hw.decode_nv12(data) {
+                Ok(None) => return Ok(None),
+                Ok(Some(nv12)) => {
+                    let (w, h) = (header.width & !1, header.height & !1);
+                    if nv12.width() < w || nv12.height() < h {
+                        return Err(Error::Inconsistent("解出的画面比帧头说的小"));
+                    }
+                    // 硬件按 16 对齐时多出的边裁掉（只拷贝）
+                    let nv12 = if (nv12.width(), nv12.height()) == (w, h) {
+                        nv12
+                    } else {
+                        let (y, uv) = nv12.planes();
+                        let pitch = usize::from(nv12.width());
+                        Nv12::from_planes(w, h, y, pitch, uv, pitch)?
+                    };
+                    return Ok(Some(Picture::Nv12(std::sync::Arc::new(nv12))));
+                }
+                Err(why) => {
+                    log::warn!("硬件解码失败，改用软件解码（OpenH264）：{why}");
+                    self.hw = None;
+                    self.screen = None;
+                }
+            }
+        }
+        if self.hw.is_some() {
+            // 出 RGB 的硬件解码器（macOS）
+            return Ok(self
+                .decode(header, data)?
+                .map(|s| Picture::Rgb(std::sync::Arc::new(s.clone()))));
+        }
+        self.soft.decode_picture(header, data)
+    }
+
     fn backend(&self) -> String {
         self.hw
             .as_ref()
@@ -354,6 +433,24 @@ pub trait HardwareEncoder: Send + std::fmt::Debug {
     /// 编码器出错。
     fn drain(&mut self) -> Result<(), String> {
         Ok(())
+    }
+
+    /// 认得这个显卡句柄：能不拷贝、直接编系统交来的显卡画面（见 [`Self::encode_gpu`]）。
+    fn accepts(&self, _handle: &GpuHandle) -> bool {
+        false
+    }
+
+    /// 直接编一帧显卡画面（只在 [`Self::accepts`] 为真时调用），结果和 [`Self::encode`] 一样。
+    ///
+    /// # Errors
+    /// 编码器出错：调用方改用软件编码。
+    fn encode_gpu(
+        &mut self,
+        _frame: &dyn GpuFrame,
+        _bps: u64,
+        _force_key: bool,
+    ) -> Result<Option<(Vec<u8>, bool)>, String> {
+        Err("这个硬件编码器不能直接用显卡画面".into())
     }
 
     /// 上一次 [`Self::encode`] 交的这一帧编码器没收（例如 Media Foundation 的 `MF_E_NOTACCEPTING`）：
@@ -465,6 +562,8 @@ pub struct H264Encoder {
     view: Option<(u16, u16)>,
     /// 为什么要求了关键帧（出了关键帧时记进 `timing`）。
     key_reason: &'static str,
+    /// 编码分辨率或控制端窗口变了（原因）：CPU 画面的编码尺寸可能跟着变，下一次要编（真变了才出关键帧）。
+    resize_reason: Option<&'static str>,
     /// 这一次编码各步骤的耗时（见 [`EncodeTiming`]）。
     timing: EncodeTiming,
     /// 交给硬件编码器、还没取回的帧：每帧是否要求了关键帧（按顺序；异步编码器会攒帧）。
@@ -479,6 +578,15 @@ enum Hw {
     Pending,
     /// 取回一个编好的帧：码流（空表示编码器丢了这一帧）、是否关键帧、是否刚打开。
     Frame(Vec<u8>, bool, bool),
+}
+
+/// 交来编码的一帧。
+#[derive(Clone, Copy)]
+enum Input<'a> {
+    /// CPU 上的 RGB 画面：编码器缩放、转颜色。
+    Rgb(&'a Screen),
+    /// 显卡画面：已经是编码尺寸的 NV12。
+    Gpu(&'a dyn GpuFrame),
 }
 
 /// 硬件编码器连续这么多帧给出没要求的关键帧，就认为它不能用。
@@ -525,6 +633,7 @@ impl H264Encoder {
             scale_permille: peerdesk_core::scale::FULL_PERMILLE,
             view: None,
             key_reason: "",
+            resize_reason: None,
             timing: EncodeTiming::default(),
             hw_sent: std::collections::VecDeque::new(),
         }
@@ -583,10 +692,10 @@ impl H264Encoder {
         Hw::Frame(data, key, fresh)
     }
 
-    /// 试着用硬件编一帧（交给编码器，取回一个编好的帧）。
-    fn encode_hardware(&mut self, w: usize, h: usize, bps: u64) -> Hw {
+    /// 准备硬件编码器：没打开或尺寸变了就（重新）打开。返回 `None` 表示不用硬件，否则是否刚打开。
+    fn hardware_ready(&mut self, w: usize, h: usize, bps: u64) -> Option<bool> {
         if self.hw_off {
-            return Hw::Off;
+            return None;
         }
         let size = (u32::try_from(w).unwrap_or(0), u32::try_from(h).unwrap_or(0));
         let reopen = self.hw.as_ref().is_none_or(|e| e.size() != size);
@@ -602,25 +711,23 @@ impl H264Encoder {
                     log::info!("视频编码：软件 OpenH264（不用硬件编码：{why}）");
                     self.soft_reason = Some(why);
                     self.hw_off = true;
-                    return Hw::Off;
+                    return None;
                 }
             }
         }
-        let packing = std::time::Instant::now();
-        color::i420_to_nv12(
-            &self.planes.0,
-            &self.planes.1,
-            &self.planes.2,
-            &mut self.nv12,
-        );
-        self.convert_us = self.convert_us.saturating_add(micros_since(packing));
-        let force_key = self.force_key || reopen;
-        let Some(enc) = self.hw.as_mut() else {
-            return Hw::Off;
-        };
-        match enc.encode(&self.nv12, bps, force_key) {
+        Some(reopen)
+    }
+
+    /// 交给硬件之后：记下要求了关键帧没有，取回的帧对上号；出错时改用软件编码。
+    fn hardware_result(
+        &mut self,
+        reopen: bool,
+        force_key: bool,
+        got: Result<Option<(Vec<u8>, bool)>, String>,
+    ) -> Hw {
+        match got {
             Ok(got) => {
-                if enc.last_rejected() {
+                if self.hw.as_ref().is_some_and(|e| e.last_rejected()) {
                     // 编码器没收这一帧：不会有它的输出；关键帧要求留到下一帧
                     self.force_key = force_key;
                 } else {
@@ -638,6 +745,210 @@ impl H264Encoder {
                 Hw::Off
             }
         }
+    }
+
+    /// 用硬件编 CPU 上转好的一帧（I420 打包成 NV12 交给编码器，取回一个编好的帧）。
+    fn encode_hardware(&mut self, w: usize, h: usize, bps: u64) -> Hw {
+        let Some(reopen) = self.hardware_ready(w, h, bps) else {
+            return Hw::Off;
+        };
+        let packing = std::time::Instant::now();
+        color::i420_to_nv12(
+            &self.planes.0,
+            &self.planes.1,
+            &self.planes.2,
+            &mut self.nv12,
+        );
+        self.convert_us = self.convert_us.saturating_add(micros_since(packing));
+        let force_key = self.force_key || reopen;
+        let nv12 = &self.nv12;
+        let got = self
+            .hw
+            .as_mut()
+            .map_or(Ok(None), |enc| enc.encode(nv12, bps, force_key));
+        self.hardware_result(reopen, force_key, got)
+    }
+
+    /// 用硬件编一帧显卡画面：编码器认得这个句柄就直接交（不拷贝）；认不得（例如不在同一块显卡上）
+    /// 读回一次 NV12 再交。
+    ///
+    /// # Errors
+    /// 要读回时读不出来。
+    fn encode_hardware_gpu(&mut self, frame: &dyn GpuFrame, bps: u64) -> Result<Hw, Error> {
+        let (w, h) = frame.size();
+        let Some(reopen) = self.hardware_ready(usize::from(w), usize::from(h), bps) else {
+            return Ok(Hw::Off);
+        };
+        let force_key = self.force_key || reopen;
+        let handle = frame.handle();
+        let direct = self.hw.as_ref().is_some_and(|e| e.accepts(&handle));
+        let got = if direct {
+            self.hw
+                .as_mut()
+                .map_or(Ok(None), |enc| enc.encode_gpu(frame, bps, force_key))
+        } else {
+            let reading = std::time::Instant::now();
+            let nv12 = frame.read_nv12()?;
+            self.convert_us = self.convert_us.saturating_add(micros_since(reading));
+            self.hw
+                .as_mut()
+                .map_or(Ok(None), |enc| enc.encode(nv12.data(), bps, force_key))
+        };
+        Ok(self.hardware_result(reopen, force_key, got))
+    }
+
+    /// CPU 画面缩到编码尺寸、转成 I420（放进 `planes`）。返回编码用的宽高（奇数尺寸裁掉一行一列）。
+    fn rgb_planes(&mut self, screen: &Screen, size: (u16, u16)) -> Result<(usize, usize), Error> {
+        let shrunk;
+        let screen = if size == (screen.width(), screen.height()) {
+            screen
+        } else {
+            let scaling = std::time::Instant::now();
+            shrunk = screen.downscale(size.0, size.1)?;
+            self.timing.scale_us = micros_since(scaling);
+            &shrunk
+        };
+        let (w, h, pixels) = even_pixels(screen);
+        color::rgb_to_i420(
+            &pixels,
+            w,
+            &mut self.planes.0,
+            &mut self.planes.1,
+            &mut self.planes.2,
+        );
+        Ok((w, h))
+    }
+
+    /// 编一帧（CPU 画面或显卡画面）。
+    fn encode_input(
+        &mut self,
+        input: Input<'_>,
+        changed: bool,
+        budget: usize,
+    ) -> Result<Option<EncodedFrame>, Error> {
+        // 这一次没有转换（画面没变、只取硬件攒着的帧）时报 0，不沿用上一次的
+        // （以前沿用：统计里出现“编码 31 ms（其中颜色转换 184 ms）”这种转换比总时间还大的数）
+        self.convert_us = 0;
+        self.timing = EncodeTiming::default();
+        let size = match input {
+            // CPU 画面：按发送端定的比例和控制端窗口算编码尺寸（见 peerdesk_core::scale::encode_size）
+            Input::Rgb(screen) => encode_size(
+                (screen.width(), screen.height()),
+                self.scale_permille,
+                self.view,
+            ),
+            // 显卡画面：采集端已经按编码尺寸准备好了
+            Input::Gpu(frame) => frame.size(),
+        };
+        // 按“上一次编出来的尺寸”判断，和用的是硬件还是软件编码器无关
+        let fresh = self.encoded_size != Some(size);
+        // 编码分辨率、控制端窗口变了：尺寸真的变了，关键帧的原因写它
+        if let Some(why) = self.resize_reason.take() {
+            if fresh && self.key_reason.is_empty() {
+                self.key_reason = why;
+            }
+        }
+        if !fresh && !changed && !self.force_key {
+            // 画面停下了：先等一会儿，确认真的停了再补清晰。
+            self.still = self.still.saturating_add(1);
+            // 硬件编码器还攒着之前交的帧：先把它们取回来
+            if !self.hw_sent.is_empty() {
+                return Ok(match self.poll_hardware() {
+                    Hw::Frame(data, key, fresh) if !data.is_empty() => {
+                        Some(self.finish(&data, key, size, false, fresh))
+                    }
+                    Hw::Frame(..) | Hw::Pending | Hw::Off => None,
+                });
+            }
+            if self.refine_left == 0 || self.still < self.refine_after() {
+                return Ok(None);
+            }
+        } else {
+            self.still = 0;
+        }
+        self.timing.width = size.0;
+        self.timing.height = size.1;
+        let bps = self.budget_bps(budget);
+        // 有硬件编码器就用它（快得多、几乎不占 CPU）；没有或失败时用 OpenH264
+        let converting = std::time::Instant::now();
+        let (w, h, hw) = match input {
+            Input::Rgb(screen) => {
+                let (w, h) = self.rgb_planes(screen, size)?;
+                self.convert_us = micros_since(converting);
+                let encoding = std::time::Instant::now();
+                let hw = self.encode_hardware(w, h, bps);
+                self.timing.encode_us = micros_since(encoding);
+                (w, h, hw)
+            }
+            Input::Gpu(frame) => {
+                self.timing.nv12_direct = true;
+                let encoding = std::time::Instant::now();
+                let hw = self.encode_hardware_gpu(frame, bps)?;
+                // 要读回时读回的时间记在“转换”里，其余是编码器本身
+                self.timing.encode_us = micros_since(encoding).saturating_sub(self.convert_us);
+                (usize::from(size.0), usize::from(size.1), hw)
+            }
+        };
+        self.timing.hardware = !matches!(hw, Hw::Off);
+        match hw {
+            Hw::Frame(data, key, fresh_hw) if !data.is_empty() => {
+                self.timing.convert_us = self.convert_us.saturating_sub(self.timing.scale_us);
+                return Ok(Some(self.finish(&data, key, size, changed, fresh_hw)));
+            }
+            // 还没编好，或编码器丢了这一帧：这一次没有帧发（之后再取）
+            Hw::Frame(..) | Hw::Pending => {
+                self.timing.convert_us = self.convert_us.saturating_sub(self.timing.scale_us);
+                return Ok(None);
+            }
+            Hw::Off => {}
+        }
+        if let Input::Gpu(frame) = input {
+            // 软件编码：显卡画面读回一次（只拷贝、拆平面，不转颜色、不缩放）
+            let reading = std::time::Instant::now();
+            let nv12 = frame.read_nv12()?;
+            color::nv12_to_i420(
+                nv12.data(),
+                w,
+                h,
+                &mut self.planes.0,
+                &mut self.planes.1,
+                &mut self.planes.2,
+            );
+            self.convert_us = self.convert_us.saturating_add(micros_since(reading));
+        }
+        self.timing.convert_us = self.convert_us.saturating_sub(self.timing.scale_us);
+        let encoding = std::time::Instant::now();
+        let fresh = self.inner.as_ref().is_none_or(|(w, h, _)| (*w, *h) != size);
+        // 编码器先拿出来用，编完放回去；编码出错时丢掉，下一帧重新打开（从关键帧开始）。
+        let mut enc = match self.inner.take() {
+            Some((_, _, mut enc)) if !fresh => {
+                self.set_budget(&mut enc, budget);
+                enc
+            }
+            Some(_) | None => {
+                // 新编码器按当前预算打开（见 open_at）。
+                self.bps = self.budget_bps(budget);
+                self.open_at(self.bps)?
+            }
+        };
+        if self.force_key && !fresh {
+            enc.force_intra_frame();
+        }
+        let yuv = YUVSlices::new(
+            (&self.planes.0, &self.planes.1, &self.planes.2),
+            (w, h),
+            (w, w / 2, w / 2),
+        );
+        let stream = enc.encode(&yuv).map_err(codec_error("H.264 编码失败"))?;
+        self.timing.encode_us = micros_since(encoding);
+        let key = matches!(stream.frame_type(), FrameType::IDR | FrameType::I);
+        let data = stream.to_vec();
+        if fresh {
+            // 第一帧编完：放开上限，之后码率才能往上调。
+            set_max_bitrate(&mut enc, self.max_bps);
+        }
+        self.inner = Some((size.0, size.1, enc));
+        Ok(Some(self.finish(&data, key, size, changed, fresh)))
     }
 
     /// 画面没变时取硬件攒着的帧；停了一阵还取不到，让编码器交出来。
@@ -814,103 +1125,20 @@ impl VideoEncoder for H264Encoder {
         changed: bool,
         budget: usize,
     ) -> Result<Option<EncodedFrame>, Error> {
-        // 这一次没有转换（画面没变、只取硬件攒着的帧）时报 0，不沿用上一次的
-        // （以前沿用：统计里出现“编码 31 ms（其中颜色转换 184 ms）”这种转换比总时间还大的数）
-        self.convert_us = 0;
-        self.timing = EncodeTiming::default();
-        // 编码尺寸：发送端按网络定的比例（见 peerdesk_core::scale）；帧头写的就是这个尺寸
-        // 再等比缩到放得进控制端的窗口（Retina 屏在小窗口里看时不用编 2880×1800）
-        let size = fit(
-            scaled_size(screen.width(), screen.height(), self.scale_permille),
-            self.view,
-        );
-        // 按“上一次编出来的尺寸”判断，和用的是硬件还是软件编码器无关
-        let fresh = self.encoded_size != Some(size);
-        if !fresh && !changed && !self.force_key {
-            // 画面停下了：先等一会儿，确认真的停了再补清晰。
-            self.still = self.still.saturating_add(1);
-            // 硬件编码器还攒着之前交的帧：先把它们取回来
-            if !self.hw_sent.is_empty() {
-                return Ok(match self.poll_hardware() {
-                    Hw::Frame(data, key, fresh) if !data.is_empty() => {
-                        Some(self.finish(&data, key, size, false, fresh))
-                    }
-                    Hw::Frame(..) | Hw::Pending | Hw::Off => None,
-                });
-            }
-            if self.refine_left == 0 || self.still < self.refine_after() {
-                return Ok(None);
-            }
-        } else {
-            self.still = 0;
+        self.encode_input(Input::Rgb(screen), changed, budget)
+    }
+
+    fn encode_frame(
+        &mut self,
+        _frame_id: u32,
+        frame: &Frame,
+        changed: bool,
+        budget: usize,
+    ) -> Result<Option<EncodedFrame>, Error> {
+        match frame {
+            Frame::Rgb(screen) => self.encode_input(Input::Rgb(screen), changed, budget),
+            Frame::Gpu(gpu) => self.encode_input(Input::Gpu(gpu.as_ref()), changed, budget),
         }
-        let converting = std::time::Instant::now();
-        let shrunk;
-        let screen = if size == (screen.width(), screen.height()) {
-            screen
-        } else {
-            let scaling = std::time::Instant::now();
-            shrunk = screen.downscale(size.0, size.1)?;
-            self.timing.scale_us = micros_since(scaling);
-            &shrunk
-        };
-        let (w, h, pixels) = even_pixels(screen);
-        color::rgb_to_i420(
-            &pixels,
-            w,
-            &mut self.planes.0,
-            &mut self.planes.1,
-            &mut self.planes.2,
-        );
-        self.convert_us = micros_since(converting);
-        self.timing.width = size.0;
-        self.timing.height = size.1;
-        let encoding = std::time::Instant::now();
-        // 有硬件编码器就用它（快得多、几乎不占 CPU）；没有或失败时用 OpenH264
-        let bps = self.budget_bps(budget);
-        let hw = self.encode_hardware(w, h, bps);
-        self.timing.convert_us = self.convert_us.saturating_sub(self.timing.scale_us);
-        self.timing.encode_us = micros_since(encoding);
-        self.timing.hardware = !matches!(hw, Hw::Off);
-        match hw {
-            Hw::Frame(data, key, fresh_hw) if !data.is_empty() => {
-                return Ok(Some(self.finish(&data, key, size, changed, fresh_hw)));
-            }
-            // 还没编好，或编码器丢了这一帧：这一次没有帧发（之后再取）
-            Hw::Frame(..) | Hw::Pending => return Ok(None),
-            Hw::Off => {}
-        }
-        let fresh = self.inner.as_ref().is_none_or(|(w, h, _)| (*w, *h) != size);
-        // 编码器先拿出来用，编完放回去；编码出错时丢掉，下一帧重新打开（从关键帧开始）。
-        let mut enc = match self.inner.take() {
-            Some((_, _, mut enc)) if !fresh => {
-                self.set_budget(&mut enc, budget);
-                enc
-            }
-            Some(_) | None => {
-                // 新编码器按当前预算打开（见 open_at）。
-                self.bps = self.budget_bps(budget);
-                self.open_at(self.bps)?
-            }
-        };
-        if self.force_key && !fresh {
-            enc.force_intra_frame();
-        }
-        let yuv = YUVSlices::new(
-            (&self.planes.0, &self.planes.1, &self.planes.2),
-            (w, h),
-            (w, w / 2, w / 2),
-        );
-        let stream = enc.encode(&yuv).map_err(codec_error("H.264 编码失败"))?;
-        self.timing.encode_us = micros_since(encoding);
-        let key = matches!(stream.frame_type(), FrameType::IDR | FrameType::I);
-        let data = stream.to_vec();
-        if fresh {
-            // 第一帧编完：放开上限，之后码率才能往上调。
-            set_max_bitrate(&mut enc, self.max_bps);
-        }
-        self.inner = Some((size.0, size.1, enc));
-        Ok(Some(self.finish(&data, key, size, changed, fresh)))
     }
 
     fn on_feedback(&mut self, _floor: u32, _mask: u32) {}
@@ -931,7 +1159,10 @@ impl VideoEncoder for H264Encoder {
 
     fn wants_refine(&self) -> bool {
         // 硬件编码器还攒着帧时也要接着调用，把它们取回来
-        self.force_key || self.refine_left > 0 || !self.hw_sent.is_empty()
+        self.force_key
+            || self.resize_reason.is_some()
+            || self.refine_left > 0
+            || !self.hw_sent.is_empty()
     }
 
     fn backend(&self) -> String {
@@ -939,10 +1170,10 @@ impl VideoEncoder for H264Encoder {
     }
 
     fn set_scale(&mut self, permille: u16) {
-        // 比例变了：尺寸变了要出关键帧；画面不动时也要编这一帧（例如升回原尺寸），所以先要求关键帧
+        // 比例变了：CPU 画面的编码尺寸可能跟着变，画面不动也要编这一帧（例如升回原尺寸）；
+        // 尺寸真的变了才出关键帧（显卡画面的尺寸由采集端决定，见 encode_input）
         if permille != self.scale_permille && self.encoded_size.is_some() {
-            self.force_key = true;
-            self.key_reason = "编码分辨率变了";
+            self.resize_reason = Some("编码分辨率变了");
         }
         self.scale_permille = permille;
     }
@@ -950,8 +1181,7 @@ impl VideoEncoder for H264Encoder {
     fn set_view(&mut self, view: Option<(u16, u16)>) {
         let view = view.filter(|(w, h)| *w > 0 && *h > 0);
         if view != self.view && self.encoded_size.is_some() {
-            self.force_key = true;
-            self.key_reason = "控制端窗口大小变了";
+            self.resize_reason = Some("控制端窗口大小变了");
         }
         self.view = view;
     }
@@ -1013,6 +1243,34 @@ impl VideoDecoder for H264Decoder {
         self.screen.as_ref()
     }
 
+    fn decode_picture(
+        &mut self,
+        header: &FrameHeader,
+        data: &[u8],
+    ) -> Result<Option<Picture>, Error> {
+        let Some(yuv) = self
+            .decoder
+            .decode(data)
+            .map_err(codec_error("H.264 解码失败"))?
+        else {
+            return Ok(None);
+        };
+        let (dw, dh) = yuv.dimensions();
+        if dw < usize::from(header.width) || dh < usize::from(header.height) {
+            return Err(Error::Inconsistent("解出的画面比帧头说的小"));
+        }
+        // OpenH264 出的是 I420：亮度照拷、色度交错成 NV12，不转颜色（界面在显卡上转）
+        let (ys, us, vs) = yuv.strides();
+        let nv12 = Nv12::from_i420(
+            header.width,
+            header.height,
+            (yuv.y(), ys),
+            (yuv.u(), us),
+            (yuv.v(), vs),
+        )?;
+        Ok(Some(Picture::Nv12(std::sync::Arc::new(nv12))))
+    }
+
     fn backend(&self) -> String {
         "软件 OpenH264".to_owned()
     }
@@ -1022,6 +1280,8 @@ impl VideoDecoder for H264Decoder {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
     use super::*;
+    use peerdesk_core::frame::{Nv12, TestGpuFrame};
+    use std::sync::Arc;
 
     /// 亮度的 PSNR：H.264 用 4:2:0，色度的损失不算在内。
     fn psnr(a: &Screen, b: &Screen) -> f64 {
@@ -1235,31 +1495,40 @@ mod tests {
         }))
     }
 
-    /// 控制端窗口小：按窗口大小编码；窗口变了出关键帧；不限时回到原尺寸。
+    /// 原尺寸时不看控制端窗口（控制端显卡缩放，文字最清楚）；按比例缩小时再放进窗口；尺寸真的变了才出关键帧。
     #[test]
-    fn encodes_at_the_viewers_size() {
+    fn view_only_matters_when_scaled_down() {
         let mut enc = H264Encoder::new(30).with_hardware(fake_none);
-        enc.set_view(Some((160, 96)));
+        let size = |f: &EncodedFrame| {
+            let (h, _) = FrameHeader::parse(&f.payload).unwrap();
+            (h.width, h.height)
+        };
+        enc.set_view(Some((120, 72)));
         let f = enc
             .encode(1, &picture(320, 192), true, 50_000)
             .unwrap()
             .unwrap();
-        let (h, _) = FrameHeader::parse(&f.payload).unwrap();
-        assert_eq!((h.width, h.height), (160, 96));
-        enc.set_view(Some((160, 96)));
-        assert!(
-            !enc.wants_refine() || enc.refine_left > 0,
-            "没变不要求关键帧"
-        );
-        enc.set_view(None);
-        assert!(enc.wants_refine(), "窗口变了：画面不动也要编");
+        assert_eq!(size(&f), (320, 192), "原尺寸");
+        enc.set_view(Some((100, 60)));
+        assert!(enc.wants_refine(), "窗口变了：画面不动也要编一次");
+        let f = enc.encode(2, &picture(320, 192), false, 50_000).unwrap();
+        assert!(f.is_none_or(|f| !f.key), "尺寸没变：不出关键帧");
+        enc.set_scale(500);
         let f = enc
-            .encode(2, &picture(320, 192), false, 50_000)
+            .encode(3, &picture(320, 192), false, 50_000)
             .unwrap()
             .unwrap();
-        let (h, _) = FrameHeader::parse(&f.payload).unwrap();
         assert!(f.key);
-        assert_eq!((h.width, h.height), (320, 192));
+        assert_eq!(size(&f), (100, 60), "半分辨率 160×96 再放进窗口");
+        assert_eq!(enc.timing().key_reason, "编码分辨率变了");
+        enc.set_view(None);
+        let f = enc
+            .encode(4, &picture(320, 192), false, 50_000)
+            .unwrap()
+            .unwrap();
+        assert!(f.key);
+        assert_eq!(size(&f), (160, 96));
+        assert_eq!(enc.timing().key_reason, "控制端窗口大小变了");
     }
 
     /// 第一帧不收（像 Media Foundation 的 `MF_E_NOTACCEPTING`），之后照常编。
@@ -1316,7 +1585,6 @@ mod tests {
         }))
     }
 
-    /// 编码器没收的帧不等它的输出（不算攒着），它带的关键帧要求留给下一帧。
     /// 诊断日志用的分步耗时和关键帧原因。
     #[test]
     fn timing_and_keyframe_reasons() {
@@ -1338,18 +1606,19 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(enc.timing().key_reason, "", "不是关键帧");
-        enc.set_view(Some((160, 96)));
+        enc.set_scale(500);
         enc.encode(4, &picture(320, 192), true, 50_000)
             .unwrap()
             .unwrap();
         let t = enc.timing();
-        assert_eq!(t.key_reason, "控制端窗口大小变了");
+        assert_eq!(t.key_reason, "编码分辨率变了");
         assert_eq!((t.width, t.height), (160, 96));
         // 画面没变、什么都不编：耗时清零，不沿用上一次的
         let _ = enc.encode(5, &picture(320, 192), false, 50_000).unwrap();
         assert_eq!(enc.convert_micros(), 0);
     }
 
+    /// 编码器没收的帧不等它的输出（不算攒着），它带的关键帧要求留给下一帧。
     #[test]
     fn rejected_frame_keeps_the_keyframe_request() {
         let mut enc = H264Encoder::new(30).with_hardware(fake_rejects_first);
@@ -1475,6 +1744,149 @@ mod tests {
         assert!(keys <= 1 + UNASKED_KEY_LIMIT + 1, "{keys}");
     }
 
+    /// 测试用的显卡画面：`picture` 转成 NV12。
+    fn gpu_frame(w: u16, h: u16) -> Arc<TestGpuFrame> {
+        let screen = picture(w, h);
+        let (mut y, mut u, mut v, mut nv12) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        color::rgb_to_i420(screen.pixels(), usize::from(w), &mut y, &mut u, &mut v);
+        color::i420_to_nv12(&y, &u, &v, &mut nv12);
+        Arc::new(TestGpuFrame::new(Nv12::new(w, h, nv12).unwrap()))
+    }
+
+    /// 显卡画面 + 软件编码：读回一次 NV12（只拷贝、拆平面，不转颜色、不缩放），尺寸就是画面的尺寸
+    /// （采集端已经按编码尺寸采好，比例和窗口不再管）；画面没变不读；读不出来报错。
+    #[test]
+    fn gpu_frames_with_software_encoding_read_back_once() {
+        let mut enc = H264Encoder::new(30).with_hardware(fake_none);
+        enc.set_scale(500);
+        enc.set_view(Some((100, 60)));
+        let g = gpu_frame(320, 192);
+        let frame = Frame::Gpu(g.clone());
+        let f = enc.encode_frame(1, &frame, true, 50_000).unwrap().unwrap();
+        let (h, data) = FrameHeader::parse(&f.payload).unwrap();
+        assert_eq!((h.width, h.height), (320, 192));
+        assert!(f.key);
+        assert_eq!(g.reads(), 1);
+        let t = enc.timing();
+        assert!(t.nv12_direct && !t.hardware, "{t:?}");
+        assert_eq!(t.scale_us, 0, "不缩放");
+        // 解出来和原画面一致（只是 H.264 的损失）
+        let mut dec = H264Decoder::new().unwrap();
+        let seen = dec.decode(&h, data).unwrap().unwrap().clone();
+        assert!(psnr(&picture(320, 192), &seen) > 30.0);
+        let _ = enc.encode_frame(2, &frame, false, 50_000).unwrap();
+        assert_eq!(g.reads(), 1, "画面没变不读");
+        let bad = Frame::Gpu(Arc::new(
+            TestGpuFrame::new(Nv12::new(320, 192, vec![16; 320 * 192 * 3 / 2]).unwrap()).failing(),
+        ));
+        assert!(enc.encode_frame(3, &bad, true, 50_000).is_err());
+    }
+
+    /// 认得显卡句柄的硬件编码器：直接交，不读回；认不得的：读回一次 NV12 交给它。
+    #[test]
+    fn gpu_frames_go_straight_to_hardware_that_accepts_them() {
+        let mut enc = H264Encoder::new(30).with_hardware(fake_direct);
+        let g = gpu_frame(320, 192);
+        let frame = Frame::Gpu(g.clone());
+        let f = enc.encode_frame(1, &frame, true, 50_000).unwrap().unwrap();
+        assert!(f.key);
+        assert_eq!(g.reads(), 0, "直接交给硬件，不读回");
+        assert!(enc.timing().hardware && enc.timing().nv12_direct);
+        assert!(enc.backend_name().contains("假硬件"));
+        assert!(
+            enc.encode_frame(2, &frame, true, 50_000).is_ok(),
+            "同一个编码器接着编"
+        );
+        // 认不得句柄
+        let mut enc = H264Encoder::new(30).with_hardware(fake_ok);
+        let g = gpu_frame(320, 192);
+        let frame = Frame::Gpu(g.clone());
+        assert!(enc.encode_frame(1, &frame, true, 50_000).unwrap().is_some());
+        assert_eq!(g.reads(), 1);
+        assert!(enc.timing().hardware);
+        // 默认的硬件编码器不接显卡画面
+        let mut hw = fake_ok(2, 2, 30, 1).unwrap();
+        assert!(!hw.accepts(&GpuHandle::None));
+        assert!(hw.encode_gpu(g.as_ref(), 1, false).is_err());
+        // CPU 画面照常
+        let mut enc = H264Encoder::new(30).with_hardware(fake_direct);
+        let rgb = Frame::rgb(picture(320, 192));
+        assert!(enc.encode_frame(1, &rgb, true, 50_000).unwrap().is_some());
+    }
+
+    /// 认得显卡句柄的假硬件编码器（像 VideoToolbox 认 CVPixelBuffer）。
+    #[derive(Debug)]
+    struct FakeDirect {
+        size: (u32, u32),
+        soft: H264Encoder,
+        frames: u32,
+    }
+
+    impl FakeDirect {
+        fn out(&mut self) -> Option<(Vec<u8>, bool)> {
+            self.frames += 1;
+            let screen = picture(
+                u16::try_from(self.size.0).unwrap(),
+                u16::try_from(self.size.1).unwrap(),
+            );
+            let f = self
+                .soft
+                .encode(self.frames, &screen, true, 100_000)
+                .unwrap()?;
+            let (_, data) = FrameHeader::parse(&f.payload).unwrap();
+            Some((data.to_vec(), f.key))
+        }
+    }
+
+    impl HardwareEncoder for FakeDirect {
+        fn name(&self) -> &str {
+            "假硬件（直接收显卡画面）"
+        }
+        fn size(&self) -> (u32, u32) {
+            self.size
+        }
+        fn encode(
+            &mut self,
+            _nv12: &[u8],
+            _bps: u64,
+            _force_key: bool,
+        ) -> Result<Option<(Vec<u8>, bool)>, String> {
+            Ok(self.out())
+        }
+        fn accepts(&self, handle: &GpuHandle) -> bool {
+            *handle == GpuHandle::None
+        }
+        fn encode_gpu(
+            &mut self,
+            frame: &dyn GpuFrame,
+            _bps: u64,
+            force_key: bool,
+        ) -> Result<Option<(Vec<u8>, bool)>, String> {
+            assert_eq!(
+                frame.size(),
+                (
+                    u16::try_from(self.size.0).unwrap(),
+                    u16::try_from(self.size.1).unwrap()
+                )
+            );
+            assert!(self.frames > 0 || force_key, "第一帧要求关键帧");
+            Ok(self.out())
+        }
+    }
+
+    fn fake_direct(
+        w: u32,
+        h: u32,
+        fps: u32,
+        _bps: u64,
+    ) -> Result<Box<dyn HardwareEncoder>, String> {
+        Ok(Box::new(FakeDirect {
+            size: (w, h),
+            soft: H264Encoder::new(fps).with_hardware(fake_none),
+            frames: 0,
+        }))
+    }
+
     fn fake_failing(
         w: u32,
         h: u32,
@@ -1515,6 +1927,88 @@ mod tests {
                 _ => Err("模拟出错".into()),
             }
         }
+    }
+
+    /// 出 NV12 的假硬件解码器（像 Media Foundation）：第一次没画面，第二次按 16 对齐多出边，
+    /// 第三次正好，第四次比帧头小，之后出错。
+    #[derive(Debug)]
+    struct FakeNv12Dec(u32);
+
+    impl HardwareDecoder for FakeNv12Dec {
+        fn name(&self) -> &str {
+            "假硬件 NV12"
+        }
+        fn decode(&mut self, _data: &[u8]) -> Result<Option<(usize, usize, Vec<u32>)>, String> {
+            Err("应当用 decode_nv12".into())
+        }
+        fn gives_nv12(&self) -> bool {
+            true
+        }
+        fn decode_nv12(&mut self, _data: &[u8]) -> Result<Option<Nv12>, String> {
+            self.0 += 1;
+            let gray = |w: u16, h: u16| {
+                let n = usize::from(w) * usize::from(h);
+                Nv12::new(w, h, [vec![200; n], vec![128; n / 2]].concat()).unwrap()
+            };
+            match self.0 {
+                1 => Ok(None),
+                2 => Ok(Some(gray(32, 18))),
+                3 => Ok(Some(gray(30, 16))),
+                4 => Ok(Some(gray(8, 8))),
+                _ => Err("模拟出错".into()),
+            }
+        }
+    }
+
+    /// 解码交给界面的画面：硬件出 NV12 的直接交（只裁对齐多出的边，不转颜色）；出 RGB 的交 RGB；
+    /// 软件解码（OpenH264）把 I420 拼成 NV12。
+    #[test]
+    fn decoders_hand_nv12_to_the_display() {
+        let header = FrameHeader {
+            codec: Codec::H264,
+            key: true,
+            width: 30,
+            height: 16,
+        };
+        let mut dec = AutoH264Decoder::with_hardware(Some(Box::new(FakeNv12Dec(0)))).unwrap();
+        assert!(dec.decode_picture(&header, b"x").unwrap().is_none());
+        for _ in 0..2 {
+            let shown = dec.decode_picture(&header, b"x").unwrap().unwrap();
+            assert!(matches!(shown, Picture::Nv12(_)), "应当是 NV12");
+            assert_eq!(shown.size(), (30, 16), "对齐多出的边裁掉");
+        }
+        assert!(dec.decode_picture(&header, b"x").is_err(), "比帧头小");
+        // 硬件出错：改用软件，真的码流解出 NV12
+        let mut enc = H264Encoder::new(30).with_hardware(fake_none);
+        let frame = enc
+            .encode(1, &picture(320, 192), true, 50_000)
+            .unwrap()
+            .unwrap();
+        let (h, data) = FrameHeader::parse(&frame.payload).unwrap();
+        let shown = dec.decode_picture(&h, data).unwrap().unwrap();
+        assert!(matches!(shown, Picture::Nv12(_)));
+        assert!(psnr(&picture(320, 192), &shown.to_screen().unwrap()) > 30.0);
+        assert_eq!(dec.backend(), "软件 OpenH264");
+        // 帧头说的比解出来的大：报错
+        let mut soft = H264Decoder::new().unwrap();
+        let big = FrameHeader {
+            width: 640,
+            height: 384,
+            ..h
+        };
+        assert!(soft.decode_picture(&big, data).is_err());
+        // 没有完整的帧：没有画面
+        assert!(soft.decode_picture(&h, &[]).unwrap().is_none());
+        // 出 RGB 的硬件解码器（macOS）：交 RGB
+        let mut rgb = AutoH264Decoder::with_hardware(Some(Box::new(FakeHwDec(1)))).unwrap();
+        assert!(matches!(
+            rgb.decode_picture(&header, b"x").unwrap(),
+            Some(Picture::Rgb(_))
+        ));
+        let mut fake = FakeHwDec(0);
+        assert!(!fake.gives_nv12());
+        assert!(fake.decode_nv12(b"x").is_err());
+        assert!(FakeNv12Dec(0).decode(b"x").is_err());
     }
 
     #[test]

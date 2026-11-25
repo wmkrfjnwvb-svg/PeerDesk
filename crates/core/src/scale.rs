@@ -164,6 +164,31 @@ pub fn fit(size: (u16, u16), view: Option<(u16, u16)>) -> (u16, u16) {
     (even(nw, size.0), even(nh, size.1))
 }
 
+/// 编码尺寸。默认按原尺寸（业内主流：按被控端原分辨率传，控制端显卡缩放到窗口，文字最清楚，
+/// 见 `docs/research/K-pipeline.md` P15）；网络不够、按比例缩小时（最后手段）再等比缩到放得进控制端窗口：
+/// 窗口里看不到的像素不必传。
+#[must_use]
+pub fn encode_size(native: (u16, u16), permille: u16, view: Option<(u16, u16)>) -> (u16, u16) {
+    if permille >= FULL_PERMILLE {
+        return native;
+    }
+    fit(scaled_size(native.0, native.1, permille), view)
+}
+
+/// 宽高取偶数（4:2:0 的 NV12 要求），至少 2×2。显卡采集按这个尺寸要画面。
+#[must_use]
+pub const fn even_size(size: (u16, u16)) -> (u16, u16) {
+    (even(size.0), even(size.1))
+}
+
+const fn even(v: u16) -> u16 {
+    if v < 2 {
+        2
+    } else {
+        v & !1
+    }
+}
+
 /// 按比例算编码尺寸：缩小时取偶数（H.264 的 4:2:0 要求），至少 16×16，不超过原尺寸；原尺寸不变。
 #[must_use]
 pub fn scaled_size(width: u16, height: u16, permille: u16) -> (u16, u16) {
@@ -262,6 +287,22 @@ mod tests {
         assert_eq!(fit((1280, 720), Some((2560, 1440))), (1280, 720));
         assert_eq!(fit((1280, 720), None), (1280, 720));
         assert_eq!(fit((1280, 720), Some((0, 0))), (1280, 720));
+        // 原尺寸不看窗口；缩小时再放进窗口
+        assert_eq!(
+            encode_size((2880, 1800), 1000, Some((1944, 1170))),
+            (2880, 1800)
+        );
+        assert_eq!(
+            encode_size((2880, 1800), 500, Some((1944, 1170))),
+            (1440, 900)
+        );
+        assert_eq!(
+            encode_size((2880, 1800), 800, Some((1944, 1170))),
+            (1872, 1170)
+        );
+        assert_eq!(encode_size((1366, 767), 1000, None), (1366, 767));
+        assert_eq!(even_size((1367, 767)), (1366, 766));
+        assert_eq!(even_size((1, 0)), (2, 2));
     }
 
     #[test]

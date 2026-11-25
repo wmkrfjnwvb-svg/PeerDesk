@@ -3,7 +3,13 @@
 //! * 采集屏幕需要“屏幕与系统录音”权限，注入键鼠需要“辅助功能”权限，都只能由本机用户在
 //!   “系统设置 → 隐私与安全性”里授予。没有权限时返回 [`PlatformError::Permission`]，说明去哪里授权；
 //! * ScreenCaptureKit 只在画面有变化时交付 `Complete` 状态的样本，静止时是 `Idle`（没有画面），
-//!   直接忽略：静止的桌面不产生帧。系统按 `minimumFrameInterval` 限制帧率，输出 BGRA，不画光标；
+//!   直接忽略：静止的桌面不产生帧。系统按 `minimumFrameInterval` 限制帧率，不画光标；
+//! * 采集直接输出编码要的画面：`420v`（NV12、视频范围、BT.601 矩阵）、宽高就是编码尺寸，缩放和颜色转换
+//!   由系统在显卡上做，交来的缓冲区在显存（IOSurface）里，原样交给 VideoToolbox，CPU 不碰像素。
+//!   依据：苹果 WWDC22 10155（“硬件加速的采集、缩放、像素和颜色格式转换”，编码用 420v、显示用 BGRA）、
+//!   Chromium `screen_capture_kit_device_mac.mm`（420v、偶数尺寸、系统缩放）。尺寸变了用
+//!   `updateConfiguration` 在运行中改（WWDC22 10155：所有配置都能在运行中改，不用重建流）；
+//!   交来的不是 420v 就报错，不悄悄换格式；
 //! * 坐标：macOS 的全局坐标以“点”为单位（Retina 屏 1 点 = 2 像素），原点是主显示器左上角，y 向下。
 //!
 //! 部分代码改编自 Airhand（MIT 许可，见仓库根目录的 THIRD_PARTY_NOTICES.md）：
@@ -29,17 +35,18 @@ use objc2::runtime::ProtocolObject;
 use objc2::{define_class, msg_send, AllocAnyThread, DefinedClass};
 use objc2_core_foundation::{CFRetained, CGPoint};
 use objc2_core_graphics::{
-    CGDirectDisplayID, CGDisplayBounds, CGDisplayCopyDisplayMode, CGDisplayIsMain,
-    CGDisplayMirrorsDisplay, CGDisplayMode, CGError, CGEvent, CGEventField, CGEventFlags,
-    CGEventSource, CGEventSourceStateID, CGEventTapLocation, CGEventType, CGGetActiveDisplayList,
-    CGMouseButton, CGPreflightScreenCaptureAccess, CGRequestScreenCaptureAccess, CGScrollEventUnit,
+    kCGColorSpaceSRGB, CGDirectDisplayID, CGDisplayBounds, CGDisplayCopyDisplayMode,
+    CGDisplayIsMain, CGDisplayMirrorsDisplay, CGDisplayMode, CGError, CGEvent, CGEventField,
+    CGEventFlags, CGEventSource, CGEventSourceStateID, CGEventTapLocation, CGEventType,
+    CGGetActiveDisplayList, CGMouseButton, CGPreflightScreenCaptureAccess,
+    CGRequestScreenCaptureAccess, CGScrollEventUnit,
 };
 use objc2_core_media::{CMSampleBuffer, CMTime};
 use objc2_core_video::{
-    kCVPixelFormatType_32BGRA, CVPixelBuffer, CVPixelBufferGetBaseAddress,
-    CVPixelBufferGetBytesPerRow, CVPixelBufferGetHeight, CVPixelBufferGetPixelFormatType,
-    CVPixelBufferGetWidth, CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags,
-    CVPixelBufferUnlockBaseAddress,
+    kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, CVPixelBuffer,
+    CVPixelBufferGetBaseAddressOfPlane, CVPixelBufferGetBytesPerRowOfPlane, CVPixelBufferGetHeight,
+    CVPixelBufferGetPixelFormatType, CVPixelBufferGetWidth, CVPixelBufferLockBaseAddress,
+    CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress,
 };
 use objc2_foundation::{
     NSArray, NSDictionary, NSError, NSNumber, NSObject, NSObjectProtocol, NSString,
@@ -48,21 +55,23 @@ use objc2_screen_capture_kit::{
     SCContentFilter, SCDisplay, SCFrameStatus, SCShareableContent, SCStream, SCStreamConfiguration,
     SCStreamDelegate, SCStreamOutput, SCStreamOutputType,
 };
+use peerdesk_core::frame::{Frame, GpuFrame, GpuHandle, Nv12};
 use peerdesk_core::input::InputEvent;
 use peerdesk_core::screen::Screen;
 use peerdesk_net::host::InputSink;
 
 use crate::capture::Grabber;
 use crate::keymap::{mac_event_flags, mac_key_flags, to_mac};
-use crate::pixel::bgra_to_screen;
 use crate::pointer::{round_to_i32, to_points, ClickTracker, WheelAccumulator};
 use crate::{sort_displays, CaptureOptions, DisplayInfo, PermissionStatus};
 use crate::{PlatformError, PlatformError as E, INPUT_PERMISSION_HINT, SCREEN_PERMISSION_HINT};
 
 /// ScreenCaptureKit 的异步调用最多等这么久。
 const SCK_TIMEOUT: Duration = Duration::from_secs(5);
-/// 系统最多同时拿着几帧（会话还拿着的帧系统不能复用）。
-const QUEUE_DEPTH: isize = 3;
+/// 系统的画面缓冲池有几块（3–8，默认 3）。我们拿着的帧系统不能复用：最新帧的槽位、会话正在用的、
+/// 编码器还在编的各占一块。苹果 WWDC22 10155：拿着超过 帧间隔 ×（块数 − 1）系统就会停下等、丢帧，
+/// 所以比默认多留几块（OBS 用 8）。
+const QUEUE_DEPTH: isize = 6;
 /// 注入时用的显示器位置多久刷新一次。
 const GEOMETRY_REFRESH: Duration = Duration::from_secs(2);
 /// 滚动：每 6 个增量发 5 个像素，滚轮一格（120）= 100 像素 ≈ 3 行。
@@ -462,6 +471,38 @@ struct SckGrabber {
     _queue: DispatchRetained<DispatchQueue>,
     inbox: Arc<Inbox>,
     pending: Option<Sample>,
+    /// 显示器的像素尺寸。
+    native: (u16, u16),
+    /// 现在让系统输出的尺寸。
+    size: (u16, u16),
+    fps: i32,
+}
+
+/// 采集配置：按 `size`（偶数）输出 420v，BT.601 矩阵、sRGB 色彩空间，不画光标。
+fn stream_config(size: (u16, u16), fps: i32) -> Retained<SCStreamConfiguration> {
+    // SAFETY: 新建并填写一个采集配置，所有参数都在系统允许的范围内；键是系统常量。
+    unsafe {
+        let c = SCStreamConfiguration::new();
+        c.setWidth(usize::from(size.0));
+        c.setHeight(usize::from(size.1));
+        c.setPixelFormat(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange);
+        // BT.601：和全链路的解码、显示用的矩阵一致（编码端 VideoToolbox 也这样标）。苹果文档要求这个值
+        // 取 kCGDisplayStreamYCbCrMatrix_* 常量之一；常量所在的 CGDisplayStream 接口被标为过时，
+        // 常量本身是 ScreenCaptureKit 文档指定的写法。
+        #[allow(deprecated)]
+        c.setColorMatrix(objc2_core_graphics::kCGDisplayStreamYCbCrMatrix_ITU_R_601_4);
+        c.setColorSpaceName(kCGColorSpaceSRGB);
+        c.setShowsCursor(false);
+        c.setMinimumFrameInterval(CMTime::new(1, fps));
+        c.setQueueDepth(QUEUE_DEPTH);
+        c
+    }
+}
+
+/// 显示器像素尺寸（偶数，系统按它输出时不缩放）。
+fn native_even(d: &Display) -> (u16, u16) {
+    let one = |v: u32| u16::try_from(v).unwrap_or(u16::MAX) & !1;
+    (one(d.info.width).max(2), one(d.info.height).max(2))
 }
 
 pub(crate) fn open_grabber(opts: &CaptureOptions) -> Result<Box<dyn Grabber>, PlatformError> {
@@ -469,17 +510,8 @@ pub(crate) fn open_grabber(opts: &CaptureOptions) -> Result<Box<dyn Grabber>, Pl
     let d = display(opts.display)?;
     let target = shareable_display(d.id)?;
     let fps = i32::try_from(opts.max_fps.max(1)).unwrap_or(60);
-    // SAFETY: 新建并填写一个采集配置，所有参数都在系统允许的范围内。
-    let config = unsafe {
-        let c = SCStreamConfiguration::new();
-        c.setWidth(usize::try_from(d.info.width).unwrap_or(0));
-        c.setHeight(usize::try_from(d.info.height).unwrap_or(0));
-        c.setPixelFormat(kCVPixelFormatType_32BGRA);
-        c.setShowsCursor(false);
-        c.setMinimumFrameInterval(CMTime::new(1, fps));
-        c.setQueueDepth(QUEUE_DEPTH);
-        c
-    };
+    let native = native_even(&d);
+    let config = stream_config(native, fps);
     let inbox = Arc::new(Inbox::default());
     let (rx, stop) = (Arc::clone(&inbox), Arc::clone(&inbox));
     let output = StreamOutput::new(Handlers {
@@ -536,6 +568,9 @@ pub(crate) fn open_grabber(opts: &CaptureOptions) -> Result<Box<dyn Grabber>, Pl
         _queue: queue,
         inbox,
         pending: None,
+        native,
+        size: native,
+        fps,
     }))
 }
 
@@ -570,7 +605,7 @@ impl Grabber for SckGrabber {
         Ok(self.pending.is_some())
     }
 
-    fn grab(&mut self, spare: Option<Screen>) -> Result<Screen, PlatformError> {
+    fn grab(&mut self, _spare: Option<Screen>) -> Result<Frame, PlatformError> {
         let sample = self
             .pending
             .take()
@@ -578,28 +613,108 @@ impl Grabber for SckGrabber {
         // SAFETY: `sample` 是有效的画面样本。
         let image =
             unsafe { sample.0.image_buffer() }.ok_or_else(|| E::Os("画面样本里没有图像".into()))?;
-        let pb: &CVPixelBuffer = &image;
-        if CVPixelBufferGetPixelFormatType(pb) != kCVPixelFormatType_32BGRA {
-            return Err(E::Os("ScreenCaptureKit 交来的像素格式不是 BGRA".into()));
+        if CVPixelBufferGetPixelFormatType(&image)
+            != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+        {
+            return Err(E::Os(format!(
+                "ScreenCaptureKit 交来的像素格式不是 420v（是 0x{:08x}）",
+                CVPixelBufferGetPixelFormatType(&image)
+            )));
         }
+        let size = (
+            u16::try_from(CVPixelBufferGetWidth(&image)).unwrap_or(0),
+            u16::try_from(CVPixelBufferGetHeight(&image)).unwrap_or(0),
+        );
+        if size.0 == 0 || size.1 == 0 || size.0 % 2 != 0 || size.1 % 2 != 0 {
+            return Err(E::Os(format!(
+                "ScreenCaptureKit 交来的画面尺寸不对：{}×{}",
+                size.0, size.1
+            )));
+        }
+        Ok(Frame::Gpu(Arc::new(MacFrame { image, size })))
+    }
+
+    fn set_target(&mut self, size: (u16, u16)) -> Result<(), PlatformError> {
+        if size == self.size {
+            return Ok(());
+        }
+        let config = stream_config(size, self.fps);
+        let stream = &self.stream;
+        // SAFETY: 完成回调是有效的 block，配置在调用期间有效。
+        wait_completion(|done| unsafe {
+            stream.updateConfiguration_completionHandler(&config, Some(done));
+        })
+        .map_err(|e| E::Os(format!("无法改采集尺寸为 {}×{}：{e}", size.0, size.1)))?;
+        self.size = size;
+        Ok(())
+    }
+
+    fn native_size(&self) -> Option<(u16, u16)> {
+        Some(self.native)
+    }
+}
+
+/// ScreenCaptureKit 交来的一帧（显存里的 420v 缓冲区）。拿着它系统就不能复用这块缓冲，用完尽快放掉。
+struct MacFrame {
+    image: CFRetained<CVPixelBuffer>,
+    size: (u16, u16),
+}
+
+impl std::fmt::Debug for MacFrame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MacFrame")
+            .field("size", &self.size)
+            .finish_non_exhaustive()
+    }
+}
+
+// SAFETY: CVPixelBuffer 是 CoreFoundation 对象，引用计数线程安全；系统交出来之后不再写它，
+// 我们只读（只读锁）或把它交给 VideoToolbox（编码器自己 retain），不修改像素。
+unsafe impl Send for MacFrame {}
+// SAFETY: 同上，所有访问都是只读的。
+unsafe impl Sync for MacFrame {}
+
+impl GpuFrame for MacFrame {
+    fn size(&self) -> (u16, u16) {
+        self.size
+    }
+
+    fn handle(&self) -> GpuHandle {
+        GpuHandle::CvPixelBuffer(CFRetained::as_ptr(&self.image).as_ptr().cast_const().cast())
+    }
+
+    fn read_nv12(&self) -> Result<Nv12, peerdesk_core::Error> {
+        let pb: &CVPixelBuffer = &self.image;
         let ro = CVPixelBufferLockFlags::ReadOnly;
         // SAFETY: 锁住像素缓冲区以便读取，下面一定解锁。
         if unsafe { CVPixelBufferLockBaseAddress(pb, ro) } != 0 {
-            return Err(E::Os("无法锁定画面缓冲区".into()));
+            return Err(peerdesk_core::Error::Inconsistent("无法锁定画面缓冲区"));
         }
-        let (w, h) = (CVPixelBufferGetWidth(pb), CVPixelBufferGetHeight(pb));
-        let stride = CVPixelBufferGetBytesPerRow(pb);
-        let base = CVPixelBufferGetBaseAddress(pb).cast::<u8>();
-        let result = if base.is_null() {
-            Err(E::Os("画面缓冲区没有数据".into()))
-        } else {
-            // SAFETY: 锁定期间 `base` 指向 每行字节数 × 高度 字节的可读内存。
-            let data = unsafe { std::slice::from_raw_parts(base, stride.saturating_mul(h)) };
-            bgra_to_screen(spare, w, h, data, stride)
-        };
+        let (w, h) = (usize::from(self.size.0), usize::from(self.size.1));
+        let mut data = Vec::with_capacity(w * h * 3 / 2);
+        let mut ok = true;
+        // 两个平面：亮度 h 行、交错的色度 h/2 行，每行取 w 字节（行宽可能大于 w，按行拷）
+        for (plane, rows) in [(0usize, h), (1usize, h / 2)] {
+            let base = CVPixelBufferGetBaseAddressOfPlane(pb, plane).cast::<u8>();
+            let stride = CVPixelBufferGetBytesPerRowOfPlane(pb, plane);
+            if base.is_null() || stride < w {
+                ok = false;
+                break;
+            }
+            // SAFETY: 锁定期间 `base` 指向这个平面 行宽 × 行数 字节的可读内存。
+            let bytes = unsafe { std::slice::from_raw_parts(base, stride.saturating_mul(rows)) };
+            for row in bytes.chunks(stride).take(rows) {
+                data.extend_from_slice(row.get(..w).unwrap_or_default());
+            }
+        }
         // SAFETY: 与上面成功的加锁配对。
         unsafe { CVPixelBufferUnlockBaseAddress(pb, ro) };
-        result
+        if !ok {
+            return Err(peerdesk_core::Error::Inconsistent(
+                "画面缓冲区不是两个平面的 NV12",
+            ));
+        }
+        Nv12::new(self.size.0, self.size.1, data)
     }
 }
 

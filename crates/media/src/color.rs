@@ -97,39 +97,32 @@ pub fn i420_to_nv12(y: &[u8], u: &[u8], v: &[u8], out: &mut Vec<u8>) {
     }
 }
 
-/// NV12（硬件解码器的输出）转成 `0x00RRGGBB` 像素，写进 `out`（先清空）。
-///
-/// `y`、`uv` 是两个平面，每行 `pitch` 字节（显卡对齐，常大于宽度）；只取左上角 `width`×`height`。
-/// 系数是 [`rgb_to_i420`] 的逆（BT.601 有限范围，×256 的整数），和软件解码出来的颜色一致。
-/// 平面不够长时缺的部分当黑色。
-// Windows、Linux 的硬件解码用（macOS 的 VideoToolbox 直接出 RGB）
-#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
-pub fn nv12_to_rgb(
-    y: &[u8],
-    uv: &[u8],
-    pitch: usize,
+/// NV12（亮度后面接交错的色度，每行按宽度紧排）拆成 I420 的三个平面（软件编码器要这种）：只是搬字节，不算颜色。
+pub fn nv12_to_i420(
+    nv12: &[u8],
     width: usize,
     height: usize,
-    out: &mut Vec<u32>,
+    y: &mut Vec<u8>,
+    u: &mut Vec<u8>,
+    v: &mut Vec<u8>,
 ) {
-    out.clear();
-    out.reserve(width * height);
-    let clamp = |v: i32| u32::try_from((v >> 8).clamp(0, 255)).unwrap_or(0);
-    for row in 0..height {
-        let luma = y.get(row * pitch..).unwrap_or_default();
-        let chroma = uv.get((row / 2) * pitch..).unwrap_or_default();
-        for col in 0..width {
-            let c = 298 * (i32::from(luma.get(col).copied().unwrap_or(16)) - 16) + 128;
-            let pair = col & !1;
-            let d = i32::from(chroma.get(pair).copied().unwrap_or(128)) - 128;
-            let e = i32::from(chroma.get(pair + 1).copied().unwrap_or(128)) - 128;
-            let r = clamp(c + 409 * e);
-            let g = clamp(c - 100 * d - 208 * e);
-            let b = clamp(c + 516 * d);
-            out.push((r << 16) | (g << 8) | b);
+    let (luma, chroma) = nv12.split_at((width * height).min(nv12.len()));
+    y.clear();
+    y.extend_from_slice(luma);
+    u.clear();
+    v.clear();
+    for pair in chroma.chunks_exact(2) {
+        if let [a, b] = pair {
+            u.push(*a);
+            v.push(*b);
         }
     }
 }
+
+/// NV12（硬件解码器的输出）转成 `0x00RRGGBB` 像素：和采集端读回检查用的是同一个函数（BT.601 有限范围）。
+// Windows、Linux 的硬件解码用（macOS 的 VideoToolbox 直接出 RGB）
+#[cfg_attr(not(any(windows, target_os = "linux")), allow(unused_imports))]
+pub use peerdesk_core::frame::nv12_to_rgb;
 
 #[cfg(test)]
 mod nv12_tests {

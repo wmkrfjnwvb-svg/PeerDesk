@@ -6,7 +6,6 @@ use std::time::{Duration, Instant};
 
 use peerdesk_core::screen::Screen;
 use peerdesk_net::demo::to_bmp;
-use peerdesk_net::host::ScreenSource;
 use peerdesk_platform::{
     check_permissions, displays, pixel, CaptureOptions, CaptureStats, DisplayInfo,
     PermissionStatus, PlatformError, ScreenCapture,
@@ -103,7 +102,7 @@ fn capture_once(opts: CaptureOptions) -> Result<Captured, PlatformError> {
     let started = Instant::now();
     let mut capture = ScreenCapture::open(opts)?;
     let first_frame = started.elapsed();
-    let screen = capture.capture().cloned();
+    let screen = capture.snapshot();
     let screen = screen.ok_or_else(|| PlatformError::Os("没有采集到画面".into()))?;
     Ok(Captured {
         screen,
