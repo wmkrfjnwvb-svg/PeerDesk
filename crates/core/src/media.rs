@@ -659,6 +659,7 @@ impl MediaSender {
     /// 开始一帧：判定超时丢失，分配帧号和字节预算，带上要交给编码器的通知。
     pub fn start_frame(&mut self, now: Time, rtt_us: u64) -> FrameJob {
         self.rtt_us = rtt_us;
+        self.governor.on_start(now);
         self.expire_unacked(now);
         // 只给还没有定论的帧留着重传（接收端可能还在收）；已确认、已判丢的不再重传，由接收端的
         // 重传请求和“不再接受的帧号”决定什么时候停。不按“编出来多久”判断：节奏器要把一个大关键帧

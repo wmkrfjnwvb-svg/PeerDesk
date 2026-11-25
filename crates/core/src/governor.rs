@@ -34,6 +34,8 @@ pub struct FpsGovernor {
     /// 从什么时候起一直轻松。
     calm_since: Option<Time>,
     last_frame: Option<Time>,
+    /// 正在编的这一帧什么时候开始的（[`Self::on_start`]）。
+    frame_start: Option<Time>,
     /// 最近一次换档的说明（诊断日志用，取走后清空）。
     change: Option<String>,
 }
@@ -49,6 +51,7 @@ impl FpsGovernor {
             strained: 0,
             calm_since: None,
             last_frame: None,
+            frame_start: None,
             change: None,
         }
     }
@@ -67,10 +70,19 @@ impl FpsGovernor {
             .is_none_or(|t| now.since(t) >= interval.saturating_mul(9) / 10)
     }
 
+    /// 开始编一帧（帧间隔从这里算）。
+    pub const fn on_start(&mut self, now: Time) {
+        self.frame_start = Some(now);
+    }
+
     /// 编完一帧：`encode_us` 是编码用的时间（不知道时给 0），`size` 和 `budget` 是这帧的字节数和预算。
     /// 返回新的帧率。
+    ///
+    /// 帧间隔从这一帧**开始编**的时刻算（[`Self::on_start`]），不从编完算：从编完算的话，编一帧要 2–4 ms 时
+    /// 下一拍离“编完”不到 90% 的帧间隔，每隔一拍就跳过一拍（实测 100 帧只编出 50 帧；1080p 软件编码
+    /// 15 ms、30 帧时会掉到 15 帧）。没调用过 `on_start` 时按编完的时刻算。
     pub fn on_frame(&mut self, now: Time, encode_us: u64, size: usize, budget: usize) -> u32 {
-        self.last_frame = Some(now);
+        self.last_frame = Some(self.frame_start.take().unwrap_or(now));
         let interval = 1_000_000 / u64::from(self.fps);
         let cpu_busy = encode_us.saturating_mul(1000) > interval.saturating_mul(CPU_BUSY_PERMILLE);
         let over = budget > 0 && size > budget.saturating_mul(OVER_BUDGET_TIMES);
@@ -140,6 +152,16 @@ impl FpsGovernor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_interval_counts_from_when_the_frame_started() {
+        // 30 帧（33 ms 一拍），编一帧 15 ms：下一拍离开始 33 ms、离编完只有 18 ms，照样该编
+        let mut g = FpsGovernor::new(30);
+        g.on_start(Time::ZERO);
+        g.on_frame(Time(15_000), 15_000, 100, 1000);
+        assert!(g.due(Time(33_000)));
+        assert!(!g.due(Time(20_000)));
+    }
 
     #[test]
     fn slows_down_when_the_cpu_cannot_keep_up_and_recovers() {

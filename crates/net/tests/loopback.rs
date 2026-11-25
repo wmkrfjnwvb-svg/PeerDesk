@@ -188,7 +188,12 @@ async fn full_session_video_input_and_files() {
     assert!(host_report.frames_sent < 60, "{}", host_report.frames_sent);
     // 视频编码丢了一帧就要等关键帧，CPU 很忙时可能有个别帧没显示。
     assert!(report.frames_delivered <= u64::from(host_report.frames_sent));
-    assert!(report.frames_delivered >= 10, "{}", report.frames_delivered);
+    assert!(
+        report.frames_delivered >= 10,
+        "送到 {}，发出 {}",
+        report.frames_delivered,
+        host_report.frames_sent
+    );
     assert_eq!(sink.count(), report.frames_delivered);
     assert!(report.video_bytes <= host_report.video_bytes && report.video_bytes > 0);
     assert_eq!(report.bad_frames, 0);

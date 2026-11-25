@@ -477,6 +477,17 @@ pub fn run(s: &Scenario) -> Result<Outcome, Error> {
                 let out = tx.on_frame(now, desk.screen(), std::mem::take(&mut pending), rtt)?;
                 if tx.stats().frames != before {
                     captured.push(now);
+                    if trace_events {
+                        let bytes: usize = out.iter().map(|o| o.body.len()).sum();
+                        if bytes > 8_000 {
+                            trace.push(format!(
+                                "[{:>6} ms] 大帧 {bytes} B（关键帧累计 {}），码率 {} kbps",
+                                now.micros() / 1000,
+                                tx.stats().keyframes,
+                                tx.rate_bps() / 1000
+                            ));
+                        }
+                    }
                 }
                 // 和产品一样经发送节奏控制发出（见 peerdesk_core::pacer）
                 pacer.push(out);

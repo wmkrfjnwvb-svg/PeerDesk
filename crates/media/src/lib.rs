@@ -22,6 +22,7 @@ mod color;
 /// Linux 的显卡和 VA-API 能力（检测和给用户的说明）。
 #[cfg(target_os = "linux")]
 pub mod gpu;
+pub mod qp;
 #[cfg(target_os = "linux")]
 mod vaapi;
 use openh264::OpenH264API;
@@ -33,18 +34,25 @@ use peerdesk_core::video::{
     Codec, EncodeTiming, EncodedFrame, FrameHeader, VideoDecoder, VideoEncoder,
 };
 
-/// 画面停下后最多再编几帧来补清晰。
+/// 画面停下后最多再编几帧来补清晰（硬件编码：不知道 QP，按帧数和大小判断；软件编码补到最小 QP，见 [`qp`]）。
 pub const REFINE_FRAMES: u8 = 12;
-/// 补清晰的一帧小于这么多字节，说明已经补不出什么了，提前停下。
+/// 补清晰的一帧小于这么多字节，说明已经补不出什么了，提前停下（硬件编码）。
 const REFINE_DONE_BYTES: usize = 64;
-/// 码率下限（比特每秒）：再低 OpenH264 的码率控制就不稳定了。
+/// 码率下限（比特每秒）。
 const MIN_BPS: u64 = 64_000;
 /// 码率上限的默认值。
 pub const DEFAULT_MAX_BPS: u64 = 50_000_000;
-/// 画质下限对应的最大 QP：再糊就不像话了，宁可这一帧超出预算。
-const MAX_QP: u8 = 42;
+/// 大帧规则默认的时限（微秒）：关键帧、大面积变化要在这么久里按目标码率发得完，发不完就粗编、之后补清晰
+/// （照 Chromium 远程桌面 `ShouldDropQualityForLargeFrame`，它用一帧间隔；办公策略，以后收进 `ContentPolicy`）。
+///
+/// 为什么 100 ms（2026-11 微软 8 条真实轨迹实测，经典估计器）：200 ms 正好压在“卡顿”的门限上，
+/// 再加传输延迟就超过 200 ms，ms-09401 卡顿 7 次；50 ms 太粗，窄带上关键帧反复补；100 ms 时
+/// 三条门槛轨迹最长等待 1519→457、1531→304、322→290 ms，首帧快 4–5 倍，卡顿也少了。
+pub const BIG_FRAME_US: u64 = 100_000;
 /// 最小 QP：补清晰时能达到的画质上限。
-const MIN_QP: u8 = 12;
+const MIN_QP: u8 = qp::MIN_QP;
+/// 估计画面变了多少时每隔多少像素抽一个（横竖都是）：720p 约 3600 个，几乎不花时间。
+const SAMPLE_STEP: usize = 16;
 
 fn codec_error(what: &'static str) -> impl Fn(openh264::Error) -> Error {
     move |_| Error::Inconsistent(what)
@@ -568,6 +576,17 @@ pub struct H264Encoder {
     timing: EncodeTiming,
     /// 交给硬件编码器、还没取回的帧：每帧是否要求了关键帧（按顺序；异步编码器会攒帧）。
     hw_sent: std::collections::VecDeque<bool>,
+    /// 软件编码的逐帧 QP 控制（openh264 自己的码控关掉，见 [`qp`]）。
+    qp: qp::QpControl,
+    /// 下一帧强制用的 QP（见 [`H264Encoder::coarse_next`]）。
+    coarse_qp: Option<u8>,
+    /// 软件编码刚编完的一帧：补清晰补完了没有（交给 `finish` 定还要不要补）。
+    soft_converged: Option<bool>,
+    /// 大帧规则的时限（微秒）：关键帧要在这么久里按目标码率发得完。0：不限。
+    big_frame_us: u64,
+    /// 上一次编的画面的抽样（每 [`SAMPLE_STEP`] 像素取一个），估计画面变了多少。
+    samples: Vec<u32>,
+    sampled: (u16, u16),
 }
 
 /// 硬件编码这一步的结果。
@@ -636,7 +655,61 @@ impl H264Encoder {
             resize_reason: None,
             timing: EncodeTiming::default(),
             hw_sent: std::collections::VecDeque::new(),
+            qp: qp::QpControl::default(),
+            coarse_qp: None,
+            soft_converged: None,
+            big_frame_us: BIG_FRAME_US,
+            samples: Vec::new(),
+            sampled: (0, 0),
         }
+    }
+
+    /// 大帧规则的时限（微秒，0 不限）：关键帧要在这么久里按目标码率发得完，发不完就粗编、之后补清晰。
+    /// 默认 [`BIG_FRAME_US`]。
+    #[must_use]
+    pub const fn with_big_frame_us(mut self, us: u64) -> Self {
+        self.big_frame_us = us;
+        self
+    }
+
+    /// 画面和上一次编的相比变了多少（千分比），按抽样估计；尺寸变了算全变。顺便记下这一次的抽样。
+    fn changed_permille(&mut self, screen: &Screen) -> u64 {
+        let width = usize::from(screen.width());
+        let size = (screen.width(), screen.height());
+        let now: Vec<u32> = screen
+            .pixels()
+            .chunks(width.max(1))
+            .step_by(SAMPLE_STEP)
+            .flat_map(|row| row.iter().step_by(SAMPLE_STEP).copied())
+            .collect();
+        let changed = if size == self.sampled && now.len() == self.samples.len() {
+            let differ = now
+                .iter()
+                .zip(&self.samples)
+                .filter(|(a, b)| a != b)
+                .count();
+            u64::try_from(differ)
+                .unwrap_or(u64::MAX)
+                .saturating_mul(1000)
+                / u64::try_from(now.len()).unwrap_or(u64::MAX).max(1)
+        } else {
+            1000
+        };
+        self.samples = now;
+        self.sampled = size;
+        changed
+    }
+
+    /// 下一帧（软件编码）强制用 QP `qp` 编（测量、以后按画面变化面积判断大帧时用），之后照常逐帧控制。
+    pub fn coarse_next(&mut self, qp: u8) {
+        self.coarse_qp = Some(qp.clamp(MIN_QP, qp::MAX_QP));
+    }
+
+    /// 指定软件编码的最大 QP（夹在 [`MIN_QP`, 51]）。默认 51：大帧粗编、之后补清晰。
+    #[must_use]
+    pub fn with_max_qp(mut self, qp: u8) -> Self {
+        self.qp = qp::QpControl::new(qp);
+        self
     }
 
     /// 指定打开硬件编码器的函数（测试用假的编码器）。
@@ -917,36 +990,83 @@ impl H264Encoder {
             self.convert_us = self.convert_us.saturating_add(micros_since(reading));
         }
         self.timing.convert_us = self.convert_us.saturating_sub(self.timing.scale_us);
-        let encoding = std::time::Instant::now();
+        let mut encoding = std::time::Instant::now();
         let fresh = self.inner.as_ref().is_none_or(|(w, h, _)| (*w, *h) != size);
         // 编码器先拿出来用，编完放回去；编码出错时丢掉，下一帧重新打开（从关键帧开始）。
+        self.bps = self.budget_bps(budget);
         let mut enc = match self.inner.take() {
-            Some((_, _, mut enc)) if !fresh => {
-                self.set_budget(&mut enc, budget);
-                enc
-            }
-            Some(_) | None => {
-                // 新编码器按当前预算打开（见 open_at）。
-                self.bps = self.budget_bps(budget);
-                self.open_at(self.bps)?
-            }
+            Some((_, _, enc)) if !fresh => enc,
+            Some(_) | None => self.open()?,
         };
         if self.force_key && !fresh {
             enc.force_intra_frame();
         }
+        // 画面变了多少（CPU 画面按抽样估计；显卡画面不读回来比，不知道）
+        let area = match input {
+            Input::Rgb(screen) => Some(self.changed_permille(screen)),
+            Input::Gpu(_) => None,
+        };
         let yuv = YUVSlices::new(
             (&self.planes.0, &self.planes.1, &self.planes.2),
             (w, h),
             (w, w / 2, w / 2),
         );
-        let stream = enc.encode(&yuv).map_err(codec_error("H.264 编码失败"))?;
-        self.timing.encode_us = micros_since(encoding);
-        let key = matches!(stream.frame_type(), FrameType::IDR | FrameType::I);
-        let data = stream.to_vec();
-        if fresh {
-            // 第一帧编完：放开上限，之后码率才能往上调。
-            set_max_bitrate(&mut enc, self.max_bps);
+        // 这一帧的 QP（见 qp 模块）：关键帧按大帧规则装进时限，在变的帧跟着目标，停下的帧往下补
+        let kind = if fresh || self.force_key {
+            qp::Kind::Key
+        } else if changed {
+            qp::Kind::Change
+        } else {
+            qp::Kind::Refine
+        };
+        let pixels = u64::from(size.0).saturating_mul(u64::from(size.1));
+        let target = u64::try_from(budget).unwrap_or(u64::MAX);
+        let key_allowed = if self.big_frame_us == 0 {
+            u64::MAX
+        } else {
+            self.bps.saturating_mul(self.big_frame_us) / 8_000_000
+        };
+        let qp = self
+            .coarse_qp
+            .take()
+            .unwrap_or_else(|| self.qp.next(kind, target, key_allowed, pixels, area));
+        // 新开的编码器第一帧只能按默认 QP（26）编，除非先编一次让它初始化：openh264 的 Rust 封装到第一次
+        // 编码时才真正初始化编码器，之前取不到、也改不了参数。只有要明显更粗（窄带宽上的大帧规则）时才多编
+        // 这一次；要更细或差不多时就按 26 编，之后补清晰补上（局域网上省掉一次编码：会话开头本来就忙）。
+        let qp = if fresh && qp < DEFAULT_LAYER_QP.saturating_add(PRIME_ABOVE) {
+            DEFAULT_LAYER_QP
+        } else {
+            qp
+        };
+        if fresh && qp != DEFAULT_LAYER_QP {
+            // 先编一次让编码器初始化（结果丢掉），再按定好的 QP 重新编成关键帧。
+            enc.encode(&yuv).map_err(codec_error("H.264 编码失败"))?;
+            enc.force_intra_frame();
+            // 这一次是初始化的开销（和打开编码器一样），不算进编码耗时：帧率调节按编码耗时判断 CPU
+            // 跟不跟得上，算进去的话每次新开编码器都像 CPU 过载（实测 100 帧时被降到 50 帧）。
+            encoding = std::time::Instant::now();
         }
+        if !fresh || qp != DEFAULT_LAYER_QP {
+            set_layer_qp(&mut enc, qp);
+        }
+        let (key, data) = enc
+            .encode(&yuv)
+            .map(|stream| {
+                (
+                    matches!(stream.frame_type(), FrameType::IDR | FrameType::I),
+                    stream.to_vec(),
+                )
+            })
+            .map_err(codec_error("H.264 编码失败"))?;
+        self.timing.encode_us = micros_since(encoding);
+        let kind = if key { qp::Kind::Key } else { kind };
+        self.qp.on_frame(
+            kind,
+            u64::try_from(data.len()).unwrap_or(u64::MAX),
+            qp,
+            pixels,
+        );
+        self.soft_converged = Some(self.qp.converged());
         self.inner = Some((size.0, size.1, enc));
         Ok(Some(self.finish(&data, key, size, changed, fresh)))
     }
@@ -993,12 +1113,13 @@ impl H264Encoder {
         self.force_key = false;
         self.encoded_size = Some(size);
         // 画面在变：之后要补清晰；没变：这是补清晰的一帧。
-        self.refine_left = if changed || fresh || key {
-            REFINE_FRAMES
-        } else if data.len() < REFINE_DONE_BYTES {
-            0
-        } else {
-            self.refine_left.saturating_sub(1)
+        // 软件编码按 QP 判断补完没有（补到最小 QP，照 Chromium）；硬件编码不知道 QP，按大小判断。
+        self.refine_left = match self.soft_converged.take() {
+            Some(true) => 0,
+            Some(false) => u8::MAX,
+            None if changed || fresh || key => REFINE_FRAMES,
+            None if data.len() < REFINE_DONE_BYTES => 0,
+            None => self.refine_left.saturating_sub(1),
         };
         let header = FrameHeader {
             codec: Codec::H264,
@@ -1017,18 +1138,13 @@ impl H264Encoder {
         self.fps / 5
     }
 
-    /// 按 `bps` 打开编码器。
-    ///
-    /// 第一帧（关键帧）的大小由打开时的码率决定：按上限打开的话，1.5 Mbps 的链路上第一帧有
-    /// 130 KB 左右，要 0.7 秒才送得完，超过一帧的截止时间，永远收不齐，画面一直是黑的。
-    /// 所以按当前预算打开；openh264 的封装把每层的最大码率设成初始码率，第一帧编完之后
-    /// （编第一帧之前 OpenH264 不接受改）再把上限放开，之后码率才能往上调。
-    fn open_at(&self, bps: u64) -> Result<Encoder, Error> {
-        let bps = u32::try_from(bps).unwrap_or(u32::MAX);
+    /// 打开编码器：关掉 openh264 自己的码控，每帧的 QP 由 [`qp::QpControl`] 定（为什么见 [`qp`]）。
+    fn open(&self) -> Result<Encoder, Error> {
+        let bps = u32::try_from(self.bps).unwrap_or(u32::MAX);
         let fps = u16::try_from(self.fps).unwrap_or(u16::MAX);
         let config = EncoderConfig::new()
             .usage_type(UsageType::ScreenContentRealTime)
-            .rate_control_mode(RateControlMode::Bitrate)
+            .rate_control_mode(RateControlMode::Off)
             .bitrate(BitRate::from_bps(bps))
             .max_frame_rate(FrameRate::from_hz(f32::from(fps)))
             // 帧率由发送端决定；编码器自己跳帧会让画面停住。
@@ -1038,7 +1154,7 @@ impl H264Encoder {
             .background_detection(false)
             // 不定期插关键帧：关键帧只在开始和丢包恢复时出现。
             .intra_frame_period(IntraFramePeriod::from_num_frames(u32::MAX))
-            .qp(QpRange::new(MIN_QP, MAX_QP))
+            .qp(QpRange::new(MIN_QP, qp::MAX_QP))
             // 级别决定码率上限；不指定时按分辨率自动选，小画面的上限很低。
             .level(Level::Level_5_2)
             .complexity(Complexity::Low)
@@ -1055,58 +1171,42 @@ impl H264Encoder {
             .saturating_mul(u64::from(self.fps))
             .clamp(MIN_BPS, self.max_bps)
     }
-
-    /// 按每帧预算设码率。变化不到一成时不动，避免频繁调整。
-    fn set_budget(&mut self, enc: &mut Encoder, budget: usize) {
-        let bps = self.budget_bps(budget);
-        let changed = bps.abs_diff(self.bps).saturating_mul(10) > self.bps;
-        if !changed {
-            return;
-        }
-        if set_bitrate(enc, bps) {
-            self.bps = bps;
-        }
-    }
 }
 
-/// 放开码率上限（第一帧编完之后调用）：每层的上限和总的上限都设成 `bps`。
-#[allow(unsafe_code)]
-fn set_max_bitrate(enc: &mut Encoder, bps: u64) {
-    for layer in [
-        openh264_sys2::SPATIAL_LAYER_0,
-        openh264_sys2::SPATIAL_LAYER_ALL,
-    ] {
-        let mut info = openh264_sys2::SBitrateInfo {
-            iLayer: layer,
-            iBitrate: i32::try_from(bps).unwrap_or(i32::MAX),
-        };
-        // SAFETY: 编码器已经初始化并编过一帧；ENCODER_OPTION_MAX_BITRATE 的参数就是 SBitrateInfo，
-        // 指针指向本函数里的局部变量，调用期间有效。只改码率上限。
-        let _ = unsafe {
-            enc.raw_api().set_option(
-                openh264_sys2::ENCODER_OPTION_MAX_BITRATE,
-                std::ptr::addr_of_mut!(info).cast(),
-            )
-        };
-    }
-}
+/// openh264 每层固定 QP 的默认值（`SVC_QUALITY_BASE_QP`）：新开的编码器第一帧就是按它编的。
+const DEFAULT_LAYER_QP: u8 = 26;
+/// 新开的编码器要比 [`DEFAULT_LAYER_QP`] 粗这么多以上才多编一次去改第一帧的 QP。
+const PRIME_ABOVE: u8 = 4;
 
-/// 运行中改码率：openh264 的安全接口没有这一项，只能走底层的 `SetOption`。返回是否生效。
+/// 码控关掉时每层用的固定 QP 改成 `qp`（运行中可改、不重建编码器、不出额外的关键帧：
+/// `WelsEncoderParamAdjust` 不重置时会拷贝 `iDLayerQp`）。返回是否生效。
 #[allow(unsafe_code)]
-fn set_bitrate(enc: &mut Encoder, bps: u64) -> bool {
-    let mut info = openh264_sys2::SBitrateInfo {
-        iLayer: openh264_sys2::SPATIAL_LAYER_ALL,
-        iBitrate: i32::try_from(bps).unwrap_or(i32::MAX),
-    };
-    // SAFETY: 编码器已经初始化；ENCODER_OPTION_BITRATE 的参数就是 SBitrateInfo，
-    // 指针指向本函数里的局部变量，调用期间有效。这一项只改目标码率，不改编码器依赖的其他参数。
-    let status = unsafe {
-        enc.raw_api().set_option(
-            openh264_sys2::ENCODER_OPTION_BITRATE,
-            std::ptr::addr_of_mut!(info).cast(),
+fn set_layer_qp(enc: &mut Encoder, qp: u8) -> bool {
+    let mut param = std::mem::MaybeUninit::<openh264_sys2::SEncParamExt>::zeroed();
+    // SAFETY: 编码器已经初始化（编过一帧）；ENCODER_OPTION_SVC_ENCODE_PARAM_EXT 的参数就是 SEncParamExt，
+    // 指针指向本函数里全零初始化的局部变量（纯 C 结构），调用期间有效，GetOption 只往里写。
+    let got = unsafe {
+        enc.raw_api().get_option(
+            openh264_sys2::ENCODER_OPTION_SVC_ENCODE_PARAM_EXT,
+            param.as_mut_ptr().cast(),
         )
     };
-    status == 0
+    if got != 0 {
+        return false;
+    }
+    // SAFETY: 全零对这个纯 C 结构是合法值；GetOption 成功时填好了当前参数。
+    let mut param = unsafe { param.assume_init() };
+    for layer in &mut param.sSpatialLayers {
+        layer.iDLayerQp = i32::from(qp);
+    }
+    // SAFETY: 参数是刚取回的当前参数，只改了每层的固定 QP（不重建编码器的那一类参数）；指针指向局部变量。
+    let set = unsafe {
+        enc.raw_api().set_option(
+            openh264_sys2::ENCODER_OPTION_SVC_ENCODE_PARAM_EXT,
+            std::ptr::addr_of_mut!(param).cast(),
+        )
+    };
+    set == 0
 }
 
 fn micros_since(t: std::time::Instant) -> u64 {
@@ -2277,6 +2377,60 @@ mod tests {
     }
 
     #[test]
+    fn big_keyframes_are_coarse_then_topped_off_until_sharp() {
+        let size = (320u16, 192u16);
+        // 低码率下的第一帧：比不限时（大帧规则关掉）时小得多，仍是关键帧
+        let screen = picture(size.0, size.1);
+        let mut plain = H264Encoder::new(30)
+            .with_hardware(fake_none)
+            .with_big_frame_us(0);
+        let big = plain.encode(1, &screen, true, 300).unwrap().unwrap();
+        let mut enc = H264Encoder::new(30)
+            .with_hardware(fake_none)
+            .with_max_qp(51);
+        let mut dec = H264Decoder::new().unwrap();
+        let first = enc.encode(1, &screen, true, 300).unwrap().unwrap();
+        assert!(first.key);
+        assert!(
+            first.payload.len() * 5 < big.payload.len() * 4,
+            "粗编 {} B，照常 {} B",
+            first.payload.len(),
+            big.payload.len()
+        );
+        let mut shown = decode(&mut dec, &first).unwrap();
+        let coarse = psnr(&shown, &screen);
+        // 画面停下：一直补到收敛（超过普通的 REFINE_FRAMES 帧也继续），之后不再发
+        let mut frames = 0;
+        for id in 2..400 {
+            if let Some(f) = enc.encode(id, &screen, false, 300).unwrap() {
+                assert!(!f.key, "补清晰不出关键帧");
+                shown = decode(&mut dec, &f).unwrap_or(shown);
+                frames += 1;
+            }
+            if !enc.wants_refine() {
+                break;
+            }
+        }
+        assert!(!enc.wants_refine(), "补到收敛就停");
+        let sharp = psnr(&shown, &screen);
+        assert!(
+            sharp > coarse + 3.0,
+            "补了 {frames} 帧：{coarse:.1} → {sharp:.1} dB"
+        );
+        // 已有的编码器上要求粗编下一帧（码控照常之后恢复）：这一帧小得多，不出关键帧
+        let noise = |salt: u32| {
+            let px = (0..u32::from(size.0) * u32::from(size.1))
+                .map(|i| (i.wrapping_mul(2_654_435_761) ^ salt) & 0x00ff_ffff)
+                .collect();
+            Screen::from_pixels(size.0, size.1, px).unwrap()
+        };
+        let normal = enc.encode(500, &noise(1), true, 50_000).unwrap().unwrap();
+        enc.coarse_next(51);
+        let small = enc.encode(501, &noise(2), true, 50_000).unwrap().unwrap();
+        assert!(!small.key && small.payload.len() < normal.payload.len());
+    }
+
+    #[test]
     fn encodes_decodes_refines_and_goes_quiet() {
         let mut enc = H264Encoder::new(30).with_hardware(fake_none);
         let mut dec = H264Decoder::new().unwrap();
@@ -2376,18 +2530,12 @@ mod tests {
     fn budget_changes_reach_the_encoder() {
         let mut enc = H264Encoder::with_max_bps(30, 1_000_000).with_hardware(fake_none);
         let _ = enc.encode(1, &picture(64, 64), true, 1000).unwrap();
-        assert_eq!(enc.bps, 240_000, "按当前预算打开");
-        let (w, h, mut inner) = enc.inner.take().unwrap();
-        enc.set_budget(&mut inner, 1050); // 变化不到一成：不动
-        assert_eq!(enc.bps, 240_000);
-        enc.set_budget(&mut inner, 3000); // 往上调也要生效
-        assert_eq!(enc.bps, 720_000);
-        enc.set_budget(&mut inner, usize::MAX); // 不超过上限
-        assert_eq!(enc.bps, 1_000_000);
-        enc.set_budget(&mut inner, 0);
+        assert_eq!(enc.bps, 240_000, "预算换算成码率");
+        let _ = enc.encode(2, &picture(64, 64), true, usize::MAX).unwrap();
+        assert_eq!(enc.bps, 1_000_000, "不超过上限");
+        let _ = enc.encode(3, &picture(64, 64), true, 0).unwrap();
         assert_eq!(enc.bps, MIN_BPS);
-        enc.inner = Some((w, h, inner));
-        // 简单画面静止后补清晰的帧很小：提前停
+        // 简单画面静止后补清晰：补到最小 QP 就停
         let plain = Screen::new(64, 64, 0x0012_3456);
         let _ = enc.encode(2, &plain, true, 10_000).unwrap();
         let mut n = 0;
@@ -2396,7 +2544,8 @@ mod tests {
                 n += 1;
             }
         }
-        assert!(n < u32::from(REFINE_FRAMES), "补了 {n} 帧");
+        assert!(n < 30, "补了 {n} 帧");
+        assert!(!enc.wants_refine());
     }
 
     /// 720p 连续编码几帧：不能卡住，也不能 panic。在单独的线程里跑，10 秒没结束就判失败，
