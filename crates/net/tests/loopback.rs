@@ -26,6 +26,8 @@ impl log::Log for StderrLog {
     fn enabled(&self, _: &log::Metadata<'_>) -> bool {
         true
     }
+    // 测试失败时要看会话日志：只有这里往 stderr 写
+    #[allow(clippy::print_stderr)]
     fn log(&self, record: &log::Record<'_>) {
         eprintln!("{} {}", record.level(), record.args());
     }
