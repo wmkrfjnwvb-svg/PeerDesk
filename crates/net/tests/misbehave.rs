@@ -239,7 +239,8 @@ async fn controller_survives_a_hostile_host() {
     assert_eq!(report.frames_delivered, 0);
     assert_eq!(report.bad_frames, 1);
     assert!(report.screen.is_none());
-    assert_eq!(report.frames_expired, 1);
+    // 半帧（帧 5）超时作废；它参考的帧 4 一个分片都没来，请求整帧重传等不到，也算作废一次
+    assert_eq!(report.frames_expired, 2);
     assert!(report.trace.contains("frame_expired"));
     assert_eq!(report.input_sent, 1);
     assert_eq!(report.input_unacked, 1, "对端从不确认");

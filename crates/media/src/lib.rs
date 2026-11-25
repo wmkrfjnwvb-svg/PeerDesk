@@ -706,7 +706,10 @@ impl H264Encoder {
     }
 
     /// 画面和上一次编的相比变了多少（千分比），按抽样估计；尺寸变了算全变。顺便记下这一次的抽样。
-    fn changed_permille(&mut self, screen: &Screen) -> u64 {
+    /// 画面变了多少（千分比）：`(按点数, 按细节加权)`。按细节加权的用来估计这一帧多大；
+    /// 按点数的用来判断是不是整屏变化（滚动文字时细节集中在文字上，按细节加权常常过半，但有运动补偿，
+    /// 不该当成整屏变化重编成关键帧：8 Mbps、12% 丢包时关键帧更难送到，实测卡顿变多）。
+    fn changed_permille(&mut self, screen: &Screen) -> (u64, u64) {
         let width = usize::from(screen.width());
         let size = (screen.width(), screen.height());
         let pixels = screen.pixels();
@@ -729,16 +732,21 @@ impl H264Encoder {
         // 比实际小 5 倍以上，2026-11 微软轨迹里切换窗口的帧在 1 Mbps 上编出 89–125 KB）
         let changed = if size == self.sampled && now.len() == self.samples.len() {
             let total: u64 = detail.iter().map(|d| u64::from(*d)).sum();
-            let differ: u64 = now
+            let (count, weight) = now
                 .iter()
                 .zip(&self.samples)
                 .zip(&detail)
                 .filter(|((a, b), _)| a != b)
-                .map(|(_, d)| u64::from(*d))
-                .sum();
-            differ.saturating_mul(1000) / total.max(1)
+                .fold((0u64, 0u64), |(c, w), (_, d)| {
+                    (c.saturating_add(1), w.saturating_add(u64::from(*d)))
+                });
+            let points = u64::try_from(now.len()).unwrap_or(u64::MAX).max(1);
+            (
+                count.saturating_mul(1000) / points,
+                weight.saturating_mul(1000) / total.max(1),
+            )
         } else {
-            1000
+            (1000, 1000)
         };
         self.samples = now;
         self.sampled = size;
@@ -1155,10 +1163,15 @@ impl H264Encoder {
         } else {
             self.bps.saturating_mul(self.big_frame_us) / 8_000_000
         };
-        let qp = self
-            .coarse_qp
-            .take()
-            .unwrap_or_else(|| self.qp.next(kind, target, key_allowed, pixels, area));
+        let qp = self.coarse_qp.take().unwrap_or_else(|| {
+            self.qp.next(
+                kind,
+                target,
+                key_allowed,
+                pixels,
+                area.map(|(_, weighted)| weighted),
+            )
+        });
         // 补清晰补不动了（降一步的量链路一次装不下，见 qp::REFINE_STEP_KEY_TIMES）：这个码率下就算补完，
         // 不再编（否则画面不动也一直按同一个 QP 编空帧）。画面再变时重新开始补。
         if kind == qp::Kind::Refine && !fresh && self.qp.qp().is_some_and(|now| qp >= now) {
@@ -1204,7 +1217,7 @@ impl H264Encoder {
         // 推一个装得进的 QP 重编（照 libvpx 屏幕内容实时模式的 vp9_encodedframe_overshoot）。openh264 编完
         // 参考帧就更新了，不能原样重编，只能重编成关键帧——整屏都换了，关键帧和增量帧差不多大。openh264 自己
         // 检测到场景切换出的关键帧（用的还是我们给的 QP）也一样处理。
-        let whole = area.is_none_or(|a| a >= qp::LARGE_CHANGE_PERMILLE);
+        let whole = area.is_none_or(|(count, _)| count >= qp::LARGE_CHANGE_PERMILLE);
         let bytes = u64::try_from(data.len()).unwrap_or(u64::MAX);
         if let Some(q) = (kind == qp::Kind::Change && whole && self.big_frame_us != 0)
             .then(|| self.qp.overshoot_qp(bytes, qp, key_allowed))

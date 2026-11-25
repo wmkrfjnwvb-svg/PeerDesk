@@ -326,6 +326,10 @@ impl Partial {
     }
 }
 
+/// 重传请求里的分片序号取这个值：请求整帧重传（接收端一个分片都没收到，只从后面的帧知道它存在）。
+/// 老版本的发送端没有这个分片，直接忽略。
+pub const WHOLE_FRAME: u16 = u16::MAX;
+
 /// 一帧从第一个分片算起最多等这么多个截止时间（关键帧除外，见 [`Reassembler::expire`]）。
 const MAX_FRAME_LIFETIME_FACTOR: u64 = 8;
 
@@ -352,6 +356,11 @@ pub struct Reassembler {
     held: BTreeMap<u32, Frame>,
     /// 跟着参考帧一起可以交出的帧（按顺序），用 [`Reassembler::take_ready`] 取。
     ready: VecDeque<Frame>,
+    /// 一个分片都没收到、只从后面的帧（它们的参考帧号）知道存在的帧：请求整帧重传（[`WHOLE_FRAME`]），
+    /// 参考它的帧先放着等。值是发现的时刻，没进展超过截止时间就作废。WebRTC 按包序号请求重传，整帧丢光也能补；
+    /// 我们按帧号和分片序号请求，整帧丢了以前只能等下一帧发现接不上、再出关键帧（2026-11 微软轨迹 8 Mbps、
+    /// 12–40% 丢包时每次一两个小帧整个丢掉，各出一个关键帧）。
+    wanted: BTreeMap<u32, Time>,
 }
 
 impl Reassembler {
@@ -369,6 +378,7 @@ impl Reassembler {
             fec: Fec::Xor,
             held: BTreeMap::new(),
             ready: VecDeque::new(),
+            wanted: BTreeMap::new(),
         }
     }
 
@@ -408,7 +418,13 @@ impl Reassembler {
     /// 接收端据此请求重传。
     #[must_use]
     pub fn missing(&self, now: Time, min_age_us: u64, limit: usize) -> Vec<(u32, u16)> {
-        self.pending
+        let whole = self
+            .wanted
+            .iter()
+            .filter(|(_, at)| now.since(**at) >= min_age_us)
+            .map(|(frame_id, _)| (*frame_id, WHOLE_FRAME));
+        let parts = self
+            .pending
             .iter()
             .filter(|(_, p)| now.since(p.first_seen) >= min_age_us)
             .flat_map(|(frame_id, p)| {
@@ -417,9 +433,8 @@ impl Reassembler {
                     .zip(0u16..)
                     .filter(|(part, _)| part.is_none())
                     .map(|(_, index)| (*frame_id, index))
-            })
-            .take(limit)
-            .collect()
+            });
+        whole.chain(parts).take(limit).collect()
     }
 
     /// 放入一个分片。收齐一帧时返回它。
@@ -500,6 +515,22 @@ impl Reassembler {
             }
         }
 
+        // 第一次见到这一帧：它要是参考一个从没见过、又还没交出的帧，那一帧整个丢了，请求整帧重传
+        if !self.pending.contains_key(&header.frame_id) {
+            self.wanted.remove(&header.frame_id);
+            let r = header.ref_frame;
+            // 帧号从 1 开始，0 表示“没有帧”
+            let unknown = self.keyframe_grace
+                && r != 0
+                && r != header.frame_id
+                && r < header.frame_id
+                && self.floor.is_none_or(|f| r > f)
+                && !self.pending.contains_key(&r)
+                && !self.held.contains_key(&r);
+            if unknown {
+                self.wanted.entry(r).or_insert(now);
+            }
+        }
         let partial = self
             .pending
             .entry(header.frame_id)
@@ -600,10 +631,14 @@ impl Reassembler {
 
     /// 这一帧要不要等参考帧（H.264 模式下，参考的帧还在补或也在等）。
     fn waits(&self, frame: &Frame) -> bool {
-        self.keyframe_grace
-            && frame.ref_frame != frame.frame_id
-            && (self.pending.contains_key(&frame.ref_frame)
-                || self.held.contains_key(&frame.ref_frame))
+        self.keyframe_grace && frame.ref_frame != frame.frame_id && self.awaited(frame.ref_frame)
+    }
+
+    /// 这一帧还可能交出：还在补、收齐了在等，或者整个丢了、在请求整帧重传。
+    fn awaited(&self, frame_id: u32) -> bool {
+        self.pending.contains_key(&frame_id)
+            || self.held.contains_key(&frame_id)
+            || self.wanted.contains_key(&frame_id)
     }
 
     /// 交出 `frame_id`：比它旧的未完成帧和等着的帧都作废（新帧优先，它不需要它们）。
@@ -619,6 +654,7 @@ impl Reassembler {
             return;
         };
         let after = floor.saturating_add(1);
+        self.wanted = self.wanted.split_off(&after);
         let keep = self.pending.split_off(&after);
         let held = self.held.split_off(&after);
         let dropped = self.pending.len().saturating_add(self.held.len());
@@ -636,10 +672,7 @@ impl Reassembler {
             let orphans: Vec<u32> = self
                 .held
                 .iter()
-                .filter(|(_, f)| {
-                    !self.pending.contains_key(&f.ref_frame)
-                        && !self.held.contains_key(&f.ref_frame)
-                })
+                .filter(|(_, f)| !self.awaited(f.ref_frame))
                 .map(|(id, _)| *id)
                 .collect();
             let Some(last) = orphans.last().copied() else {
@@ -679,6 +712,18 @@ impl Reassembler {
             .collect();
         for id in &late {
             self.pending.remove(id);
+            self.stats.expired = self.stats.expired.saturating_add(1);
+            self.raise_floor(*id);
+        }
+        // 请求了整帧重传、截止时间内一个分片都没等到：作废（等它的帧跟着作废，发送端据此补关键帧）
+        let gone: Vec<u32> = self
+            .wanted
+            .iter()
+            .filter(|(_, at)| now.since(**at) >= deadline)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in &gone {
+            self.wanted.remove(id);
             self.stats.expired = self.stats.expired.saturating_add(1);
             self.raise_floor(*id);
         }
@@ -794,7 +839,11 @@ mod tests {
         assert_eq!(r.stats().delivered, 3);
 
         // 参考帧补不回来（超时作废）：等它的帧跟着作废，发送端据此补关键帧
-        r.push(Time(10), packets(5, 200, 100)[0].clone()).unwrap();
+        r.push(
+            Time(10),
+            fragment(5, 3, &[1u8; 200], 100).unwrap()[0].clone(),
+        )
+        .unwrap();
         assert_eq!(
             r.push(Time(11), packets(6, 50, 100)[0].clone()).unwrap(),
             None
@@ -809,7 +858,11 @@ mod tests {
         assert_eq!(r.take_ready(), None);
 
         // 关键帧收齐：不需要更旧的帧，在补的和等着的都作废
-        r.push(Time(20), packets(10, 200, 100)[0].clone()).unwrap();
+        r.push(
+            Time(20),
+            fragment(10, 7, &[1u8; 200], 100).unwrap()[0].clone(),
+        )
+        .unwrap();
         assert_eq!(
             r.push(Time(21), packets(11, 50, 100)[0].clone()).unwrap(),
             None
@@ -828,7 +881,11 @@ mod tests {
         // 缓冲区满：等着的帧也算；作废最旧的未完成帧时，等它的帧跟着作废
         let mut r = Reassembler::new(1_000_000, 2);
         r.set_keyframe_grace(true);
-        r.push(Time(0), packets(20, 200, 100)[0].clone()).unwrap();
+        r.push(
+            Time(0),
+            fragment(20, 0, &[1u8; 200], 100).unwrap()[0].clone(),
+        )
+        .unwrap();
         assert_eq!(
             r.push(Time(1), packets(21, 50, 100)[0].clone()).unwrap(),
             None
@@ -846,6 +903,53 @@ mod tests {
             .is_some());
         assert_eq!(r.stats().held, 0);
         assert_eq!(r.stats().expired, 1);
+    }
+
+    #[test]
+    fn a_frame_lost_entirely_is_requested_whole_and_its_successors_wait_for_it() {
+        let mut r = Reassembler::new(50_000, 8);
+        r.set_keyframe_grace(true);
+        r.push(Time(0), packets(1, 50, 100)[0].clone()).unwrap();
+        // 帧 2 一个分片都没到；帧 3（参考帧 2）收齐了：先放着，请求帧 2 整帧重传
+        assert_eq!(
+            r.push(Time(10), packets(3, 50, 100)[0].clone()).unwrap(),
+            None
+        );
+        assert_eq!(r.missing(Time(10), 0, 8), vec![(2, WHOLE_FRAME)]);
+        assert!(r.missing(Time(10), 5, 8).is_empty(), "刚发现：可能只是乱序");
+        // 帧 2 重传到了：2、3 按顺序交出
+        assert_eq!(
+            r.push(Time(60), packets(2, 50, 100)[0].clone())
+                .unwrap()
+                .map(|f| f.frame_id),
+            Some(2)
+        );
+        assert_eq!(r.take_ready().map(|f| f.frame_id), Some(3));
+        assert!(r.missing(Time(60), 0, 8).is_empty());
+        // 整帧重传等不来（截止时间内一个分片都没到）：作废，等它的帧跟着作废
+        r.push(Time(100), packets(5, 50, 100)[0].clone()).unwrap();
+        assert_eq!(r.missing(Time(100), 0, 8), vec![(4, WHOLE_FRAME)]);
+        let _ = r.expire(Time(50_099));
+        assert_eq!(r.floor(), Some(3));
+        let _ = r.expire(Time(50_100));
+        assert_eq!(r.floor(), Some(5));
+        assert!(r.missing(Time(50_100), 0, 8).is_empty());
+        // 帧 7 参考没见过的帧 6：请求；接着来了参考已交出的帧 5 的帧 8（编码器换了参考）：它交出后，
+        // 帧 6、7 都用不着了，不再请求
+        r.push(Time(50_200), packets(7, 50, 100)[0].clone())
+            .unwrap();
+        assert_eq!(r.missing(Time(50_200), 0, 8), vec![(6, WHOLE_FRAME)]);
+        let eight = fragment(8, 5, &[1u8; 50], 100).unwrap();
+        assert!(r.push(Time(50_201), eight[0].clone()).unwrap().is_some());
+        assert!(r.missing(Time(50_300), 0, 8).is_empty());
+        // 不打开（块编码）：不请求整帧
+        let mut r = Reassembler::new(50_000, 8);
+        r.push(Time(0), packets(1, 50, 100)[0].clone()).unwrap();
+        r.push(Time(1), packets(3, 200, 100)[0].clone()).unwrap();
+        assert!(r
+            .missing(Time(1), 0, 8)
+            .iter()
+            .all(|(_, frag)| *frag != WHOLE_FRAME));
     }
 
     #[test]

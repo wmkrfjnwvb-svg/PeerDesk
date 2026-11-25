@@ -24,6 +24,7 @@ use crate::screen::Screen;
 use crate::time::Time;
 use crate::transport::{
     fragment, parity_for, rs_parity_for, Fec, Reassembler, VideoPacket, RS_PARITY_PREFIX,
+    WHOLE_FRAME,
 };
 use crate::video::{Codec, EncodedFrame, FrameHeader, VideoDecoder, VideoEncoder};
 use crate::wire::{Reader, Writer};
@@ -923,6 +924,23 @@ impl MediaSender {
             self.rate.on_report(now, &results, self.rtt_us);
         }
         self.observe(now, &feedback, ext);
+        // 整帧重传（接收端一个分片都没收到这一帧）：展开成这一帧的全部数据分片，按同样的规则补发
+        let nacks: Vec<(u32, u16)> = nacks
+            .iter()
+            .flat_map(|&(frame, frag)| {
+                let count = if frag == WHOLE_FRAME {
+                    self.recent
+                        .iter()
+                        .find(|k| k.frame == frame)
+                        .map_or(0, |k| k.packets.len())
+                } else {
+                    0
+                };
+                let all = (0..count).map(move |i| (frame, u16::try_from(i).unwrap_or(u16::MAX)));
+                let one = (frag != WHOLE_FRAME).then_some((frame, frag));
+                one.into_iter().chain(all)
+            })
+            .collect();
         // 接收端还在为这些帧要重传：它们在路上、在进展，不能按超时判丢（判丢就要重发关键帧）。
         for (id, at, _) in &mut self.unacked {
             if nacks.iter().any(|(frame, _)| frame == id) {
@@ -2014,6 +2032,40 @@ mod tests {
         let mut short = with_ext;
         short.extend([2, 0, 0, 0, 1, 0, 1]);
         assert!(decode_feedback(&short).is_err(), "说有 2 个，只有 1 个");
+    }
+
+    #[test]
+    fn a_whole_frame_request_resends_all_its_data_fragments() {
+        let mut tx = MediaSender::new(cfg(), Box::new(FakeEncoder::default()));
+        tx.set_profile(Profile {
+            fec_permille: 0,
+            ..Profile::STABLE
+        });
+        let out = tx
+            .on_frame(Time::ZERO, &Screen::new(16, 16, 3), true, 40_000)
+            .unwrap();
+        assert!(out.len() > 3);
+        for (seq, o) in (0u32..).zip(&out) {
+            tx.on_packet_sent(Time::ZERO, seq, o);
+        }
+        let fb = Feedback {
+            floor: 0,
+            delivered: 0,
+            queue_delay_us: 0,
+            loss_permille: 0,
+            recv_bytes_per_s: 0,
+        };
+        // 接收端一个分片都没收到这一帧，只从后面的帧知道它存在：整帧重传，每个数据分片一份
+        let whole = encode_feedback(&fb, &Extension::default(), &[(1, WHOLE_FRAME)]);
+        let again = tx.on_feedback_datagram(Time(60_000), &whole).unwrap();
+        assert_eq!(again.len(), out.len());
+        assert!(again.iter().all(|o| o.kind == PacketKind::Retransmit));
+        // 不认识的帧：什么也不发
+        let unknown = encode_feedback(&fb, &Extension::default(), &[(9, WHOLE_FRAME)]);
+        assert!(tx
+            .on_feedback_datagram(Time(60_000), &unknown)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
