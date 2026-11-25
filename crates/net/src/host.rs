@@ -275,6 +275,16 @@ pub async fn serve(
     let trace = TraceId(opts.session.device_id);
     let mut tracer = Tracer::new(4096);
     let mut config = opts.session.clone();
+    // 实验开关：PEERDESK_ESTIMATOR=legacy、v1 或 gcc 选估计器，默认用产品默认的那个。
+    let wanted = std::env::var("PEERDESK_ESTIMATOR")
+        .ok()
+        .and_then(|name| EstimatorKind::parse(&name))
+        .unwrap_or(EstimatorKind::PRODUCT);
+    // 到达报告（TRANSPORT_CC）只在本端的估计器要用时才声明：协商出来就是双方都用 v2 反馈格式，
+    // 没协商出来双方都用原来的格式。不能“声明了却不用”：控制端会发 v2 反馈，这里按老格式解不了。
+    if wanted != EstimatorKind::GccV1 {
+        config.caps = Caps(config.caps.0 & !Caps::TRANSPORT_CC.0);
+    }
     config.binding = link.channel_binding()?;
     if opts.trusted.contains(link.peer_fingerprint()) {
         config.auth = Auth::Open;
@@ -379,12 +389,7 @@ pub async fn serve(
     let router_task =
         send_stats.then(|| tokio::spawn(crate::gateway::watch_router(Arc::clone(&router_ms))));
     let mut screen_size = (0u16, 0u16);
-    // 实验开关：PEERDESK_ESTIMATOR=legacy、v1 或 gcc 选估计器，默认用产品默认的那个。
     // 要到达报告的估计器（gcc）对端也得支持，老版本对端退回 v1。
-    let wanted = std::env::var("PEERDESK_ESTIMATOR")
-        .ok()
-        .and_then(|name| EstimatorKind::parse(&name))
-        .unwrap_or(EstimatorKind::PRODUCT);
     let estimator = if wanted == EstimatorKind::GccV1 && !caps.has(Caps::TRANSPORT_CC) {
         crate::note!(info, "对方版本不支持到达报告，码率估计改用 classic-v1");
         EstimatorKind::ClassicV1
@@ -570,7 +575,7 @@ pub async fn serve(
                     Some(done) => done,
                     None => break "编码线程结束".to_owned(),
                 };
-                media.set_encode_time(took);
+                media.set_encode_time(took, timing.hardware);
                 last_encode_us = took;
                 window = (window.0.saturating_add(took), window.1.saturating_add(convert), window.2 + 1);
                 encode_window.add(took, &timing, result.as_ref().ok().and_then(|(e, _)| e.as_ref()).map(|e| e.payload.len()));

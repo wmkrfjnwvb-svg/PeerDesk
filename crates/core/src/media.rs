@@ -265,6 +265,8 @@ pub struct FrameJob {
     pub scale_permille: u16,
     /// 控制端显示画面的区域（像素），编码尺寸不超过它；`None` 表示不限。
     pub view: Option<(u16, u16)>,
+    /// 码率估计过期了（见 [`VideoEncoder::set_rate_stale`]）。
+    pub rate_stale: bool,
 }
 
 /// 在编码器所在的地方执行一个任务。返回编码结果，以及之后画面不变时还要不要继续交画面（补清晰、恢复）。
@@ -289,10 +291,17 @@ fn prepare(encoder: &mut dyn VideoEncoder, job: &FrameJob) {
     }
     encoder.set_scale(job.scale_permille);
     encoder.set_view(job.view);
+    encoder.set_rate_stale(job.rate_stale);
 }
 
 /// 帧率已经在最低档、帧还一直装不进预算这么久（微秒）就降分辨率（最后手段）。
 const OVERFLOW_DOWN_US: u64 = 2_000_000;
+
+/// 码率估计多久没被证实就算过期（微秒）：之后的大帧不按大帧时限放宽（见 [`VideoEncoder::set_rate_stale`]）。
+/// 证实 = 接收端测到包串速率，或者送达速率到了估计的一半（链路真的在承载这个速率）。
+/// 2 秒而不是 1 秒：操作之间停 1 秒很常见，链路 1 秒里变差的机会很小，而每次停顿后第一帧都要先粗后清；
+/// 1 秒时办公负载的每次停顿都触发（微软轨迹 ms-05729 上改变了之后的丢包时序）。
+const RATE_STALE_AFTER_US: u64 = 2_000_000;
 
 /// 画面发送端。
 ///
@@ -323,6 +332,8 @@ pub struct MediaSender {
     resent: BTreeMap<(u32, u16), Option<Time>>,
     rtt_us: u64,
     last_obs: Option<Observation>,
+    /// 最近一次测量证实码率估计的时刻（见 [`RATE_STALE_AFTER_US`]）。
+    rate_seen: Option<Time>,
     /// 连续有丢包的反馈次数（决定要不要换成“无线”画像）。
     lossy_feedbacks: u32,
     /// 纠错方式（握手协商）。
@@ -330,6 +341,7 @@ pub struct MediaSender {
     governor: FpsGovernor,
     /// 下一次 [`Self::finish_frame`] 用的编码时间（微秒），由编码线程报告。
     encode_us: u64,
+    encode_hw: bool,
     /// 编码分辨率（只对 H.264；见 [`crate::scale`]）。
     scale: ScalePolicy,
     /// 编码尺寸要变（画面停下后升回原尺寸、控制端窗口变了）：画面不动也要编一帧。
@@ -387,10 +399,12 @@ impl MediaSender {
             resent: BTreeMap::new(),
             rtt_us: 0,
             last_obs: None,
+            rate_seen: None,
             lossy_feedbacks: 0,
             fec: Fec::Xor,
             governor: FpsGovernor::new(cfg.fps),
             encode_us: 0,
+            encode_hw: false,
             scale_up: false,
             key_sent: None,
             view: None,
@@ -502,7 +516,7 @@ impl MediaSender {
 
     /// 当前帧率（CPU 跟不上或内容装不进预算时会低于设定值）。
     #[must_use]
-    pub const fn fps(&self) -> u32 {
+    pub fn fps(&self) -> u32 {
         self.governor.fps()
     }
 
@@ -512,9 +526,11 @@ impl MediaSender {
         self.governor.due(now)
     }
 
-    /// 编码线程报告这一帧编了多久（微秒），在 [`Self::finish_frame`] 之前调用。
-    pub const fn set_encode_time(&mut self, us: u64) {
+    /// 编码线程报告这一帧编了多久（微秒）、是不是硬件编码（流水线的，CPU 过载门限放宽），
+    /// 在 [`Self::finish_frame`] 之前调用。
+    pub const fn set_encode_time(&mut self, us: u64, hardware: bool) {
         self.encode_us = us;
+        self.encode_hw = hardware;
     }
 
     /// 在途数据有没有超过上限。超过时不要编下一帧：画面的变化先攒着，等在途数据被确认之后
@@ -697,7 +713,15 @@ impl MediaSender {
             feedback,
             scale_permille,
             view: self.view,
+            rate_stale: self.rate_stale(now),
         }
+    }
+
+    /// 码率估计过期了：证实过、但已经超过 [`RATE_STALE_AFTER_US`] 没再证实。会话开头还没证实过的不算
+    /// （起步码率怎么定是启动探测的事）。
+    fn rate_stale(&self, now: Time) -> bool {
+        self.rate_seen
+            .is_some_and(|t| now.since(t) > RATE_STALE_AFTER_US)
     }
 
     /// 迟迟等不到反馈的帧按丢失处理。会话循环每一轮都要调用（不能只在编下一帧时检查）：
@@ -743,8 +767,13 @@ impl MediaSender {
         let Some(encoded) = encoded else {
             return Ok(Vec::new());
         };
-        self.governor
-            .on_frame(now, encode_us, encoded.payload.len(), job.budget);
+        self.governor.on_frame(
+            now,
+            encode_us,
+            self.encode_hw,
+            encoded.payload.len(),
+            job.budget,
+        );
         if let Some(change) = self.governor.take_change() {
             self.event(change);
         }
@@ -993,6 +1022,10 @@ impl MediaSender {
             in_flight: self.in_flight(),
         };
         self.rate.on_observation(now, &obs);
+        let delivered_bps = u64::from(feedback.recv_bytes_per_s).saturating_mul(8);
+        if ext.train_bytes_per_s > 0 || delivered_bps.saturating_mul(2) >= self.rate.rate_bps() {
+            self.rate_seen = Some(now);
+        }
         self.last_obs = Some(obs);
         self.acknowledge(now, feedback);
         self.adapt_profile(feedback.loss_permille);
@@ -2106,6 +2139,36 @@ mod tests {
                 .pixels()[0],
             6
         );
+    }
+
+    #[test]
+    fn the_rate_goes_stale_after_a_quiet_spell() {
+        let mut tx = MediaSender::detached(cfg(), Codec::H264);
+        // 还没被证实过（会话开头）：不算过期
+        assert!(!tx.start_frame(Time(0), 0).rate_stale);
+        assert!(!tx.start_frame(Time(5_000_000), 0).rate_stale);
+        // 送达速率只有估计的一成：不算证实
+        let rate = u32::try_from(tx.rate_bps() / 8).unwrap();
+        let fb = |recv| Feedback {
+            recv_bytes_per_s: recv,
+            ..Feedback::default()
+        };
+        tx.on_feedback(Time(5_100_000), &fb(rate / 10));
+        assert!(!tx.start_frame(Time(9_000_000), 0).rate_stale);
+        // 送达速率到了估计的一半：证实；之后 2 秒内还新鲜，超过就过期
+        tx.on_feedback(Time(9_100_000), &fb(rate));
+        assert!(!tx.start_frame(Time(11_000_000), 0).rate_stale);
+        assert!(tx.start_frame(Time(11_200_000), 0).rate_stale);
+        // 包串测到速率也算证实
+        tx.observe(
+            Time(11_300_000),
+            &fb(0),
+            Extension {
+                train_bytes_per_s: 100_000,
+                ..Extension::default()
+            },
+        );
+        assert!(!tx.start_frame(Time(11_400_000), 0).rate_stale);
     }
 
     #[test]

@@ -37,8 +37,10 @@ const KEY_MIN_QP: u8 = 22;
 /// 整幅画面都变了的增量帧大约是同 QP 关键帧的多少（千分比）：实测整屏切换的增量帧是关键帧的
 /// 0.68–0.86（QP 34–51），取 0.8。
 const CHANGE_OF_KEY_PERMILLE: u64 = 800;
-/// 画面变了这么多（千分比）以上算大面积变化：和关键帧一样，QP 不低于 [`KEY_MIN_QP`]。
-const LARGE_CHANGE_PERMILLE: u64 = 500;
+/// 画面变了这么多（千分比）以上算整屏变化（编出来远超时限时重编成关键帧，见 [`QpControl::overshoot_qp`]）。
+pub const LARGE_CHANGE_PERMILLE: u64 = 500;
+/// 整屏变化编出来超过大帧时限这么多倍就重编（见 [`QpControl::overshoot_qp`]）。
+const OVERSHOOT_TIMES: u64 = 2;
 /// 补清晰时一帧的补充量最多是预算的几倍：1 倍，补清晰正好用满链路；再多会占满在途上限，画面一动新帧就得排在补清晰的帧后面。
 const REFINE_BUDGET_FACTOR: u64 = 1;
 
@@ -107,12 +109,6 @@ impl QpControl {
         self.qp
     }
 
-    /// 上一帧是不是“画面在变”的增量帧（是的话这一帧按上一帧的大小修正，不用估计变化面积）。
-    #[must_use]
-    pub fn changing(&self) -> bool {
-        matches!(self.last, Some((_, _, Kind::Change)))
-    }
-
     /// 补清晰补完了没有（QP 到了最小值）。
     #[must_use]
     pub fn converged(&self) -> bool {
@@ -174,6 +170,13 @@ impl QpControl {
             Kind::Key => self.fit(KEY_MIN_QP, key_allowed, |q| self.key_bytes(pixels, q)),
             Kind::Change => {
                 let now = self.qp.unwrap_or(BASE_QP);
+                // 变化的这块区域整个换成新内容（不能靠运动补偿）时，QP 为 q 估计多大
+                let renewed = |area: u64, q: u8| {
+                    self.key_bytes(pixels, q)
+                        .saturating_mul(area.min(1000))
+                        .saturating_mul(CHANGE_OF_KEY_PERMILLE)
+                        / 1_000_000
+                };
                 let q = match self.last {
                     // 上一帧也是在变的增量帧：按它的实际大小和目标比修正
                     Some((bytes, q, Kind::Change)) => {
@@ -190,11 +193,21 @@ impl QpControl {
                             delta -= 1;
                         }
                         let q = i32::from(q) + delta;
-                        u8::try_from(q.clamp(i32::from(MIN_QP), i32::from(self.max_qp)))
-                            .unwrap_or(self.max_qp)
+                        let q = u8::try_from(q.clamp(i32::from(MIN_QP), i32::from(self.max_qp)))
+                            .unwrap_or(self.max_qp);
+                        // 降到 KEY_MIN_QP 以下时：这块区域突然整个换掉（拖动窗口之后马上切换窗口）也要装得进
+                        // 大帧时限，最多提到 KEY_MIN_QP。不按面积估计一直在变的帧：滚动、视频靠运动补偿，
+                        // 比按面积估计的小得多（实测窄带上逐帧按面积估计，视频和拖动之后的画面明显更糊）
+                        match changed_permille {
+                            Some(area) if q < KEY_MIN_QP => q.max(
+                                self.fit(MIN_QP, key_allowed, |x| renewed(area, x))
+                                    .min(KEY_MIN_QP),
+                            ),
+                            Some(_) | None => q,
+                        }
                     }
-                    // 静止后第一帧变化：按变化面积估计大小，装进大帧时限（大面积变化和关键帧一样，QP 不低于
-                    // 关键帧的下限）；不知道面积时用上一次在变时的 QP
+                    // 静止后第一帧变化：按变化面积估计大小，装进大帧时限（大面积和关键帧一样不低于 KEY_MIN_QP：
+                    // 高熵画面按 QP 12 整屏编会超出 openh264 的码流缓冲）；不知道面积时用上一次在变时的 QP
                     Some(_) | None => match changed_permille {
                         Some(area) => self.fit(
                             if area >= LARGE_CHANGE_PERMILLE {
@@ -203,12 +216,7 @@ impl QpControl {
                                 MIN_QP
                             },
                             key_allowed,
-                            |q| {
-                                self.key_bytes(pixels, q)
-                                    .saturating_mul(area.min(1000))
-                                    .saturating_mul(CHANGE_OF_KEY_PERMILLE)
-                                    / 1_000_000
-                            },
+                            |x| renewed(area, x),
                         ),
                         None => self.change_qp.unwrap_or(now).max(now),
                     },
@@ -223,6 +231,21 @@ impl QpControl {
             ),
         };
         qp.clamp(MIN_QP, self.max_qp)
+    }
+
+    /// 一帧整屏变化编出来 `bytes` 字节（用的 QP 是 `qp`），超过大帧时限 `allowed` 的 [`OVERSHOOT_TIMES`] 倍时，
+    /// 按它的实际大小推算装得进时限的 QP（不低于关键帧的下限）；不用重编（没超，或者 QP 已经到顶）时为 `None`。
+    /// 照 libvpx 屏幕内容实时模式（`vp9_encodedframe_overshoot`）：场景切换超出太多，用更高的 QP 重编这一帧。
+    #[must_use]
+    pub fn overshoot_qp(&self, bytes: u64, qp: u8, allowed: u64) -> Option<u8> {
+        if bytes <= allowed.saturating_mul(OVERSHOOT_TIMES) || qp >= self.max_qp {
+            return None;
+        }
+        Some(
+            self.fit(KEY_MIN_QP.max(qp.saturating_add(1)), allowed, |q| {
+                rescale(bytes, qp, q)
+            }),
+        )
     }
 
     /// 编完一帧：`bytes` 字节、用的 QP `qp`、`pixels` 个像素。
@@ -325,5 +348,49 @@ mod tests {
         c.on_frame(Kind::Refine, 10, 20, P720);
         assert_eq!(c.next(Kind::Change, 1_000, 10_000, P720, None), 33);
         assert_eq!(QpControl::default().qp(), None);
+    }
+
+    #[test]
+    fn low_qp_while_changing_only_if_the_changing_region_could_be_renewed_in_time() {
+        // 拖动窗口：变化 20%，帧很小，按上一帧推算要降到 12
+        let drag = |allowed, area| {
+            let mut c = QpControl::new(MAX_QP);
+            c.on_frame(Kind::Change, 500, 14, P720);
+            c.next(Kind::Change, 15_000, allowed, P720, area)
+        };
+        let drag = |allowed| drag(allowed, Some(200));
+        // 窄一些的链路（时限 46 KB）：这块区域突然整个换掉按 QP 12 要 120 KB 以上，提到 KEY_MIN_QP
+        assert_eq!(drag(46_000), KEY_MIN_QP);
+        // 宽的链路（时限 1 MB）：装得下，和不看面积一样往下降
+        let mut c = QpControl::new(MAX_QP);
+        c.on_frame(Kind::Change, 500, 14, P720);
+        let free = c.next(Kind::Change, 15_000, 1_000_000, P720, None);
+        assert!(free < 14);
+        assert_eq!(drag(1_000_000), free);
+        // 中间：提到刚好装得下的 QP
+        let mid = drag(200_000);
+        assert!(mid > MIN_QP && mid < KEY_MIN_QP, "{mid}");
+        // QP 本来就不低于 KEY_MIN_QP（窄带）：不管面积，按上一帧推算
+        let mut c = QpControl::new(MAX_QP);
+        c.on_frame(Kind::Change, 15_000, 26, P720);
+        assert_eq!(c.next(Kind::Change, 20_000, 1_000, P720, Some(1000)), 25);
+    }
+
+    #[test]
+    fn a_scene_change_far_over_the_limit_is_re_encoded_at_a_qp_from_its_real_size() {
+        let c = QpControl::new(MAX_QP);
+        // 拖动之后切换整个窗口：按 QP 12 编出 200 KB，时限 75 KB 的 2 倍都超了 → 按实际大小推 QP
+        let q = c.overshoot_qp(200_000, MIN_QP, 75_000).unwrap();
+        assert!(
+            q >= KEY_MIN_QP && rescale(200_000, MIN_QP, q) <= 75_000,
+            "{q}"
+        );
+        assert!(rescale(200_000, MIN_QP, q - 1) > 75_000 || q == KEY_MIN_QP);
+        // 超得不多：不重编
+        assert_eq!(c.overshoot_qp(140_000, MIN_QP, 75_000), None);
+        // QP 已经到顶：重编也小不了
+        assert_eq!(c.overshoot_qp(200_000, MAX_QP, 1_000), None);
+        // 已经很高的 QP：至少再高 1
+        assert_eq!(c.overshoot_qp(1_000_000, 50, 1), Some(MAX_QP));
     }
 }

@@ -311,6 +311,8 @@ pub struct VtEncoder {
     frame: i64,
     bps: u64,
     opts: VtOptions,
+    /// 最近一次设 `DataRateLimits` 的结果（0 成功；不成功时码控缓冲没设上，日志写一次）。
+    limits_status: i32,
 }
 
 impl std::fmt::Debug for VtEncoder {
@@ -641,6 +643,7 @@ impl VtEncoder {
             frame: 0,
             bps: 0,
             opts,
+            limits_status: 0,
         };
         // SAFETY: 会话有效；键和值都是系统常量或刚创建的数字。
         unsafe {
@@ -737,31 +740,60 @@ impl VtEncoder {
         // 两个限制（字节数、秒数成对）：
         // - 和 WebRTC 一样，每秒最多平均码率的 1.5 倍（大帧不至于把链路塞爆）；
         // - 大帧规则（见 crate::BIG_FRAME_US）：任意 100 ms 里不超过这 100 ms 按平均码率能发的量——
-        //   一帧缓冲的码控（Sunshine 的 NVENC 路径 vbvBufferSize = 码率 / 帧率）。关键帧、整屏变化时
-        //   VideoToolbox 自己把 QP 提上去，先发粗的、之后补清晰；只有 1 秒的限制时 400 kbps 上一个关键帧能有 70 KB。
-        let bytes = number_i64(i64::try_from(bps.saturating_mul(3) / 16).unwrap_or(i64::MAX));
-        let second = number_f64(1.0);
-        let window_us = crate::BIG_FRAME_US;
-        let window_bytes = number_i64(
-            i64::try_from(bps.saturating_mul(window_us) / 8_000_000).unwrap_or(i64::MAX),
-        );
-        let window =
-            number_f64(f64::from(u32::try_from(window_us).unwrap_or(u32::MAX)) / 1_000_000.0);
-        let values = [bytes.0, second.0, window_bytes.0, window.0];
-        // SAFETY: 数组在调用期间有效；数组持有四个数字（两对字节数、秒数）；会话有效。
+        //   一帧缓冲的码控（Sunshine 的 NVENC 路径 vbvBufferSize = 码率 / 帧率）。
+        // 实测（2026-11-25，CI 的 Apple 芯片虚拟机）：300 kbps 时 720p 文字画面的第一个关键帧仍有 94786 字节，
+        // 远超 100 ms 的量（3750 字节）；设置是否被系统接受见 limits_status（日志写明），各种组合的对照见测试
+        // `vt_keyframe_under_rate_limits`。
+        let status = self.set_rate_limits(&[
+            (bps.saturating_mul(3) / 16, 1_000_000),
+            (
+                bps.saturating_mul(crate::BIG_FRAME_US) / 8_000_000,
+                crate::BIG_FRAME_US,
+            ),
+        ]);
+        if status != 0 && self.limits_status == 0 {
+            log::warn!(
+                "视频编码：VideoToolbox 不接受码率上限 DataRateLimits（{status}），关键帧大小不受限"
+            );
+        }
+        self.limits_status = status;
+    }
+
+    /// 设码率上限 `DataRateLimits`：每对是（字节数, 时间窗口微秒），任意这么长的窗口里不超过这么多字节。
+    /// 返回系统的结果码（0 成功）。
+    pub fn set_rate_limits(&mut self, pairs: &[(u64, u64)]) -> i32 {
+        let numbers: Vec<Owned> = pairs
+            .iter()
+            .flat_map(|&(bytes, window_us)| {
+                [
+                    number_i64(i64::try_from(bytes).unwrap_or(i64::MAX)),
+                    number_f64(
+                        f64::from(u32::try_from(window_us).unwrap_or(u32::MAX)) / 1_000_000.0,
+                    ),
+                ]
+            })
+            .collect();
+        let values: Vec<CFTypeRef> = numbers.iter().map(|n| n.0).collect();
+        // SAFETY: 数组在调用期间有效（numbers 持有每个数字）；数组元素是成对的字节数、秒数；会话有效。
         unsafe {
             let limits = Owned(CFArrayCreate(
                 std::ptr::null(),
                 values.as_ptr(),
-                4,
+                isize::try_from(values.len()).unwrap_or(0),
                 std::ptr::addr_of!(kCFTypeArrayCallBacks).cast(),
             ));
-            let _ = VTSessionSetProperty(
+            VTSessionSetProperty(
                 self.session,
                 kVTCompressionPropertyKey_DataRateLimits,
                 limits.0,
-            );
+            )
         }
+    }
+
+    /// 最近一次设码率上限的结果码（0 成功）。
+    #[must_use]
+    pub const fn limits_status(&self) -> i32 {
+        self.limits_status
     }
 
     /// 把 NV12 拷进像素缓冲（按缓冲区的行宽）。

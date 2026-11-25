@@ -128,9 +128,12 @@ fn session_through_server(tag: &str, extra: &[&str]) -> (String, String) {
     let host_pin = host_pin.unwrap();
     assert!(status(&server).contains("\"signal\":{\"enabled\":true,\"online\":1}"));
 
+    // 会话 3 秒：CI 的 Apple 芯片虚拟机上 VideoToolbox 建编码会话加第一帧约 0.6 秒（2026-11-25 日志：
+    // 连上 0.53 秒后才出第一帧，半分辨率升到原尺寸又建一次），解码端也要建两次；1 秒的会话里控制端
+    // 一帧都没解出来。这里测的是经服务器连上、出画面，首帧快慢由端到端测试卡门槛。
     let out = Command::new(BIN)
         .args(["connect", "--server", &addr, "--server-pin", &server_pin])
-        .args(["--device", &host_pin, "--seconds", "1"])
+        .args(["--device", &host_pin, "--seconds", "3"])
         .args(extra)
         .arg("--data-dir")
         .arg(&ctrl_dir)

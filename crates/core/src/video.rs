@@ -164,6 +164,11 @@ pub trait VideoEncoder: Send {
     /// 尺寸变了的那一帧是关键帧。不支持缩放的编码器忽略。
     fn set_view(&mut self, _view: Option<(u16, u16)>) {}
 
+    /// 码率估计是不是“过期”了：好一阵没有测量证实它（静止时链路可能已经变差，发送端不知道）。
+    /// 过期时编码器不按大帧时限放宽（关键帧、静止后第一帧变化最多一帧的预算），先发粗的、之后补清晰。
+    /// 照 TCP 拥塞窗口验证（RFC 2861、Linux `tcp_slow_start_after_idle`）：闲置后不信闲置前的窗口。
+    fn set_rate_stale(&mut self, _stale: bool) {}
+
     /// 现在用的编码器（“详情”面板、日志用）。
     fn backend(&self) -> String {
         format!("{:?}", self.codec())

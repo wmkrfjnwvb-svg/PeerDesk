@@ -86,7 +86,7 @@ jobs:
       # 声卡（cpal）在 Linux 上要 ALSA 的开发库
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq libasound2-dev libva-dev libgbm-dev libdrm-dev libclang-dev
       - name: Run scenarios
-        run: cargo test --release -p peerdesk-e2e -- --nocapture --test-threads 2
+        run: cargo test --release -p peerdesk-e2e --no-fail-fast -- --nocapture --test-threads 2
       # 真实二进制的闭环：虚拟桌面上真采集、真注入，经回环网络和加了延迟丢包的网络各跑一次。
       - name: Live loop (real binaries, X11, netem)
         run: |

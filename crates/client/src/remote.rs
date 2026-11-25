@@ -64,6 +64,7 @@ pub(crate) fn session(identity: &Identity, policy: &Policy, auth: Auth) -> Sessi
         device_id: identity.device_id(),
         region: String::new(),
         // 剪贴板能力：双方都支持、两端都有剪贴板时才真正同步（命令行不同步剪贴板）。
+        // 到达报告：控制端都能发；被控端只在估计器要用时才声明（见 peerdesk_net::host::serve）。
         caps: Caps::H264
             .with(Caps::CLIPBOARD)
             .with(Caps::AUDIO)
@@ -71,7 +72,8 @@ pub(crate) fn session(identity: &Identity, policy: &Policy, auth: Auth) -> Sessi
             .with(Caps::FEC_RS)
             .with(Caps::HOST_STATS)
             .with(Caps::FILE_BROWSE)
-            .with(Caps::VIEW_SIZE),
+            .with(Caps::VIEW_SIZE)
+            .with(Caps::TRANSPORT_CC),
         policy: policy.clone(),
         auth,
         // 由网络层替换成真实连接的通道绑定。

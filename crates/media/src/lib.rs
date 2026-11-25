@@ -584,6 +584,8 @@ pub struct H264Encoder {
     soft_converged: Option<bool>,
     /// 大帧规则的时限（微秒）：关键帧要在这么久里按目标码率发得完。0：不限。
     big_frame_us: u64,
+    /// 码率估计过期了（发送端判断，见 `VideoEncoder::set_rate_stale`）：大帧不按时限放宽，最多一帧的预算。
+    rate_stale: bool,
     /// 上一次编的画面的抽样（每 [`SAMPLE_STEP`] 像素取一个），估计画面变了多少。
     samples: Vec<u32>,
     sampled: (u16, u16),
@@ -661,6 +663,7 @@ impl H264Encoder {
             coarse_qp: None,
             soft_converged: None,
             big_frame_us: BIG_FRAME_US,
+            rate_stale: false,
             samples: Vec::new(),
             sampled: (0, 0),
             layer_qp: None,
@@ -1004,12 +1007,14 @@ impl H264Encoder {
         if self.force_key && !fresh {
             enc.force_intra_frame();
         }
-        // 画面变了多少（CPU 画面按抽样估计；显卡画面不读回来比，不知道）。只有静止后第一帧变化要用；
-        // 其余的帧只在关键帧时记一次抽样（作比较的基准），省掉每帧的抽样。
-        let first_change = !fresh && !self.force_key && changed && !self.qp.changing();
+        // 画面变了多少（CPU 画面按抽样估计，每帧约 3600 个像素；显卡画面不读回来比，不知道）。每一帧变化都看
+        // （Chromium 远程桌面也是逐帧按更新面积判断大帧）：拖动小窗口之后马上切换整个窗口，按上一帧的大小
+        // 推算会把整屏变化按拖动时的 QP 12 编（实测蜂窝网络上 203 KB）。关键帧时记一次抽样作比较的基准。
         let area = match input {
-            Input::Rgb(screen) if first_change => Some(self.changed_permille(screen)),
-            Input::Rgb(screen) if fresh || self.force_key || !changed => {
+            Input::Rgb(screen) if changed && !fresh && !self.force_key => {
+                Some(self.changed_permille(screen))
+            }
+            Input::Rgb(screen) if fresh || self.force_key => {
                 let _ = self.changed_permille(screen);
                 None
             }
@@ -1032,6 +1037,9 @@ impl H264Encoder {
         let target = u64::try_from(budget).unwrap_or(u64::MAX);
         let key_allowed = if self.big_frame_us == 0 {
             u64::MAX
+        } else if self.rate_stale {
+            // 码率估计过期：静止时链路可能已经变差，不多押，最多一帧的预算（之后补清晰）
+            target
         } else {
             self.bps.saturating_mul(self.big_frame_us) / 8_000_000
         };
@@ -1061,15 +1069,36 @@ impl H264Encoder {
         if self.layer_qp != Some(qp) && set_layer_qp(&mut enc, qp) {
             self.layer_qp = Some(qp);
         }
-        let (key, data) = enc
-            .encode(&yuv)
-            .map(|stream| {
-                (
-                    matches!(stream.frame_type(), FrameType::IDR | FrameType::I),
-                    stream.to_vec(),
-                )
-            })
-            .map_err(codec_error("H.264 编码失败"))?;
+        let encode = |enc: &mut Encoder| {
+            enc.encode(&yuv)
+                .map(|stream| {
+                    (
+                        matches!(stream.frame_type(), FrameType::IDR | FrameType::I),
+                        stream.to_vec(),
+                    )
+                })
+                .map_err(codec_error("H.264 编码失败"))
+        };
+        let (mut key, mut data) = encode(&mut enc)?;
+        let mut qp = qp;
+        // 整屏变化（切换窗口这类“场景切换”）编出来远超大帧时限：上一帧的大小推算不出这种帧。按它的实际大小
+        // 推一个装得进的 QP 重编（照 libvpx 屏幕内容实时模式的 vp9_encodedframe_overshoot）。openh264 编完
+        // 参考帧就更新了，不能原样重编，只能重编成关键帧——整屏都换了，关键帧和增量帧差不多大。openh264 自己
+        // 检测到场景切换出的关键帧（用的还是我们给的 QP）也一样处理。
+        let whole = area.is_none_or(|a| a >= qp::LARGE_CHANGE_PERMILLE);
+        let bytes = u64::try_from(data.len()).unwrap_or(u64::MAX);
+        if let Some(q) = (kind == qp::Kind::Change && whole && self.big_frame_us != 0)
+            .then(|| self.qp.overshoot_qp(bytes, qp, key_allowed))
+            .flatten()
+        {
+            enc.force_intra_frame();
+            if set_layer_qp(&mut enc, q) {
+                self.layer_qp = Some(q);
+            }
+            (key, data) = encode(&mut enc)?;
+            qp = q;
+            self.key_reason = "整屏变化编出来远超大帧时限，按实际大小重编成关键帧";
+        }
         self.timing.encode_us = micros_since(encoding);
         let kind = if key { qp::Kind::Key } else { kind };
         self.qp.on_frame(
@@ -1296,6 +1325,10 @@ impl VideoEncoder for H264Encoder {
             self.resize_reason = Some("控制端窗口大小变了");
         }
         self.view = view;
+    }
+
+    fn set_rate_stale(&mut self, stale: bool) {
+        self.rate_stale = stale;
     }
 }
 
@@ -2355,14 +2388,9 @@ mod tests {
             .is_some());
     }
 
-    /// 实机（macOS VideoToolbox、Windows Media Foundation）：低码率下 720p 文字画面的关键帧要装进大帧规则的
-    /// 时限（[`BIG_FRAME_US`] 按码率能发的量），允许超出到 4 倍；同时打出高码率时的大小对照。
-    /// 硬件编码器靠码控缓冲（VideoToolbox 的 100 ms `DataRateLimits`、Media Foundation 的 `AVEncCommonBufferSize`）
-    /// 自己把 QP 提上去。没有硬件编码器（CI 的 Windows 虚拟机）时说明原因、跳过。
+    /// 720p 文字画面（白底、一行行深色小块，接近真实的办公桌面），NV12。
     #[cfg(any(windows, target_os = "macos"))]
-    #[test]
-    fn hardware_keyframe_fits_the_big_frame_window() {
-        // 白底、一行行“字”（深色小块）：接近真实的办公桌面
+    fn text_nv12() -> Vec<u8> {
         let mut screen = Screen::new(1280, 720, 0x00f0_f0f0);
         for row in 0..40u16 {
             for col in 0..150u16 {
@@ -2375,7 +2403,20 @@ mod tests {
         let (w, _, pixels) = even_pixels(&screen);
         color::rgb_to_i420(&pixels, w, &mut y, &mut u, &mut v);
         color::i420_to_nv12(&y, &u, &v, &mut nv12);
-        let mut first_key = |bps: u64| -> Option<(String, usize)> {
+        nv12
+    }
+
+    /// 实机（macOS VideoToolbox、Windows Media Foundation）测量：低码率下 720p 文字画面的关键帧多大，
+    /// 和大帧规则的时限（[`BIG_FRAME_US`] 按码率能发的量）对照；会话第一帧和中途要的关键帧分别量。
+    ///
+    /// 只量不卡：2026-11-25 CI 的 Apple 芯片虚拟机上 300 kbps 时第一个关键帧 94786 字节（100 ms 的量
+    /// 3750 字节），VideoToolbox 的码控缓冲管不住关键帧。各种码率上限组合的对照见 `vt_keyframe_under_rate_limits`。
+    /// 没有硬件编码器（CI 的 Windows 虚拟机）时说明原因、跳过。
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn hardware_keyframe_size_at_low_bitrate() {
+        let nv12 = text_nv12();
+        let keys = |bps: u64| -> Option<(String, Vec<usize>)> {
             let mut hw = match open_system_hardware(1280, 720, 30, bps) {
                 Ok(hw) => hw,
                 Err(why) => {
@@ -2384,29 +2425,80 @@ mod tests {
                 }
             };
             let mut got = Vec::new();
-            for i in 0..3 {
-                got.extend(hw.encode(&nv12, bps, i == 0).unwrap());
+            for i in 0..31 {
+                got.extend(hw.encode(&nv12, bps, i == 0 || i == 30).unwrap());
             }
             hw.drain().unwrap();
             while let Some(frame) = hw.poll().unwrap() {
                 got.push(frame);
             }
-            let (data, key) = got.first().expect("编码器一帧都没交出").clone();
-            assert!(key, "第一帧要是关键帧");
-            Some((hw.name().to_owned(), data.len()))
+            assert!(got.first().is_some_and(|(_, key)| *key), "第一帧要是关键帧");
+            let sizes = got
+                .iter()
+                .filter(|(_, key)| *key)
+                .map(|(d, _)| d.len())
+                .collect();
+            Some((hw.name().to_owned(), sizes))
         };
-        let Some((name, low)) = first_key(300_000) else {
+        let Some((name, low)) = keys(300_000) else {
             return;
         };
-        let high = first_key(20_000_000).map_or(0, |(_, b)| b);
-        let window = usize::try_from(300_000 * BIG_FRAME_US / 8_000_000).unwrap();
+        let high = keys(20_000_000).map(|(_, s)| s).unwrap_or_default();
+        let window = 300_000 * BIG_FRAME_US / 8_000_000;
         eprintln!(
-            "{name}：720p 文字画面关键帧 300 kbps 时 {low} 字节（100 ms 的量 {window} 字节），20 Mbps 时 {high} 字节"
+            "{name}：720p 文字画面关键帧（第一帧、第 30 帧）300 kbps 时 {low:?} 字节（100 ms 的量 {window} 字节），\
+             20 Mbps 时 {high:?} 字节"
         );
-        assert!(
-            low <= window * 4,
-            "{name}：300 kbps 时关键帧 {low} 字节，超过 100 ms 的量 {window} 的 4 倍"
-        );
+    }
+
+    /// macOS 实机测量：VideoToolbox 的码率上限 `DataRateLimits` 几种设法下，300 kbps 时 720p 文字画面的
+    /// 关键帧多大、系统接不接受这个设置（结果码 0 为接受）。低延迟码控开、关各量一遍。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn vt_keyframe_under_rate_limits() {
+        let nv12 = text_nv12();
+        let bps = 300_000u64;
+        let window = bps * BIG_FRAME_US / 8_000_000;
+        let product = [(bps * 3 / 16, 1_000_000), (window, BIG_FRAME_US)];
+        let short = [(window, BIG_FRAME_US)];
+        let webrtc = [(bps * 3 / 16, 1_000_000)];
+        let variants: [(&str, &[(u64, u64)]); 3] = [
+            ("1 秒 1.5 倍 + 100 ms（产品）", &product),
+            ("只有 100 ms", &short),
+            ("只有 1 秒 1.5 倍（WebRTC）", &webrtc),
+        ];
+        for low_latency in [true, false] {
+            for (name, pairs) in variants {
+                let opts = vt::VtOptions {
+                    low_latency,
+                    ..vt::VtOptions::DEFAULT
+                };
+                let mut enc = match vt::VtEncoder::open_with(1280, 720, 30, bps, opts) {
+                    Ok(enc) => enc,
+                    Err(why) => {
+                        eprintln!("低延迟码控 {low_latency}，{name}：打不开（{why}）");
+                        continue;
+                    }
+                };
+                let status = enc.set_rate_limits(pairs);
+                for i in 0..31 {
+                    enc.submit(&nv12, bps, i == 0 || i == 30).unwrap();
+                }
+                let (mut keys, mut total) = (Vec::new(), 0usize);
+                for one in enc.flush().unwrap() {
+                    let (data, key) = one.unwrap();
+                    total += data.len();
+                    if key {
+                        keys.push(data.len());
+                    }
+                }
+                eprintln!(
+                    "VideoToolbox 300 kbps，低延迟码控 {low_latency}，{name}：设置结果 {status}（开会话时 {}），\
+                     关键帧 {keys:?} 字节（100 ms 的量 {window}），31 帧共 {total} 字节",
+                    enc.limits_status()
+                );
+            }
+        }
     }
 
     /// Windows 实机：系统 H.264 解码器解 OpenH264 的码流（验证 NV12 读取、对齐裁剪、颜色），
@@ -2612,6 +2704,47 @@ mod tests {
         }
         assert!(n < 30, "补了 {n} 帧");
         assert!(!enc.wants_refine());
+    }
+
+    /// 码率估计过期（发送端判断）：关键帧不按大帧时限放宽，最多一帧的预算，比新鲜时小。
+    #[test]
+    fn a_stale_rate_does_not_stretch_the_keyframe() {
+        let screen = picture(320, 192);
+        let size = |stale: bool| {
+            let mut enc = H264Encoder::new(30).with_hardware(fake_none);
+            enc.set_rate_stale(stale);
+            enc.encode(1, &screen, true, 2_000)
+                .unwrap()
+                .unwrap()
+                .payload
+                .len()
+        };
+        let (fresh, stale) = (size(false), size(true));
+        assert!(stale < fresh, "过期 {stale} 字节，新鲜 {fresh} 字节");
+    }
+
+    /// 拖动小块（预算宽裕，QP 降到很低）之后突然整屏换成新内容、预算又很小：编出来远超大帧时限，
+    /// 按实际大小重编成关键帧，写明原因。
+    #[test]
+    fn a_scene_change_far_over_the_limit_is_re_encoded_as_a_keyframe() {
+        let mut enc = H264Encoder::new(30).with_hardware(fake_none);
+        let mut screen = Screen::new(320, 192, 0x00f0_f0f0);
+        let first = enc.encode(1, &screen, true, 100_000).unwrap().unwrap();
+        assert!(first.key);
+        for id in 2..12u16 {
+            screen.fill(id * 8, 20, 6, 6, 0x0020_2020);
+            let frame = enc.encode(u32::from(id), &screen, true, 100_000).unwrap();
+            assert!(frame.is_some_and(|f| !f.key));
+        }
+        let changed = enc
+            .encode(12, &picture(320, 192), true, 300)
+            .unwrap()
+            .unwrap();
+        assert!(changed.key, "{} 字节", changed.payload.len());
+        assert_eq!(
+            enc.timing().key_reason,
+            "整屏变化编出来远超大帧时限，按实际大小重编成关键帧"
+        );
     }
 
     /// 720p 连续编码几帧：不能卡住，也不能 panic。在单独的线程里跑，10 秒没结束就判失败，
