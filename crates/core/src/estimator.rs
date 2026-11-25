@@ -226,6 +226,10 @@ pub trait RateEstimator: Send + std::fmt::Debug {
     fn profile(&self) -> &Profile;
     /// 换一套网络画像。
     fn set_profile(&mut self, profile: Profile);
+    /// 取走最近的码率变化说明（诊断日志用：真实会话里码率掉下来、升上去时要知道为什么）。
+    fn take_notes(&mut self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// 选哪个估计器。
@@ -320,6 +324,9 @@ pub struct ClassicV1 {
     capacity: Option<(u64, Time)>,
     last_decrease: Option<Time>,
     usage: Usage,
+    /// 码率变化说明（取走后清空）和上次写说明时的码率（升码率累计超过一定比例才写一次）。
+    notes: Vec<String>,
+    noted_bps: u64,
 }
 
 /// 门限的上下界（0.1 毫秒）和调整速度（每毫秒千万分之一）：WebRTC 的 6–600 毫秒、k_up 0.0087、k_down 0.039。
@@ -346,6 +353,8 @@ impl ClassicV1 {
             last_threshold_update: None,
             capacity: None,
             last_decrease: None,
+            notes: Vec::new(),
+            noted_bps: start_bps,
             usage: Usage::Normal,
         }
     }
@@ -402,6 +411,10 @@ impl RateEstimator for ClassicV1 {
         self.profile = profile;
     }
 
+    fn take_notes(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.notes)
+    }
+
     fn on_observation(&mut self, now: Time, obs: &Observation) {
         let p = self.profile;
         let fb = &obs.feedback;
@@ -434,8 +447,37 @@ impl RateEstimator for ClassicV1 {
                 } else {
                     self.rate_bps.saturating_mul(u64::from(p.decrease_permille)) / 1000
                 };
+                // 只给日志看：发送端是不是在用满码率（没用满时送达速率不代表链路能力）
+                let using = recv_bps.saturating_mul(10) >= self.rate_bps.saturating_mul(6);
+                let from_bps = self.rate_bps;
                 self.rate_bps = self.rate_bps.min(target).clamp(self.min_bps, self.max_bps);
                 self.last_decrease = Some(now);
+                if self.notes.len() < MAX_NOTES {
+                    self.notes.push(format!(
+                        "降码率 {} → {} kbps：趋势{}（{} ms，门限 {} ms），排队 {} ms，丢包 {}‰，\
+                         送达 {} kbps（{}），包串测得容量 {}",
+                        from_bps / 1000,
+                        self.rate_bps / 1000,
+                        if self.usage == Usage::Over {
+                            "过载"
+                        } else {
+                            "正常"
+                        },
+                        tenths(i64::from(obs.ext.trend_tenth_ms)),
+                        tenths(self.threshold),
+                        fb.queue_delay_us / 1000,
+                        fb.loss_permille,
+                        recv_bps / 1000,
+                        if using {
+                            "发送端用满了码率"
+                        } else {
+                            "发送端没用满码率"
+                        },
+                        capacity
+                            .map_or_else(|| "未知".to_owned(), |c| format!("{} kbps", c / 1000)),
+                    ));
+                }
+                self.noted_bps = self.rate_bps;
             }
             return;
         }
@@ -458,8 +500,42 @@ impl RateEstimator for ClassicV1 {
             .rate_bps
             .saturating_add(step.max(1))
             .clamp(self.min_bps, self.max_bps);
+        // 累计升了四分之一以上才写一次说明（每次反馈都在小步升，全写会刷屏）
+        if self.rate_bps.saturating_mul(4) >= self.noted_bps.saturating_mul(5)
+            && self.notes.len() < MAX_NOTES
+        {
+            self.notes.push(format!(
+                "升码率 {} → {} kbps：{}，送达 {} kbps，排队 {} ms",
+                self.noted_bps / 1000,
+                self.rate_bps / 1000,
+                target.map_or_else(
+                    || "不知道链路容量，按比例慢慢升".to_owned(),
+                    |t| format!(
+                        "包串测得容量，逼近它的 {}‰（{} kbps）",
+                        p.safety_permille,
+                        t / 1000
+                    )
+                ),
+                recv_bps / 1000,
+                fb.queue_delay_us / 1000,
+            ));
+            self.noted_bps = self.rate_bps;
+        }
     }
 }
+
+/// 毫秒的十分之一写成“1.5”这样的字符串。
+fn tenths(v: i64) -> String {
+    format!(
+        "{}{}.{}",
+        if v < 0 { "-" } else { "" },
+        v.unsigned_abs() / 10,
+        v.unsigned_abs() % 10
+    )
+}
+
+/// 最多攒多少条说明（会话每秒取一次，正常远不到）。
+const MAX_NOTES: usize = 16;
 
 #[cfg(test)]
 mod tests {

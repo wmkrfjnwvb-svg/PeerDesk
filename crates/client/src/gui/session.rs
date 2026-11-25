@@ -278,6 +278,10 @@ impl ScreenSource for Watched {
     fn change_seq(&self) -> Option<u64> {
         self.inner.change_seq()
     }
+
+    fn stats_line(&mut self) -> Option<String> {
+        self.inner.stats_line()
+    }
 }
 
 async fn host_main(

@@ -153,6 +153,32 @@ pub trait VideoEncoder: Send {
     fn convert_micros(&self) -> u64 {
         0
     }
+
+    /// 上一次编码各步骤的耗时和情况（诊断日志用）。
+    fn timing(&self) -> EncodeTiming {
+        EncodeTiming::default()
+    }
+}
+
+/// 一次编码各步骤的耗时和情况（诊断日志用：看时间花在缩放、颜色转换还是编码器本身）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EncodeTiming {
+    /// 缩放（CPU 上把采集的画面缩到要编的尺寸）的微秒数；采集时已经缩好时为 0。
+    pub scale_us: u64,
+    /// 颜色转换（RGB → YUV、打包 NV12）的微秒数；采集直接交 NV12 时只是拷贝。
+    pub convert_us: u64,
+    /// 编码器本身（交给硬件编码器并取回、或软件编码）的微秒数。
+    pub encode_us: u64,
+    /// 用的是硬件编码器。
+    pub hardware: bool,
+    /// 采集直接交来尺寸正好的 NV12，没有在 CPU 上转换。
+    pub nv12_direct: bool,
+    /// 编出来的尺寸。
+    pub width: u16,
+    /// 编出来的高度。
+    pub height: u16,
+    /// 这次出了关键帧的话，为什么（空表示不是关键帧）。
+    pub key_reason: &'static str,
 }
 
 /// 视频解码器。

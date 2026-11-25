@@ -157,6 +157,17 @@ struct StatsWindow {
     expired: u64,
     recovered: u64,
     bad: u32,
+    /// 这一秒的解码耗时（平均 / 最大）。
+    decode: crate::diag::Stat,
+    /// 这一秒交给界面显示的耗时（转成界面的图片格式等，平均 / 最大）。
+    present: crate::diag::Stat,
+    /// 上一秒末的累计值（算这一秒的增量）。
+    assembled: u32,
+    assembly_us: u64,
+    nacks: u32,
+    skipped: u32,
+    duplicates: u64,
+    stale: u64,
 }
 
 /// 按键或点击之后这么久还没有新画面，就不算这一次（多半是操作没有改变画面）。
@@ -411,6 +422,7 @@ pub async fn run(
     let mut stats_tick = tokio::time::interval(STATS_EVERY);
     stats_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut window = StatsWindow::default();
+    let mut last_quic = link.quic_stats();
     let mut waiting_input: Option<peerdesk_core::time::Time> = None;
     let mut last_shown = link.now();
     let session_start = link.now();
@@ -427,6 +439,7 @@ pub async fn run(
             done = decoded_rx.recv() => match done {
                 Some((frame_id, Ok(Some(screen)), took)) => {
                     window.decode_us = window.decode_us.max(took);
+                    window.decode.add(took);
                     shown_size = (screen.width(), screen.height());
                     media.decode_succeeded();
                     let now = link.now();
@@ -445,7 +458,9 @@ pub async fn run(
                         }
                     }
                     tracer.record(link.now(), trace, Stage::FrameDelivered, u64::from(frame_id));
+                    let presenting = std::time::Instant::now();
                     sink.present(&screen);
+                    window.present.add(u64::try_from(presenting.elapsed().as_micros()).unwrap_or(u64::MAX));
                     last_screen = Some(screen);
                 }
                 Some((_, Ok(None), _)) => {}
@@ -600,6 +615,25 @@ pub async fn run(
                     reaction_summary(&window.reactions).0,
                     reaction_summary(&window.reactions).1,
                 );
+                // 接收端各步骤（见 crate::diag）：收齐一帧用了多久、请求了多少重传、解码和显示各花多少
+                let assembled = stats.assembled.saturating_sub(window.assembled);
+                crate::note!(info, target: "peerdesk::stats",
+                    "接收端 收齐 {} 帧，收齐用时 平均 {} ms、最长 {} ms；发出重传请求 {} 片；重复分片 {}，过期分片 {}；\
+                     等关键帧跳过 {} 帧；解码 {} ms（{} 次）；交给界面显示 {} ms",
+                    assembled,
+                    crate::diag::tenth_ms(stats.assembly_us_sum.saturating_sub(window.assembly_us).checked_div(u64::from(assembled)).unwrap_or(0)),
+                    crate::diag::tenth_ms(media.take_assembly_max()),
+                    stats.nacks_sent.saturating_sub(window.nacks),
+                    reassembly.duplicates.saturating_sub(window.duplicates),
+                    reassembly.stale.saturating_sub(window.stale),
+                    stats.skipped.saturating_sub(window.skipped),
+                    window.decode.ms(),
+                    window.decode.count(),
+                    window.present.ms(),
+                );
+                let quic = link.quic_stats();
+                crate::note!(info, target: "peerdesk::stats", "{}", crate::diag::quic_line(&last_quic, &quic));
+                last_quic = quic;
                 if let Some(hook) = &opts.on_quality {
                     let fb = media.last_feedback().unwrap_or_default();
                     (hook.0)(LinkQuality {
@@ -624,6 +658,12 @@ pub async fn run(
                     expired: reassembly.expired,
                     recovered: reassembly.recovered,
                     bad: stats.bad,
+                    assembled: stats.assembled,
+                    assembly_us: stats.assembly_us_sum,
+                    nacks: stats.nacks_sent,
+                    skipped: stats.skipped,
+                    duplicates: reassembly.duplicates,
+                    stale: reassembly.stale,
                     ..StatsWindow::default()
                 };
             }

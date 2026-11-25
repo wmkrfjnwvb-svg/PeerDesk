@@ -28,7 +28,9 @@ use openh264::OpenH264API;
 use peerdesk_core::error::Error;
 use peerdesk_core::scale::{fit, scaled_size};
 use peerdesk_core::screen::Screen;
-use peerdesk_core::video::{Codec, EncodedFrame, FrameHeader, VideoDecoder, VideoEncoder};
+use peerdesk_core::video::{
+    Codec, EncodeTiming, EncodedFrame, FrameHeader, VideoDecoder, VideoEncoder,
+};
 
 /// 画面停下后最多再编几帧来补清晰。
 pub const REFINE_FRAMES: u8 = 12;
@@ -461,6 +463,10 @@ pub struct H264Encoder {
     scale_permille: u16,
     /// 控制端显示画面的区域（见 [`VideoEncoder::set_view`]）。
     view: Option<(u16, u16)>,
+    /// 为什么要求了关键帧（出了关键帧时记进 `timing`）。
+    key_reason: &'static str,
+    /// 这一次编码各步骤的耗时（见 [`EncodeTiming`]）。
+    timing: EncodeTiming,
     /// 交给硬件编码器、还没取回的帧：每帧是否要求了关键帧（按顺序；异步编码器会攒帧）。
     hw_sent: std::collections::VecDeque<bool>,
 }
@@ -518,6 +524,8 @@ impl H264Encoder {
             soft_reason: None,
             scale_permille: peerdesk_core::scale::FULL_PERMILLE,
             view: None,
+            key_reason: "",
+            timing: EncodeTiming::default(),
             hw_sent: std::collections::VecDeque::new(),
         }
     }
@@ -547,6 +555,7 @@ impl H264Encoder {
         self.hw_off = true;
         self.hw_sent.clear();
         self.force_key = true;
+        self.key_reason = "硬件编码出错，改用软件编码";
     }
 
     /// 取回了一个硬件编好的帧：对上它交的时候是否要求了关键帧，检查“没要求却是关键帧”。
@@ -569,6 +578,7 @@ impl H264Encoder {
             self.hw_off = true;
             self.hw_sent.clear();
             self.force_key = true;
+            self.key_reason = "硬件编码器每帧都是关键帧，改用软件编码";
         }
         Hw::Frame(data, key, fresh)
     }
@@ -659,6 +669,16 @@ impl H264Encoder {
         changed: bool,
         fresh: bool,
     ) -> EncodedFrame {
+        if key {
+            // 为什么出了关键帧：要求的原因，或者第一帧 / 尺寸变了，或者编码器自己出的
+            self.timing.key_reason = if !self.key_reason.is_empty() {
+                std::mem::take(&mut self.key_reason)
+            } else if fresh || self.encoded_size != Some(size) {
+                "第一帧或尺寸变了"
+            } else {
+                "编码器自己出的"
+            };
+        }
         self.force_key = false;
         self.encoded_size = Some(size);
         // 画面在变：之后要补清晰；没变：这是补清晰的一帧。
@@ -794,6 +814,10 @@ impl VideoEncoder for H264Encoder {
         changed: bool,
         budget: usize,
     ) -> Result<Option<EncodedFrame>, Error> {
+        // 这一次没有转换（画面没变、只取硬件攒着的帧）时报 0，不沿用上一次的
+        // （以前沿用：统计里出现“编码 31 ms（其中颜色转换 184 ms）”这种转换比总时间还大的数）
+        self.convert_us = 0;
+        self.timing = EncodeTiming::default();
         // 编码尺寸：发送端按网络定的比例（见 peerdesk_core::scale）；帧头写的就是这个尺寸
         // 再等比缩到放得进控制端的窗口（Retina 屏在小窗口里看时不用编 2880×1800）
         let size = fit(
@@ -825,7 +849,9 @@ impl VideoEncoder for H264Encoder {
         let screen = if size == (screen.width(), screen.height()) {
             screen
         } else {
+            let scaling = std::time::Instant::now();
             shrunk = screen.downscale(size.0, size.1)?;
+            self.timing.scale_us = micros_since(scaling);
             &shrunk
         };
         let (w, h, pixels) = even_pixels(screen);
@@ -837,9 +863,16 @@ impl VideoEncoder for H264Encoder {
             &mut self.planes.2,
         );
         self.convert_us = micros_since(converting);
+        self.timing.width = size.0;
+        self.timing.height = size.1;
+        let encoding = std::time::Instant::now();
         // 有硬件编码器就用它（快得多、几乎不占 CPU）；没有或失败时用 OpenH264
         let bps = self.budget_bps(budget);
-        match self.encode_hardware(w, h, bps) {
+        let hw = self.encode_hardware(w, h, bps);
+        self.timing.convert_us = self.convert_us.saturating_sub(self.timing.scale_us);
+        self.timing.encode_us = micros_since(encoding);
+        self.timing.hardware = !matches!(hw, Hw::Off);
+        match hw {
             Hw::Frame(data, key, fresh_hw) if !data.is_empty() => {
                 return Ok(Some(self.finish(&data, key, size, changed, fresh_hw)));
             }
@@ -869,6 +902,7 @@ impl VideoEncoder for H264Encoder {
             (w, w / 2, w / 2),
         );
         let stream = enc.encode(&yuv).map_err(codec_error("H.264 编码失败"))?;
+        self.timing.encode_us = micros_since(encoding);
         let key = matches!(stream.frame_type(), FrameType::IDR | FrameType::I);
         let data = stream.to_vec();
         if fresh {
@@ -885,9 +919,14 @@ impl VideoEncoder for H264Encoder {
         self.convert_us
     }
 
+    fn timing(&self) -> EncodeTiming {
+        self.timing
+    }
+
     fn on_lost(&mut self, _frame_id: u32) {
         // 之后的增量帧都参考了丢的那一帧，接收端解不了：下一帧编关键帧。
         self.force_key = true;
+        self.key_reason = "有帧丢了（接收端解不了后面的帧）";
     }
 
     fn wants_refine(&self) -> bool {
@@ -903,6 +942,7 @@ impl VideoEncoder for H264Encoder {
         // 比例变了：尺寸变了要出关键帧；画面不动时也要编这一帧（例如升回原尺寸），所以先要求关键帧
         if permille != self.scale_permille && self.encoded_size.is_some() {
             self.force_key = true;
+            self.key_reason = "编码分辨率变了";
         }
         self.scale_permille = permille;
     }
@@ -911,6 +951,7 @@ impl VideoEncoder for H264Encoder {
         let view = view.filter(|(w, h)| *w > 0 && *h > 0);
         if view != self.view && self.encoded_size.is_some() {
             self.force_key = true;
+            self.key_reason = "控制端窗口大小变了";
         }
         self.view = view;
     }
@@ -1276,6 +1317,39 @@ mod tests {
     }
 
     /// 编码器没收的帧不等它的输出（不算攒着），它带的关键帧要求留给下一帧。
+    /// 诊断日志用的分步耗时和关键帧原因。
+    #[test]
+    fn timing_and_keyframe_reasons() {
+        let mut enc = H264Encoder::new(30).with_hardware(fake_none);
+        let f = enc
+            .encode(1, &picture(320, 192), true, 50_000)
+            .unwrap()
+            .unwrap();
+        assert!(f.key);
+        let t = enc.timing();
+        assert_eq!((t.width, t.height, t.hardware), (320, 192, false));
+        assert_eq!(t.key_reason, "第一帧或尺寸变了");
+        enc.on_lost(1);
+        enc.encode(2, &picture(320, 192), true, 50_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(enc.timing().key_reason, "有帧丢了（接收端解不了后面的帧）");
+        enc.encode(3, &picture(320, 192), true, 50_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(enc.timing().key_reason, "", "不是关键帧");
+        enc.set_view(Some((160, 96)));
+        enc.encode(4, &picture(320, 192), true, 50_000)
+            .unwrap()
+            .unwrap();
+        let t = enc.timing();
+        assert_eq!(t.key_reason, "控制端窗口大小变了");
+        assert_eq!((t.width, t.height), (160, 96));
+        // 画面没变、什么都不编：耗时清零，不沿用上一次的
+        let _ = enc.encode(5, &picture(320, 192), false, 50_000).unwrap();
+        assert_eq!(enc.convert_micros(), 0);
+    }
+
     #[test]
     fn rejected_frame_keeps_the_keyframe_request() {
         let mut enc = H264Encoder::new(30).with_hardware(fake_rejects_first);

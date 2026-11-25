@@ -80,6 +80,8 @@ struct State {
     /// 第一帧之前出的错：打开失败。
     failed: Option<PlatformError>,
     stats: CaptureStats,
+    /// 上次写诊断日志以来最慢的一次读取。
+    window_max: Duration,
 }
 
 #[derive(Debug, Default)]
@@ -127,6 +129,7 @@ impl Shared {
             st.stats.grabs = st.stats.grabs.saturating_add(1);
             st.stats.last_grab = took;
             st.stats.total_grab = st.stats.total_grab.saturating_add(took);
+            st.window_max = st.window_max.max(took);
             st.latest.clone()
         };
         // 比较在锁外进行：只有采集线程会改 `latest`，会话取画面不会被整屏比较挡住。
@@ -217,6 +220,8 @@ pub struct ScreenCapture {
     current: Option<Arc<Screen>>,
     current_seq: u64,
     thread: Option<JoinHandle<()>>,
+    /// 上次写诊断日志时的统计（算这一秒的增量）。
+    reported: CaptureStats,
 }
 
 impl ScreenCapture {
@@ -247,6 +252,7 @@ impl ScreenCapture {
             current: None,
             current_seq: 0,
             thread: Some(thread),
+            reported: CaptureStats::default(),
         };
         let failed = {
             let guard = me.shared.lock();
@@ -294,6 +300,36 @@ impl ScreenSource for ScreenCapture {
 
     fn change_seq(&self) -> Option<u64> {
         Some(self.current_seq)
+    }
+
+    fn stats_line(&mut self) -> Option<String> {
+        let (now, max) = {
+            let mut st = self.shared.lock();
+            (st.stats.clone(), std::mem::take(&mut st.window_max))
+        };
+        let grabs = now.grabs.saturating_sub(self.reported.grabs);
+        let spent = now.total_grab.saturating_sub(self.reported.total_grab);
+        let avg = spent
+            .checked_div(u32::try_from(grabs).unwrap_or(u32::MAX))
+            .unwrap_or_default();
+        let line = format!(
+            "采集 新画面 {} 帧，读取 {} 次，读取耗时（从系统读出并转成 RGB）{:.1}/{:.1} ms；{}；出错重开 {} 次{}",
+            now.frames.saturating_sub(self.reported.frames),
+            grabs,
+            avg.as_secs_f64() * 1000.0,
+            max.as_secs_f64() * 1000.0,
+            self.current.as_deref().map_or_else(
+                || "还没有画面".to_owned(),
+                |s| format!("画面 {}×{}", s.width(), s.height())
+            ),
+            now.reopens.saturating_sub(self.reported.reopens),
+            now.last_error
+                .as_ref()
+                .filter(|_| now.reopens != self.reported.reopens)
+                .map_or_else(String::new, |e| format!("（{e}）")),
+        );
+        self.reported = now;
+        Some(line)
     }
 }
 
@@ -436,6 +472,14 @@ mod tests {
         assert_eq!(stats.grabs, 7);
         assert!(stats.mean_grab() <= stats.total_grab);
         assert_eq!(stats.reopens, 0);
+        // 诊断日志：这一秒的增量，取完从零算
+        let line = cap.stats_line().unwrap();
+        assert!(
+            line.contains("新画面 6 帧，读取 7 次") && line.contains("出错重开 0 次"),
+            "{line}"
+        );
+        let line = cap.stats_line().unwrap();
+        assert!(line.contains("新画面 0 帧，读取 0 次"), "{line}");
         // 旧缓冲区被还回来复用
         assert!(s.reused.load(Ordering::Relaxed) > 0);
     }

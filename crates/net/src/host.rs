@@ -49,6 +49,11 @@ pub trait ScreenSource: Send {
     fn change_seq(&self) -> Option<u64> {
         None
     }
+
+    /// 采集这一秒的情况（帧数、读取耗时、尺寸、格式），诊断日志用；不知道时为 `None`。
+    fn stats_line(&mut self) -> Option<String> {
+        None
+    }
 }
 
 /// 起始码率：没有历史数据时从这里起步。
@@ -204,6 +209,7 @@ type EncodeDone = (
     Result<(Option<EncodedFrame>, bool), peerdesk_core::Error>,
     u64,
     u64,
+    peerdesk_core::video::EncodeTiming,
 );
 
 /// 启动编码线程。编码要好几毫秒到几十毫秒，放在会话循环里会让输入和反馈排队等它。
@@ -230,7 +236,8 @@ fn spawn_encoder(
                 }
             }
             let convert = encoder.convert_micros();
-            if done_tx.send((job, result, took, convert)).is_err() {
+            let timing = encoder.timing();
+            if done_tx.send((job, result, took, convert, timing)).is_err() {
                 break;
             }
         }
@@ -398,6 +405,9 @@ pub async fn serve(
     stats_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut last_stats = media.stats();
     let mut last_encode_us = 0u64;
+    let mut encode_window = crate::diag::EncodeWindow::default();
+    let mut last_budget = 0usize;
+    let mut last_quic = link.quic_stats();
     // 这一秒里编码和颜色转换的总耗时、帧数（统计行用平均值，单帧的值跳得厉害）
     let mut window = (0u64, 0u64, 0u64);
 
@@ -526,13 +536,15 @@ pub async fn serve(
             // 编码线程交回一帧：切片发出。
             done = encoded_rx.recv() => {
                 encoding = false;
-                let (job, result, took, convert) = match done {
+                let (job, result, took, convert, timing) = match done {
                     Some(done) => done,
                     None => break "编码线程结束".to_owned(),
                 };
                 media.set_encode_time(took);
                 last_encode_us = took;
                 window = (window.0.saturating_add(took), window.1.saturating_add(convert), window.2 + 1);
+                encode_window.add(took, &timing, result.as_ref().ok().and_then(|(e, _)| e.as_ref()).map(|e| e.payload.len()));
+                last_budget = job.budget;
                 media.set_max_payload(link.max_payload());
                 let out = match result.and_then(|(encoded, refine)| media.finish_frame(link.now(), &job, encoded, refine)) {
                     Ok(out) => out,
@@ -574,6 +586,41 @@ pub async fn serve(
                     media.fec_permille(),
                     media.profile_name(),
                 );
+                // 各模块这一秒的细节（见 crate::diag）：采集、编码、发送端、码率估计、QUIC，加上各模块的决定
+                if let Some(line) = source.stats_line() {
+                    crate::note!(info, target: "peerdesk::stats", "{line}");
+                }
+                if let Some(line) = encode_window.take_line() {
+                    crate::note!(info, target: "peerdesk::stats", "{line}");
+                }
+                crate::note!(info, target: "peerdesk::stats",
+                    "发送端 每帧预算 {} KB，在途 {} KB，排队待发 {} KB；收到重传请求 {} 片，重传 {} 片，\
+                     没重传（刚重传过、可能还在路上）{} 片，没重传（这轮额度用完）{} 片；判定丢帧 {}",
+                    last_budget / 1024,
+                    media.in_flight() / 1024,
+                    pacer.queued_bytes() / 1024,
+                    now.nack_requests.saturating_sub(last_stats.nack_requests),
+                    now.retransmitted.saturating_sub(last_stats.retransmitted),
+                    now.resend_skipped.saturating_sub(last_stats.resend_skipped),
+                    now.resend_capped.saturating_sub(last_stats.resend_capped),
+                    now.lost.saturating_sub(last_stats.lost),
+                );
+                if let Some(o) = media.last_observation() {
+                    crate::note!(info, target: "peerdesk::stats",
+                        "码率估计 最近反馈：排队 {} ms，延迟趋势 {} ms，丢包 {}‰，送达 {} kbps，包串测速 {} kbps",
+                        o.feedback.queue_delay_us / 1000,
+                        crate::diag::signed_tenths(o.ext.trend_tenth_ms),
+                        o.feedback.loss_permille,
+                        u64::from(o.feedback.recv_bytes_per_s) * 8 / 1000,
+                        u64::from(o.ext.train_bytes_per_s) * 8 / 1000,
+                    );
+                }
+                let quic = link.quic_stats();
+                crate::note!(info, target: "peerdesk::stats", "{}", crate::diag::quic_line(&last_quic, &quic));
+                last_quic = quic;
+                for event in media.take_events() {
+                    crate::note!(info, target: "peerdesk::stats", "决定 {event}");
+                }
                 if send_stats {
                     let stats = peerdesk_core::stats::HostStats {
                         encoder: backend.lock().map(|b| b.clone()).unwrap_or_default(),
@@ -600,7 +647,7 @@ pub async fn serve(
                 let Some(screen) = source.capture() else {
                     // 画面来源结束：正在编的那一帧编完发出去再结束。
                     let last = if encoding { encoded_rx.recv().await } else { None };
-                    let last = last.and_then(|(job, r, _, _)| r.ok().map(|(e, f)| (job, e, f)));
+                    let last = last.and_then(|(job, r, _, _, _)| r.ok().map(|(e, f)| (job, e, f)));
                     media.set_max_payload(link.max_payload());
                     let out = last.map(|(job, e, f)| media.finish_frame(link.now(), &job, e, f).unwrap_or_default());
                     out.unwrap_or_default().iter().for_each(|o| drop(link.send_flags(Channel::Video, o.flags, &o.body)));

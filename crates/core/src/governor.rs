@@ -34,6 +34,8 @@ pub struct FpsGovernor {
     /// 从什么时候起一直轻松。
     calm_since: Option<Time>,
     last_frame: Option<Time>,
+    /// 最近一次换档的说明（诊断日志用，取走后清空）。
+    change: Option<String>,
 }
 
 impl FpsGovernor {
@@ -47,6 +49,7 @@ impl FpsGovernor {
             strained: 0,
             calm_since: None,
             last_frame: None,
+            change: None,
         }
     }
 
@@ -78,7 +81,20 @@ impl FpsGovernor {
             self.strained = self.strained.saturating_add(1);
             if self.strained >= DOWN_AFTER {
                 self.strained = 0;
+                let from = self.fps;
                 self.fps = self.step(false);
+                if self.fps != from {
+                    let why = if cpu_busy {
+                        format!(
+                            "CPU 跟不上：编一帧 {} ms，帧间隔 {} ms",
+                            encode_us / 1000,
+                            interval / 1000
+                        )
+                    } else {
+                        format!("内容装不进预算：这帧 {size} 字节，预算 {budget}")
+                    };
+                    self.change = Some(format!("帧率 {from} → {}：{why}", self.fps));
+                }
             }
         } else {
             self.strained = 0;
@@ -86,13 +102,27 @@ impl FpsGovernor {
                 let since = *self.calm_since.get_or_insert(now);
                 if now.since(since) >= UP_AFTER_US {
                     self.calm_since = Some(now);
+                    let from = self.fps;
                     self.fps = self.step(true);
+                    if self.fps != from {
+                        self.change = Some(format!(
+                            "帧率 {from} → {}：轻松了 {} 秒（编一帧 {} ms）",
+                            self.fps,
+                            UP_AFTER_US / 1_000_000,
+                            encode_us / 1000
+                        ));
+                    }
                 }
             } else {
                 self.calm_since = None;
             }
         }
         self.fps
+    }
+
+    /// 取走最近一次换档的说明（诊断日志用）。
+    pub fn take_change(&mut self) -> Option<String> {
+        self.change.take()
     }
 
     /// 相邻的档位，不超过上限。
@@ -123,6 +153,9 @@ mod tests {
             g.on_frame(t, 20_000, 100, 1000);
         }
         assert_eq!(g.fps(), 30);
+        let why = g.take_change().unwrap();
+        assert!(why.contains("帧率 60 → 30：CPU 跟不上"), "{why}");
+        assert!(g.take_change().is_none(), "取走后清空");
         assert!(!g.due(t.plus(10_000)), "30 帧：33 ms 一帧");
         assert!(g.due(t.plus(31_000)));
         // 一直很轻松：一档档升回 60，不超过上限
@@ -131,6 +164,7 @@ mod tests {
             g.on_frame(t, 1_000, 100, 1000);
         }
         assert_eq!(g.fps(), 60);
+        assert!(g.take_change().unwrap().contains("轻松了"));
     }
 
     #[test]
@@ -161,6 +195,7 @@ mod tests {
             g.on_frame(t, 0, 50_000, 10_000);
         }
         assert_eq!(g.fps(), 5, "一直装不进：降到最低一档");
+        assert!(g.take_change().unwrap().contains("内容装不进预算"));
         // 偶尔超一点、又不算轻松：不升也不降
         for _ in 0..100 {
             t = t.plus(200_000);

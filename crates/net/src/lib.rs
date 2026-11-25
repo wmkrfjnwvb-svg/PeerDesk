@@ -34,6 +34,7 @@ pub mod clipsync;
 pub mod controller;
 #[cfg(feature = "media")]
 pub mod demo;
+pub mod diag;
 pub mod error;
 pub mod files;
 pub mod fs_store;

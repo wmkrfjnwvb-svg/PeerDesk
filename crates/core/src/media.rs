@@ -160,6 +160,12 @@ pub struct SenderStats {
     pub retransmitted: u32,
     /// 因为持续丢包从“稳定”换成“无线”画像的次数。
     pub profile_switches: u32,
+    /// 收到的重传请求（分片数）。
+    pub nack_requests: u32,
+    /// 重传请求里因为“刚重传过、可能还在路上”而没有再发的分片数。
+    pub resend_skipped: u32,
+    /// 因为一轮重传额度用完而没有发的分片数。
+    pub resend_capped: u32,
 }
 
 /// 交给编码器的一帧任务。编码可以在别的线程上做：任务里带着上次之后发送端判定的丢失和收到的确认，
@@ -240,6 +246,8 @@ pub struct MediaSender {
     key_sent: Option<(u32, Time)>,
     /// 控制端显示画面的区域（见 [`FrameJob::view`]）。
     view: Option<(u16, u16)>,
+    /// 各模块的决定和原因，等会话取走写日志（见 [`Self::take_events`]）。
+    events: Vec<String>,
 }
 
 impl std::fmt::Debug for MediaSender {
@@ -290,6 +298,7 @@ impl MediaSender {
             scale_up: false,
             key_sent: None,
             view: None,
+            events: Vec::new(),
             scale: if codec == Codec::H264 {
                 ScalePolicy::new()
             } else {
@@ -371,6 +380,10 @@ impl MediaSender {
         // 变了：画面不动也要按新尺寸编一帧（否则停着的画面一直是旧尺寸）
         if view != self.view {
             self.scale_up = true;
+            self.event(format!(
+                "控制端显示区域 {:?} → {view:?}（像素，None 表示不限）",
+                self.view
+            ));
         }
         self.view = view;
     }
@@ -468,7 +481,14 @@ impl MediaSender {
         self.expire_unacked(now);
         let (lost, feedback) = std::mem::take(&mut self.notes);
         let key_pending = self.key_pending();
+        let before = self.scale.permille();
         let scale_permille = self.scale.decide(now, self.rate.rate_bps(), key_pending);
+        if scale_permille != before {
+            self.event(format!(
+                "编码分辨率 {before}‰ → {scale_permille}‰：原尺寸关键帧按码率 {} kbps 估计送得完",
+                self.rate.rate_bps() / 1000
+            ));
+        }
         self.scale_up = false;
         FrameJob {
             frame_id: self.last_frame.wrapping_add(1).max(1),
@@ -525,6 +545,9 @@ impl MediaSender {
         };
         self.governor
             .on_frame(now, encode_us, encoded.payload.len(), job.budget);
+        if let Some(change) = self.governor.take_change() {
+            self.event(change);
+        }
         if encoded.key {
             self.key_sent = Some((job.frame_id, now));
             self.scale.on_keyframe(
@@ -605,8 +628,16 @@ impl MediaSender {
         // 又丢一大半（窄带宽上大关键帧就是这样反复丢、半天收不齐）。没补到的下一轮还会再要。
         let allowance = self.rate.rate_bps().saturating_mul(RESEND_WINDOW_US) / 8_000_000;
         let mut resent_bytes = 0u64;
-        for (frame, frag) in nacks {
+        self.stats.nack_requests = self
+            .stats
+            .nack_requests
+            .saturating_add(u32::try_from(nacks.len()).unwrap_or(u32::MAX));
+        for (i, (frame, frag)) in nacks.iter().copied().enumerate() {
             if resent_bytes >= allowance.max(1) {
+                self.stats.resend_capped = self
+                    .stats
+                    .resend_capped
+                    .saturating_add(u32::try_from(nacks.len() - i).unwrap_or(u32::MAX));
                 break;
             }
             // 上次重传之后，要等它排完队、到达、接收端再报告，才算真的又丢了：往返时间加上当前排队延迟。
@@ -620,6 +651,9 @@ impl MediaSender {
                 .iter()
                 .find(|(id, _, _)| *id == frame)
                 .and_then(|(_, _, packets)| packets.get(usize::from(frag)));
+            if !again {
+                self.stats.resend_skipped = self.stats.resend_skipped.saturating_add(1);
+            }
             if let Some(packet) = packet.filter(|_| again) {
                 resent_bytes = resent_bytes
                     .saturating_add(u64::try_from(packet.body.len()).unwrap_or(u64::MAX));
@@ -639,6 +673,13 @@ impl MediaSender {
         Ok(out)
     }
 
+    /// 记一条决定（最多攒 64 条，会话每秒取走）。
+    fn event(&mut self, text: String) {
+        if self.events.len() < 64 {
+            self.events.push(text);
+        }
+    }
+
     /// 同一个分片两次重传至少隔多久：往返时间加上最近报告的排队延迟。
     fn resend_after_us(&self) -> u64 {
         let queue = self
@@ -651,6 +692,13 @@ impl MediaSender {
     #[must_use]
     pub fn in_flight(&self) -> u64 {
         self.unacked.iter().map(|(_, _, bytes)| *bytes).sum()
+    }
+
+    /// 取走这段时间里各个模块的决定和原因（码率、帧率、编码分辨率、网络画像），诊断日志用。
+    pub fn take_events(&mut self) -> Vec<String> {
+        let mut out = std::mem::take(&mut self.events);
+        out.extend(self.rate.take_notes());
+        out
     }
 
     /// 带宽估计器的名字。
@@ -718,6 +766,7 @@ impl MediaSender {
         let key_pending = self.key_pending();
         if self.scale.on_idle(now, self.rate.rate_bps(), key_pending) {
             self.scale_up = true;
+            self.event("编码分辨率升回原尺寸：画面停下了，后台送原尺寸关键帧".to_owned());
         }
     }
 
@@ -736,6 +785,10 @@ impl MediaSender {
         if self.lossy_feedbacks >= 2 {
             self.rate.set_profile(Profile::WIRELESS);
             self.stats.profile_switches = self.stats.profile_switches.saturating_add(1);
+            self.event(format!(
+                "网络画像 稳定 → 无线：连续两次反馈丢包 ≥ {}‰（这次 {loss_permille}‰），加纠错、随机丢包不再降码率",
+                FEC_FROM_LOSS_PERMILLE
+            ));
         }
     }
 
@@ -781,6 +834,14 @@ pub struct ReceiverStats {
     pub bad: u32,
     /// 收齐的帧的字节数。
     pub video_bytes: u64,
+    /// 收齐的帧数（不管能不能解）。
+    pub assembled: u32,
+    /// 收齐一帧用的时间（第一个分片到最后一个，微秒）之和与最大值：大帧突发、丢包重传时变长。
+    pub assembly_us_sum: u64,
+    /// 收齐一帧用的最长时间（微秒）；诊断日志取走后清零（见 [`MediaReceiver::take_assembly_max`]）。
+    pub assembly_us_max: u64,
+    /// 发出的重传请求（分片数）。
+    pub nacks_sent: u32,
 }
 
 /// 接收端交出的一帧画面。
@@ -1026,6 +1087,10 @@ impl MediaReceiver {
         let Some(frame) = self.reassembler.push(now, packet)? else {
             return Ok(None);
         };
+        let took = frame.completed.since(frame.first_seen);
+        self.stats.assembled = self.stats.assembled.saturating_add(1);
+        self.stats.assembly_us_sum = self.stats.assembly_us_sum.saturating_add(took);
+        self.stats.assembly_us_max = self.stats.assembly_us_max.max(took);
         self.stats.video_bytes = self
             .stats
             .video_bytes
@@ -1072,7 +1137,16 @@ impl MediaReceiver {
     pub fn feedback_datagram(&mut self, now: Time) -> Vec<u8> {
         let feedback = self.feedback(now);
         let nacks = self.reassembler.missing(now, NACK_AFTER_US, MAX_NACKS);
+        self.stats.nacks_sent = self
+            .stats
+            .nacks_sent
+            .saturating_add(u32::try_from(nacks.len()).unwrap_or(u32::MAX));
         encode_feedback(&feedback, &self.metrics.report(), &nacks)
+    }
+
+    /// 取走这段时间收齐一帧用的最长时间（微秒），清零。
+    pub fn take_assembly_max(&mut self) -> u64 {
+        std::mem::take(&mut self.stats.assembly_us_max)
     }
 
     /// 生成一条反馈，同时让超时的帧作废。

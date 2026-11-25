@@ -1,7 +1,7 @@
 //! QUIC 端点与连接。
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -392,6 +392,41 @@ pub struct Link {
     /// 每个通道各自的序号：接收端按通道统计丢包，不同通道的包不能共用一个序号。
     seq: [AtomicU32; 7],
     started: Instant,
+    /// 应用交给 QUIC 发送的数据报数（含被 QUIC 发送缓冲挤掉的）。
+    app_sent: AtomicU64,
+    /// 超过路径 MTU、没发出去的数据报数。
+    app_too_large: AtomicU64,
+    /// 应用从 QUIC 读到的数据报数。
+    app_read: AtomicU64,
+}
+
+/// 一条连接的 QUIC 层统计（累计值），诊断日志用：把“网络丢的”和“我们自己这一层丢的”分开。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QuicStats {
+    /// 应用交给 QUIC 发送的数据报数。
+    pub app_sent: u64,
+    /// 超过路径 MTU 没发出去的数据报数。
+    pub app_too_large: u64,
+    /// 应用读到的数据报数。
+    pub app_read: u64,
+    /// QUIC 实际发出的 DATAGRAM 帧数（比 `app_sent` 少：发送缓冲满时最旧的被挤掉）。
+    pub datagram_frames_sent: u64,
+    /// QUIC 收到的 DATAGRAM 帧数（比 `app_read` 多：应用读得慢，接收缓冲满时被丢）。
+    pub datagram_frames_received: u64,
+    /// UDP 层发出、收到的包数。
+    pub udp_sent: u64,
+    /// UDP 层收到的包数。
+    pub udp_received: u64,
+    /// QUIC 判定在网络上丢了的包数和字节数。
+    pub lost_packets: u64,
+    /// QUIC 判定丢了的字节数。
+    pub lost_bytes: u64,
+    /// QUIC 拥塞控制的拥塞事件次数。
+    pub congestion_events: u64,
+    /// QUIC 拥塞窗口（字节）。
+    pub cwnd: u64,
+    /// 当前路径 MTU。
+    pub mtu: u16,
 }
 
 impl Link {
@@ -409,6 +444,9 @@ impl Link {
             peer,
             seq: Default::default(),
             started: Instant::now(),
+            app_sent: AtomicU64::new(0),
+            app_too_large: AtomicU64::new(0),
+            app_read: AtomicU64::new(0),
         })
     }
 
@@ -439,6 +477,26 @@ impl Link {
     pub fn wire_bytes(&self) -> (u64, u64) {
         let stats = self.conn.stats();
         (stats.udp_tx.bytes, stats.udp_rx.bytes)
+    }
+
+    /// QUIC 层统计（累计值，见 [`QuicStats`]）。
+    #[must_use]
+    pub fn quic_stats(&self) -> QuicStats {
+        let s = self.conn.stats();
+        QuicStats {
+            app_sent: self.app_sent.load(Ordering::Relaxed),
+            app_too_large: self.app_too_large.load(Ordering::Relaxed),
+            app_read: self.app_read.load(Ordering::Relaxed),
+            datagram_frames_sent: s.frame_tx.datagram,
+            datagram_frames_received: s.frame_rx.datagram,
+            udp_sent: s.udp_tx.datagrams,
+            udp_received: s.udp_rx.datagrams,
+            lost_packets: s.path.lost_packets,
+            lost_bytes: s.path.lost_bytes,
+            congestion_events: s.path.congestion_events,
+            cwnd: s.path.cwnd,
+            mtu: s.path.current_mtu,
+        }
     }
 
     /// 当前估计的往返延迟。
@@ -495,6 +553,7 @@ impl Link {
     /// 原样发送一个数据报，不加包头。正常代码用 [`Link::send`]；
     /// 这个入口用来测试对端面对畸形数据报时的健壮性。
     pub fn send_raw(&self, datagram: Vec<u8>) -> Result<(), NetError> {
+        self.app_sent.fetch_add(1, Ordering::Relaxed);
         self.conn
             .send_datagram(Bytes::from(datagram))
             .or_else(|e| match e {
@@ -504,6 +563,7 @@ impl Link {
                 // 路径 MTU 变小了（丢包严重时 QUIC 的黑洞检测会调小）：这个包当作丢了，由重传和下一帧补；
                 // 发送方每帧按新的大小切片。原来当成致命错误，窄带宽上会话直接断开。
                 quinn::SendDatagramError::TooLarge => {
+                    self.app_too_large.fetch_add(1, Ordering::Relaxed);
                     log::debug!("数据报超过当前路径 MTU，丢弃这一片");
                     Ok(())
                 }
@@ -519,6 +579,7 @@ impl Link {
             .read_datagram()
             .await
             .map_err(|e| NetError::Closed(e.to_string()))?;
+        self.app_read.fetch_add(1, Ordering::Relaxed);
         let (header, payload) = decode_datagram(&bytes)?;
         Ok((header, payload.to_vec()))
     }

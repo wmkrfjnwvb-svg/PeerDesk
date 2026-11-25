@@ -44,14 +44,14 @@ run() { # 网络名 pacing（off 或倍数千分比）
   mkdir -p "$w"
   local env=(PEERDESK_PACE=0)
   if [ "$pace" != off ]; then env=(PEERDESK_PACE=1 PEERDESK_PACE_FACTOR="$pace"); fi
-  env "${env[@]}" DISPLAY=$DISPLAY_NUM "$BIN" host --listen 127.0.0.1:0 --data-dir "$w/host" --open --once \
+  env "${env[@]}" PEERDESK_DATA_DIR="$w/host" DISPLAY=$DISPLAY_NUM "$BIN" host --listen 127.0.0.1:0 --data-dir "$w/host" --open --once \
     >"$w/host.log" 2>&1 & local host=$!
   pids+=($host)
   for _ in $(seq 60); do grep -q '^指纹' "$w/host.log" && break; sleep 0.25; done
   local addr pin
   addr=$(sed -n 's/^监听 //p' "$w/host.log")
   pin=$(sed -n 's/^指纹 //p' "$w/host.log")
-  "$BIN" connect "$addr" --pin "$pin" --data-dir "$w/ctrl" --seconds "$SECONDS_PER_RUN" >"$w/ctrl.log" 2>&1 || true
+  PEERDESK_DATA_DIR="$w/ctrl" "$BIN" connect "$addr" --pin "$pin" --data-dir "$w/ctrl" --seconds "$SECONDS_PER_RUN" >"$w/ctrl.log" 2>&1 || true
   wait "$host" 2>/dev/null || true
   local first frames gap rtt bytes
   first=$(sed -n 's/^第一幅画面 *//p' "$w/ctrl.log")
