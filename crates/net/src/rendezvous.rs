@@ -76,6 +76,22 @@ pub enum PathPolicy {
     DirectOnly,
     /// 只走中继（用于测试，或者不想暴露自己地址的场合）。
     RelayOnly,
+    /// 先走中继（马上出画面），会话中在后台试直连，通了就切过去。
+    RelayFirst,
+}
+
+impl PathPolicy {
+    /// 这一次拨号只走中继（[`Self::RelayOnly`]，以及 [`Self::RelayFirst`] 的第一次）。
+    #[must_use]
+    pub const fn relay_only(self) -> bool {
+        matches!(self, PathPolicy::RelayOnly | PathPolicy::RelayFirst)
+    }
+
+    /// 走了中继之后要不要在会话中试着升级成直连（用户没要求只走中继时都要：中继是成本，直连更快）。
+    #[must_use]
+    pub const fn upgrades(self) -> bool {
+        matches!(self, PathPolicy::Auto | PathPolicy::RelayFirst)
+    }
 }
 
 /// 本机地址：`loopback` 为真给回环地址，否则给“所有地址”。
@@ -594,14 +610,14 @@ async fn dial_on(
 
     // 候选：对方报告的局域网 / IPv6 / 端口映射地址，服务器看到的公网地址，还有中继。
     let mut remotes: Vec<Candidate> = Vec::new();
-    if !matches!(policy, PathPolicy::RelayOnly) {
+    if !policy.relay_only() {
         remotes.extend(locals.iter().copied());
         remotes.push(Candidate {
             addr,
             kind: PathKind::Public,
         });
     }
-    if matches!(policy, PathPolicy::RelayOnly) && relay.is_none() {
+    if policy.relay_only() && relay.is_none() {
         return Err(NetError::Connect("服务器没有提供中继".into()));
     }
     // 拿到对方地址立刻先发一轮 ping（不等中继转发器准备好）：本端路由器先为对方开门，
@@ -609,7 +625,7 @@ async fn dial_on(
     crate::ice::ping_all(node, nonce, u32::MAX, &remotes);
     let shim = match (policy, relay) {
         (PathPolicy::DirectOnly, _) | (_, None) => None,
-        (PathPolicy::Auto | PathPolicy::RelayOnly, Some(grant)) => {
+        (PathPolicy::Auto | PathPolicy::RelayOnly | PathPolicy::RelayFirst, Some(grant)) => {
             Some(Shim::start(grant, None).await?)
         }
     };
@@ -631,7 +647,7 @@ async fn dial_on(
         ..base
     };
     let probing = Instant::now();
-    let direct_allowed = !matches!(policy, PathPolicy::RelayOnly);
+    let direct_allowed = !policy.relay_only();
     let race = crate::ice::race(node, &mut sub, nonce, remotes, limits, direct_allowed).await;
     timing.probe = probing.elapsed();
     let report = crate::ice::describe(&race);
@@ -666,7 +682,7 @@ async fn dial_on(
             Err(e @ NetError::PinMismatch { .. }) => return Err(e),
             Err(e) => direct_error = Some(e),
         }
-    } else if plan != PunchPlan::Skip && !any_direct && !matches!(policy, PathPolicy::RelayOnly) {
+    } else if plan != PunchPlan::Skip && !any_direct && !policy.relay_only() {
         // 快路径都不通：多端口打洞（生日攻击）。普通打洞没通时，多半是对方的路由器给对方换了
         // 端口（对方成了难打洞的一端），所以本端撒包、对方开很多端口。
         let tried = Instant::now();
@@ -699,7 +715,7 @@ async fn dial_on(
             Err(e @ NetError::PinMismatch { .. }) => return Err(e),
             Err(e) => direct_error = Some(e),
         }
-    } else if !any_direct && !matches!(policy, PathPolicy::RelayOnly) {
+    } else if !any_direct && !policy.relay_only() {
         direct_error = Some(NetError::Connect(
             "两端的 NAT 都是对称型（换目的地就换端口），打洞几乎不可能成功，直接走中继".into(),
         ));

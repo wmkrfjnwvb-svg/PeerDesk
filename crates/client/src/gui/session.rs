@@ -22,7 +22,9 @@ use peerdesk_net::controller::{self, ControllerOptions, LinkHook, ScreenSink};
 use peerdesk_net::host::{self, HostOptions, ScreenSource, FRAME_DEADLINE_US};
 use peerdesk_net::identity::to_hex;
 use peerdesk_net::netcheck::{prepare_host, NetReport};
-use peerdesk_net::rendezvous::{dial_via, fetch_nodes, register_with, Path as Route, Server, Shim};
+use peerdesk_net::rendezvous::{
+    dial_via, fetch_nodes, register_with, Dialed, Lookup, Path as Route, PathPolicy, Server, Shim,
+};
 use peerdesk_net::{Identity, NetError, Node};
 use tokio::sync::watch;
 
@@ -362,8 +364,14 @@ async fn host_main(
     let limiter = Arc::new(Mutex::new(Limiter::default()));
     let recv_root = config.data_dir.join("received");
     let mut seed = 1u64;
-    loop {
-        let link = tokio::select! {
+    // 会话进行中来的其他控制端的连接，按顺序排着（一次只服务一个）
+    let mut waiting: std::collections::VecDeque<peerdesk_net::Link> =
+        std::collections::VecDeque::new();
+    'serve: loop {
+        let link = if let Some(link) = waiting.pop_front() {
+            link
+        } else {
+            tokio::select! {
             () = stopped(&mut stop) => break,
             next = incoming.recv() => match next {
                 Some(Ok(link)) => link,
@@ -374,6 +382,7 @@ async fn host_main(
                 }
                 None => break,
             },
+            }
         };
         peerdesk_net::note!(
             info,
@@ -423,9 +432,30 @@ async fn host_main(
             shared: Arc::clone(&shared),
             announce: Some(ev.clone()),
         };
-        let result = tokio::select! {
-            () = stopped(&mut stop) => break,
-            r = host::serve(link, opts, Box::new(source), input) => r.map(|report| report.end),
+        let current = *link.peer_fingerprint();
+        let mut incoming_open = true;
+        let serving = host::serve(link, opts, Box::new(source), input);
+        tokio::pin!(serving);
+        let result = loop {
+            tokio::select! {
+                () = stopped(&mut stop) => break 'serve,
+                r = &mut serving => break r.map(|report| report.end),
+                // 会话中同一个控制端又连上来：它换了通道（中继升级直连、网络变了重连），
+                // 旧会话马上结束、服务新连接，不等旧连接超时（以前要等十几秒，新连接的握手也跟着超时）
+                next = incoming.recv(), if incoming_open => match next {
+                    Some(Ok(newer)) if *newer.peer_fingerprint() == current => {
+                        waiting.push_front(newer);
+                        break Ok("同一个控制端换了通道".to_owned());
+                    }
+                    Some(Ok(other)) => waiting.push_back(other),
+                    Some(Err(e)) => {
+                        peerdesk_net::note!(warn, "被控：握手失败：{e}");
+                        ev.send(HostEvent::HandshakeFailed(e));
+                    }
+                    // 端点都关了：不再等新连接（否则这里会一直立刻返回、空转）
+                    None => incoming_open = false,
+                },
+            }
         };
         match &result {
             Ok(end) => peerdesk_net::note!(info, "被控：会话结束：{end}"),
@@ -610,6 +640,17 @@ pub const RECONNECT_TRIES: u32 = 3;
 const RECONNECT_GAP: Duration = Duration::from_secs(1);
 /// 多久看一次中继有没有发来通知。
 const NOTICE_POLL: Duration = Duration::from_millis(500);
+/// 走中继时，过多久试一次直连（中继是成本，直连更快）：先试得勤一些，之后每 5 分钟一次。
+/// 打洞失败多半是 NAT 本身的限制，频繁重试没用，也给服务器添负担。
+const UPGRADE_SCHEDULE: [Duration; 3] = [
+    Duration::from_secs(15),
+    Duration::from_secs(45),
+    Duration::from_secs(120),
+];
+/// 之后每隔多久试一次。
+const UPGRADE_EVERY: Duration = Duration::from_secs(300);
+/// [`PathPolicy::RelayFirst`]：先走中继出画面，这么久之后就试直连。
+const RELAY_FIRST_UPGRADE: Duration = Duration::from_secs(1);
 
 /// 会话结束的原因是不是网络断了（应当换通道重连），而不是对方或自己结束的。
 #[must_use]
@@ -819,6 +860,40 @@ enum Outcome {
     Done(Summary),
     Lost(String),
     Notice(String),
+    /// 走中继时在后台打通了直连：结束这一次（中继）会话，在这条直连上重新开始。
+    Upgrade(Box<Dialed>),
+}
+
+/// 走中继时在后台反复试直连，通了就交出这条连接（不返回就是一直没通）。
+async fn find_direct(
+    node: &Node,
+    servers: &[Server],
+    device: &Lookup,
+    policy: PathPolicy,
+    account: &str,
+) -> Dialed {
+    let first = if policy == PathPolicy::RelayFirst {
+        vec![RELAY_FIRST_UPGRADE]
+    } else {
+        UPGRADE_SCHEDULE.to_vec()
+    };
+    let mut waits = first.into_iter().chain(std::iter::repeat(UPGRADE_EVERY));
+    loop {
+        let wait = waits.next().unwrap_or(UPGRADE_EVERY);
+        tokio::time::sleep(wait).await;
+        match dial_via(node, servers, device, PathPolicy::DirectOnly, account).await {
+            Ok(dialed) if dialed.shim.is_none() => {
+                peerdesk_net::note!(
+                    info,
+                    "控制：直连打通了（{}），从中继切过去",
+                    dialed.route.label()
+                );
+                return dialed;
+            }
+            Ok(_) => {}
+            Err(e) => peerdesk_net::note!(info, "控制：试直连没通（{e}），继续走中继"),
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -851,6 +926,7 @@ async fn watch_remote(
     });
     let started = Instant::now();
     let mut attempt = 0u32;
+    let mut upgraded: Option<Box<Dialed>> = None;
     let result = loop {
         let (tx, rx) = tokio::sync::mpsc::channel(256);
         *current.lock().unwrap_or_else(PoisonError::into_inner) = Some(tx);
@@ -864,10 +940,13 @@ async fn watch_remote(
             rx,
             ev,
             data_dir,
+            upgraded.take(),
         )
         .await;
         match outcome {
             Ok(Outcome::Done(summary)) => break Ok(summary),
+            // 换到直连：不算重连次数
+            Ok(Outcome::Upgrade(dialed)) => upgraded = Some(dialed),
             Ok(Outcome::Notice(text)) => {
                 ev.send(ViewEvent::Notice(text.clone()));
                 break Ok(Summary {
@@ -911,7 +990,10 @@ async fn one_session(
     input: tokio::sync::mpsc::Receiver<InputEvent>,
     ev: &Emitter<ViewEvent>,
     data_dir: &std::path::Path,
+    upgraded: Option<Box<Dialed>>,
 ) -> Result<Outcome, NetError> {
+    // 走中继时，会话中在后台试直连（用户没要求只走中继时）
+    let mut direct_search = None;
     // 走中继时的本机转发器要保持到会话结束。
     let (link, shim, route, detail) = match target {
         Target::Addr { addr, pin } => (
@@ -927,7 +1009,13 @@ async fn one_session(
             account,
         } => {
             let servers = server_order(*server, load_nodes(data_dir));
-            let dialed = dial_via(node, &servers, device, *policy, account).await?;
+            let dialed = match upgraded {
+                Some(dialed) => *dialed,
+                None => dial_via(node, &servers, device, *policy, account).await?,
+            };
+            if dialed.shim.is_some() && policy.upgrades() {
+                direct_search = Some((servers.clone(), *device, *policy, account.clone()));
+            }
             // 顺便更新集群节点缓存，下次这个服务器崩了还能换别的节点。
             if let Ok(nodes) = fetch_nodes(node, server).await {
                 if !nodes.is_empty() {
@@ -1013,7 +1101,17 @@ async fn one_session(
             }
         }
     };
+    let upgrade = async {
+        match &direct_search {
+            Some((servers, device, policy, account)) => {
+                find_direct(node, servers, device, *policy, account).await
+            }
+            None => std::future::pending().await,
+        }
+    };
     tokio::select! {
+        // 旧连接随会话一起放开；被控端看到同一个控制端的新连接就结束旧会话（见 host_main）
+        dialed = upgrade => Ok(Outcome::Upgrade(Box::new(dialed))),
         report = session => {
             let report = report?;
             if network_lost(&report.end) {

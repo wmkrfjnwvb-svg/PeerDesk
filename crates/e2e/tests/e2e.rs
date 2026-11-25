@@ -340,3 +340,59 @@ fn typing_on_a_very_narrow_link() {
         )
     });
 }
+
+/// 停着的时候网络变了：空闲时没有数据，带宽估计冻结在旧值上。
+/// 先在 20 Mbps 上打字，停 3 秒（期间掉到 2 Mbps），然后切换窗口（大面积突变）：
+/// 按旧的估计一下子发出去会把瓶颈塞满、长时间冻结。
+#[test]
+fn link_drops_while_idle() {
+    let fast = Link {
+        rate_bps: Some(20_000_000),
+        delay_us: 20_000,
+        ..Link::lan()
+    };
+    let slow = Link {
+        rate_bps: Some(2_000_000),
+        ..fast
+    };
+    compare(&Scenario {
+        network: vec![(0, fast), (3_500_000, slow)],
+        ..Scenario::new(
+            "drop-while-idle",
+            vec![
+                phase(Action::Typing, 60),
+                phase(Action::Idle, 90),
+                phase(Action::Switching, 30),
+                phase(Action::Scrolling, 60),
+                phase(Action::Idle, 30),
+            ],
+        )
+    });
+}
+
+/// 停着的时候网络变好了（2 → 20 Mbps）：之后滚动，要很快用上新带宽（画质跟上）。
+#[test]
+fn link_improves_while_idle() {
+    let slow = Link {
+        rate_bps: Some(2_000_000),
+        delay_us: 20_000,
+        ..Link::lan()
+    };
+    let fast = Link {
+        rate_bps: Some(20_000_000),
+        ..slow
+    };
+    compare(&Scenario {
+        network: vec![(0, slow), (3_500_000, fast)],
+        start_bps: 1_000_000,
+        ..Scenario::new(
+            "rise-while-idle",
+            vec![
+                phase(Action::Typing, 60),
+                phase(Action::Idle, 90),
+                phase(Action::Scrolling, 90),
+                phase(Action::Idle, 30),
+            ],
+        )
+    });
+}

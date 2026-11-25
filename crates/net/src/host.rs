@@ -623,16 +623,17 @@ pub async fn serve(
                 }
                 // 每一轮都检查迟迟没有确认的帧（不能只在编帧时查：关键帧没确认时根本不编帧）
                 media.expire_unacked(link.now());
-                // 在途数据超过上限：这一帧不编，变化攒着，等确认之后编最新的画面。
-                if encoding || pacer.busy(peerdesk_core::pacer::rate_for(pacing, media.rate_bps()), 1_000_000 / u64::from(opts.fps.max(1))) || media.in_flight_full(link.now()) || !media.due(link.now()) || (!pending_change && !media.wants_frame()) {
-                    continue;
-                }
-                let rtt = u64::try_from(link.rtt().as_micros()).unwrap_or(u64::MAX);
+                // 控制端窗口大小（变了的话画面不动也要按新尺寸编一帧）
                 let packed = view.load(std::sync::atomic::Ordering::Relaxed);
                 media.set_view(Some((
                     u16::try_from(packed >> 16).unwrap_or(0),
                     u16::try_from(packed & 0xffff).unwrap_or(0),
                 )));
+                // 在途数据超过上限：这一帧不编，变化攒着，等确认之后编最新的画面。
+                if encoding || pacer.busy(peerdesk_core::pacer::rate_for(pacing, media.rate_bps()), 1_000_000 / u64::from(opts.fps.max(1))) || media.in_flight_full(link.now()) || !media.due(link.now()) || (!pending_change && !media.wants_frame()) {
+                    continue;
+                }
+                let rtt = u64::try_from(link.rtt().as_micros()).unwrap_or(u64::MAX);
                 let job = media.start_frame(link.now(), rtt);
                 if jobs.send((job, screen.clone(), std::mem::take(&mut pending_change))).is_err() {
                     break "编码线程结束".to_owned();

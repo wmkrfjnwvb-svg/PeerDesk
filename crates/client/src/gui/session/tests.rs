@@ -180,6 +180,20 @@ fn view_a_host_send_input_and_get_kicked() {
         std::thread::sleep(Duration::from_millis(10));
     };
     assert!(full, "回环上要升回原尺寸：{:?}", v.frames().size());
+    // 控制端窗口变小：被控端按窗口大小编码（同一个值重复设不会再发）
+    v.set_view((640, 360));
+    v.set_view((640, 360));
+    let small = loop {
+        if v.frames().size() == [640, 360] {
+            break true;
+        }
+        if Instant::now() >= deadline + WAIT {
+            break false;
+        }
+        let _ = v.frames().take();
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(small, "按窗口大小编码：{:?}", v.frames().size());
     assert!(v.frames().frames() >= 1);
     assert!(repaints.load(Ordering::Relaxed) >= 1);
 
@@ -478,14 +492,14 @@ fn connect_through_a_signaling_server() {
     let HostEvent::Registered { code, .. } = registered else {
         panic!("{registered:?}")
     };
-    let device = peerdesk_net::rendezvous::Lookup::Code(code);
+    let device = Lookup::Code(code);
 
     let (repaint, _) = counter();
     let v = start_view(
         Target::Device {
             server: server.server(None),
             device,
-            policy: peerdesk_net::rendezvous::PathPolicy::RelayOnly,
+            policy: PathPolicy::RelayOnly,
             account: String::new(),
         },
         "secret-pw",
@@ -599,6 +613,15 @@ fn relay_session(
     host_dir: &Path,
     ctrl_dir: &Path,
 ) -> (HostHandle, Log<HostEvent>, ViewHandle, Log<ViewEvent>) {
+    relay_session_with(server, host_dir, ctrl_dir, PathPolicy::RelayOnly)
+}
+
+fn relay_session_with(
+    server: &TestServer,
+    host_dir: &Path,
+    ctrl_dir: &Path,
+    policy: PathPolicy,
+) -> (HostHandle, Log<HostEvent>, ViewHandle, Log<ViewEvent>) {
     let (h, _, mut host_seen) = host(host_dir, "secret-pw", Some(server.server(Some(server.pin))));
     let HostEvent::Registered { code, .. } = wait_for(
         || h.poll(),
@@ -611,8 +634,8 @@ fn relay_session(
     let v = start_view(
         Target::Device {
             server: server.server(None),
-            device: peerdesk_net::rendezvous::Lookup::Code(code),
-            policy: peerdesk_net::rendezvous::PathPolicy::RelayOnly,
+            device: Lookup::Code(code),
+            policy,
             account: String::new(),
         },
         "secret-pw",
@@ -626,6 +649,64 @@ fn relay_session(
         |e| matches!(e, ViewEvent::Connected { .. }),
     );
     (h, host_seen, v, seen)
+}
+
+/// 先走中继出画面，会话中在后台打通直连就切过去（中继是成本，直连更快），画面接着来。
+#[test]
+fn relay_session_upgrades_to_direct() {
+    let (server_dir, host_dir, ctrl_dir) = (temp_dir("s6"), temp_dir("h6"), temp_dir("c6"));
+    let server = TestServer::start(&server_dir);
+    let (h, _, v, mut seen) =
+        relay_session_with(&server, &host_dir, &ctrl_dir, PathPolicy::RelayFirst);
+    assert!(
+        seen.all.iter().any(|e| matches!(
+            e,
+            ViewEvent::Connected {
+                route: Route::Relay,
+                ..
+            }
+        )),
+        "先走中继：{:?}",
+        seen.all
+    );
+    wait_for(
+        || v.poll(),
+        &mut seen,
+        |e| {
+            matches!(
+                e,
+                ViewEvent::Connected {
+                    route: Route::Direct,
+                    ..
+                }
+            )
+        },
+    );
+    // 换过去之后画面还在来
+    let _ = v.frames().take();
+    let deadline = Instant::now() + WAIT;
+    while v.frames().take().is_none() {
+        if Instant::now() >= deadline {
+            let mut hs = Log::new();
+            hs.all.extend(h.poll());
+            seen.all.extend(v.poll());
+            panic!("切到直连后没有画面\nview {:?}\nhost {:?}", seen.all, hs.all);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !seen
+            .all
+            .iter()
+            .any(|e| matches!(e, ViewEvent::Reconnecting { .. })),
+        "升级不算断线重连"
+    );
+    drop(v);
+    drop(h);
+    drop(server);
+    for dir in [server_dir, host_dir, ctrl_dir] {
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
 
 #[test]
@@ -740,8 +821,8 @@ fn pixels_are_converted() {
             addr: "1.2.3.4:1".parse().unwrap(),
             pin: None
         },
-        device: peerdesk_net::rendezvous::Lookup::Device([0; 32]),
-        policy: peerdesk_net::rendezvous::PathPolicy::Auto,
+        device: Lookup::Device([0; 32]),
+        policy: PathPolicy::Auto,
         account: String::new(),
     })
     .is_ipv6());

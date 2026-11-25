@@ -234,7 +234,7 @@ pub struct MediaSender {
     encode_us: u64,
     /// 编码分辨率（只对 H.264；见 [`crate::scale`]）。
     scale: ScalePolicy,
-    /// 画面停下后决定升回原尺寸：要编一帧（原尺寸的关键帧）。
+    /// 编码尺寸要变（画面停下后升回原尺寸、控制端窗口变了）：画面不动也要编一帧。
     scale_up: bool,
     /// 最近发出的关键帧：(帧号, 发出时间)。
     key_sent: Option<(u32, Time)>,
@@ -367,18 +367,17 @@ impl MediaSender {
 
     /// 控制端报告了显示画面的区域（像素）；`(0, 0)` 或 `None` 表示不限（例如“原始大小”）。
     pub fn set_view(&mut self, view: Option<(u16, u16)>) {
-        self.view = view.filter(|(w, h)| *w > 0 && *h > 0);
+        let view = view.filter(|(w, h)| *w > 0 && *h > 0);
+        // 变了：画面不动也要按新尺寸编一帧（否则停着的画面一直是旧尺寸）
+        if view != self.view {
+            self.scale_up = true;
+        }
+        self.view = view;
     }
 
     /// 最近的关键帧还没确认。
     fn key_pending(&self) -> bool {
         self.unacked.iter().any(|(id, _, _)| *id == self.last_key)
-    }
-
-    /// 现在按源画面的多少编码（千分比）。
-    #[must_use]
-    pub const fn scale_permille(&self) -> u16 {
-        self.scale.permille()
     }
 
     /// 画面没变时还要不要按时交来（编码器在补清晰或要恢复）。
@@ -1103,6 +1102,22 @@ impl MediaReceiver {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
     use super::*;
+
+    #[test]
+    fn a_new_view_size_asks_for_a_frame() {
+        let mut tx = MediaSender::detached(SenderConfig::default(), Codec::H264);
+        assert!(!tx.wants_frame());
+        tx.set_view(Some((640, 360)));
+        assert!(tx.wants_frame(), "窗口变了：画面不动也要按新尺寸编一帧");
+        let job = tx.start_frame(Time(0), 10_000);
+        assert_eq!(job.view, Some((640, 360)));
+        assert!(!tx.wants_frame());
+        tx.set_view(Some((640, 360)));
+        assert!(!tx.wants_frame(), "没变不用编");
+        tx.set_view(Some((0, 0)));
+        assert!(tx.wants_frame(), "原始大小：不限");
+        assert_eq!(tx.start_frame(Time(1), 10_000).view, None);
+    }
     use crate::video::{EncodedFrame, TileDecoder, TileEncoder};
 
     /// 模拟视频编码的依赖关系：增量帧只记录和上一帧相比的“版本号”，
