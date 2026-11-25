@@ -7,7 +7,7 @@
 //! 组内丢一个分片可以恢复。它便宜、没有额外依赖，对随机丢包有效；
 //! 对成串的丢包效果有限，那种情况靠重传（见 [`crate::adaptive`]）。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 use crate::proto::VideoHeader;
 use crate::wire::{Reader, Writer};
@@ -190,6 +190,8 @@ pub struct ReassemblyStats {
     pub stale: u64,
     /// 靠校验分片恢复出来的数据分片数。
     pub recovered: u64,
+    /// 收齐了、但参考的帧还在补，先放着等它的帧数（H.264，见 [`Reassembler::set_keyframe_grace`]）。
+    pub held: u64,
 }
 
 /// 纠错方式（会话里双方协商：都支持 RS 时用 RS，否则用异或）。
@@ -338,9 +340,18 @@ pub struct Reassembler {
     stats: ReassemblyStats,
     /// 纠错方式（会话协商的结果）。
     fec: Fec,
-    /// 参考自己的帧当作关键帧，给更长的时间（见 [`Reassembler::expire`]）。只对 H.264 打开：
-    /// 块编码的每一帧都参考自己、都很小，丢了靠重发块恢复，给长时间反而拖慢恢复。
+    /// H.264 模式：参考自己的帧当作关键帧，给更长的时间（见 [`Reassembler::expire`]）；其余帧要等参考帧
+    /// 交出之后才能解，所以按参考顺序交出（见 `held`）。只对 H.264 打开：块编码的每一帧都参考自己、都很小，
+    /// 丢了靠重发块恢复，给长时间反而拖慢恢复。
     keyframe_grace: bool,
+    /// 收齐了、但参考的帧还在补（在 `pending` 或也在这里等）的帧，按帧号。参考帧交出时按顺序跟着交出，
+    /// 参考帧作废时跟着作废。WebRTC 的帧缓冲也是这样：帧收齐了但不连续就等，不跳过去
+    /// （`FrameBuffer`）。以前是“新帧收齐就作废比它旧的未完成帧”，可 H.264 的新帧参考旧帧，旧帧一作废新帧也解不了，
+    /// 只能重发关键帧：2026-11 微软轨迹 ms-09235（8 Mbps、平均丢包 12%）40 秒 46 个关键帧，56 帧是这样没的
+    /// （旧帧缺片的重传要一个往返，约 50 ms，下一帧 33 ms 后就收齐了）。
+    held: BTreeMap<u32, Frame>,
+    /// 跟着参考帧一起可以交出的帧（按顺序），用 [`Reassembler::take_ready`] 取。
+    ready: VecDeque<Frame>,
 }
 
 impl Reassembler {
@@ -356,6 +367,8 @@ impl Reassembler {
             stats: ReassemblyStats::default(),
             keyframe_grace: false,
             fec: Fec::Xor,
+            held: BTreeMap::new(),
+            ready: VecDeque::new(),
         }
     }
 
@@ -364,7 +377,7 @@ impl Reassembler {
         self.fec = fec;
     }
 
-    /// 打开或关闭关键帧宽限（H.264 打开）。
+    /// 打开或关闭 H.264 模式：关键帧宽限，按参考顺序交出（见 `held`）。
     pub fn set_keyframe_grace(&mut self, on: bool) {
         self.keyframe_grace = on;
     }
@@ -454,19 +467,33 @@ impl Reassembler {
             self.stats.stale = self.stats.stale.saturating_add(1);
             return Ok(None);
         }
+        // 已经收齐、在等参考帧的帧：迟到的重传或校验分片
+        if self.held.contains_key(&header.frame_id) {
+            self.stats.duplicates = self.stats.duplicates.saturating_add(1);
+            return Ok(None);
+        }
         if !self.pending.contains_key(&header.frame_id) {
-            // 缓冲区满：作废最旧的帧，给新帧让位。
+            // 缓冲区满：作废最旧的帧，给新帧让位（等参考帧的也算在内）。
             let excess = self
                 .pending
                 .len()
+                .saturating_add(self.held.len())
                 .saturating_add(1)
                 .saturating_sub(self.max_pending);
             for _ in 0..excess {
-                if let Some((oldest, _)) = self.pending.pop_first() {
+                let oldest = match (self.pending.keys().next(), self.held.keys().next()) {
+                    (Some(a), Some(b)) => Some(*a.min(b)),
+                    (a, b) => a.or(b).copied(),
+                };
+                if let Some(oldest) = oldest {
+                    self.pending.remove(&oldest);
+                    self.held.remove(&oldest);
                     self.stats.expired = self.stats.expired.saturating_add(1);
                     self.raise_floor(oldest);
                 }
             }
+            self.drop_stale();
+            self.drop_orphans();
             if self.floor.is_some_and(|f| header.frame_id <= f) {
                 self.stats.stale = self.stats.stale.saturating_add(1);
                 return Ok(None);
@@ -531,22 +558,100 @@ impl Reassembler {
             return Ok(None);
         }
 
-        let done = self.pending.remove(&header.frame_id);
-        // 新帧优先：比它旧的未完成帧全部作废。
-        let newer = self.pending.split_off(&header.frame_id);
-        let superseded = u64::try_from(self.pending.len()).unwrap_or(u64::MAX);
-        self.stats.expired = self.stats.expired.saturating_add(superseded);
-        self.pending = newer;
-        self.raise_floor(header.frame_id);
-        self.stats.delivered = self.stats.delivered.saturating_add(1);
-
-        Ok(done.map(|done| Frame {
+        let Some(done) = self.pending.remove(&header.frame_id) else {
+            return Ok(None);
+        };
+        let frame = Frame {
             frame_id: header.frame_id,
             ref_frame: done.ref_frame,
             data: done.parts.into_iter().flatten().flatten().collect(),
             first_seen: done.first_seen,
             completed: now,
-        }))
+        };
+        // 参考的帧还在补：先放着，它交出时跟着交出
+        if self.waits(&frame) {
+            self.stats.held = self.stats.held.saturating_add(1);
+            self.held.insert(frame.frame_id, frame);
+            return Ok(None);
+        }
+        let mut last = frame.frame_id;
+        self.deliver(last);
+        // 等着这一帧的帧按顺序跟着交出
+        while let Some(next) = self
+            .held
+            .iter()
+            .find(|(_, f)| f.ref_frame == last)
+            .map(|(id, _)| *id)
+        {
+            if let Some(f) = self.held.remove(&next) {
+                self.deliver(next);
+                self.ready.push_back(f);
+            }
+            last = next;
+        }
+        self.drop_orphans();
+        Ok(Some(frame))
+    }
+
+    /// 上一次 [`Self::push`] 交出一帧时，跟着它一起能交出的帧（按顺序），每次取一个。
+    pub fn take_ready(&mut self) -> Option<Frame> {
+        self.ready.pop_front()
+    }
+
+    /// 这一帧要不要等参考帧（H.264 模式下，参考的帧还在补或也在等）。
+    fn waits(&self, frame: &Frame) -> bool {
+        self.keyframe_grace
+            && frame.ref_frame != frame.frame_id
+            && (self.pending.contains_key(&frame.ref_frame)
+                || self.held.contains_key(&frame.ref_frame))
+    }
+
+    /// 交出 `frame_id`：比它旧的未完成帧和等着的帧都作废（新帧优先，它不需要它们）。
+    fn deliver(&mut self, frame_id: u32) {
+        self.raise_floor(frame_id);
+        self.drop_stale();
+        self.stats.delivered = self.stats.delivered.saturating_add(1);
+    }
+
+    /// 作废帧号不大于 `floor` 的未完成帧和等着的帧。
+    fn drop_stale(&mut self) {
+        let Some(floor) = self.floor else {
+            return;
+        };
+        let after = floor.saturating_add(1);
+        let keep = self.pending.split_off(&after);
+        let held = self.held.split_off(&after);
+        let dropped = self.pending.len().saturating_add(self.held.len());
+        self.stats.expired = self
+            .stats
+            .expired
+            .saturating_add(u64::try_from(dropped).unwrap_or(u64::MAX));
+        self.pending = keep;
+        self.held = held;
+    }
+
+    /// 参考帧已经没了（作废）的等待帧永远解不了：作废，连同等它们的帧。
+    fn drop_orphans(&mut self) {
+        loop {
+            let orphans: Vec<u32> = self
+                .held
+                .iter()
+                .filter(|(_, f)| {
+                    !self.pending.contains_key(&f.ref_frame)
+                        && !self.held.contains_key(&f.ref_frame)
+                })
+                .map(|(id, _)| *id)
+                .collect();
+            let Some(last) = orphans.last().copied() else {
+                return;
+            };
+            for id in &orphans {
+                self.held.remove(id);
+                self.stats.expired = self.stats.expired.saturating_add(1);
+            }
+            self.raise_floor(last);
+            self.drop_stale();
+        }
     }
 
     /// 作废没有进展的帧，返回它们的帧号。
@@ -577,13 +682,9 @@ impl Reassembler {
             self.stats.expired = self.stats.expired.saturating_add(1);
             self.raise_floor(*id);
         }
-        // 帧号低于最新作废帧的其余未完成帧也不可能再交付。
-        if let Some(floor) = self.floor {
-            let keep = self.pending.split_off(&floor);
-            let dropped = u64::try_from(self.pending.len()).unwrap_or(u64::MAX);
-            self.stats.expired = self.stats.expired.saturating_add(dropped);
-            self.pending = keep;
-        }
+        // 帧号低于最新作废帧的其余未完成帧也不可能再交付；等着作废帧的帧也解不了。
+        self.drop_stale();
+        self.drop_orphans();
         late
     }
 }
@@ -656,6 +757,95 @@ mod tests {
         assert_eq!(r.push(Time(3), old[1].clone()).unwrap(), None);
         assert_eq!(r.stats().stale, 1);
         assert!(r.push(Time(4), future[1].clone()).unwrap().is_some());
+    }
+
+    #[test]
+    fn h264_frames_wait_for_their_reference_and_come_out_in_order() {
+        let mut r = Reassembler::new(50_000, 8);
+        r.set_keyframe_grace(true);
+        // 帧 1 缺一片（在等重传）；参考它的帧 2、3 先收齐：放着等，不把帧 1 作废
+        let one = packets(1, 200, 100);
+        r.push(Time(0), one[0].clone()).unwrap();
+        assert_eq!(
+            r.push(Time(1), packets(2, 50, 100)[0].clone()).unwrap(),
+            None
+        );
+        assert_eq!(
+            r.push(Time(2), packets(3, 50, 100)[0].clone()).unwrap(),
+            None
+        );
+        assert_eq!(r.stats().held, 2);
+        assert_eq!(r.stats().expired, 0);
+        // 等着的帧又收到分片（重传、校验）：算重复
+        assert_eq!(
+            r.push(Time(3), packets(2, 50, 100)[0].clone()).unwrap(),
+            None
+        );
+        assert_eq!(r.stats().duplicates, 1);
+        // 帧 1 的重传到了：1、2、3 按顺序交出
+        assert_eq!(
+            r.push(Time(4), one[1].clone()).unwrap().map(|f| f.frame_id),
+            Some(1)
+        );
+        assert_eq!(r.take_ready().map(|f| f.frame_id), Some(2));
+        assert_eq!(r.take_ready().map(|f| f.frame_id), Some(3));
+        assert_eq!(r.take_ready(), None);
+        assert_eq!(r.floor(), Some(3));
+        assert_eq!(r.stats().delivered, 3);
+
+        // 参考帧补不回来（超时作废）：等它的帧跟着作废，发送端据此补关键帧
+        r.push(Time(10), packets(5, 200, 100)[0].clone()).unwrap();
+        assert_eq!(
+            r.push(Time(11), packets(6, 50, 100)[0].clone()).unwrap(),
+            None
+        );
+        assert_eq!(
+            r.push(Time(12), packets(7, 50, 100)[0].clone()).unwrap(),
+            None
+        );
+        assert_eq!(r.expire(Time(50_010)), vec![5]);
+        assert_eq!(r.floor(), Some(7));
+        assert_eq!(r.stats().expired, 3);
+        assert_eq!(r.take_ready(), None);
+
+        // 关键帧收齐：不需要更旧的帧，在补的和等着的都作废
+        r.push(Time(20), packets(10, 200, 100)[0].clone()).unwrap();
+        assert_eq!(
+            r.push(Time(21), packets(11, 50, 100)[0].clone()).unwrap(),
+            None
+        );
+        let key = fragment(12, 12, &[1u8; 50], 100).unwrap();
+        assert_eq!(
+            r.push(Time(22), key[0].clone())
+                .unwrap()
+                .map(|f| f.frame_id),
+            Some(12)
+        );
+        assert_eq!(r.take_ready(), None);
+        assert_eq!(r.stats().expired, 5);
+        assert_eq!(r.pending(), 0);
+
+        // 缓冲区满：等着的帧也算；作废最旧的未完成帧时，等它的帧跟着作废
+        let mut r = Reassembler::new(1_000_000, 2);
+        r.set_keyframe_grace(true);
+        r.push(Time(0), packets(20, 200, 100)[0].clone()).unwrap();
+        assert_eq!(
+            r.push(Time(1), packets(21, 50, 100)[0].clone()).unwrap(),
+            None
+        );
+        r.push(Time(2), packets(22, 200, 100)[0].clone()).unwrap();
+        assert_eq!(r.floor(), Some(21));
+        assert_eq!(r.stats().expired, 2);
+        assert_eq!(r.pending(), 1);
+        // 不打开（块编码）：新帧收齐照旧作废更旧的未完成帧
+        let mut r = Reassembler::new(50_000, 8);
+        r.push(Time(0), packets(1, 200, 100)[0].clone()).unwrap();
+        assert!(r
+            .push(Time(1), packets(2, 50, 100)[0].clone())
+            .unwrap()
+            .is_some());
+        assert_eq!(r.stats().held, 0);
+        assert_eq!(r.stats().expired, 1);
     }
 
     #[test]

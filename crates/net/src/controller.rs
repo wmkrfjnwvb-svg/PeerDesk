@@ -559,10 +559,9 @@ pub async fn run(
                         let now = link.now();
                         video_since_feedback = video_since_feedback.saturating_add(1);
                         match media.on_datagram_deferred(now, header.send_time, header.seq, header.flags, &payload) {
-                            Ok(Some(job)) => {
-                                if decode_jobs.send(job).is_err() { break "解码线程结束".to_owned(); }
+                            Ok(jobs) => {
+                                if jobs.into_iter().any(|job| decode_jobs.send(job).is_err()) { break "解码线程结束".to_owned(); }
                             }
-                            Ok(None) => {}
                             Err(_) => bad_datagrams = bad_datagrams.saturating_add(1),
                         }
                     }

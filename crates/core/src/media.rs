@@ -1343,7 +1343,8 @@ impl MediaReceiver {
     }
 
     /// 收到一个视频数据报。`send_time`、`seq`、`flags` 来自数据报头。
-    /// 收齐并解出一帧时返回它。分片本身不合法时返回错误（调用方计为坏数据报）。
+    /// 收齐并解出帧时返回最新的一帧（一个数据报可能让几帧一起能解：参考帧补齐了，等它的帧跟着解）。
+    /// 分片本身不合法时返回错误（调用方计为坏数据报）。
     pub fn on_datagram(
         &mut self,
         now: Time,
@@ -1352,39 +1353,50 @@ impl MediaReceiver {
         flags: u8,
         body: &[u8],
     ) -> Result<Option<Shown<'_>>, Error> {
-        let Some(job) = self.assemble(now, send_time, seq, flags, body)? else {
+        let jobs = self.assemble(now, send_time, seq, flags, body)?;
+        if jobs.is_empty() {
             return Ok(None);
-        };
+        }
         let decoder = self.decoder.as_mut().ok_or(Error::InvalidArgument(
             "解码器不在这里：用 on_datagram_deferred",
         ))?;
-        match decoder.decode(&job.header, &job.data) {
-            Ok(Some(screen)) => {
-                self.decoded = Some(job.frame_id);
-                self.log.delivered(job.frame_id);
-                self.stats.decoded = self.stats.decoded.saturating_add(1);
-                Ok(Some(Shown {
-                    frame_id: job.frame_id,
-                    key: job.header.key,
-                    screen,
-                }))
-            }
-            Ok(None) => {
-                self.decoded = Some(job.frame_id);
-                self.log.delivered(job.frame_id);
-                Ok(None)
-            }
-            Err(_) => {
-                self.decoded = None;
-                self.stats.bad = self.stats.bad.saturating_add(1);
+        let mut shown = None;
+        let mut failed = false;
+        for job in jobs {
+            if failed {
+                // 前一帧解失败了，接在它后面的帧也解不了
+                self.stats.skipped = self.stats.skipped.saturating_add(1);
                 self.log.advance(job.frame_id);
-                Ok(None)
+                continue;
+            }
+            match decoder.decode(&job.header, &job.data) {
+                Ok(picture) => {
+                    self.decoded = Some(job.frame_id);
+                    self.log.delivered(job.frame_id);
+                    if picture.is_some() {
+                        self.stats.decoded = self.stats.decoded.saturating_add(1);
+                        shown = Some((job.frame_id, job.header.key));
+                    }
+                }
+                Err(_) => {
+                    self.decoded = None;
+                    self.stats.bad = self.stats.bad.saturating_add(1);
+                    self.log.advance(job.frame_id);
+                    failed = true;
+                    shown = None;
+                }
             }
         }
+        let screen = decoder.screen();
+        Ok(shown.zip(screen).map(|((frame_id, key), screen)| Shown {
+            frame_id,
+            key,
+            screen,
+        }))
     }
 
-    /// 解码器放在别的线程时用：收齐一帧、而且它接得上时，返回交给解码线程的任务。
-    /// 这一帧先算作送达；解码线程报告失败时调用 [`Self::decode_failed`]。
+    /// 解码器放在别的线程时用：收齐帧、而且接得上时，返回交给解码线程的任务（按顺序，可能几帧一起：
+    /// 参考帧补齐了，等它的帧跟着交出）。这些帧先算作送达；解码线程报告失败时调用 [`Self::decode_failed`]。
     pub fn on_datagram_deferred(
         &mut self,
         now: Time,
@@ -1392,13 +1404,13 @@ impl MediaReceiver {
         seq: u32,
         flags: u8,
         body: &[u8],
-    ) -> Result<Option<DecodeJob>, Error> {
-        let job = self.assemble(now, send_time, seq, flags, body)?;
-        if let Some(job) = &job {
+    ) -> Result<Vec<DecodeJob>, Error> {
+        let jobs = self.assemble(now, send_time, seq, flags, body)?;
+        for job in &jobs {
             self.decoded = Some(job.frame_id);
             self.log.delivered(job.frame_id);
         }
-        Ok(job)
+        Ok(jobs)
     }
 
     /// 解码线程解出了一帧。
@@ -1412,7 +1424,7 @@ impl MediaReceiver {
         self.stats.bad = self.stats.bad.saturating_add(1);
     }
 
-    /// 重组分片；收齐一帧并且它接得上时返回解码任务。
+    /// 重组分片；收齐帧并且接得上时返回解码任务（按顺序）。
     fn assemble(
         &mut self,
         now: Time,
@@ -1420,7 +1432,7 @@ impl MediaReceiver {
         seq: u32,
         flags: u8,
         body: &[u8],
-    ) -> Result<Option<DecodeJob>, Error> {
+    ) -> Result<Vec<DecodeJob>, Error> {
         self.tracker.on_packet(now, send_time, seq, body.len());
         if self.reports {
             self.arrivals.on_packet(now, seq);
@@ -1431,7 +1443,7 @@ impl MediaReceiver {
                 self.metrics
                     .on_probe(now, u32::from_le_bytes(*id), body.len());
             }
-            return Ok(None);
+            return Ok(Vec::new());
         }
         let mut r = Reader::new(body);
         let header = VideoHeader::decode(&mut r)?;
@@ -1442,9 +1454,29 @@ impl MediaReceiver {
             parity: flags & FLAG_PARITY != 0,
             data: r.rest().to_vec(),
         };
-        let Some(frame) = self.reassembler.push(now, packet)? else {
-            return Ok(None);
+        let Some(first) = self.reassembler.push(now, packet)? else {
+            return Ok(Vec::new());
         };
+        // 一帧收齐时，等它的帧（参考它、先收齐了）按顺序跟着交出
+        let frames =
+            std::iter::once(first).chain(std::iter::from_fn(|| self.reassembler.take_ready()));
+        let frames: Vec<crate::transport::Frame> = frames.collect();
+        let mut jobs = Vec::with_capacity(frames.len());
+        // 前一个交给解码器的帧（解码在后面做；按顺序判断接不接得上）
+        let mut last = self.decoded;
+        for frame in frames {
+            if let Some(job) = self.accept(frame, last) {
+                last = Some(job.frame_id);
+                jobs.push(job);
+            } else {
+                last = None;
+            }
+        }
+        Ok(jobs)
+    }
+
+    /// 收齐的一帧：记计数；接在 `last`（前一个交给解码器的帧）后面能解时返回解码任务，否则记为没送达。
+    fn accept(&mut self, frame: crate::transport::Frame, last: Option<u32>) -> Option<DecodeJob> {
         let took = frame.completed.since(frame.first_seen);
         self.stats.assembled = self.stats.assembled.saturating_add(1);
         self.stats.assembly_us_sum = self.stats.assembly_us_sum.saturating_add(took);
@@ -1456,24 +1488,24 @@ impl MediaReceiver {
         let Ok((fh, data)) = FrameHeader::parse(&frame.data) else {
             self.stats.bad = self.stats.bad.saturating_add(1);
             self.log.advance(frame.frame_id);
-            return Ok(None);
+            return None;
         };
         // 视频编码的增量帧只能接在它参考的那一帧后面解；块编码的每一帧都能直接应用。
         let decodable = fh.key
             || fh.codec == Codec::Tile
-            || self.decoded == Some(frame.ref_frame) && frame.ref_frame != frame.frame_id;
+            || last == Some(frame.ref_frame) && frame.ref_frame != frame.frame_id;
         if !decodable {
             // 没交给解码器：不算送达，发送端据此补关键帧。
             self.decoded = None;
             self.stats.skipped = self.stats.skipped.saturating_add(1);
             self.log.advance(frame.frame_id);
-            return Ok(None);
+            return None;
         }
-        Ok(Some(DecodeJob {
+        Some(DecodeJob {
             frame_id: frame.frame_id,
             header: fh,
             data: data.to_vec(),
-        }))
+        })
     }
 
     /// 让超时的帧作废。返回反馈里的 `floor`（据此判断有没有新情况要报告）和作废的帧号。
@@ -2154,12 +2186,10 @@ mod tests {
             let mut jobs = Vec::new();
             for (i, o) in out.iter().enumerate() {
                 let seq = u32::try_from(i).unwrap();
-                if let Some(job) = rx
-                    .on_datagram_deferred(Time(t), Time(t), seq, o.flags, &o.body)
-                    .unwrap()
-                {
-                    jobs.push(job);
-                }
+                jobs.extend(
+                    rx.on_datagram_deferred(Time(t), Time(t), seq, o.flags, &o.body)
+                        .unwrap(),
+                );
             }
             jobs
         };
