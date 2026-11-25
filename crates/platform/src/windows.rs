@@ -219,6 +219,8 @@ pub(crate) fn permissions() -> PermissionStatus {
 /// 下一次 `grab` 从哪里读。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Pending {
+    /// 画面已经拷进显卡转换器：在显卡上转成编码尺寸的 NV12。
+    Gpu,
     /// 没有新画面。
     Nothing,
     /// DXGI 的画面已经复制进 staging 纹理（宽、高）。
@@ -232,6 +234,14 @@ struct DxgiGrabber {
     ctx: ID3D11DeviceContext,
     dup: IDXGIOutputDuplication,
     staging: Option<(ID3D11Texture2D, u32, u32)>,
+    /// 显卡上的格式转换和缩放（见 `wingpu`）。
+    gpu: Option<crate::wingpu::GpuConverter>,
+    /// 会话要的采集尺寸（编码尺寸）。
+    target: Option<(u16, u16)>,
+    /// 显示器的像素尺寸。
+    native: (u16, u16),
+    /// 显示器所在显卡的 LUID（硬件编码器要在同一块显卡上才能直接用显卡画面）。
+    luid: u64,
     pending: Pending,
     /// 还没有交出过任何一帧。
     first: bool,
@@ -282,6 +292,13 @@ pub(crate) fn open_grabber(opts: &CaptureOptions) -> Result<Box<dyn Grabber>, Pl
         count,
     })?;
     let (device, ctx) = create_device(&o.adapter)?;
+    // SAFETY: 读显卡描述。
+    let luid = unsafe { o.adapter.GetDesc1() }.map_or(0, |d| {
+        let high = u64::from(u32::from_ne_bytes(d.AdapterLuid.HighPart.to_ne_bytes()));
+        (high << 32) | u64::from(d.AdapterLuid.LowPart)
+    });
+    let even = |v: u32| u16::try_from(v).unwrap_or(u16::MAX) & !1;
+    let native = (even(o.info.width).max(2), even(o.info.height).max(2));
     // SAFETY: `device` 是刚在这个输出所属的适配器上创建的设备。
     let dup = unsafe { o.output.DuplicateOutput(&device) }.map_err(|e| {
         if e.code() == windows::Win32::Foundation::E_ACCESSDENIED {
@@ -306,6 +323,10 @@ pub(crate) fn open_grabber(opts: &CaptureOptions) -> Result<Box<dyn Grabber>, Pl
         ctx,
         dup,
         staging: None,
+        gpu: None,
+        target: None,
+        native,
+        luid,
         pending: Pending::Nothing,
         first: true,
         rect,
@@ -357,10 +378,39 @@ impl DxgiGrabber {
                 desc.Format
             )));
         }
+        if let Some(conv) = self.converter(desc.Width, desc.Height) {
+            conv.copy_desktop(&tex);
+            return Ok(Pending::Gpu);
+        }
         let staging = self.staging(desc.Width, desc.Height)?;
         // SAFETY: 两个纹理尺寸、格式相同，都属于同一个设备。
         unsafe { self.ctx.CopyResource(&staging, &tex) };
         Ok(Pending::Staged(desc.Width, desc.Height))
+    }
+
+    /// 显卡转换器（桌面 `w`×`h` → 编码尺寸）；尺寸变了重建。显卡做不了时返回 `None`，
+    /// 之后一直在 CPU 上转（原因写一次日志）。
+    fn converter(&mut self, w: u32, h: u32) -> Option<&crate::wingpu::GpuConverter> {
+        if GPU_OFF.get().is_some() {
+            return None;
+        }
+        let dst = peerdesk_core::scale::even_size(self.target.unwrap_or(self.native));
+        let fits = self
+            .gpu
+            .as_ref()
+            .is_some_and(|c| c.sizes() == ((w, h), dst));
+        if !fits {
+            self.gpu = None;
+            match crate::wingpu::GpuConverter::new(&self.device, &self.ctx, self.luid, (w, h), dst)
+            {
+                Ok(c) => self.gpu = Some(c),
+                Err(why) => {
+                    gpu_off(&why);
+                    return None;
+                }
+            }
+        }
+        self.gpu.as_ref()
     }
 
     /// 读 staging 纹理里的画面。
@@ -512,13 +562,48 @@ impl Grabber for DxgiGrabber {
 
     fn grab(&mut self, spare: Option<Screen>) -> Result<Frame, PlatformError> {
         let pending = std::mem::replace(&mut self.pending, Pending::Nothing);
+        if pending == Pending::Gpu {
+            let converted = self
+                .gpu
+                .as_ref()
+                .ok_or_else(|| "转换器不见了".to_owned())
+                .and_then(crate::wingpu::GpuConverter::convert);
+            self.first = false;
+            return match converted {
+                Ok(frame) => Ok(Frame::Gpu(std::sync::Arc::new(frame))),
+                Err(why) => {
+                    // 之后一直在 CPU 上转；这一帧报错，采集线程重新打开后照常读
+                    gpu_off(&why);
+                    Err(E::Os(format!("显卡转换画面失败：{why}")))
+                }
+            };
+        }
         let screen = match pending {
             Pending::Staged(w, h) => self.read_staged(w, h, spare)?,
             Pending::Gdi => self.read_gdi(spare)?,
-            Pending::Nothing => return Err(E::Os("没有可读的画面".into())),
+            Pending::Nothing | Pending::Gpu => return Err(E::Os("没有可读的画面".into())),
         };
         self.first = false;
         Ok(Frame::rgb(screen))
+    }
+
+    fn set_target(&mut self, size: (u16, u16)) -> Result<(), PlatformError> {
+        // 下一帧按新尺寸建转换器（见 converter）
+        self.target = Some(size);
+        Ok(())
+    }
+
+    fn native_size(&self) -> Option<(u16, u16)> {
+        Some(self.native)
+    }
+}
+
+/// 显卡转换做不了的原因（整个进程只记一次：之后都在 CPU 上转）。
+static GPU_OFF: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+fn gpu_off(why: &str) {
+    if GPU_OFF.set(why.to_owned()).is_ok() {
+        log::warn!("采集改在 CPU 上转颜色、缩放（显卡做不了：{why}）");
     }
 }
 
