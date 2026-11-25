@@ -14,6 +14,7 @@
 | [H-audio.md](H-audio.md) | 声音：WebRTC NetEQ 抖动缓冲、Opus 配置、RED 冗余、音画同步 |
 | [I-release.md](I-release.md) | 发布：硬件编码、代码签名和公证、自动更新 |
 | [J-keyboard.md](J-keyboard.md) | 远程键盘：跨系统快捷键映射、输入法、键盘布局、系统快捷键捕获 |
+| [K-pipeline.md](K-pipeline.md) | 编解码与传输链路排查（2026-11-25）：模块互相影响的根因、业内做法、模块边界、分步修改计划 |
 
 ## 实现状态总表（2026-11-24 晚）
 
