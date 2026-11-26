@@ -29,10 +29,7 @@ const TREND_WINDOW: usize = 20;
 const SMOOTHING_PERMILLE: i64 = 900;
 /// 至少这么多个包的帧才用来测包串速率：包太少时间隔太短，测不准。
 const MIN_TRAIN_PACKETS: u32 = 3;
-/// 排队连着这么多份反馈高于门限才算拥塞（见 `ClassicV1::on_observation`）。3 份约 60 ms：Wi-Fi 的延迟尖峰
-/// 一阵几十毫秒，盖得住一两份反馈；自己堵出来的排队一直在。
-const PERSIST_FEEDBACKS: u32 = 3;
-/// 两份反馈相隔不超过这么久（微秒）才算连着（控制端有新包时 20 ms 一份；静止时 1 秒一份，就不算连着）。
+/// 两份反馈相隔不超过这么久（微秒）才算不断档（控制端有新包时 20 ms 一份；静止时 1 秒一份，就断档了）。
 const CONTIGUOUS_US: u64 = 60_000;
 /// 包串首尾到达间隔至少这么久（微秒）才算数。接收端是应用读数据报时打的时间戳，程序忙一下、几十个包
 /// 就一次读走，间隔几乎是 0（2026-11-26 用户日志：30 Mbps 的 Wi-Fi 测出 3 420 173 kbps，码率被直接拉到上限）。
@@ -625,9 +622,7 @@ pub struct ClassicV1 {
     /// 最近测到的瓶颈带宽（比特每秒），带时间。
     capacity: Option<(u64, Time)>,
     last_decrease: Option<Time>,
-    /// 连着几份反馈排队高于高门限、低门限（反馈之间断档超过 [`CONTIGUOUS_US`] 就从头数），上一份反馈的时间。
-    high_streak: u32,
-    low_streak: u32,
+    /// 上一份反馈的时间（判断反馈断没断档，见 [`CONTIGUOUS_US`]）。
     last_feedback: Option<Time>,
     usage: Usage,
     /// 码率变化说明（取走后清空）和上次写说明时的码率（升码率累计超过一定比例才写一次）。
@@ -662,8 +657,6 @@ impl ClassicV1 {
             last_threshold_update: None,
             capacity: None,
             last_decrease: None,
-            high_streak: 0,
-            low_streak: 0,
             last_feedback: None,
             notes: Vec::new(),
             noted_bps: start_bps,
@@ -777,29 +770,24 @@ impl RateEstimator for ClassicV1 {
         // 丢包只有在排队也一直在时才算拥塞；单独的随机丢包交给纠错和重传，不降码率。
         // 发送端是不是在用满码率（没用满时送达速率只是“要发的量”，不代表链路能力；升码率时用）
         let using = recv_bps.saturating_mul(10) >= self.rate_bps.saturating_mul(6);
-        // 排队要连着几份反馈都高才算（照 WebRTC：过载要持续一段时间，CLAUDE.md“加滞回”）。只看一份时：
-        // 画面静止时零星小包的排队读数就是它碰上的 Wi-Fi 抖动，那份反馈里只有一两个包、送达速率被空闲时间稀释，
-        // 按它降一下就到底（2026-11-26 用户日志：趋势正常、排队 12–25 ms、送达 13 kbps，30 Mbps → 100 kbps）。
-        // 连着几份、中间不断档，说明这段时间包一直在到、瓶颈一直在忙：这时的送达速率就是链路能力，按它降不会过头。
+        // 排队读数只在反馈不断档时才算数：和上一份反馈相隔不超过 [`CONTIGUOUS_US`]，说明这段时间包一直在到，
+        // 排队读数是链路在忙时量的，这时的送达速率也就是链路能力，按它降不会过头。断档的那份（画面静止时零星的小包）
+        // 不算：它的排队读数是 Wi-Fi 省电（空闲后网卡要醒）的延迟，那份反馈里只有一两个包、送达速率被空闲时间稀释。
+        // 2026-11-26 用户日志（Wi-Fi、30 Mbps）：趋势正常、零星小包排队 12–25 ms、送达 13 kbps，按它降一下就到底
+        // （30 Mbps → 100 kbps）。要求连着几份都高（不管断不断档）在窄带上反应太慢：微软轨迹 4 条 × 3 个种子，
+        // 连着 3 份时卡顿 31 → 58、2 份 35；只要求不断档 31（和改前一样），大屏 Wi-Fi 场景码率也不再塌。
         let contiguous = self
             .last_feedback
             .is_some_and(|t| now.since(t) <= CONTIGUOUS_US);
         self.last_feedback = Some(now);
-        let streak = |above: bool, n: u32| match (above, contiguous) {
-            (false, _) => 0,
-            (true, true) => n.saturating_add(1),
-            (true, false) => 1,
-        };
-        self.high_streak = streak(fb.queue_delay_us > p.high_delay_us, self.high_streak);
-        self.low_streak = streak(fb.queue_delay_us > p.low_delay_us, self.low_streak);
-        let persist: u32 = std::env::var("XP_PERSIST").ok().and_then(|v| v.parse().ok()).unwrap_or(PERSIST_FEEDBACKS);
-        let queue_high = self.high_streak >= persist;
+        let queue_high = fb.queue_delay_us > p.high_delay_us && contiguous;
         // 固有丢包慢慢跟（每份反馈 1/128，反馈 20 ms 一次时约 2.5 秒）
         let loss = u64::from(fb.loss_permille).saturating_mul(1000);
         self.inherent_loss = self.inherent_loss - self.inherent_loss / 128 + loss / 128;
         let inherent = u16::try_from(self.inherent_loss / 1000).unwrap_or(u16::MAX);
         let lossy_and_queued = fb.loss_permille > p.loss_permille.saturating_add(inherent)
-            && self.low_streak >= persist;
+            && fb.queue_delay_us > p.low_delay_us
+            && contiguous;
         let congested = self.usage == Usage::Over || queue_high || lossy_and_queued;
         // 一个往返（至少 100 ms）之内只降一次：同一次拥塞的反馈会连着来好几条。
         let hold = obs.rtt_us.max(100_000);
@@ -846,14 +834,9 @@ impl RateEstimator for ClassicV1 {
             }
             return;
         }
-        // 排队在消退，或者排队连着几份反馈都在（和降码率一样要持续才算）：先不升。只看一份时，Wi-Fi 省电下零星的帧
-        // 几乎每份都是 12–25 ms（空闲后网卡要醒），码率永远升不上去（仿真：大屏 Wi-Fi 一直停在 1.36 Mbps）。
-        let inc_block = match std::env::var("XP_INC").ok().as_deref() {
-            Some("single") => fb.queue_delay_us >= p.low_delay_us,
-            Some("contig") => fb.queue_delay_us >= p.low_delay_us && contiguous,
-            _ => self.low_streak >= persist,
-        };
-        if self.usage == Usage::Under || inc_block {
+        // 排队在消退，或者（不断档的反馈里）还有排队：先不升。断档的那份不算：Wi-Fi 省电下零星的帧几乎每份都是
+        // 12–25 ms（空闲后网卡要醒），算上的话码率永远升不上去（仿真：大屏 Wi-Fi 一直停在 1.36 Mbps）。
+        if self.usage == Usage::Under || (fb.queue_delay_us >= p.low_delay_us && contiguous) {
             return;
         }
         // 只有真在用这个码率时才升：屏幕静止时没有数据，估计冻结，不凭空上涨。
@@ -1221,10 +1204,9 @@ mod tests {
     }
 
     /// 2026-11-26 用户日志（Wi-Fi、30 Mbps）：画面静止时零星小包的排队读数 12–25 ms、趋势正常、送达十几 kbps。
-    /// 排队要连着几份反馈都高、中间不断档才算拥塞：零星小包、一阵 Wi-Fi 尖峰都不降；排队一直在（瓶颈一直在忙）时
-    /// 按这时的送达速率降。
+    /// 排队读数只在反馈不断档（包一直在到、链路在忙）时才算：零星小包不降；链路在忙时排队高就按这时的送达速率降。
     #[test]
-    fn only_a_queue_that_persists_is_congestion() {
+    fn queue_readings_count_only_while_feedback_is_continuous() {
         let flat = Extension {
             groups: 10,
             ..Extension::default()
@@ -1235,34 +1217,27 @@ mod tests {
             v.on_observation(Time(i * 1_000_000), &obs(fb(15_000, 0, 1_750), flat));
         }
         assert_eq!(v.rate_bps(), 30_000_000);
-        // 一阵 40 ms 的尖峰：连着两份反馈排队 20 ms，之后恢复：不降
-        let t = 6_000_000;
-        v.on_observation(Time(t), &obs(fb(20_000, 0, 2_000_000), flat));
-        v.on_observation(Time(t + 20_000), &obs(fb(20_000, 0, 2_000_000), flat));
-        v.on_observation(Time(t + 40_000), &obs(fb(1_000, 0, 2_000_000), flat));
+        // 几帧小画面，每帧隔 100 ms（反馈断档）：排队 20 ms、丢一个包（几百‰），也不降
+        for i in 1..=5u64 {
+            v.on_observation(
+                Time(5_000_000 + i * 100_000),
+                &obs(fb(20_000, 500, 20_000), flat),
+            );
+        }
         assert_eq!(v.rate_bps(), 30_000_000);
-        // 几个包里丢一个（几百‰），排队也只有一份：不降
-        v.on_observation(Time(t + 60_000), &obs(fb(5_000, 500, 1_750), flat));
-        assert_eq!(v.rate_bps(), 30_000_000);
-        // 排队连着 3 份（60 ms）都高、中间不断档：瓶颈一直在忙，按这时的送达速率（2 Mbps）降
+        // 连续在发（20 ms 一份反馈）：断档后的第一份不算，第二份起排队高就按送达速率（2 Mbps）降
         let t = 7_000_000;
-        for i in 0..3u64 {
-            v.on_observation(Time(t + i * 20_000), &obs(fb(20_000, 0, 250_000), flat));
-        }
+        v.on_observation(Time(t), &obs(fb(20_000, 0, 250_000), flat));
+        assert_eq!(v.rate_bps(), 30_000_000);
+        v.on_observation(Time(t + 20_000), &obs(fb(20_000, 0, 250_000), flat));
         assert_eq!(v.rate_bps(), 1_700_000);
-        // 中间断档（超过 60 ms 没有反馈）：重新数
-        let mut w = ClassicV1::new(Profile::STABLE, 30_000_000, 100_000, 50_000_000);
-        for i in 0..3u64 {
-            w.on_observation(Time(i * 100_000), &obs(fb(20_000, 0, 250_000), flat));
-        }
-        assert_eq!(w.rate_bps(), 30_000_000);
-        // 丢包明显、排队连着几份都在：拥塞
+        // 连续在发时丢包明显、又在排队：拥塞
         let mut x = ClassicV1::new(Profile::STABLE, 30_000_000, 100_000, 50_000_000);
-        for i in 0..3u64 {
+        for i in 0..2u64 {
             x.on_observation(Time(i * 20_000), &obs(fb(5_000, 200, 250_000), flat));
         }
         assert_eq!(x.rate_bps(), 1_700_000);
-        // 延迟趋势过载：一份就降（趋势本身已经是很多组攒出来的）
+        // 延迟趋势过载：断档也算（趋势本身是很多组攒出来的）
         let mut y = ClassicV1::new(Profile::STABLE, 30_000_000, 100_000, 50_000_000);
         let over = Extension {
             trend_tenth_ms: 3000,
@@ -1271,6 +1246,7 @@ mod tests {
         };
         y.on_observation(Time(20_000), &obs(fb(0, 0, 250_000), over));
         assert_eq!(y.rate_bps(), 1_700_000);
+        // 已知的局限：连续在发时碰上一阵 Wi-Fi 尖峰（排队 20 ms），也会按当时的送达速率降一次
     }
 
     #[test]
