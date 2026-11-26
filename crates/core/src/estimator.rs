@@ -1264,9 +1264,9 @@ impl ClassicV1 {
     }
 
     /// 离开了应用受限（和它的核实、排空）：探测的触发条件清掉。正在等的那一轮由发送端中止、回报。
+    /// 降码率的那一段（`drop`）留着：5 秒内回到应用受限、码率还低着，照样核实。
     const fn leave_app_limited(&mut self) {
         self.probing.app_since = None;
-        self.probing.drop = None;
         self.probing.next_target = None;
         self.probing.rounds = 0;
     }
@@ -1734,7 +1734,11 @@ impl RateEstimator for ClassicV1 {
                 }
                 self.noted_bps = self.rate_bps;
                 // 应用受限时降的：记下这一段是从多少降下来的（之后核实用，见 `Probing`）；一串探测到此为止
-                if relaxed {
+                // 跟踪里降、但当时发送端没用满码率的也记：送达速率那一刻只是“要发的量”（一阵流量刚收尾），按它降
+                // 多半降过头了；紧接着要是进了应用受限，就没有流量把码率带回去，得靠核实。
+                // （wifi-light 实测：大屏开头的流量收尾时 30 → 9.5 Mbps，之后轻操作 5 秒都停在 9.5 Mbps。）
+                // 用满了码率时降的是真凭实据，之前记的那一段作废。跟踪怎么降不受这里影响（I3）。
+                if relaxed || !using {
                     let before = self
                         .probing
                         .drop
@@ -1742,6 +1746,8 @@ impl RateEstimator for ClassicV1 {
                         .map_or(from_bps, |(b, _)| b);
                     self.probing.drop = Some((before, now));
                     self.end_chain();
+                } else {
+                    self.probing.drop = None;
                 }
                 // 降了：进排空（起步期间不切，起步什么时候结束由发送端的探测决定）
                 if self.phase != Phase::Startup {
