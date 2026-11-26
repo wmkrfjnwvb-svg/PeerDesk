@@ -76,6 +76,42 @@ impl Extension {
     }
 }
 
+/// 接收端对一组探测的测量结果，带组号随反馈带回（对端支持 [`crate::proto::Caps::PROBE_ID`] 时）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProbeReport {
+    /// 组号。
+    pub id: u32,
+    /// 测得的速率（字节每秒）；0 表示测不出（包太少）。
+    pub bytes_per_s: u32,
+    /// 这一组收到了几个包。
+    pub packets: u16,
+    /// 这一组收完了（收齐，或者再没有包来）；`false` 是收到一半时先报的。
+    pub done: bool,
+}
+
+impl ProbeReport {
+    /// 编码后的长度。
+    pub const LEN: usize = 11;
+
+    /// 编码。
+    pub fn encode(&self, w: &mut Writer) {
+        w.u32(self.id)
+            .u32(self.bytes_per_s)
+            .u16(self.packets)
+            .u8(u8::from(self.done));
+    }
+
+    /// 解码。
+    pub fn decode(r: &mut Reader<'_>) -> Result<Self, Error> {
+        Ok(Self {
+            id: r.u32()?,
+            bytes_per_s: r.u32()?,
+            packets: r.u16()?,
+            done: r.u8()? != 0,
+        })
+    }
+}
+
 /// 一组包（一帧）的发送和到达时间。
 #[derive(Debug, Clone, Copy)]
 struct Group {
@@ -183,6 +219,8 @@ pub struct ReceiverMetrics {
     /// 上次报告时这一组有几个包，和之后连着几次报告都没有新包（连着两次就结束这一组）。
     probe_seen: u32,
     probe_quiet: u32,
+    /// 最近一组探测带组号的结果，等下一份反馈带走（见 [`Self::take_probe_report`]）。
+    probe_report: Option<ProbeReport>,
 }
 
 impl ReceiverMetrics {
@@ -200,7 +238,22 @@ impl ReceiverMetrics {
             probe_reported: 0,
             probe_seen: 0,
             probe_quiet: 0,
+            probe_report: None,
         }
+    }
+
+    /// 取走最近一组探测带组号的结果（没有新结果时为 `None`）。在 [`Self::report`] 之后调用。
+    pub const fn take_probe_report(&mut self) -> Option<ProbeReport> {
+        self.probe_report.take()
+    }
+
+    fn tag_probe(&mut self, g: &ProbeGroup, done: bool) {
+        self.probe_report = Some(ProbeReport {
+            id: g.id,
+            bytes_per_s: u32::try_from(g.rate().unwrap_or(0)).unwrap_or(u32::MAX),
+            packets: u16::try_from(g.packets).unwrap_or(u16::MAX),
+            done,
+        });
     }
 
     /// 收到属于 `frame` 的一个数据报。`send_time` 是发送端打的时间戳。
@@ -260,9 +313,11 @@ impl ReceiverMetrics {
 
     /// 结算正在收的探测组（先报告过同样多的包就不重复报告）。
     fn finish_probe(&mut self) {
-        if let Some(rate) = self
-            .probe
-            .take()
+        let done = self.probe.take();
+        if let Some(g) = done {
+            self.tag_probe(&g, true);
+        }
+        if let Some(rate) = done
             .filter(|g| g.packets != self.probe_reported)
             .and_then(|g| g.rate())
         {
@@ -295,6 +350,7 @@ impl ReceiverMetrics {
             if let Some(rate) = g.rate() {
                 self.note_train(rate);
                 self.probe_reported = g.packets;
+                self.tag_probe(&g, false);
             }
         }
     }
@@ -468,8 +524,10 @@ pub enum RateState {
     /// 跟踪：发送量被网络限制，按拥塞信号降、按送达速率升。
     #[default]
     Tracking,
-    /// 排空：刚降过码率，等队列排掉。
+    /// 排空（跟踪）：网络受限时刚降过码率，等队列排掉。只是标记：升降规则和跟踪完全相同（不变量 I3）。
     Drain,
+    /// 排空（应用受限）：应用受限时降过码率，等队列排掉；不升，一个往返内不再降。
+    DrainApp,
     /// 应用受限：发送端没那么多要发，送达速率不代表链路能力。
     AppLimited,
     /// 核实：应用受限时降过码率，等探测结论。
@@ -478,10 +536,11 @@ pub enum RateState {
 
 impl RateState {
     /// 全部状态，按固定顺序（统计表的列顺序）。
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Startup,
         Self::Tracking,
         Self::Drain,
+        Self::DrainApp,
         Self::AppLimited,
         Self::Verify,
     ];
@@ -492,7 +551,8 @@ impl RateState {
         match self {
             Self::Startup => "起步",
             Self::Tracking => "跟踪",
-            Self::Drain => "排空",
+            Self::Drain => "排空（跟踪）",
+            Self::DrainApp => "排空（应用受限）",
             Self::AppLimited => "应用受限",
             Self::Verify => "核实",
         }
@@ -505,8 +565,104 @@ impl RateState {
             Self::Startup => 0,
             Self::Tracking => 1,
             Self::Drain => 2,
-            Self::AppLimited => 3,
-            Self::Verify => 4,
+            Self::DrainApp => 3,
+            Self::AppLimited => 4,
+            Self::Verify => 5,
+        }
+    }
+}
+
+/// 运行中探测每组匀速发多久（微秒）、至少几个包。和起步探测一样（30 ms、16 个包）：接收端是应用读数据报时
+/// 打的时间戳，程序忙一下几十个包一次读走，WebRTC 的 15 ms、5 个包在这里测不准。
+pub const RUN_PROBE_SPAN_US: u64 = 30_000;
+/// 见 [`RUN_PROBE_SPAN_US`]。
+pub const RUN_PROBE_MIN_PACKETS: u32 = 16;
+
+/// 按 `target_bps` 探一组要发几个包。
+#[must_use]
+pub fn run_probe_packets(target_bps: u64) -> u32 {
+    let bytes = target_bps.saturating_mul(RUN_PROBE_SPAN_US) / 8_000_000;
+    u32::try_from(bytes / u64::from(crate::cc::probe::PROBE_PACKET_BYTES))
+        .unwrap_or(u32::MAX)
+        .max(RUN_PROBE_MIN_PACKETS)
+}
+
+/// 运行中探测的种类。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeKind {
+    /// 核实：应用受限时降过码率（或者码率停在底线），探一下链路是不是真的变窄了。
+    Verify,
+    /// 周期：应用受限、码率明显低于已知的链路能力，定期往上探。
+    Periodic,
+}
+
+impl ProbeKind {
+    /// 名字。
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Verify => "核实",
+            Self::Periodic => "周期",
+        }
+    }
+}
+
+/// 估计器要发送端做的一轮探测。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProbeAsk {
+    /// 种类。
+    pub kind: ProbeKind,
+    /// 按多快发（比特每秒）。
+    pub target_bps: u64,
+}
+
+/// 一轮探测怎么结束的（发送端告诉估计器）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeEnd {
+    /// 接收端测得的速率（比特每秒）。
+    Result(u64),
+    /// 到时间没有结果。
+    TimedOut,
+    /// 中止（原因）：出现过载或网络受限的原因，或者一直等不到能探的时机。结果不用。
+    Aborted(&'static str),
+}
+
+/// 一轮探测的结论。每轮必有其一（不变量 I4）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeVerdict {
+    /// 证实：链路承载得了目标速率（结果 ≥ 目标的七成），码率按结果升。
+    Confirmed,
+    /// 否定：链路承载不了，记下测得的容量，码率不升。
+    Denied,
+    /// 超时：结论未知。
+    TimedOut,
+    /// 中止。
+    Aborted,
+}
+
+impl ProbeVerdict {
+    /// 全部结论，按固定顺序（统计用）。
+    pub const ALL: [Self; 4] = [Self::Confirmed, Self::Denied, Self::TimedOut, Self::Aborted];
+
+    /// 名字。
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Confirmed => "证实",
+            Self::Denied => "否定",
+            Self::TimedOut => "超时",
+            Self::Aborted => "中止",
+        }
+    }
+
+    /// 在 [`ProbeVerdict::ALL`] 里的下标。
+    #[must_use]
+    pub const fn index(self) -> usize {
+        match self {
+            Self::Confirmed => 0,
+            Self::Denied => 1,
+            Self::TimedOut => 2,
+            Self::Aborted => 3,
         }
     }
 }
@@ -579,6 +735,17 @@ pub trait RateEstimator: Send + std::fmt::Debug {
 
     /// 发送端刚出现一个网络受限的原因（不等下一份反馈：应用受限进慢出快）。
     fn on_net_limited(&mut self, _cause: NetCause) {}
+
+    /// 现在要不要做一轮运行中探测（发送端空闲时每个定时周期问一次；对端的反馈带探测组号时才问）。
+    /// 返回了一轮，发送端一定会用 [`Self::on_probe_end`] 回报它怎么结束的。
+    fn probe_wanted(&mut self, _now: Time) -> Option<ProbeAsk> {
+        None
+    }
+
+    /// 上一次 [`Self::probe_wanted`] 要的那一轮探测结束了。返回结论。
+    fn on_probe_end(&mut self, _now: Time, _end: ProbeEnd) -> ProbeVerdict {
+        ProbeVerdict::Aborted
+    }
 }
 
 /// 照 WebRTC GoogCC 组织的网络控制器（见 [`crate::cc`]）。
@@ -763,25 +930,91 @@ pub struct ClassicV1 {
     phase: Phase,
     /// 这一段不断档的反馈里，各份的时间和排队读数（只留最近一个窗口加一份，见 [`ClassicV1::standing_queue`]）。
     queue_run: VecDeque<(Time, u32)>,
+    /// 运行中探测的触发和结论（见 [`Probing`]）。
+    probing: Probing,
 }
+
+/// 运行中探测在估计器这边的状态：什么时候要探、探多快、结论怎么用。发、等、超时、中止在发送端
+/// （[`crate::media::MediaSender`] 的探测状态机：空闲 → 待发 → 已发 → 判定）。
+///
+/// 触发：
+/// - 核实（T1）：应用受限时降到了降前的 66% 以下，之后排队低于 low 满一个往返（降后 5 秒内有效）。
+///   目标是降前的 85%（WebRTC `ProbeController::RequestProbe` 的 0.66、0.85、5 秒），但第一轮不超过当前码率的 4 倍、
+///   证实了再按结果的 2 倍接着探，最多 3 轮。直接按 85% 探的话，链路真从 30 降到 3 Mbps 时一组是 96 KB，
+///   在 3 Mbps 上要排 250 ms；先探 4 倍，最坏多排几十毫秒。
+/// - 核实（I5）：应用受限时码率在底线停满 1 秒（之后间隔翻倍，最长 30 秒）。
+/// - 周期（T2）：应用受限满 5 秒、距上次探测够久（5 秒起，没探上去就翻倍，最长 30 秒），并且码率低于已知链路能力的
+///   七成。目标是码率的 2 倍，证实了接着翻倍，最多 3 轮。和 WebRTC（`TimeForAlrProbe`，应用受限时每 5 秒无条件探）
+///   不同：码率已经接近链路能力时不探——一组探测是 30 ms 的满速流量（30 Mbps 上 112 KB），轻操作每秒只发十几 KB，
+///   每 5–30 秒探一次的话探测流量占一两成，中继流量是成本。
+///
+/// 窄带保护：一组探测的字节数不许超过“已知容量 × 50 ms”，不知道容量就不探（I5 的核实除外）。一组至少 16 个包
+/// （19 KB），所以已知容量低于 3 Mbps 的链路上运行中探测的字节数是 0。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Probing {
+    /// 应用受限时降码率的这一段：(第一次降之前的码率, 最近一次降的时刻)。
+    drop: Option<(u64, Time)>,
+    /// 从什么时候起每份反馈的排队都低于 low。
+    calm_since: Option<Time>,
+    /// 从什么时候起一直在应用受限（含它的核实、排空）。
+    app_since: Option<Time>,
+    /// 正在等发送端回报的那一轮，和这一串已经探了几轮。
+    asked: Option<ProbeAsk>,
+    rounds: u8,
+    /// 这一串接着探的目标（上一轮证实之后）。
+    next_target: Option<u64>,
+    /// 上一轮探测结束的时刻，周期探测和底线核实现在的间隔。
+    last_end: Option<Time>,
+    periodic_gap_us: u64,
+    floor_gap_us: u64,
+    /// 最近一份反馈的往返时间。
+    rtt_us: u64,
+    /// 链路能力的上沿探到过了（起步探测有结论、某一轮被否定、或者证实了却没探上去多少）。没探到过时，已知的容量
+    /// 只是帧的包串测的下界（按码率发的帧测不出比码率高多少），码率贴着它也还要往上探一次；探到过之后，
+    /// 只有码率低于它的七成才探——否则轻操作时每隔几秒到几十秒就白发一组满速的探测。
+    limit_known: bool,
+}
+
+/// 降到降前的这么多（千分比）以下才值得核实，核实的目标是降前的这么多。
+const VERIFY_BELOW_PERMILLE: u64 = 660;
+const VERIFY_TARGET_PERMILLE: u64 = 850;
+/// 降码率之后这么久之内才核实（微秒）。
+const VERIFY_WITHIN_US: u64 = 5_000_000;
+/// 第一轮探测不超过当前码率的几倍；证实之后每轮按结果的几倍；一串最多几轮。
+const PROBE_FIRST_SCALE: u64 = 4;
+const PROBE_STEP: u64 = 2;
+const PROBE_MAX_ROUNDS: u8 = 3;
+/// 结果达到目标的这么多（千分比）算证实（和起步探测一样）。
+const PROBE_CONFIRM_PERMILLE: u64 = 700;
+/// 周期探测：应用受限满这么久才开始，间隔从这么久起、最长这么久（微秒）。
+const PERIODIC_FIRST_US: u64 = 5_000_000;
+const PERIODIC_MAX_US: u64 = 30_000_000;
+/// 码率低于已知链路能力的这么多（千分比）才周期探测。
+const PERIODIC_BELOW_PERMILLE: u64 = 700;
+/// 一组探测的字节数不超过已知容量这么久的量（微秒）。
+const PROBE_FIT_US: u64 = 50_000;
+/// 固有丢包（千分比 × 1000）到这个值的链路不做运行中探测：1%，和起步探测、加纠错的门限一样。
+const LOSSY_LINK: u64 = 10_000;
+/// 一轮探测中止之后至少隔这么久再探（微秒）。
+const PROBE_RETRY_US: u64 = 200_000;
 
 /// [`ClassicV1`] 的状态机。码率控制要回答三件事，证据各不相同，所以分开：
 /// 是否拥塞（排队、趋势）、链路容量（包串、探测）、发送量受谁限制（[`SendLimit`]，发送端按原因判）。
 ///
 /// | 状态 | 降 | 升 | 出口 |
 /// |---|---|---|---|
-/// | 起步 | 和跟踪相同 | 和跟踪相同，另按起步探测的结论 | 发送端报告起步探测结束（探测自己最多 1 秒）→ 跟踪 |
+/// | 起步 | 和跟踪相同 | 和跟踪相同，另按起步探测的结论 | 发送端报告起步探测结束 → 跟踪（等第一个关键帧最多 2 秒，探测最多 1 秒） |
 /// | 跟踪 | 一份反馈的排队、趋势、丢包加排队 | 送达速率 ≥ 码率 60% 时升 | 降了 → 排空；应用受限 → 应用受限 |
 /// | 排空 | 同来源状态（一个往返内不重复降） | 同来源状态 | 排队低于 low → 回来源状态；max(1 秒, 4 个往返) → 跟踪；来源是应用受限时一有网络受限 → 跟踪 |
-/// | 应用受限 | 只认常驻队列或趋势过载，一次最多降一半 | 不升 | 网络受限 → 跟踪（无时间上限）；降了 → 排空；在底线停满 1 秒 → 核实 |
-/// | 核实 | 同应用受限 | 不升（第 2 步按探测结论） | 网络受限 → 跟踪；降了 → 排空；1 秒 → 应用受限 |
+/// | 应用受限 | 只认常驻队列或趋势过载，一次最多降一半 | 不自己升，按探测结论 | 网络受限 → 跟踪（无时间上限）；降了 → 排空；降过且队列平静、或在底线停满 1 秒 → 核实 |
+/// | 核实 | 同应用受限 | 按探测结论 | 探测结论（证实、否定、超时、中止）→ 应用受限；网络受限 → 跟踪；降了 → 排空；兜底 2 秒 |
 ///
 /// 不变量：
 /// - I1：任何状态下过载证据都优先，这一份反馈不会升。
 /// - I2：码率只在三处变：拥塞降、跟踪（含起步、来源是跟踪的排空）的升、探测结论。
 /// - I3：发送端一直是网络受限时（从不进应用受限），每一步的码率和没有状态机的版本完全相同。
 ///   所以来源是跟踪的“排空”只是一个标记，升降规则就是跟踪的规则；窄带不变差由这一条保证。
-/// - I4：每轮探测必然在时限内有结论（第 2 步）。
+/// - I4：每轮探测必然在时限内以证实、否定、超时、中止之一结束（见 [`Probing`] 和发送端的探测状态机）。
 /// - I5：应用受限时码率停在底线超过 1 秒必须进核实，不允许“底线、不升、没人管”。
 ///
 /// 和 WebRTC 不一样的地方：WebRTC 应用受限时不放宽过载反应（`DelayBasedBwe::MaybeUpdateEstimate` 的 `in_alr`
@@ -812,7 +1045,10 @@ impl Phase {
         match self {
             Self::Startup => RateState::Startup,
             Self::Tracking => RateState::Tracking,
-            Self::Drain { .. } => RateState::Drain,
+            Self::Drain {
+                from_app: false, ..
+            } => RateState::Drain,
+            Self::Drain { from_app: true, .. } => RateState::DrainApp,
             Self::AppLimited { .. } => RateState::AppLimited,
             Self::Verify { .. } => RateState::Verify,
         }
@@ -874,6 +1110,48 @@ impl ClassicV1 {
             inherent_loss: 0,
             phase: Phase::Tracking,
             queue_run: VecDeque::new(),
+            probing: Probing {
+                drop: None,
+                calm_since: None,
+                app_since: None,
+                asked: None,
+                rounds: 0,
+                next_target: None,
+                last_end: None,
+                periodic_gap_us: PERIODIC_FIRST_US,
+                floor_gap_us: FLOOR_VERIFY_US,
+                rtt_us: 0,
+                limit_known: false,
+            },
+        }
+    }
+
+    /// 一组按 `target_bps` 的探测放不放得进链路：字节数不超过已知容量 [`PROBE_FIT_US`] 的量。不知道容量算放不进。
+    ///
+    /// 一直有随机丢包的链路（固有丢包 1% 以上）也算放不进：丢包下探测测不准。和起步探测的规则一样
+    /// （有丢包不探：ms-02560 按探测升码率后卡顿 0 → 3 次）；只看最近一份反馈的话，12% 丢包的链路上总有几份
+    /// 碰巧没丢，探了也多半被否定——微软轨迹 8 Mbps、12–13% 丢包的三条上 38 轮周期探测 26 轮否定，白发 1.7 MB。
+    fn probe_fits(&self, target_bps: u64) -> bool {
+        if self.inherent_loss >= LOSSY_LINK {
+            return false;
+        }
+        let bytes = u64::from(run_probe_packets(target_bps))
+            .saturating_mul(u64::from(crate::cc::probe::PROBE_PACKET_BYTES));
+        self.capacity
+            .is_some_and(|(c, _)| bytes <= c.saturating_mul(PROBE_FIT_US) / 8_000_000)
+    }
+
+    /// 已知的链路能力（测得的容量打安全折扣，不超过上限）；没测过时为 `None`。
+    fn ceiling_bps(&self) -> Option<u64> {
+        self.capacity.map(|(c, _)| {
+            (c.saturating_mul(u64::from(self.profile.safety_permille)) / 1000).min(self.max_bps)
+        })
+    }
+
+    /// 写一条说明（探测结论、状态切换用同一个额度）。
+    fn note(&mut self, text: String) {
+        if self.notes.len() < MAX_NOTES * 2 {
+            self.notes.push(text);
         }
     }
 
@@ -962,28 +1240,49 @@ impl ClassicV1 {
                 }
             }
             (Phase::AppLimited { floor_since }, SendLimit::App) => {
-                // I5：码率在底线、又不升，不能就这么停着
+                // 记下码率从什么时候起一直在底线（I5，见 `probe_wanted`）
                 let at_floor = self.rate_bps <= self.min_bps;
                 let since = floor_since.filter(|_| at_floor).or(at_floor.then_some(now));
-                if since.is_some_and(|t| now.since(t) >= FLOOR_VERIFY_US) {
-                    self.go(
-                        Phase::Verify { since: now },
-                        "应用受限时码率在底线停了 1 秒，要核实链路是不是真的这么窄",
-                    );
-                } else {
-                    self.phase = Phase::AppLimited { floor_since: since };
-                }
+                self.phase = Phase::AppLimited { floor_since: since };
             }
             (Phase::Verify { since }, SendLimit::App) => {
-                if now.since(since) >= VERIFY_MAX_US {
-                    // 这一步还没有运行中探测：核实只能超时。从头计时，下一秒再核实
+                // 兜底：发送端的探测状态机每轮都有时限，正常到不了这里
+                if now.since(since) >= VERIFY_MAX_US.saturating_mul(2) {
+                    self.probing.asked = None;
                     self.go(
                         Phase::AppLimited { floor_since: None },
-                        "核实超时：没有探测结论，码率不变",
+                        "核实超时：一直没有探测结论，码率不变",
                     );
                 }
             }
         }
+        if self.phase.relaxed() {
+            self.probing.app_since.get_or_insert(now);
+        } else {
+            self.leave_app_limited();
+        }
+    }
+
+    /// 离开了应用受限（和它的核实、排空）：探测的触发条件清掉。正在等的那一轮由发送端中止、回报。
+    const fn leave_app_limited(&mut self) {
+        self.probing.app_since = None;
+        self.probing.drop = None;
+        self.probing.next_target = None;
+        self.probing.rounds = 0;
+    }
+
+    /// 这一串探测到此为止。
+    const fn end_chain(&mut self) {
+        self.probing.next_target = None;
+        self.probing.rounds = 0;
+    }
+
+    /// 开始一轮探测：记下来等发送端回报。
+    fn ask(&mut self, kind: ProbeKind, target_bps: u64) -> Option<ProbeAsk> {
+        let ask = ProbeAsk { kind, target_bps };
+        self.probing.asked = Some(ask);
+        self.probing.rounds = self.probing.rounds.saturating_add(1);
+        Some(ask)
     }
 
     /// 当前的过载判断（诊断用）。
@@ -1056,6 +1355,7 @@ impl RateEstimator for ClassicV1 {
         let target = capacity_bps.saturating_mul(u64::from(self.profile.safety_permille)) / 1000;
         self.rate_bps = target.clamp(self.min_bps, self.max_bps);
         self.noted_bps = self.rate_bps;
+        self.probing.limit_known = true;
     }
 
     fn state(&self) -> RateState {
@@ -1065,7 +1365,239 @@ impl RateEstimator for ClassicV1 {
     fn on_net_limited(&mut self, cause: NetCause) {
         if self.phase.relaxed() {
             self.go(Phase::Tracking, &format!("网络受限：{}", cause.name()));
+            self.leave_app_limited();
         }
+    }
+
+    fn probe_wanted(&mut self, now: Time) -> Option<ProbeAsk> {
+        if self.probing.asked.is_some() {
+            return None;
+        }
+        let rested = self
+            .probing
+            .last_end
+            .is_none_or(|t| now.since(t) >= PROBE_RETRY_US);
+        match self.phase {
+            // 核实里上一轮证实了：接着探下一轮
+            Phase::Verify { .. } => {
+                let target = self.probing.next_target.take()?;
+                self.ask(ProbeKind::Verify, target)
+            }
+            Phase::AppLimited { floor_since } => {
+                // 周期探测上一轮证实了：接着探
+                if let Some(target) = self.probing.next_target.take() {
+                    return self.ask(ProbeKind::Periodic, target);
+                }
+                if !rested {
+                    return None;
+                }
+                let goal = self
+                    .probing
+                    .drop
+                    .map(|(before, _)| before.saturating_mul(VERIFY_TARGET_PERMILLE) / 1000);
+                let first = self.rate_bps.saturating_mul(PROBE_FIRST_SCALE);
+                // T1：降到降前的 66% 以下、之后排队低于 low 满一个往返、降后 5 秒内
+                if let Some((before, at)) = self.probing.drop {
+                    if now.since(at) > VERIFY_WITHIN_US {
+                        self.probing.drop = None;
+                    } else if self.rate_bps.saturating_mul(1000)
+                        < before.saturating_mul(VERIFY_BELOW_PERMILLE)
+                        && self
+                            .probing
+                            .calm_since
+                            .is_some_and(|c| c >= at && now.since(c) >= self.probing.rtt_us)
+                    {
+                        let target = first.min(goal.unwrap_or(first)).min(self.max_bps);
+                        if self.probe_fits(target) {
+                            self.go(
+                                Phase::Verify { since: now },
+                                &format!(
+                                    "应用受限时从 {} kbps 降下来了，队列排掉了，核实链路是不是真的变窄",
+                                    before / 1000
+                                ),
+                            );
+                            return self.ask(ProbeKind::Verify, target);
+                        }
+                    }
+                }
+                // 降过、还在等队列平静满一个往返：先不做周期探测，等核实
+                if self.probing.drop.is_some_and(|(before, _)| {
+                    self.rate_bps.saturating_mul(1000)
+                        < before.saturating_mul(VERIFY_BELOW_PERMILLE)
+                        && self.probe_fits(first.min(goal.unwrap_or(first)).min(self.max_bps))
+                }) && floor_since.is_none()
+                {
+                    return None;
+                }
+                // I5：码率在底线停够了（不受窄带保护限制：停在底线不动比多发一组探测更糟；间隔翻倍）
+                if floor_since.is_some_and(|t| now.since(t) >= self.probing.floor_gap_us) {
+                    let target = first.min(goal.unwrap_or(first)).min(self.max_bps);
+                    self.go(
+                        Phase::Verify { since: now },
+                        "应用受限时码率在底线停了一阵，核实链路是不是真的这么窄",
+                    );
+                    return self.ask(ProbeKind::Verify, target);
+                }
+                // T2：应用受限够久、距上次探测够久、码率明显低于已知的链路能力
+                let long_enough = self
+                    .probing
+                    .app_since
+                    .is_some_and(|t| now.since(t) >= PERIODIC_FIRST_US)
+                    && self
+                        .probing
+                        .last_end
+                        .is_none_or(|t| now.since(t) >= self.probing.periodic_gap_us);
+                let low = !self.probing.limit_known
+                    || self.ceiling_bps().is_some_and(|c| {
+                        self.rate_bps.saturating_mul(1000)
+                            < c.saturating_mul(PERIODIC_BELOW_PERMILLE)
+                    });
+                let target = self.rate_bps.saturating_mul(PROBE_STEP).min(self.max_bps);
+                if long_enough && low && target > self.rate_bps && self.probe_fits(target) {
+                    return self.ask(ProbeKind::Periodic, target);
+                }
+                None
+            }
+            Phase::Startup | Phase::Tracking | Phase::Drain { .. } => None,
+        }
+    }
+
+    fn on_probe_end(&mut self, now: Time, end: ProbeEnd) -> ProbeVerdict {
+        let Some(ask) = self.probing.asked.take() else {
+            return ProbeVerdict::Aborted;
+        };
+        self.probing.last_end = Some(now);
+        let in_verify = matches!(self.phase, Phase::Verify { .. });
+        let kind = ask.kind.name();
+        let target = ask.target_bps;
+        // 状态已经不是要探的那个状态了（降了码率进了排空，或者回了跟踪）：结果不用
+        let stale = match ask.kind {
+            ProbeKind::Verify => !in_verify,
+            ProbeKind::Periodic => !matches!(self.phase, Phase::AppLimited { .. }),
+        };
+        let end = match end {
+            ProbeEnd::Result(_) if stale => ProbeEnd::Aborted("状态变了"),
+            ProbeEnd::Result(_) | ProbeEnd::TimedOut | ProbeEnd::Aborted(_) => end,
+        };
+        let from = self.rate_bps;
+        let safety = u64::from(self.profile.safety_permille);
+        let (verdict, text) = match end {
+            ProbeEnd::Result(result)
+                if result.saturating_mul(1000) >= target.saturating_mul(PROBE_CONFIRM_PERMILLE) =>
+            {
+                self.capacity = Some((result.max(self.capacity.map_or(0, |(c, _)| c)), now));
+                // 核实：降前的码率本来就是验证过的，探到了目标就回到目标（目标已经是降前的 85%）；
+                // 周期探测是往没验证过的地方试，按结果打安全折扣
+                let proven = match ask.kind {
+                    ProbeKind::Verify => target.min(result),
+                    ProbeKind::Periodic => target.min(result.saturating_mul(safety) / 1000),
+                };
+                self.rate_bps = self.rate_bps.max(proven).clamp(self.min_bps, self.max_bps);
+                self.noted_bps = self.rate_bps;
+                // 还没到头就接着探：核实探到降前的 85%，周期探到已知能力的七成以上
+                let more = match ask.kind {
+                    ProbeKind::Verify => self.probing.drop.is_some_and(|(before, _)| {
+                        target < before.saturating_mul(VERIFY_TARGET_PERMILLE) / 1000
+                    }),
+                    ProbeKind::Periodic => self.rate_bps < self.max_bps,
+                };
+                let next = match (ask.kind, self.probing.drop) {
+                    (ProbeKind::Verify, Some((before, _))) => result
+                        .saturating_mul(PROBE_STEP)
+                        .min(before.saturating_mul(VERIFY_TARGET_PERMILLE) / 1000),
+                    (ProbeKind::Verify, None) | (ProbeKind::Periodic, _) => {
+                        result.saturating_mul(PROBE_STEP)
+                    }
+                }
+                .min(self.max_bps);
+                if more
+                    && self.probing.rounds < PROBE_MAX_ROUNDS
+                    && next > target
+                    && self.probe_fits(next)
+                {
+                    self.probing.next_target = Some(next);
+                } else {
+                    self.end_chain();
+                }
+                self.probing.periodic_gap_us = PERIODIC_FIRST_US;
+                self.probing.floor_gap_us = FLOOR_VERIFY_US;
+                // 证实了却没探上去多少（不到一成）：到头了
+                if self.rate_bps.saturating_mul(10) < from.saturating_mul(11) {
+                    self.probing.limit_known = true;
+                    self.end_chain();
+                }
+                (
+                    ProbeVerdict::Confirmed,
+                    format!(
+                        "按 {} kbps 探，测得 {} kbps，链路承载得了，码率 {} → {} kbps",
+                        target / 1000,
+                        result / 1000,
+                        from / 1000,
+                        self.rate_bps / 1000
+                    ),
+                )
+            }
+            ProbeEnd::Result(result) => {
+                self.end_chain();
+                // 没探上去：记下测得的容量；明显比现在的码率还低（不到一半）才降（和静止探测的规则一样）
+                self.capacity = Some((result, now));
+                self.probing.limit_known = true;
+                let target_rate = result.saturating_mul(safety) / 1000;
+                if target_rate.saturating_mul(2) < from {
+                    self.rate_bps = target_rate.clamp(self.min_bps, self.max_bps);
+                    self.noted_bps = self.rate_bps;
+                }
+                (
+                    ProbeVerdict::Denied,
+                    format!(
+                        "按 {} kbps 探，只测得 {} kbps，链路承载不了，码率 {} → {} kbps",
+                        target / 1000,
+                        result / 1000,
+                        from / 1000,
+                        self.rate_bps / 1000
+                    ),
+                )
+            }
+            ProbeEnd::TimedOut => {
+                self.end_chain();
+                (
+                    ProbeVerdict::TimedOut,
+                    format!("按 {} kbps 探，到时间没有结果，码率不变", target / 1000),
+                )
+            }
+            ProbeEnd::Aborted(why) => {
+                self.end_chain();
+                (
+                    ProbeVerdict::Aborted,
+                    format!("按 {} kbps 探，{why}，结果不用，码率不变", target / 1000),
+                )
+            }
+        };
+        // 没探上去（否定、超时）：下次隔得更久。中止不算，等能探了再探
+        if matches!(verdict, ProbeVerdict::Denied | ProbeVerdict::TimedOut) {
+            self.probing.periodic_gap_us = self
+                .probing
+                .periodic_gap_us
+                .saturating_mul(2)
+                .min(PERIODIC_MAX_US);
+            self.probing.floor_gap_us = self
+                .probing
+                .floor_gap_us
+                .saturating_mul(2)
+                .min(PERIODIC_MAX_US);
+        }
+        self.note(format!("{kind}探测结论 {}：{text}", verdict.name()));
+        // 核实有了结论（或者这一串探完了）：回应用受限。降码率的这一段到此了结（中止的留着，5 秒内能探了再核实）
+        if in_verify && self.probing.next_target.is_none() {
+            if verdict != ProbeVerdict::Aborted {
+                self.probing.drop = None;
+            }
+            self.go(
+                Phase::AppLimited { floor_since: None },
+                &format!("核实结论：{}", verdict.name()),
+            );
+        }
+        verdict
     }
 
     fn set_startup(&mut self, on: bool, why: &str) {
@@ -1125,6 +1657,12 @@ impl RateEstimator for ClassicV1 {
             contiguous,
             STANDING_US.max(obs.rtt_us),
         );
+        self.probing.rtt_us = obs.rtt_us;
+        if fb.queue_delay_us < p.low_delay_us {
+            self.probing.calm_since.get_or_insert(now);
+        } else {
+            self.probing.calm_since = None;
+        }
         // 以上是各状态共用的测量（和状态无关，每份反馈都一样算）。下面先走状态机的出口，再按状态判断。
         self.step(now, obs);
         let relaxed = self.phase.relaxed();
@@ -1195,6 +1733,16 @@ impl RateEstimator for ClassicV1 {
                     ));
                 }
                 self.noted_bps = self.rate_bps;
+                // 应用受限时降的：记下这一段是从多少降下来的（之后核实用，见 `Probing`）；一串探测到此为止
+                if relaxed {
+                    let before = self
+                        .probing
+                        .drop
+                        .filter(|(_, at)| now.since(*at) <= VERIFY_WITHIN_US)
+                        .map_or(from_bps, |(b, _)| b);
+                    self.probing.drop = Some((before, now));
+                    self.end_chain();
+                }
                 // 降了：进排空（起步期间不切，起步什么时候结束由发送端的探测决定）
                 if self.phase != Phase::Startup {
                     self.go(
@@ -1399,7 +1947,7 @@ mod tests {
         f.put(20_000, 0, 250_000, FLAT, NET);
         assert_eq!(f.v.rate_bps(), 1_700_000);
         assert_eq!(f.v.state(), RateState::Drain);
-        assert!(f.notes().contains("码率状态 跟踪 → 排空：降了码率"));
+        assert!(f.notes().contains("码率状态 跟踪 → 排空（跟踪）：降了码率"));
         // 出口二：发送端报应用受限 → 应用受限
         let mut g = Feed::new(Profile::STABLE, 2_400_000);
         g.put(1_000, 0, 25_000, FLAT, SendLimit::App);
@@ -1427,7 +1975,7 @@ mod tests {
         assert_eq!(f.v.state(), RateState::Tracking);
         assert!(f
             .notes()
-            .contains("码率状态 排空 → 跟踪：队列排掉了（排队 1 ms，低于 3 ms）"));
+            .contains("码率状态 排空（跟踪） → 跟踪：队列排掉了（排队 1 ms，低于 3 ms）"));
         f.put(1_000, 0, 250_000, FLAT, SendLimit::App);
         assert_eq!(f.v.state(), RateState::AppLimited);
         // 出口二：排队一直不低于 low，到 1 秒 → 跟踪。一个往返（至少 100 ms）过后还过载就再降，排空重新计时
@@ -1456,7 +2004,7 @@ mod tests {
         assert_eq!(g.v.state(), RateState::Tracking);
         assert!(g
             .notes()
-            .contains("排空 → 跟踪：排空到时限了，排队还有 5 ms"));
+            .contains("排空（跟踪） → 跟踪：排空到时限了，排队还有 5 ms"));
         assert_eq!(g.v.rate_bps(), 850_000);
         // 往返很长时时限是 4 个往返
         let mut h = Feed::new(Profile::STABLE, 2_400_000);
@@ -1504,8 +2052,10 @@ mod tests {
         // 出口：排队持续 100 ms 以上是常驻队列，降，但一次最多降一半 → 排空
         f.put(30_000, 0, 25_000, FLAT, SendLimit::App);
         assert_eq!(f.v.rate_bps(), 15_000_000);
-        assert_eq!(f.v.state(), RateState::Drain);
-        assert!(f.notes().contains("应用受限 → 排空：应用受限时降了码率"));
+        assert_eq!(f.v.state(), RateState::DrainApp);
+        assert!(f
+            .notes()
+            .contains("应用受限 → 排空（应用受限）：应用受限时降了码率"));
         for _ in 0..4 {
             f.put(30_000, 0, 25_000, FLAT, SendLimit::App);
         }
@@ -1522,7 +2072,7 @@ mod tests {
         let mut h = Feed::app_limited(Profile::STABLE, 30_000_000);
         h.put(0, 0, 25_000, OVER, SendLimit::App);
         assert_eq!(h.v.rate_bps(), 15_000_000);
-        assert_eq!(h.v.state(), RateState::Drain);
+        assert_eq!(h.v.state(), RateState::DrainApp);
         // 往返比 100 ms 长时，常驻队列的窗口按往返
         let mut k = Feed::app_limited(Profile::STABLE, 30_000_000);
         for i in 0..12 {
@@ -1587,7 +2137,7 @@ mod tests {
             f.put(0, 0, 25_000, OVER, SendLimit::App);
             assert_eq!(
                 (f.v.state(), f.v.rate_bps()),
-                (RateState::Drain, 15_000_000)
+                (RateState::DrainApp, 15_000_000)
             );
             f.notes();
             f
@@ -1595,10 +2145,12 @@ mod tests {
         // 出口一：排队低于 low → 回应用受限
         let mut f = cut();
         f.put(5_000, 0, 25_000, FLAT, SendLimit::App);
-        assert_eq!(f.v.state(), RateState::Drain);
+        assert_eq!(f.v.state(), RateState::DrainApp);
         f.put(1_000, 0, 25_000, FLAT, SendLimit::App);
         assert_eq!(f.v.state(), RateState::AppLimited);
-        assert!(f.notes().contains("排空 → 应用受限：队列排掉了"));
+        assert!(f
+            .notes()
+            .contains("排空（应用受限） → 应用受限：队列排掉了"));
         // 出口二：下一份反馈报网络受限 → 跟踪
         let mut g = cut();
         g.put(5_000, 0, 25_000, FLAT, NET);
@@ -1607,71 +2159,468 @@ mod tests {
         let mut h = cut();
         h.v.on_net_limited(NetCause::KeyPending);
         assert_eq!(h.v.state(), RateState::Tracking);
-        assert!(h.notes().contains("排空 → 跟踪：网络受限：关键帧还没确认"));
+        assert!(h
+            .notes()
+            .contains("排空（应用受限） → 跟踪：网络受限：关键帧还没确认"));
         // 出口四：1 秒还没排掉 → 跟踪
         let mut k = cut();
         let cut_at = k.t;
         while k.t < cut_at + 980_000 {
             k.put(5_000, 0, 25_000, FLAT, SendLimit::App);
-            assert_eq!(k.v.state(), RateState::Drain);
+            assert_eq!(k.v.state(), RateState::DrainApp);
         }
         k.put(5_000, 0, 25_000, FLAT, SendLimit::App);
         assert_eq!(k.v.state(), RateState::Tracking);
         assert_eq!(k.v.rate_bps(), 15_000_000, "排空里不升");
     }
 
-    /// I5：应用受限时码率停在底线超过 1 秒必须进核实；核实有时限（这一步没有探测，只能超时），每次切换都有日志。
+    // ---- 运行中探测：触发（T1 核实、I5 底线核实、T2 周期）和结论 ----
+
+    /// 应用受限、码率 `rate`、已知容量 `capacity`。
+    fn probing(rate: u64, capacity: Option<u64>) -> Feed {
+        let mut f = Feed::app_limited(Profile::STABLE, rate);
+        f.v.capacity = capacity.map(|c| (c, Time(0)));
+        f.notes();
+        f
+    }
+
+    /// 应用受限时常驻队列把码率降一半 `times` 次，然后队列排掉、平静一个往返。
+    fn cut(f: &mut Feed, times: u32) {
+        for _ in 0..times {
+            let before = f.v.rate_bps();
+            while f.v.rate_bps() == before {
+                f.put(30_000, 0, 25_000, FLAT, SendLimit::App);
+            }
+        }
+        assert_eq!(f.v.state(), RateState::DrainApp);
+        assert_eq!(f.v.probe_wanted(Time(f.t)), None, "排空里不探");
+        f.put(1_000, 0, 25_000, FLAT, SendLimit::App);
+        assert_eq!(f.v.state(), RateState::AppLimited);
+        assert_eq!(
+            f.v.probe_wanted(Time(f.t)),
+            None,
+            "排队低于 low 还没满一个往返"
+        );
+        f.put(1_000, 0, 25_000, FLAT, SendLimit::App);
+    }
+
+    #[test]
+    fn t1_a_cut_while_app_limited_is_verified_and_a_false_one_is_undone() {
+        let mut f = probing(30_000_000, Some(30_000_000));
+        cut(&mut f, 1);
+        assert_eq!(f.v.rate_bps(), 15_000_000);
+        // 目标是降前的 85%（没超过当前码率的 4 倍）
+        let ask = f.v.probe_wanted(Time(f.t)).unwrap();
+        assert_eq!(
+            ask,
+            ProbeAsk {
+                kind: ProbeKind::Verify,
+                target_bps: 25_500_000
+            }
+        );
+        assert_eq!(f.v.state(), RateState::Verify);
+        assert_eq!(f.v.probe_wanted(Time(f.t)), None, "这一轮还没回报");
+        // 证实：码率 = min(目标, 结果)，回应用受限
+        f.t += 100_000;
+        assert_eq!(
+            f.v.on_probe_end(Time(f.t), ProbeEnd::Result(25_000_000)),
+            ProbeVerdict::Confirmed
+        );
+        assert_eq!(f.v.rate_bps(), 25_000_000);
+        assert_eq!(f.v.state(), RateState::AppLimited);
+        let notes = f.notes();
+        assert!(
+            notes.contains("应用受限 → 核实：应用受限时从 30000 kbps 降下来了"),
+            "{notes}"
+        );
+        assert!(
+            notes.contains(
+                "核实探测结论 证实：按 25500 kbps 探，测得 25000 kbps，链路承载得了，码率 15000 → 25000 kbps"
+            ),
+            "{notes}"
+        );
+        assert!(notes.contains("核实 → 应用受限：核实结论：证实"), "{notes}");
+        // 这一段了结了：不再核实
+        f.t += 1_000_000;
+        assert_eq!(f.v.probe_wanted(Time(f.t)), None);
+        // 没有要等的探测时回报结束：中止，什么都不动
+        assert_eq!(
+            f.v.on_probe_end(Time(f.t), ProbeEnd::Result(1)),
+            ProbeVerdict::Aborted
+        );
+        assert_eq!(f.v.rate_bps(), 25_000_000);
+    }
+
+    #[test]
+    fn t1_after_a_deep_cut_the_first_probe_is_at_most_four_times_the_rate() {
+        // 30 → 15 → 7.5 → 3.75 Mbps：第一轮只探 15 Mbps（4 倍），证实了再按结果的 2 倍，到降前的 85% 为止
+        let mut f = probing(30_000_000, Some(30_000_000));
+        cut(&mut f, 3);
+        assert_eq!(f.v.rate_bps(), 3_750_000);
+        let ask = f.v.probe_wanted(Time(f.t)).unwrap();
+        assert_eq!(ask.target_bps, 15_000_000);
+        f.t += 100_000;
+        assert_eq!(
+            f.v.on_probe_end(Time(f.t), ProbeEnd::Result(15_000_000)),
+            ProbeVerdict::Confirmed
+        );
+        assert_eq!(f.v.rate_bps(), 15_000_000);
+        assert_eq!(f.v.state(), RateState::Verify, "还没到降前的 85%，接着探");
+        let ask = f.v.probe_wanted(Time(f.t)).unwrap();
+        assert_eq!((ask.kind, ask.target_bps), (ProbeKind::Verify, 25_500_000));
+        f.t += 100_000;
+        f.v.on_probe_end(Time(f.t), ProbeEnd::Result(25_500_000));
+        assert_eq!(f.v.rate_bps(), 25_500_000);
+        assert_eq!(f.v.state(), RateState::AppLimited);
+        assert_eq!(f.notes().matches("核实探测结论 证实").count(), 2);
+    }
+
+    #[test]
+    fn t1_a_real_drop_is_denied_and_the_rate_does_not_bounce_back() {
+        // 链路真的从 30 降到了 3 Mbps
+        let mut f = probing(30_000_000, Some(30_000_000));
+        cut(&mut f, 3);
+        let ask = f.v.probe_wanted(Time(f.t)).unwrap();
+        f.t += 100_000;
+        assert_eq!(
+            f.v.on_probe_end(Time(f.t), ProbeEnd::Result(3_000_000)),
+            ProbeVerdict::Denied
+        );
+        assert_eq!(
+            f.v.rate_bps(),
+            3_750_000,
+            "不升；也没低到要降（不到一半才降）"
+        );
+        assert_eq!(f.v.state(), RateState::AppLimited);
+        assert!(f.notes().contains(&format!(
+            "核实探测结论 否定：按 {} kbps 探，只测得 3000 kbps，链路承载不了，码率 3750 → 3750 kbps",
+            ask.target_bps / 1000
+        )));
+        // 记下了容量 3 Mbps：之后任何一组探测（至少 19 KB）都超过它 50 ms 的量，不再探
+        f.t += 60_000_000;
+        f.put(1_000, 0, 25_000, FLAT, SendLimit::App);
+        assert_eq!(f.v.probe_wanted(Time(f.t)), None);
+        // 测得的容量明显比码率还低：按它降
+        let mut g = probing(30_000_000, Some(30_000_000));
+        cut(&mut g, 3);
+        g.v.probe_wanted(Time(g.t)).unwrap();
+        assert_eq!(
+            g.v.on_probe_end(Time(g.t), ProbeEnd::Result(1_000_000)),
+            ProbeVerdict::Denied
+        );
+        assert_eq!(g.v.rate_bps(), 900_000);
+    }
+
+    #[test]
+    fn t1_timeouts_and_aborts_leave_the_rate_alone() {
+        // 超时：结论未知，这一段了结
+        let mut f = probing(30_000_000, Some(30_000_000));
+        cut(&mut f, 1);
+        f.v.probe_wanted(Time(f.t)).unwrap();
+        assert_eq!(
+            f.v.on_probe_end(Time(f.t), ProbeEnd::TimedOut),
+            ProbeVerdict::TimedOut
+        );
+        assert_eq!(
+            (f.v.state(), f.v.rate_bps()),
+            (RateState::AppLimited, 15_000_000)
+        );
+        assert!(f
+            .notes()
+            .contains("核实探测结论 超时：按 25500 kbps 探，到时间没有结果，码率不变"));
+        f.t += 1_000_000;
+        assert_eq!(f.v.probe_wanted(Time(f.t)), None);
+        // 中止：码率不变，回应用受限；200 ms 之后、降后 5 秒之内还会再核实
+        let mut g = probing(30_000_000, Some(30_000_000));
+        cut(&mut g, 1);
+        g.v.probe_wanted(Time(g.t)).unwrap();
+        assert_eq!(
+            g.v.on_probe_end(Time(g.t), ProbeEnd::Aborted("最近的反馈里还有排队")),
+            ProbeVerdict::Aborted
+        );
+        assert_eq!(
+            (g.v.state(), g.v.rate_bps()),
+            (RateState::AppLimited, 15_000_000)
+        );
+        assert!(g.notes().contains(
+            "核实探测结论 中止：按 25500 kbps 探，最近的反馈里还有排队，结果不用，码率不变"
+        ));
+        assert_eq!(
+            g.v.probe_wanted(Time(g.t + 100_000)),
+            None,
+            "刚中止，先歇 200 ms"
+        );
+        assert!(g.v.probe_wanted(Time(g.t + 200_000)).is_some());
+        g.v.on_probe_end(Time(g.t + 200_000), ProbeEnd::Aborted("有丢包"));
+        // 降了超过 5 秒：不核实了（码率还远低于已知的链路能力，改由周期探测往上探）
+        let later = g.v.probe_wanted(Time(g.t + 6_000_000)).unwrap();
+        assert_eq!(later.kind, ProbeKind::Periodic);
+        assert_eq!(g.v.state(), RateState::AppLimited);
+        assert_eq!(g.v.probing.drop, None);
+        // 核实期间出现过载：降码率进排空（I1）；之后回报的结果不用
+        let mut h = probing(30_000_000, Some(30_000_000));
+        cut(&mut h, 1);
+        h.v.probe_wanted(Time(h.t)).unwrap();
+        h.t += 200_000;
+        h.put(0, 0, 25_000, OVER, SendLimit::App);
+        assert_eq!(
+            (h.v.state(), h.v.rate_bps()),
+            (RateState::DrainApp, 7_500_000)
+        );
+        assert_eq!(
+            h.v.on_probe_end(Time(h.t), ProbeEnd::Result(25_000_000)),
+            ProbeVerdict::Aborted
+        );
+        assert_eq!(h.v.rate_bps(), 7_500_000);
+        assert!(h.notes().contains("状态变了，结果不用"));
+        // 核实期间出现网络受限的原因：回跟踪；结果不用
+        let mut k = probing(30_000_000, Some(30_000_000));
+        cut(&mut k, 1);
+        k.v.probe_wanted(Time(k.t)).unwrap();
+        k.v.on_net_limited(NetCause::FrameNearBudget);
+        assert_eq!(k.v.state(), RateState::Tracking);
+        assert_eq!(
+            k.v.on_probe_end(Time(k.t), ProbeEnd::Result(25_000_000)),
+            ProbeVerdict::Aborted
+        );
+        assert_eq!(k.v.rate_bps(), 15_000_000);
+        assert_eq!(k.v.probe_wanted(Time(k.t + 1_000_000)), None, "跟踪里不探");
+        // 兜底：发送端一直不回报，核实 2 秒后自己结束
+        let mut m = probing(30_000_000, Some(30_000_000));
+        cut(&mut m, 1);
+        m.v.probe_wanted(Time(m.t)).unwrap();
+        let since = m.t;
+        while m.t < since + 2_000_000 {
+            assert_eq!(m.v.state(), RateState::Verify);
+            m.put(1_000, 0, 25_000, FLAT, SendLimit::App);
+        }
+        assert_eq!(m.v.state(), RateState::AppLimited);
+        assert!(m.notes().contains("核实超时：一直没有探测结论"));
+    }
+
+    #[test]
+    fn t1_needs_a_big_cut_and_a_link_known_to_be_wide_enough() {
+        // 不知道容量、或者已知容量放不下一组探测（窄带保护）：不核实
+        for capacity in [None, Some(2_000_000)] {
+            let mut f = probing(30_000_000, capacity);
+            cut(&mut f, 1);
+            f.t += 1_000_000;
+            assert_eq!(f.v.probe_wanted(Time(f.t)), None);
+            assert_eq!(f.v.state(), RateState::AppLimited);
+        }
+        // 降得不多（没到降前的 66% 以下）：不核实
+        let mut g = probing(30_000_000, Some(30_000_000));
+        while g.v.rate_bps() == 30_000_000 {
+            // 送达 24 Mbps：降到它的 85% = 20.4 Mbps（降前的 68%）
+            g.put(30_000, 0, 3_000_000, FLAT, SendLimit::App);
+        }
+        assert_eq!(g.v.rate_bps(), 20_400_000);
+        g.put(1_000, 0, 25_000, FLAT, SendLimit::App);
+        g.put(1_000, 0, 25_000, FLAT, SendLimit::App);
+        assert_eq!(g.v.state(), RateState::AppLimited);
+        assert_eq!(g.v.probe_wanted(Time(g.t)), None);
+        // 一组探测要发几个包：30 ms 的量，至少 16 个
+        assert_eq!(run_probe_packets(100_000), 16);
+        assert_eq!(run_probe_packets(30_000_000), 93);
+        assert_eq!(ProbeKind::Verify.name(), "核实");
+        assert_eq!(ProbeKind::Periodic.name(), "周期");
+        for (i, v) in ProbeVerdict::ALL.iter().enumerate() {
+            assert_eq!(v.index(), i);
+            assert!(!v.name().is_empty());
+        }
+    }
+
+    /// I5：应用受限时码率停在底线超过 1 秒必须核实（不管知不知道容量），不允许“底线、不升、没人管”。
     #[test]
     fn i5_app_limited_at_the_floor_must_be_verified_within_a_second() {
-        let mut f = Feed::app_limited(Profile::STABLE, 100_000);
+        let mut f = probing(100_000, None);
         let start = f.t;
-        while f.t < start + 980_000 {
+        while f.t < start + 1_020_000 {
+            assert_eq!(f.v.probe_wanted(Time(f.t)), None, "{} ms", f.t / 1000);
             f.put(1_000, 0, 1_000, FLAT, SendLimit::App);
-            assert_eq!(f.v.state(), RateState::AppLimited, "{} ms", f.t / 1000);
         }
-        f.put(1_000, 0, 1_000, FLAT, SendLimit::App);
-        f.put(1_000, 0, 1_000, FLAT, SendLimit::App);
+        let ask = f.v.probe_wanted(Time(f.t)).unwrap();
+        assert_eq!(
+            ask,
+            ProbeAsk {
+                kind: ProbeKind::Verify,
+                target_bps: 400_000
+            }
+        );
         assert_eq!(f.v.state(), RateState::Verify);
         assert!(f
             .notes()
-            .contains("应用受限 → 核实：应用受限时码率在底线停了 1 秒"));
-        // 核实的出口一：到时限 → 应用受限（从头计时，一秒后再核实，不会停死）
-        let verify_at = f.t;
-        while f.t < verify_at + 980_000 {
-            f.put(1_000, 0, 1_000, FLAT, SendLimit::App);
-            assert_eq!(f.v.state(), RateState::Verify);
-        }
-        f.put(1_000, 0, 1_000, FLAT, SendLimit::App);
-        f.put(1_000, 0, 1_000, FLAT, SendLimit::App);
+            .contains("应用受限 → 核实：应用受限时码率在底线停了一阵"));
+        // 超时：回应用受限，下一次隔 2 秒（间隔翻倍），不会停死也不会刷屏
+        assert_eq!(
+            f.v.on_probe_end(Time(f.t), ProbeEnd::TimedOut),
+            ProbeVerdict::TimedOut
+        );
         assert_eq!(f.v.state(), RateState::AppLimited);
-        assert!(f.notes().contains("核实 → 应用受限：核实超时"));
-        for _ in 0..60 {
+        let again = f.t;
+        while f.t < again + 2_020_000 {
+            assert_eq!(f.v.probe_wanted(Time(f.t)), None, "{} ms", f.t / 1000);
             f.put(1_000, 0, 1_000, FLAT, SendLimit::App);
         }
-        assert_eq!(f.v.state(), RateState::Verify, "一秒后又进核实");
-        // 核实的出口二：网络受限 → 跟踪
-        f.put(1_000, 0, 1_000, FLAT, NET);
-        assert_eq!(f.v.state(), RateState::Tracking);
-        // 核实的出口三：过载（I1）→ 排空
-        let mut g = Feed::app_limited(Profile::STABLE, 100_000);
-        for _ in 0..60 {
-            g.put(1_000, 0, 1_000, FLAT, SendLimit::App);
+        assert!(f.v.probe_wanted(Time(f.t)).is_some(), "2 秒后又核实");
+        // 证实：码率离开底线
+        assert_eq!(
+            f.v.on_probe_end(Time(f.t), ProbeEnd::Result(400_000)),
+            ProbeVerdict::Confirmed
+        );
+        assert_eq!(f.v.rate_bps(), 400_000);
+        assert_eq!(f.v.state(), RateState::AppLimited);
+        // 码率不在底线：不核实
+        f.t += 5_000_000;
+        f.put(1_000, 0, 1_000, FLAT, SendLimit::App);
+        assert_eq!(f.v.probe_wanted(Time(f.t)), None);
+    }
+
+    #[test]
+    fn t2_periodic_probes_climb_when_the_rate_is_far_below_the_known_capacity() {
+        // 应用受限、码率 1 Mbps、已知容量 30 Mbps（例如起步时没探）：满 5 秒开始往上探
+        let mut f = probing(1_000_000, Some(30_000_000));
+        let start = f.t;
+        while f.t < start + 4_980_000 {
+            assert_eq!(f.v.probe_wanted(Time(f.t)), None, "{} ms", f.t / 1000);
+            f.put(1_000, 0, 25_000, FLAT, SendLimit::App);
         }
-        assert_eq!(g.v.state(), RateState::Verify);
-        g.put(0, 0, 1_000, OVER, SendLimit::App);
-        assert_eq!(g.v.state(), RateState::Drain);
-        assert_eq!(g.v.rate_bps(), 100_000);
-        // 码率不在底线：不核实；中途离开底线（探测结论把码率提上去）就从头计时
-        let mut h = Feed::app_limited(Profile::STABLE, 100_000);
-        for _ in 0..30 {
-            h.put(1_000, 0, 1_000, FLAT, SendLimit::App);
+        f.put(1_000, 0, 25_000, FLAT, SendLimit::App);
+        let mut targets = Vec::new();
+        // 一串最多 3 轮：每轮按上一轮结果的 2 倍（2、4、8 Mbps），证实后码率是结果的九成
+        while let Some(ask) = f.v.probe_wanted(Time(f.t)) {
+            assert_eq!(ask.kind, ProbeKind::Periodic);
+            assert_eq!(f.v.state(), RateState::AppLimited, "周期探测不换状态");
+            targets.push(ask.target_bps);
+            f.t += 100_000;
+            assert_eq!(
+                f.v.on_probe_end(Time(f.t), ProbeEnd::Result(ask.target_bps)),
+                ProbeVerdict::Confirmed
+            );
         }
-        h.v.on_start_probe(Time(h.t), 10_000_000);
-        for _ in 0..100 {
-            h.put(1_000, 0, 1_000, FLAT, SendLimit::App);
+        assert_eq!(targets, [2_000_000, 4_000_000, 8_000_000]);
+        assert_eq!(f.v.rate_bps(), 7_200_000);
+        assert_eq!(f.notes().matches("周期探测结论 证实").count(), 3);
+        // 证实了：5 秒后接着探
+        f.t += 4_900_000;
+        assert_eq!(f.v.probe_wanted(Time(f.t)), None);
+        f.t += 100_000;
+        let ask = f.v.probe_wanted(Time(f.t)).unwrap();
+        assert_eq!(ask.target_bps, 14_400_000);
+        // 没探上去（否定）：记下容量，间隔翻倍到 10 秒
+        assert_eq!(
+            f.v.on_probe_end(Time(f.t), ProbeEnd::Result(7_000_000)),
+            ProbeVerdict::Denied
+        );
+        assert_eq!(f.v.rate_bps(), 7_200_000);
+        assert_eq!(f.v.probing.periodic_gap_us, 10_000_000);
+        // 码率已经到了已知能力（7 Mbps 的九成）的七成以上：不探了
+        f.t += 60_000_000;
+        assert_eq!(f.v.probe_wanted(Time(f.t)), None);
+        // 超时也翻倍，最长 30 秒
+        let mut g = probing(1_000_000, Some(30_000_000));
+        g.t += 5_000_000;
+        g.put(1_000, 0, 25_000, FLAT, SendLimit::App);
+        for gap in [10_000_000u64, 20_000_000, 30_000_000, 30_000_000] {
+            assert!(g.v.probe_wanted(Time(g.t)).is_some());
+            assert_eq!(
+                g.v.on_probe_end(Time(g.t), ProbeEnd::TimedOut),
+                ProbeVerdict::TimedOut
+            );
+            assert_eq!(g.v.probing.periodic_gap_us, gap);
+            assert_eq!(g.v.probe_wanted(Time(g.t + gap - 1)), None);
+            g.t += gap;
         }
-        assert_eq!(h.v.state(), RateState::AppLimited);
-        assert_eq!(h.v.rate_bps(), 9_000_000);
+        assert_eq!(g.v.rate_bps(), 1_000_000);
+        // 周期探测期间回了跟踪：结果不用
+        let mut h = probing(1_000_000, Some(30_000_000));
+        h.t += 5_000_000;
+        h.put(1_000, 0, 25_000, FLAT, SendLimit::App);
+        h.v.probe_wanted(Time(h.t)).unwrap();
+        h.v.on_net_limited(NetCause::FrameBlocked);
+        assert_eq!(
+            h.v.on_probe_end(Time(h.t), ProbeEnd::Result(2_000_000)),
+            ProbeVerdict::Aborted
+        );
+        assert_eq!(h.v.rate_bps(), 1_000_000);
+        assert_eq!(h.v.probing.app_since, None);
+    }
+
+    /// 窄带保护：已知容量低于 3 Mbps（或者不知道容量）的链路上，周期探测一次都不发。
+    #[test]
+    fn t2_never_probes_a_narrow_or_unknown_link() {
+        for capacity in [None, Some(1_000_000), Some(3_000_000)] {
+            let mut f = probing(300_000, capacity);
+            for _ in 0..3_000 {
+                f.put(1_000, 0, 25_000, FLAT, SendLimit::App);
+                assert_eq!(f.v.probe_wanted(Time(f.t)), None, "{capacity:?}");
+            }
+            assert_eq!(f.v.state(), RateState::AppLimited);
+        }
+        // 一直有随机丢包的链路（固有丢包 1% 以上）：不探，哪怕最近一份反馈碰巧没丢
+        let mut lossy = probing(1_000_000, Some(30_000_000));
+        for _ in 0..400 {
+            lossy.put(1_000, 120, 25_000, FLAT, SendLimit::App);
+        }
+        lossy.put(1_000, 0, 25_000, FLAT, SendLimit::App);
+        assert_eq!(lossy.v.state(), RateState::AppLimited);
+        assert_eq!(lossy.v.probe_wanted(Time(lossy.t)), None);
+        // 码率已经在上限：没有可探的
+        let mut g = probing(50_000_000, Some(100_000_000));
+        g.t += 10_000_000;
+        g.put(1_000, 0, 25_000, FLAT, SendLimit::App);
+        assert_eq!(g.v.probe_wanted(Time(g.t)), None);
+        // 没有状态机的估计器从不要探测
+        let mut old = EstimatorKind::Legacy.build(Profile::STABLE, 1_000_000, 100_000, 10_000_000);
+        assert_eq!(old.probe_wanted(Time(0)), None);
+        assert_eq!(
+            old.on_probe_end(Time(0), ProbeEnd::TimedOut),
+            ProbeVerdict::Aborted
+        );
+    }
+
+    #[test]
+    fn probe_results_are_tagged_with_the_cluster_id() {
+        let mut m = ReceiverMetrics::new();
+        assert_eq!(m.take_probe_report(), None);
+        // 20 个包的一组，每毫秒一个：收到 10 个、过了 10 ms 先报一次（没收完）
+        for i in 0..12u64 {
+            m.on_probe(Time(50_000 + i * 1_000), Time(i * 1_000), 7, 20, 1200);
+        }
+        m.report();
+        let partial = m.take_probe_report().unwrap();
+        assert_eq!((partial.id, partial.packets, partial.done), (7, 12, false));
+        assert!(partial.bytes_per_s > 1_000_000, "{partial:?}");
+        assert_eq!(m.take_probe_report(), None, "取走了");
+        // 收齐：马上结算，带“收完了”
+        for i in 12..20u64 {
+            m.on_probe(Time(50_000 + i * 1_000), Time(i * 1_000), 7, 20, 1200);
+        }
+        m.report();
+        let done = m.take_probe_report().unwrap();
+        assert_eq!((done.id, done.packets, done.done), (7, 20, true));
+        // 只到了两个包的一组：再没有包来，两份报告之后结束，测不出（速率 0）
+        m.on_probe(Time(200_000), Time(100_000), 8, 20, 1200);
+        m.on_probe(Time(201_000), Time(101_000), 8, 20, 1200);
+        m.report();
+        assert_eq!(m.take_probe_report(), None);
+        m.report();
+        m.report();
+        assert_eq!(
+            m.take_probe_report(),
+            Some(ProbeReport {
+                id: 8,
+                bytes_per_s: 0,
+                packets: 2,
+                done: true
+            })
+        );
+        // 编码往返
+        let mut w = Writer::new();
+        done.encode(&mut w);
+        let bytes = w.into_vec();
+        assert_eq!(ProbeReport::decode(&mut Reader::new(&bytes)).unwrap(), done);
+        assert!(ProbeReport::decode(&mut Reader::new(&bytes[..5])).is_err());
     }
 
     /// 把估计器摆到某个状态（码率 30 Mbps）。
@@ -1691,6 +2640,12 @@ mod tests {
                 f
             }
             RateState::AppLimited => Feed::app_limited(Profile::STABLE, 30_000_000),
+            RateState::DrainApp => {
+                let mut f = Feed::app_limited(Profile::STABLE, 60_000_000);
+                f.put(0, 0, 25_000, OVER, SendLimit::App);
+                f.t += 200_000;
+                f
+            }
             RateState::Verify => {
                 let mut f = Feed::app_limited(Profile::STABLE, 30_000_000);
                 f.v.phase = Phase::Verify { since: Time(f.t) };
@@ -1698,7 +2653,7 @@ mod tests {
             }
         };
         // 排空以外的状态再喂两份平静的反馈（排空一见排队低就结束了）
-        if state != RateState::Drain {
+        if !matches!(state, RateState::Drain | RateState::DrainApp) {
             let limit = if f.v.phase.relaxed() {
                 SendLimit::App
             } else {
@@ -1760,7 +2715,7 @@ mod tests {
         }
         assert_eq!(
             (f.v.state(), f.v.rate_bps()),
-            (RateState::Drain, 15_000_000)
+            (RateState::DrainApp, 15_000_000)
         );
         // 探测结论在任何状态下都能改码率
         for state in RateState::ALL {
@@ -1903,7 +2858,7 @@ mod tests {
                 inherent_loss: 0,
             };
             let mut t = 0u64;
-            let mut seen = [false; 5];
+            let mut seen = [false; 6];
             for i in 0..20_000u32 {
                 // 多数 20 ms 一份，偶尔断档；排队、丢包、送达、趋势、包串都随机
                 t += if rng.chance(50) { 1_000_000 } else { 20_000 };
@@ -1955,8 +2910,8 @@ mod tests {
             }
             assert_eq!(
                 seen,
-                [true, true, true, false, false],
-                "走到过起步、跟踪、排空"
+                [true, true, true, false, false, false],
+                "走到过起步、跟踪、排空（跟踪）"
             );
         }
     }

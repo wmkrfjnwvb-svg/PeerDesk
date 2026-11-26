@@ -423,6 +423,8 @@ pub async fn serve(
     // 环境变量 PEERDESK_START_PROBE=0 关掉起步探测（真实程序平台做对照用，见 scripts/trace-lab.py）
     let start_probe = std::env::var("PEERDESK_START_PROBE").map_or(true, |v| v != "0");
     media.set_start_probe(start_probe && caps.has(Caps::PROBE_TRAIN));
+    // 对端的反馈里探测结果带组号：打开运行中探测（应用受限时降过码率之后核实、码率偏低时往上探）
+    media.set_probe_ids(caps.has(Caps::PROBE_TRAIN) && caps.has(Caps::PROBE_ID));
     // 双方都支持 RS 纠错时用它（老版本只认异或）
     media.set_fec(if caps.has(Caps::FEC_RS) {
         Fec::Rs

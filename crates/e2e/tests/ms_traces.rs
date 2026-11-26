@@ -12,7 +12,8 @@
 use peerdesk_core::adaptive::Profile;
 use peerdesk_core::sim::Link;
 use peerdesk_e2e::{
-    run, Action, ContentPolicy, EstimatorKind, FeatureRow, Outcome, Phase, Scenario, StateShare,
+    run, Action, ContentPolicy, EstimatorKind, FeatureRow, Outcome, Phase, ProbeStats, Scenario,
+    StateShare,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -127,6 +128,8 @@ struct Sample {
     idle_psnr: f64,
     unsharp: bool,
     states: StateShare,
+    probes: ProbeStats,
+    sent_bytes: u64,
     /// 表格的一行、明细、事件记录（打开 `PEERDESK_EVENTS` 时）。
     row: String,
     detail: String,
@@ -173,15 +176,18 @@ fn one(name: &str, csv: &str, seed: u64, estimator: EstimatorKind) -> Sample {
         idle_psnr: idle_psnr(&o),
         unsharp: row.contains("未清晰"),
         states: o.states,
+        probes: o.probes,
+        sent_bytes: o.sent_bytes,
         row,
         detail: format!(
-            "  网络丢 {}，排队丢 {}，跳过 {}，坏帧 {}，恢复 {}；{}",
+            "  网络丢 {}，排队丢 {}，跳过 {}，坏帧 {}，恢复 {}；{}；{}",
             o.net.lost,
             o.net.queue_dropped,
             o.skipped,
             o.bad,
             o.recoveries,
-            o.states.line()
+            o.states.line(),
+            o.probes.line(o.sent_bytes)
         ),
         trace: o.trace,
     }
@@ -274,6 +280,7 @@ fn microsoft_traces() {
     let (mut runs, mut freezes, mut unsharp, mut wait_sum, mut wait_max, mut psnr_sum) =
         (0u32, 0u32, 0u32, 0.0, 0.0f64, 0.0f64);
     let mut states = StateShare::default();
+    let (mut probes, mut sent_bytes) = (ProbeStats::default(), 0u64);
     for ((name, _), samples) in traces.iter().zip(&results) {
         let f: Vec<f64> = samples.iter().map(|s| f64::from(s.freezes)).collect();
         let w: Vec<f64> = samples.iter().map(|s| s.max_wait_ms).collect();
@@ -294,6 +301,8 @@ fn microsoft_traces() {
             psnr_sum += s.idle_psnr;
             unsharp += u32::from(s.unsharp);
             states.merge(&s.states);
+            probes.merge(&s.probes);
+            sent_bytes += s.sent_bytes;
         }
     }
     println!(
@@ -303,6 +312,7 @@ fn microsoft_traces() {
         psnr_sum / f64::from(runs.max(1))
     );
     println!("{}", states.line());
+    println!("{}", probes.line(sent_bytes));
     println!("用时 {:.0} 秒", started.elapsed().as_secs_f64());
 }
 

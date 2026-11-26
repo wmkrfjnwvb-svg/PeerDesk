@@ -16,6 +16,7 @@ use peerdesk_core::adaptive::Profile;
 use peerdesk_core::error::Error;
 pub use peerdesk_core::estimator::EstimatorKind;
 pub use peerdesk_core::estimator::RateState;
+pub use peerdesk_core::media::ProbeStats;
 use peerdesk_core::media::{MediaReceiver, MediaSender, SenderConfig};
 pub use peerdesk_core::policy::ContentPolicy;
 use peerdesk_core::proto::{decode_datagram, encode_datagram, Channel, Header};
@@ -154,6 +155,9 @@ pub struct Scenario {
     pub start_probe: bool,
     /// 内容策略（现在只有办公；以后的游戏、电影模式各加场景守住）。
     pub policy: ContentPolicy,
+    /// 反馈里的探测结果带组号（产品里由握手的 `PROBE_ID` 决定；新版本之间都打开）。关掉是模拟对端是老版本：
+    /// 反馈格式和探测行为照旧，没有运行中探测。
+    pub probe_ids: bool,
 }
 
 impl Scenario {
@@ -179,6 +183,7 @@ impl Scenario {
             trace: std::env::var_os("PEERDESK_EVENTS").is_some(),
             start_probe: std::env::var("PEERDESK_START_PROBE").map_or(true, |v| v != "0"),
             policy: ContentPolicy::OFFICE,
+            probe_ids: true,
         }
     }
 }
@@ -241,6 +246,10 @@ pub struct Outcome {
     pub retransmitted: u32,
     /// 码率控制各状态的时间，以及真实队列高时被判成应用受限的时间。
     pub states: StateShare,
+    /// 探测的流量和结论，和发出的全部字节（含数据报头；算探测占比用）。
+    pub probes: ProbeStats,
+    /// 见 [`Self::probes`]。
+    pub sent_bytes: u64,
     /// 带宽估计器的名字。
     pub estimator: &'static str,
     /// 每次反馈一行特征，带着仿真知道的真实情况（以后训练 AI 模型用）。
@@ -262,6 +271,10 @@ pub struct StateShare {
     pub queued_us: u64,
     /// 真实队列高、同时处于应用受限的时间（微秒）。
     pub queued_app_limited_us: u64,
+    /// 进入“核实”的次数（平均停留 = 核实的时间 ÷ 次数）。
+    pub verify_entries: u32,
+    /// 上一段时间是不是在核实（数进入次数用）。
+    in_verify: bool,
 }
 
 impl StateShare {
@@ -276,6 +289,13 @@ impl StateShare {
         if state == RateState::AppLimited {
             self.queued_app_limited_us = self.queued_app_limited_us.saturating_add(high);
         }
+        let verify = state == RateState::Verify;
+        if verify && !self.in_verify && dt_us > 0 {
+            self.verify_entries = self.verify_entries.saturating_add(1);
+        }
+        if dt_us > 0 {
+            self.in_verify = verify;
+        }
     }
 
     /// 把另一次运行的时间加进来（多次运行合计）。
@@ -287,6 +307,7 @@ impl StateShare {
         self.queued_app_limited_us = self
             .queued_app_limited_us
             .saturating_add(other.queued_app_limited_us);
+        self.verify_entries = self.verify_entries.saturating_add(other.verify_entries);
     }
 
     /// 某个状态的时间占比（千分比）。
@@ -314,13 +335,20 @@ impl StateShare {
             })
             .collect();
         let q = self.queued_app_limited_permille();
+        let verify_us = self
+            .state_us
+            .get(RateState::Verify.index())
+            .copied()
+            .unwrap_or(0);
         format!(
-            "状态时间占比：{}；真实队列 > {} ms 共 {} ms，其中被判为应用受限 {}.{}%",
+            "状态时间占比：{}；真实队列 > {} ms 共 {} ms，其中被判为应用受限 {}.{}%；进核实 {} 次，平均停留 {} ms",
             shares.join("、"),
             TRUE_QUEUE_HIGH_US / 1000,
             self.queued_us / 1000,
             q / 10,
-            q % 10
+            q % 10,
+            self.verify_entries,
+            verify_us / 1000 / u64::from(self.verify_entries.max(1))
         )
     }
 }
@@ -505,6 +533,8 @@ pub fn run(s: &Scenario) -> Result<Outcome, Error> {
     // 静止时探测（产品里由握手的 PROBE_TRAIN 决定；新版本之间都打开）
     tx.set_idle_probe(true);
     tx.set_start_probe(s.start_probe);
+    tx.set_probe_ids(s.probe_ids);
+    rx.set_probe_ids(s.probe_ids);
     let mut net: Net<Vec<u8>> = Net::new(s.seed);
     let mut network = s.network.clone();
     network.sort_by_key(|(t, _)| *t);
@@ -821,6 +851,7 @@ pub fn run(s: &Scenario) -> Result<Outcome, Error> {
         });
     }
     let (tx_stats, rx_stats) = (tx.stats(), rx.stats());
+    let sent_bytes = results.iter().map(|p| p.bytes).sum();
     Ok(Outcome {
         name: s.name.clone(),
         codec: s.codec,
@@ -835,6 +866,8 @@ pub fn run(s: &Scenario) -> Result<Outcome, Error> {
         freezes: overall_freezes,
         retransmitted: tx_stats.retransmitted,
         states,
+        probes: tx_stats.probes,
+        sent_bytes,
         estimator: tx.estimator(),
         features,
         trace,
@@ -902,8 +935,8 @@ mod tests {
         assert_eq!(total.queued_app_limited_us, 20_000);
         assert_eq!(
             a.line(),
-            "状态时间占比：起步 0.0%、跟踪 50.0%、排空 0.0%、应用受限 50.0%、核实 0.0%；\
-             真实队列 > 30 ms 共 30 ms，其中被判为应用受限 33.3%"
+            "状态时间占比：起步 0.0%、跟踪 50.0%、排空（跟踪） 0.0%、排空（应用受限） 0.0%、应用受限 50.0%、\
+             核实 0.0%；真实队列 > 30 ms 共 30 ms，其中被判为应用受限 33.3%；进核实 0 次，平均停留 0 ms"
         );
         // 一次真实运行：各状态时间加起来等于场景时长；特征行带真实排队和状态
         let o = run(&Scenario::new(
