@@ -6,12 +6,14 @@
 
 mod app;
 pub mod assistant;
+pub mod book;
 pub mod coords;
 pub mod files;
 pub mod files_window;
 pub mod fonts;
 pub mod form;
 pub mod guide_art;
+pub mod home;
 pub mod i18n;
 pub mod input;
 pub mod keys;

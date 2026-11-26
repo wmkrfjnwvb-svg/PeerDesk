@@ -123,6 +123,12 @@ impl Viewer {
         &self.title
     }
 
+    /// 会话处在哪个阶段（主窗口据此在连接表单下面显示进度和失败原因）。
+    #[must_use]
+    pub const fn phase(&self) -> &ViewPhase {
+        &self.phase
+    }
+
     /// 文件管理用的连接（见 [`ViewHandle::files_link`]）。
     #[must_use]
     pub fn files_link(&self) -> Option<std::sync::Arc<peerdesk_net::Link>> {

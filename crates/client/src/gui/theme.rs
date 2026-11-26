@@ -32,11 +32,11 @@ macro_rules! icons {
 
 icons! {
     APPLE_LOGO, ARROWS_CLOCKWISE, ARROW_COUNTER_CLOCKWISE, ARROW_LINE_UP, ARROW_RIGHT, ARROW_UP,
-    CARET_DOWN, CARET_UP, CHART_BAR, CHECK_CIRCLE, CIRCLE, CLOCK_COUNTER_CLOCKWISE, COPY,
+    CARET_DOWN, CARET_RIGHT, CARET_UP, CHART_BAR, CHECK, CHECK_CIRCLE, CIRCLE, CLOCK_COUNTER_CLOCKWISE, COPY,
     CORNERS_IN, CORNERS_OUT, CURSOR_CLICK, DESKTOP, DESKTOP_TOWER, DOTS_SIX_VERTICAL,
     DOWNLOAD_SIMPLE, EYE, EYE_SLASH, FILE, FILE_PLUS, FOLDER, FOLDER_OPEN, FOLDER_PLUS, GEAR_SIX,
     HAND_EYE, INFO, KEYBOARD, LINK, LINUX_LOGO, LOCK_SIMPLE, MONITOR, NUMBER_SQUARE_ONE,
-    PHONE_DISCONNECT, PLUG, SHIELD_WARNING, SLIDERS_HORIZONTAL, SPEAKER_HIGH, SPEAKER_SLASH,
+    PHONE_DISCONNECT, PLUG, PLUS, SHIELD_WARNING, STAR, DOTS_THREE, SLIDERS_HORIZONTAL, SPEAKER_HIGH, SPEAKER_SLASH,
     TRASH, UPLOAD_SIMPLE, WARNING, WIFI_HIGH, WINDOWS_LOGO, X, X_CIRCLE,
 }
 
@@ -921,6 +921,124 @@ pub fn big_input(
     response
 }
 
+/// 品牌标志（小写的 p 和 d，中间一个青绿的点表示直连）。几何照 `packaging/icons/peerdesk-mark.svg`
+/// 的 20 格画法：改标志时两边一起改。`side` 是边长。
+pub fn brand_mark(ui: &mut Ui, p: &Palette, side: f32) -> Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(side), Sense::hover());
+    response.widget_info(|| WidgetInfo::labeled(WidgetType::Image, true, "PeerDesk"));
+    let unit = side / 20.0;
+    let at = |x: f32, y: f32| rect.min + Vec2::new(x, y) * unit;
+    let painter = ui.painter();
+    // 两个碗：笔画宽 2.4 格，沿笔画中线描（外框 7.4 格见方、圆角 3.4，中线往里收半个笔画）
+    let bowl = Stroke::new(2.4 * unit, p.ink);
+    for (x, y) in [(2.4, 7.0), (12.6, 8.0)] {
+        painter.rect_stroke(
+            egui::Rect::from_min_size(at(x, y), Vec2::splat(5.0 * unit)),
+            2.2 * unit,
+            bowl,
+            StrokeKind::Middle,
+        );
+    }
+    // 两条竖：p 的往下，d 的往上
+    for (x, y) in [(1.2, 9.2), (16.4, 1.2)] {
+        painter.rect_filled(
+            egui::Rect::from_min_size(at(x, y), Vec2::new(2.4, 9.6) * unit),
+            1.2 * unit,
+            p.ink,
+        );
+    }
+    painter.circle_filled(at(10.0, 10.0), 1.2 * unit, p.direct.solid);
+    response
+}
+
+/// 状态圆点（占一个圆点的位置，和旁边的文字竖直居中）。
+pub fn dot(ui: &mut Ui, p: &Palette, signal: Signal) -> Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(size::DOT), Sense::hover());
+    paint_dot(ui.painter(), rect.center(), p, signal);
+    response
+}
+
+/// 带字距的文字（设备码、密码）：`tracking` 是字距占字号的比例。
+#[must_use]
+pub fn spaced(
+    content: &str,
+    size: f32,
+    weight: Weight,
+    tracking: f32,
+    color: Color32,
+) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    job.append(
+        content,
+        0.0,
+        egui::TextFormat {
+            font_id: font_id(size, weight),
+            extra_letter_spacing: size * tracking,
+            color,
+            ..Default::default()
+        },
+    );
+    job
+}
+
+/// 分段选择：一排互斥的选项放在一个槽里，选中的那段是面色。选了别的返回 `true`。
+pub fn segmented<T: Copy + PartialEq>(
+    ui: &mut Ui,
+    p: &Palette,
+    current: &mut T,
+    options: &[(T, &str)],
+) -> bool {
+    let mut changed = false;
+    Frame::new()
+        .fill(p.track)
+        .corner_radius(radius::TRACK)
+        .inner_margin(pad(size::TRACK_INSET, size::TRACK_INSET))
+        .show(ui, |ui| {
+            // 放在右对齐的布局里时倒着放，看到的顺序才和给的一样
+            let reversed = ui.layout().prefer_right_to_left();
+            let mut ordered: Vec<&(T, &str)> = options.iter().collect();
+            if reversed {
+                ordered.reverse();
+            }
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = space::S2;
+                for (value, label) in ordered {
+                    let selected = *current == *value;
+                    let (fill, color, weight) = if selected {
+                        (p.surface, p.ink, Weight::Medium)
+                    } else {
+                        (Color32::TRANSPARENT, p.muted, Weight::Regular)
+                    };
+                    let button = egui::Button::new(text(*label, font::BODY, weight).color(color))
+                        .fill(fill)
+                        .stroke(Stroke::NONE)
+                        .corner_radius(radius::CONTROL);
+                    let response =
+                        add_button(ui, button, Vec2::new(0.0, size::SEGMENT), space::S14, true);
+                    response.widget_info(|| {
+                        WidgetInfo::selected(WidgetType::RadioButton, true, selected, *label)
+                    });
+                    if response.clicked() && !selected {
+                        *current = *value;
+                        changed = true;
+                    }
+                }
+            });
+        });
+    changed
+}
+
+/// 空状态、出错状态：面板里居中的一个图标和一句话（说清楚为什么空、下一步做什么）。
+pub fn empty_state(ui: &mut Ui, p: &Palette, glyph: &str, message: &str) {
+    ui.vertical_centered(|ui| {
+        ui.add_space(space::S24);
+        ui.label(text(glyph, font::ICON_HERO, Weight::Regular).color(p.idle.solid));
+        ui.add_space(space::S6);
+        ui.add(egui::Label::new(text(message, font::SMALL, Weight::Regular).color(p.muted)).wrap());
+        ui.add_space(space::S24);
+    });
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::indexing_slicing)]
@@ -969,6 +1087,22 @@ mod tests {
                     let _ = nav_item(ui, &p, icon::GEAR_SIX, "设置", false);
                     let mut value = String::new();
                     let _ = big_input(ui, &p, &mut value, "设备码", false);
+                    let _ = brand_mark(ui, &p, font::ICON_LARGE);
+                    let _ = dot(ui, &p, Signal::Idle);
+                    ui.label(spaced(
+                        "482 193 507",
+                        font::CODE,
+                        Weight::Semibold,
+                        font::CODE_TRACKING,
+                        p.ink,
+                    ));
+                    let mut tab = 1;
+                    assert!(!segmented(ui, &p, &mut tab, &[(0, "最近"), (1, "收藏")]));
+                    assert_eq!(tab, 1);
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        assert!(!segmented(ui, &p, &mut tab, &[(0, "最近"), (1, "收藏")]));
+                    });
+                    empty_state(ui, &p, icon::STAR, "还没有收藏");
                     notice(ui, &p, Signal::Relay, |ui, colors| {
                         ui.colored_label(colors.text, "正在走中继");
                     });
@@ -1012,6 +1146,45 @@ mod tests {
             run(vec![button(false)], &mut on);
             assert_eq!(on, expected, "enabled={enabled}");
         }
+    }
+
+    /// 点分段选择里没选中的那一段：换过去，并报告变了。
+    #[test]
+    fn segmented_switches_on_click() {
+        let ctx = egui::Context::default();
+        let _ = install(&ctx);
+        let mut tab = 0;
+        let mut changed = false;
+        let right = std::cell::Cell::new(Pos2::ZERO);
+        let mut run = |events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let p = Palette::of(ui.ctx());
+                    let row = ui
+                        .horizontal(|ui| segmented(ui, &p, &mut tab, &[(0, "最近"), (1, "收藏")]));
+                    changed |= row.inner;
+                    // 第二段在槽的右半边
+                    let slot = row.response.rect;
+                    right.set(egui::pos2(slot.right() - space::S20, slot.center().y));
+                });
+            });
+        };
+        run(Vec::new());
+        let pos = right.get();
+        let button = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        run(vec![egui::Event::PointerMoved(pos), button(true)]);
+        run(vec![button(false)]);
+        assert!(changed);
+        assert_eq!(tab, 1);
     }
 
     /// 鼠标停在主按钮上时盖一层浅色。
