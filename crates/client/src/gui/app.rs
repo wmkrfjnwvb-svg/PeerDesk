@@ -37,8 +37,6 @@ use crate::{EXIT_FAILED, EXIT_OK};
 
 /// 自测模式：启动后自动开启被控、再连接本机。值为 `host` 时只开启被控。CI 用它截图。
 const SELFTEST_ENV: &str = "PEERDESK_GUI_SELFTEST";
-/// 窗口图标的边长（像素）。
-const ICON_SIZE: u32 = 128;
 /// 首页两张卡片的最小高度（两张一样高）。
 const CARD_HEIGHT: f32 = 250.0;
 /// 复制等操作的轻提示显示多久。
@@ -65,17 +63,18 @@ pub fn run() -> u8 {
     let lang = effective_lang(&default_data_dir());
     peerdesk_net::rendezvous::set_prefer_ipv6(lang.prefers_ipv6());
     let s = strings(lang);
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title(s.app_title)
+        .with_app_id("peerdesk")
+        .with_inner_size([1000.0, 680.0])
+        .with_min_inner_size([820.0, 560.0]);
+    // 窗口图标（品牌标志，见 packaging/icons/README.md）。解码失败时不设图标，记日志
+    match eframe::icon_data::from_png_bytes(include_bytes!("../../assets/window-icon.png")) {
+        Ok(icon) => viewport = viewport.with_icon(icon),
+        Err(e) => log::warn!("窗口图标解码失败，不设图标：{e}"),
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title(s.app_title)
-            .with_app_id("peerdesk")
-            .with_icon(egui::IconData {
-                rgba: theme::app_icon(ICON_SIZE),
-                width: ICON_SIZE,
-                height: ICON_SIZE,
-            })
-            .with_inner_size([1000.0, 680.0])
-            .with_min_inner_size([820.0, 560.0]),
+        viewport,
         renderer: eframe::Renderer::Glow,
         ..Default::default()
     };

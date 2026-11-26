@@ -921,56 +921,6 @@ pub fn big_input(
     response
 }
 
-/// 程序图标（窗口、任务栏）：墨色圆角方块里的白色品牌标记（两个圆环连一条线：两台电脑直连）。
-/// 返回 `size × size` 的 RGBA。
-#[must_use]
-pub fn app_icon(size: u32) -> Vec<u8> {
-    let n = f32::from(u16::try_from(size).unwrap_or(256));
-    let mut out = Vec::with_capacity(usize::try_from(size * size * 4).unwrap_or(0));
-    let ink = Palette::LIGHT.ink;
-    let corner = n * 0.22;
-    // 标记照设计稿的 24 格画法放大：圆环半径 3、圆心在 6 和 18、线宽 2，整体放大到占图标的六成
-    let unit = n * 0.6 / 24.0;
-    let (ring, stroke) = (3.0 * unit, 2.0 * unit);
-    let (left, right, mid) = (n / 2.0 - 6.0 * unit, n / 2.0 + 6.0 * unit, n / 2.0);
-    for py in 0..size {
-        for px in 0..size {
-            let (x, y) = (
-                f32::from(u16::try_from(px).unwrap_or(0)) + 0.5,
-                f32::from(u16::try_from(py).unwrap_or(0)) + 0.5,
-            );
-            // 圆角方块：到最近角圆心的距离
-            let cx = x.clamp(corner, n - corner);
-            let cy = y.clamp(corner, n - corner);
-            let d = ((x - cx).powi(2) + (y - cy).powi(2)).sqrt();
-            let alpha = (corner + 0.5 - d).clamp(0.0, 1.0);
-            // 标记的覆盖率：两个圆环和中间的连线，取最大的（边缘半个像素内渐变）
-            let ring_at = |c: f32| {
-                let d = ((x - c).powi(2) + (y - mid).powi(2)).sqrt();
-                (stroke / 2.0 + 0.5 - (d - ring).abs()).clamp(0.0, 1.0)
-            };
-            let bar_x = (0.5 + (x - (left + ring)).min((right - ring) - x)).clamp(0.0, 1.0);
-            let bar = bar_x * (stroke / 2.0 + 0.5 - (y - mid).abs()).clamp(0.0, 1.0);
-            let white = ring_at(left).max(ring_at(right)).max(bar);
-            out.extend_from_slice(&[
-                lerp(ink, Color32::WHITE, white).r(),
-                lerp(ink, Color32::WHITE, white).g(),
-                lerp(ink, Color32::WHITE, white).b(),
-                unit_to_u8(alpha),
-            ]);
-        }
-    }
-    out
-}
-
-/// 0..=1 换成 0..=255。
-fn unit_to_u8(v: f32) -> u8 {
-    // 0..=1 乘 255，在 u8 范围内
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let v = (v.clamp(0.0, 1.0) * 255.0).round() as u8;
-    v
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::indexing_slicing)]
@@ -1162,20 +1112,6 @@ mod tests {
         assert_eq!(ctx.theme(), Theme::Light);
         Appearance::System.apply(&ctx);
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn icon_is_an_ink_tile_with_the_white_peer_mark() {
-        let size = 64;
-        let px = app_icon(size);
-        assert_eq!(px.len(), 64 * 64 * 4);
-        let at = |x: usize, y: usize| &px[(y * 64 + x) * 4..(y * 64 + x) * 4 + 4];
-        assert_eq!(at(0, 0)[3], 0, "圆角外透明");
-        assert_eq!(at(32, 5), [0x15, 0x18, 0x1D, 255], "墨色");
-        assert_eq!(at(32, 32), [255, 255, 255, 255], "连线");
-        assert_eq!(at(22, 32), [0x15, 0x18, 0x1D, 255], "左圆环的圆心是空的");
-        assert_eq!(at(17, 32), [255, 255, 255, 255], "左圆环");
-        assert_eq!(unit_to_u8(2.0), 255);
     }
 
     #[test]

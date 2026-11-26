@@ -24,6 +24,8 @@ OutputBaseFilename={#OutputName}
 Compression=lzma2
 SolidCompression=yes
 UninstallDisplayIcon={app}\peerdesk.exe
+; 安装程序自己的图标（exe 里的图标由 crates/client/build.rs 编进去，快捷方式和卸载列表用它）
+SetupIconFile=..\icons\peerdesk.ico
 WizardStyle=modern
 
 [Languages]
