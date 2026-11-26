@@ -16,6 +16,7 @@
 | [J-keyboard.md](J-keyboard.md) | 远程键盘：跨系统快捷键映射、输入法、键盘布局、系统快捷键捕获 |
 | [K-pipeline.md](K-pipeline.md) | 编解码与传输链路排查（2026-11-25）：模块互相影响的根因、业内做法、模块边界、分步修改计划 |
 | [L-framework.md](L-framework.md) | 传输与画质控制的总框架（按 WebRTC 流程）：三种时钟、每个信号一个主人、每个算法的触发条件和保持时间、分步计划 |
+| [O-modes-industry.md](O-modes-industry.md) | 电影、音乐模式的同行调研（2026-11-26）：AnyDesk、GeForce NOW、Moonlight 的模式或预设，Zoom、Teams 的音乐模式，W3C contentHint，Chromium 投屏的视频检测，对 PeerDesk 的建议 |
 
 ## 实现状态总表（2026-11-24 晚）
 

@@ -141,7 +141,7 @@ pub struct Scenario {
     /// 调试：把发送端各模块的决定、每秒的网络控制状态、因为哪个闸门没编帧打到标准错误。
     /// 默认按环境变量 `PEERDESK_EVENTS` 打开。
     pub trace: bool,
-    /// 起步探测（见 `MediaSender::set_start_probe`）。默认按环境变量 `PEERDESK_START_PROBE`（`1` 打开）。
+    /// 起步探测（见 `MediaSender::set_start_probe`）。默认打开（和产品一样），环境变量 `PEERDESK_START_PROBE=0` 关掉做对照。
     pub start_probe: bool,
     /// 内容策略（现在只有办公；以后的游戏、电影模式各加场景守住）。
     pub policy: ContentPolicy,
@@ -168,7 +168,7 @@ impl Scenario {
             pacing: peerdesk_core::pacer::enabled(),
             fec: fec_from(std::env::var_os("PEERDESK_FEC").as_deref()),
             trace: std::env::var_os("PEERDESK_EVENTS").is_some(),
-            start_probe: std::env::var("PEERDESK_START_PROBE").is_ok_and(|v| v == "1"),
+            start_probe: std::env::var("PEERDESK_START_PROBE").map_or(true, |v| v != "0"),
             policy: ContentPolicy::OFFICE,
         }
     }

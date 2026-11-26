@@ -308,9 +308,11 @@ const IDLE_PROBE_SCALE: u64 = 4;
 /// 静止探测的组号从这里起（和网络控制器的探测组号分开）。
 const IDLE_PROBE_ID_BASE: u32 = 0x8000_0000;
 
-/// 第一个关键帧的送达速度（从发出到确认）至少是当时码率的这么多（千分比）才起步探测：链路比起步码率还窄
-/// 时不探（探测包会在瓶颈排几百毫秒、挤爆队列，微软窄带轨迹卡顿 76 → 130 次）。
-const START_PROBE_GATE_PERMILLE: u64 = 800;
+/// 第一个关键帧的送达速度（字节 ÷ 从发出到确认扣掉往返时间）至少是当时码率的这么多（千分比）才起步探测。
+/// 链路只比起步码率宽一点时探测包反而添堵：先探测再出画面时微软窄带轨迹卡顿 76 → 130 次，门槛 0.8 倍时
+/// 76 → 87 次（多在 1–8 Mbps 的轨迹），2 倍时和不探一样。不扣往返时间的话，小关键帧（十几 KB）测的主要是往返
+/// 时间：30 Mbps、往返 30 ms 的链路只算出 1.7 Mbps。
+const START_PROBE_GATE_PERMILLE: u64 = 2000;
 /// 起步探测（见 [`MediaSender::set_start_probe`]）：第一组按起步码率的几倍，达到目标的多少（千分比）就按
 /// 结果的几倍接着探；每组匀速发多久（微秒）；最多探多久（微秒，到时不管有没有探完都开始出画面）。
 /// 每组发 30 ms 而不是 WebRTC 的 15 ms：接收端是应用读数据报时打的时间戳，程序忙一下几十个包一次读走，
@@ -584,13 +586,15 @@ impl MediaSender {
         if self.start_probe.is_none_or(|p| p.started.is_some()) {
             return;
         }
-        let delivered_bps = bytes.saturating_mul(8_000_000) / took_us.max(1);
+        let transfer_us = took_us.saturating_sub(self.rtt_us).max(1_000);
+        let delivered_bps = bytes.saturating_mul(8_000_000) / transfer_us;
         let rate = self.rate.rate_bps();
         if delivered_bps.saturating_mul(1000) < rate.saturating_mul(START_PROBE_GATE_PERMILLE) {
             self.start_probe = None;
             self.event(format!(
-                "不做起步探测：第一个关键帧 {bytes} 字节送了 {} ms（{} kbps），链路比起步码率 {} kbps 还窄",
+                "不做起步探测：第一个关键帧 {bytes} 字节送了 {} ms（扣掉往返 {} ms，约 {} kbps），链路不比起步码率 {} kbps 宽多少",
                 took_us / 1000,
+                self.rtt_us / 1000,
                 delivered_bps / 1000,
                 rate / 1000
             ));
