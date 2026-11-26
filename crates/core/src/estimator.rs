@@ -102,6 +102,8 @@ struct ProbeGroup {
     /// 逐包单程延迟对发送时刻的回归累加：x = 发送时刻、d = 到达 − 发送（都相对这一组第一个收到的包，微秒）。
     /// [包数, Σx, Σd, Σx², Σxd]。
     sums: [i128; 5],
+    /// 回归的原点：这一组第一个收到的包的发送、到达时刻（之后不变；`first_send` 会被更早发出的乱序包改小）。
+    origin: (Time, Time),
 }
 
 impl ProbeGroup {
@@ -115,13 +117,14 @@ impl ProbeGroup {
             packets: 1,
             bytes,
             sums: [1, 0, 0, 0, 0],
+            origin: (send_time, now),
         }
     }
 
     fn add(&mut self, now: Time, send_time: Time, bytes: u64) {
         let signed = |t: Time| i128::from(t.micros());
-        let x = signed(send_time) - signed(self.first_send);
-        let d = signed(now) - signed(self.first_arrival) - x;
+        let x = signed(send_time) - signed(self.origin.0);
+        let d = signed(now) - signed(self.origin.1) - x;
         let [n, sx, sd, sxx, sxd] = self.sums;
         self.sums = [n + 1, sx + x, sd + d, sxx + x * x, sxd + x * d];
         self.last_arrival = now;
