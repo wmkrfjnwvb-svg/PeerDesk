@@ -25,7 +25,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(windows)]
 fn windows_icon() -> Result<(), Box<dyn std::error::Error>> {
     let manifest = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?);
-    let ico = manifest.join("../../packaging/icons/peerdesk.ico").canonicalize()?;
+    let ico = manifest
+        .join("../../packaging/icons/peerdesk.ico")
+        .canonicalize()?;
     println!("cargo:rerun-if-changed={}", ico.display());
     // 资源脚本里的路径用正斜杠，省得转义反斜杠；canonicalize 在 Windows 上会加 \\?\ 前缀，去掉
     let path = ico.display().to_string().replace('\\', "/");
