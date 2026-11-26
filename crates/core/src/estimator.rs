@@ -803,11 +803,8 @@ impl RateEstimator for ClassicV1 {
         // 丢包只有在排队也一直在时才算拥塞；单独的随机丢包交给纠错和重传，不降码率。
         // 发送端是不是在用满码率（没用满时送达速率只是“要发的量”，不代表链路能力）。看发送端实际发了多少：
         // 链路突然变窄时送达速率也低，按它判断会把真拥塞当成没用满、反应变慢。不知道发了多少时按送达速率。
-        let using = obs
-            .sent_bps
-            .unwrap_or(recv_bps)
-            .saturating_mul(10)
-            >= self.rate_bps.saturating_mul(6);
+        let using =
+            obs.sent_bps.unwrap_or(recv_bps).saturating_mul(10) >= self.rate_bps.saturating_mul(6);
         // 排队读数只在反馈不断档时才算数：和上一份反馈相隔不超过 [`CONTIGUOUS_US`]，说明这段时间包一直在到，
         // 排队读数是链路在忙时量的，这时的送达速率也就是链路能力，按它降不会过头。断档的那份（画面静止时零星的小包）
         // 不算：它的排队读数是 Wi-Fi 省电（空闲后网卡要醒）的延迟，那份反馈里只有一两个包、送达速率被空闲时间稀释。
@@ -1347,7 +1344,11 @@ mod tests {
         for _ in 0..4 {
             feed(&mut v, &mut t, 30_000, 0);
         }
-        assert_eq!(v.rate_bps(), 15_000_000, "一个往返（至少 100 ms）之内只降一次");
+        assert_eq!(
+            v.rate_bps(),
+            15_000_000,
+            "一个往返（至少 100 ms）之内只降一次"
+        );
         feed(&mut v, &mut t, 30_000, 0);
         assert_eq!(v.rate_bps(), 7_500_000);
     }

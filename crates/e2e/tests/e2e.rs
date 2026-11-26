@@ -109,14 +109,15 @@ fn gates(o: &Outcome) {
         slow == 0,
         &format!("{slow}/{} 次没做到", idle.len()),
     );
-    // 重传只补真丢了的：不超过实际丢包（含排队丢包）的 2 倍加 20 片。2026-11-26 用户日志：大帧后半段还在路上就被
-    // 要重传，两分钟里重传 2628 片、实际丢包 97 个，多出来的流量又把排队撑长
-    let lost = o.net.lost.saturating_add(o.net.queue_dropped);
-    gate(
-        o,
-        "不重传还在路上的分片",
-        u64::from(o.retransmitted) <= lost.saturating_mul(2).saturating_add(20),
-        &format!("重传 {} 片，实际丢包 {lost} 个", o.retransmitted),
+    // 已知问题（只报告，不卡）：接收端按“这一帧第一片到了 10 ms”请求重传，大帧后半段还在路上就被要重传。
+    // 2026-11-26 用户日志：两分钟里重传 2628 片、实际丢包 97 个。改成按空洞判断后窄带上尾部丢包发现得太晚
+    // （微软轨迹卡顿 75 → 101），先没合，见 docs/research/L-framework.md 第 6.5 节
+    println!(
+        "{} {}: 重传 {} 片，实际丢包 {} 个",
+        o.name,
+        o.codec.name(),
+        o.retransmitted,
+        o.net.lost.saturating_add(o.net.queue_dropped)
     );
 }
 

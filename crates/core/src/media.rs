@@ -2341,6 +2341,7 @@ mod tests {
         assert!(out.len() > 3, "关键帧跨好几个分片");
         // 丢第 2 片：收不齐
         assert!(deliver(&mut rx, Time::ZERO, &out, |i| i == 1).is_empty());
+        assert!(!rx.wants_nack(Time(1_000)), "刚缺：可能只是乱序");
         assert!(rx.wants_nack(Time(20_000)));
         let fb = rx.feedback_datagram(Time(20_000));
         // 原包还在节奏器里没发（接收端只是还没收到）：不重传
