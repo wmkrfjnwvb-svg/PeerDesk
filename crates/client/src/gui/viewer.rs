@@ -28,6 +28,8 @@ pub struct Outcome {
     pub open: bool,
     /// 这一帧里连上了。
     pub connected: bool,
+    /// 这一帧里认证通过、握手完成（对方的系统和电脑名到了）。
+    pub established: bool,
     /// 被控端的系统和电脑名。
     pub peer: (PeerOs, String),
     /// 点了助手上的“文件”：打开文件管理并选中这个会话。
@@ -140,6 +142,7 @@ impl Viewer {
         let mut outcome = Outcome {
             open: true,
             connected: false,
+            established: false,
             peer: (PeerOs::Unknown, String::new()),
             open_files: false,
         };
@@ -156,6 +159,7 @@ impl Viewer {
             if let super::session::ViewEvent::Peer(os, name) = &event {
                 self.peer_os = *os;
                 self.peer_name.clone_from(name);
+                outcome.established = true;
             }
             self.phase = self.phase.apply(&event, s);
             outcome.connected |= matches!(self.phase, ViewPhase::Connected { .. });
@@ -305,14 +309,15 @@ impl Viewer {
                                         .color(p.muted),
                                     );
                                     ui.separator();
-                                    for sc in Shortcut::ALL {
+                                    // 只列对方系统有的快捷键，用对方系统的叫法，右边写组合键
+                                    for sc in Shortcut::available(self.peer_os) {
                                         let events = sc.events(self.peer_os);
-                                        let item = ui
-                                            .add_enabled(
-                                                !events.is_empty(),
-                                                egui::Button::new(sc.label(s)).frame(false),
-                                            )
-                                            .on_disabled_hover_text(s.not_on_this_os);
+                                        let combo = sc.combo(self.peer_os).unwrap_or_default();
+                                        let item = ui.add(
+                                            egui::Button::new(sc.label_on(self.peer_os, s))
+                                                .shortcut_text(combo)
+                                                .frame(false),
+                                        );
                                         if item.clicked() {
                                             for event in events {
                                                 let _ = self.handle.send(event);

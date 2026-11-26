@@ -73,6 +73,51 @@ impl Shortcut {
         Shortcut::Undo,
     ];
 
+    /// 对方系统上有的快捷键（按 [`Self::ALL`] 的顺序）：没有的不列出来（以前列出来再变灰，
+    /// 对方是 Windows 时还看得到 macOS 的说法，反过来也一样）。
+    pub fn available(os: PeerOs) -> impl Iterator<Item = Shortcut> {
+        Self::ALL
+            .into_iter()
+            .filter(move |sc| sc.keys(os).is_some())
+    }
+
+    /// 菜单里的文字：用对方系统的叫法（macOS 上“开始菜单”叫聚焦搜索，“任务管理器”叫强制退出）。
+    #[must_use]
+    pub const fn label_on(self, os: PeerOs, s: &Strings) -> &'static str {
+        match (self, os) {
+            (Shortcut::Start, PeerOs::Mac) => s.sc_spotlight,
+            (Shortcut::TaskManager, PeerOs::Mac) => s.sc_force_quit,
+            _ => self.label(s),
+        }
+    }
+
+    /// 组合键的写法：macOS 用 ⌃⌥⇧⌘ 符号、按苹果的顺序连写（⌥⌘Esc），其他系统用 + 连接（Ctrl+Shift+Esc）。
+    #[must_use]
+    pub fn combo(self, os: PeerOs) -> Option<String> {
+        let keys = self.keys(os)?;
+        if os == PeerOs::Mac {
+            let order = [LEFT_CTRL, LEFT_ALT, LEFT_SHIFT, LEFT_GUI];
+            let mut text: String = order
+                .iter()
+                .filter(|m| keys.contains(m))
+                .map(|&m| key_name(m, true))
+                .collect();
+            for &k in keys.iter().filter(|k| !order.contains(k)) {
+                text.push_str(key_name(k, true));
+            }
+            Some(text)
+        } else {
+            let names: Vec<&str> = keys
+                .iter()
+                .map(|&k| match (k, os) {
+                    (LEFT_GUI, PeerOs::Linux) => "Super",
+                    _ => key_name(k, false),
+                })
+                .collect();
+            Some(names.join("+"))
+        }
+    }
+
     /// 按钮上的文字。
     #[must_use]
     pub const fn label(self, s: &Strings) -> &'static str {
@@ -144,6 +189,38 @@ impl Shortcut {
     }
 }
 
+/// 键的名字（`mac` 时修饰键用符号）。
+const fn key_name(code: u16, mac: bool) -> &'static str {
+    match code {
+        LEFT_CTRL if mac => "⌃",
+        LEFT_ALT if mac => "⌥",
+        LEFT_SHIFT if mac => "⇧",
+        LEFT_GUI if mac => "⌘",
+        LEFT_CTRL => "Ctrl",
+        LEFT_ALT => "Alt",
+        LEFT_SHIFT => "Shift",
+        LEFT_GUI => "Win",
+        A => "A",
+        C => "C",
+        D => "D",
+        L => "L",
+        Q => "Q",
+        S => "S",
+        V => "V",
+        W => "W",
+        Z => "Z",
+        DIGIT_4 => "4",
+        ESCAPE => "Esc",
+        TAB => "Tab",
+        SPACE => "Space",
+        F4 => "F4",
+        F11 => "F11",
+        PRINT_SCREEN => "PrtSc",
+        DELETE => "Del",
+        _ => "?",
+    }
+}
+
 /// 助手标题栏里显示的被控端系统。
 #[must_use]
 pub const fn os_label(os: PeerOs, s: &Strings) -> &'static str {
@@ -158,6 +235,47 @@ pub const fn os_label(os: PeerOs, s: &Strings) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 只列对方系统有的快捷键，用对方系统的叫法，组合键按对方系统的写法。
+    #[test]
+    fn the_menu_shows_only_the_remote_systems_shortcuts_in_its_own_words() {
+        let s = &ZH;
+        let mac: Vec<Shortcut> = Shortcut::available(PeerOs::Mac).collect();
+        assert!(!mac.contains(&Shortcut::CtrlAltDel));
+        assert_eq!(Shortcut::Start.label_on(PeerOs::Mac, s), s.sc_spotlight);
+        assert_eq!(
+            Shortcut::TaskManager.label_on(PeerOs::Mac, s),
+            s.sc_force_quit
+        );
+        assert_eq!(Shortcut::TaskManager.combo(PeerOs::Mac).unwrap(), "⌥⌘Esc");
+        assert_eq!(Shortcut::Screenshot.combo(PeerOs::Mac).unwrap(), "⇧⌘4");
+        assert_eq!(Shortcut::Start.combo(PeerOs::Mac).unwrap(), "⌘Space");
+        let win: Vec<Shortcut> = Shortcut::available(PeerOs::Windows).collect();
+        assert_eq!(win.len(), Shortcut::ALL.len());
+        assert_eq!(Shortcut::Start.label_on(PeerOs::Windows, s), s.sc_start);
+        assert_eq!(
+            Shortcut::CtrlAltDel.combo(PeerOs::Windows).unwrap(),
+            "Ctrl+Alt+Del"
+        );
+        assert_eq!(
+            Shortcut::TaskManager.combo(PeerOs::Windows).unwrap(),
+            "Ctrl+Shift+Esc"
+        );
+        assert_eq!(Shortcut::Lock.combo(PeerOs::Windows).unwrap(), "Win+L");
+        // Linux：Windows 键叫 Super；没有统一的任务管理器，不列
+        assert_eq!(Shortcut::Lock.combo(PeerOs::Linux).unwrap(), "Super+L");
+        assert_eq!(Shortcut::Screenshot.combo(PeerOs::Linux).unwrap(), "PrtSc");
+        assert!(!Shortcut::available(PeerOs::Linux).any(|sc| sc == Shortcut::TaskManager));
+        assert!(Shortcut::TaskManager.combo(PeerOs::Linux).is_none());
+        // 每个列出来的都有组合键，组合键里没有不认识的键
+        for os in [PeerOs::Windows, PeerOs::Mac, PeerOs::Linux, PeerOs::Unknown] {
+            for sc in Shortcut::available(os) {
+                let combo = sc.combo(os).unwrap();
+                assert!(!combo.is_empty() && !combo.contains('?'), "{sc:?} {combo}");
+            }
+        }
+        assert_eq!(key_name(0xFF, false), "?");
+    }
     use crate::gui::i18n::{EN, ZH};
 
     fn key(code: u16, down: bool) -> InputEvent {
