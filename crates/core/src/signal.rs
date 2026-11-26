@@ -121,6 +121,19 @@ pub enum SignalMsg {
         /// 上一次体检以后，服务器在探测地址看到的本机地址。
         seen: Option<SocketAddr>,
     },
+    /// 控制端 → 服务器：这些设备现在在不在线（最近连接、设备列表里显示）。
+    /// 一次最多问 [`MAX_PRESENCE`] 台（设备码和指纹合计）。
+    Presence {
+        /// 按设备码问。
+        codes: Vec<u32>,
+        /// 按设备指纹问（记下的是直连地址、但知道指纹的设备）。
+        devices: Vec<DeviceId>,
+    },
+    /// 服务器 → 控制端：和请求一一对应，先设备码、后指纹；`true` 表示在线。
+    PresenceReply {
+        /// 每台设备在不在线。
+        online: Vec<bool>,
+    },
 }
 
 fn put_addr(w: &mut Writer, addr: &SocketAddr) {
@@ -324,6 +337,8 @@ fn get_text(r: &mut Reader<'_>) -> Result<String, Error> {
 
 /// 一台设备最多报告这么多个候选地址。
 pub const MAX_LOCALS: usize = 12;
+/// 一次在线状态查询最多问这么多台设备：最近连接和设备列表一屏的量；限制单次查询能试探的设备码数量。
+pub const MAX_PRESENCE: usize = 64;
 
 fn put_addrs(w: &mut Writer, cands: &[Candidate]) {
     let cands = cands.get(..cands.len().min(MAX_LOCALS)).unwrap_or_default();
@@ -409,7 +424,9 @@ impl SignalMsg {
             | SignalMsg::Check
             | SignalMsg::Nodes
             | SignalMsg::NodeList { .. }
-            | SignalMsg::Checked { .. } => None,
+            | SignalMsg::Checked { .. }
+            | SignalMsg::Presence { .. }
+            | SignalMsg::PresenceReply { .. } => None,
         }
     }
 
@@ -429,6 +446,8 @@ impl SignalMsg {
             SignalMsg::Nodes => "Nodes",
             SignalMsg::NodeList { .. } => "NodeList",
             SignalMsg::Checked { .. } => "Checked",
+            SignalMsg::Presence { .. } => "Presence",
+            SignalMsg::PresenceReply { .. } => "PresenceReply",
         }
     }
 
@@ -521,6 +540,27 @@ impl SignalMsg {
                 put_opt_addr(&mut w, probe.as_ref());
                 put_opt_addr(&mut w, seen.as_ref());
             }
+            SignalMsg::Presence { codes, devices } => {
+                // 超过上限的截掉（先保设备码）：和服务器的上限一致，多问的服务器也不会答。
+                let codes = codes.get(..codes.len().min(MAX_PRESENCE)).unwrap_or_default();
+                let room = MAX_PRESENCE.saturating_sub(codes.len());
+                let devices = devices.get(..devices.len().min(room)).unwrap_or_default();
+                w.u8(13).u8(u8::try_from(codes.len()).unwrap_or(0));
+                for code in codes {
+                    w.u32(*code);
+                }
+                w.u8(u8::try_from(devices.len()).unwrap_or(0));
+                for device in devices {
+                    w.bytes(device);
+                }
+            }
+            SignalMsg::PresenceReply { online } => {
+                let online = online.get(..online.len().min(MAX_PRESENCE)).unwrap_or_default();
+                w.u8(14).u8(u8::try_from(online.len()).unwrap_or(0));
+                for on in online {
+                    w.u8(u8::from(*on));
+                }
+            }
             SignalMsg::ConnectCode {
                 code,
                 locals,
@@ -596,6 +636,28 @@ impl SignalMsg {
                 locals: get_addrs(&mut r)?,
                 account: get_text(&mut r)?,
             },
+            13 => {
+                let n = usize::from(r.u8()?);
+                let codes = (0..n).map(|_| r.u32()).collect::<Result<Vec<_>, _>>()?;
+                let m = usize::from(r.u8()?);
+                if n + m > MAX_PRESENCE {
+                    return Err(Error::Inconsistent("一次问的设备太多"));
+                }
+                let devices = (0..m)
+                    .map(|_| get_id(&mut r))
+                    .collect::<Result<Vec<_>, _>>()?;
+                SignalMsg::Presence { codes, devices }
+            }
+            14 => {
+                let n = usize::from(r.u8()?);
+                if n > MAX_PRESENCE {
+                    return Err(Error::Inconsistent("在线状态太多"));
+                }
+                let online = (0..n)
+                    .map(|_| r.u8().map(|b| b != 0))
+                    .collect::<Result<Vec<_>, _>>()?;
+                SignalMsg::PresenceReply { online }
+            }
             other => return Err(Error::UnknownMessage(other)),
         };
         // 兼容：新版本可以在消息末尾追加字段，老版本读完认识的部分，忽略后面的。
@@ -942,6 +1004,13 @@ mod tests {
                 observed: addr("203.0.113.9:4000"),
                 probe: Some(addr("203.0.113.1:3478")),
                 seen: None,
+            },
+            SignalMsg::Presence {
+                codes: vec![123_456_789, 987_654_321],
+                devices: vec![[7; 32]],
+            },
+            SignalMsg::PresenceReply {
+                online: vec![true, false, true],
             },
             SignalMsg::Connect {
                 target: [1; 32],
