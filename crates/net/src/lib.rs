@@ -37,6 +37,7 @@ pub mod demo;
 pub mod diag;
 pub mod error;
 pub mod files;
+pub mod framelog;
 pub mod fs_store;
 pub mod gateway;
 #[cfg(feature = "media")]

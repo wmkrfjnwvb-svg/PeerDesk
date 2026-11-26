@@ -278,6 +278,8 @@ pub async fn serve(
     let link = Arc::new(link);
     let trace = TraceId(opts.session.device_id);
     let mut tracer = Tracer::new(4096);
+    // 测量用的逐帧时间日志（PEERDESK_FRAME_LOG，默认关）
+    let mut frame_log = crate::framelog::FrameLog::from_env();
     let mut config = opts.session.clone();
     // 实验开关：PEERDESK_ESTIMATOR=legacy、v1 或 gcc 选估计器，默认用产品默认的那个。
     let wanted = std::env::var("PEERDESK_ESTIMATOR")
@@ -707,6 +709,7 @@ pub async fn serve(
                     break "画面来源结束".to_owned();
                 };
                 screen_size = frame.size();
+                let captured = crate::framelog::unix_us();
                 let changed = match seq {
                     Some(seq) => last_seq.replace(seq) != Some(seq),
                     None => {
@@ -720,6 +723,7 @@ pub async fn serve(
                 pending_change |= changed;
                 if changed {
                     media.screen_changed(link.now());
+                    frame_log.changed(captured);
                 }
                 // 每一轮都检查迟迟没有确认的帧（不能只在编帧时查：关键帧没确认时根本不编帧）
                 media.expire_unacked(link.now());
@@ -742,6 +746,7 @@ pub async fn serve(
                 }
                 let rtt = u64::try_from(link.rtt().as_micros()).unwrap_or(u64::MAX);
                 let job = media.start_frame(link.now(), rtt);
+                frame_log.encoded(job.frame_id, captured);
                 if jobs.send((job, frame, std::mem::take(&mut pending_change))).is_err() {
                     break "编码线程结束".to_owned();
                 }
@@ -754,6 +759,7 @@ pub async fn serve(
     for event in keys.release_all() {
         sink.inject(&event);
     }
+    frame_log.flush();
     let bye = session.close(link.now(), &mut tracer);
     let _ = write_control(&mut ctrl_send, &bye).await;
     let _ = ctrl_send.finish();

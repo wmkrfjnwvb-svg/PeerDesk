@@ -277,6 +277,8 @@ pub async fn run(
     let link = Arc::new(link);
     let trace = TraceId(opts.session.device_id);
     let mut tracer = Tracer::new(4096);
+    // 测量用的逐帧时间日志（PEERDESK_FRAME_LOG，默认关）
+    let mut frame_log = crate::framelog::FrameLog::from_env();
     let mut config = opts.session.clone();
     config.binding = link.channel_binding()?;
     let mut session = Session::controller(config, trace);
@@ -464,6 +466,7 @@ pub async fn run(
                     tracer.record(link.now(), trace, Stage::FrameDelivered, u64::from(frame_id));
                     let presenting = std::time::Instant::now();
                     sink.present(&picture);
+                    frame_log.shown(frame_id, crate::framelog::unix_us());
                     window.present.add(u64::try_from(presenting.elapsed().as_micros()).unwrap_or(u64::MAX));
                     last_picture = Some(picture);
                 }
@@ -716,6 +719,7 @@ pub async fn run(
     if let Some(t) = &router_task {
         t.abort();
     }
+    frame_log.flush();
 
     let bye = session.close(link.now(), &mut tracer);
     let _ = write_control(&mut ctrl_send, &bye).await;
