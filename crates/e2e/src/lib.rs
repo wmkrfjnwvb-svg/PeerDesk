@@ -141,6 +141,8 @@ pub struct Scenario {
     /// 调试：把发送端各模块的决定、每秒的网络控制状态、因为哪个闸门没编帧打到标准错误。
     /// 默认按环境变量 `PEERDESK_EVENTS` 打开。
     pub trace: bool,
+    /// 起步探测（见 `MediaSender::set_start_probe`）。默认按环境变量 `PEERDESK_START_PROBE`（`1` 打开）。
+    pub start_probe: bool,
     /// 内容策略（现在只有办公；以后的游戏、电影模式各加场景守住）。
     pub policy: ContentPolicy,
 }
@@ -166,6 +168,7 @@ impl Scenario {
             pacing: peerdesk_core::pacer::enabled(),
             fec: fec_from(std::env::var_os("PEERDESK_FEC").as_deref()),
             trace: std::env::var_os("PEERDESK_EVENTS").is_some(),
+            start_probe: std::env::var("PEERDESK_START_PROBE").is_ok_and(|v| v == "1"),
             policy: ContentPolicy::OFFICE,
         }
     }
@@ -404,6 +407,7 @@ pub fn run(s: &Scenario) -> Result<Outcome, Error> {
     rx.set_reports(tx.reports());
     // 静止时探测（产品里由握手的 PROBE_TRAIN 决定；新版本之间都打开）
     tx.set_idle_probe(true);
+    tx.set_start_probe(s.start_probe);
     let mut net: Net<Vec<u8>> = Net::new(s.seed);
     let mut network = s.network.clone();
     network.sort_by_key(|(t, _)| *t);

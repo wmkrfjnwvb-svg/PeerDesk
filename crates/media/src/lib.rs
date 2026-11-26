@@ -43,13 +43,6 @@ const REFINE_DONE_BYTES: usize = 64;
 const MIN_BPS: u64 = 64_000;
 /// 码率上限的默认值。
 pub const DEFAULT_MAX_BPS: u64 = 50_000_000;
-/// 硬件关键帧（还没实测时）每百万像素约多少字节。2026-11-25 CI 实测 VideoToolbox：720p 文字画面在 300 kbps 时
-/// 关键帧 95 KB（约 100 KB/MP），码率控制管不住关键帧（DataRateLimits 系统接受但不约束；MinAllowedFrameQP 48
-/// 也只压到 48 KB）；低延迟码控还把 90 帧丢了 73 帧。软件编码自己控 QP，同样的画面能装进 100 ms 的时限。
-const HW_KEY_BYTES_PER_MEGAPIXEL: u64 = 100_000;
-/// 硬件关键帧按当前码率要传超过这么久（微秒）就改用软件编码（窄带）；低于一半才换回硬件（滞回，免得来回换：
-/// 换编码器要出关键帧）。720p 大约 1.5 Mbps 以下用软件、3 Mbps 以上换回硬件。
-const HW_KEY_MAX_US: u64 = 500_000;
 /// 大帧规则默认的时限（微秒）：关键帧、大面积变化要在这么久里按目标码率发得完，发不完就粗编、之后补清晰
 /// （照 Chromium 远程桌面 `ShouldDropQualityForLargeFrame`，它用一帧间隔）。办公策略的值（[`ContentPolicy::OFFICE`]）；
 /// 硬件编码器的码控缓冲（VideoToolbox `DataRateLimits`、Media Foundation `AVEncCommonBufferSize`）也按它设。
@@ -571,12 +564,6 @@ pub struct H264Encoder {
     hw: Option<Box<dyn HardwareEncoder>>,
     /// 硬件编码不能用（没有、打不开或失败过）：之后一直用软件编码。
     hw_off: bool,
-    /// 窄带：硬件关键帧按当前码率送不完（见 [`HW_KEY_MAX_US`]），暂时用软件编码。
-    narrow: bool,
-    /// 硬件关键帧实测多大：每百万像素多少字节（没测到时按 [`HW_KEY_BYTES_PER_MEGAPIXEL`] 估计）。
-    hw_key_density: Option<u64>,
-    /// 最近一帧的预算换算的码率（静止时判断能不能换回硬件）。
-    last_bps: u64,
     hw_open: HardwareOpener,
     /// 硬件编码器的输入（NV12），每帧复用。
     nv12: Vec<u8>,
@@ -671,9 +658,6 @@ impl H264Encoder {
             planes: (Vec::new(), Vec::new(), Vec::new()),
             hw: None,
             hw_off: false,
-            narrow: false,
-            hw_key_density: None,
-            last_bps: 0,
             hw_open: open_system_hardware,
             nv12: Vec::new(),
             encoded_size: None,
@@ -789,52 +773,6 @@ impl H264Encoder {
         }
     }
 
-    /// 按当前码率 `bps`，`size` 的硬件关键帧要传多久（微秒）。
-    fn hw_key_us(&self, size: (u16, u16), bps: u64) -> u64 {
-        let pixels = u64::from(size.0).saturating_mul(u64::from(size.1));
-        let bytes = self
-            .hw_key_density
-            .unwrap_or(HW_KEY_BYTES_PER_MEGAPIXEL)
-            .saturating_mul(pixels)
-            / 1_000_000;
-        bytes.saturating_mul(8_000_000) / bps.max(1)
-    }
-
-    /// 窄带改用软件编码、宽了换回硬件。换编码器要出关键帧，所以只在本来就要出关键帧（`key_due`），
-    /// 或者换回硬件时画面停下、补清晰补完了（`idle`）才换。
-    fn choose_narrow(&mut self, size: (u16, u16), bps: u64, key_due: bool, idle: bool) {
-        if self.hw_off {
-            return;
-        }
-        let key_us = self.hw_key_us(size, bps);
-        // 只在硬件编码器开着时往软件换（没有硬件的机器上不必判断，免得之后“换回硬件”白出一个关键帧）
-        if !self.narrow && self.hw.is_some() && key_due && key_us > HW_KEY_MAX_US {
-            self.narrow = true;
-            self.hw = None;
-            self.hw_sent.clear();
-            self.force_key = true;
-            let why = format!(
-                "窄带：硬件关键帧按 {} kbps 要 {} ms",
-                bps / 1000,
-                key_us / 1000
-            );
-            log::info!("视频编码：改用软件编码（{why}；软件编码自己控 QP，关键帧能装进时限）");
-            self.soft_reason = Some(why);
-        } else if self.narrow && key_us < HW_KEY_MAX_US / 2 && (key_due || idle) {
-            self.narrow = false;
-            self.force_key = true;
-            self.soft_reason = None;
-            log::info!(
-                "视频编码：码率够了（{} kbps，硬件关键帧约 {} ms），换回硬件编码",
-                bps / 1000,
-                key_us / 1000
-            );
-            if !key_due {
-                self.key_reason = "码率够了，换回硬件编码";
-            }
-        }
-    }
-
     /// 硬件出错：之后一直用软件编码（从关键帧开始）。
     fn hardware_failed(&mut self, why: &str) {
         log::warn!("硬件编码失败，改用软件编码（OpenH264）：{why}");
@@ -849,14 +787,6 @@ impl H264Encoder {
     /// 取回了一个硬件编好的帧：对上它交的时候是否要求了关键帧，检查“没要求却是关键帧”。
     fn hardware_output(&mut self, data: Vec<u8>, key: bool, fresh: bool) -> Hw {
         let asked = self.hw_sent.pop_front().unwrap_or(true);
-        // 记下硬件关键帧实际多大（每百万像素），窄带时判断要不要改用软件编码
-        if key && !data.is_empty() {
-            if let Some((w, h)) = self.hw.as_ref().map(|e| e.size()) {
-                let pixels = u64::from(w).saturating_mul(u64::from(h)).max(1);
-                let bytes = u64::try_from(data.len()).unwrap_or(u64::MAX);
-                self.hw_key_density = Some(bytes.saturating_mul(1_000_000) / pixels);
-            }
-        }
         // 要了关键帧、编码器却交出空帧（码率控制把它丢了：2026-11-25 CI 实测 VideoToolbox 低延迟码控
         // 300 kbps 时丢掉了强制要的关键帧）：要求还没满足，下一帧接着要；否则接收端一直等不到关键帧。
         if asked && data.is_empty() && !self.force_key {
@@ -887,7 +817,7 @@ impl H264Encoder {
 
     /// 准备硬件编码器：没打开或尺寸变了就（重新）打开。返回 `None` 表示不用硬件，否则是否刚打开。
     fn hardware_ready(&mut self, w: usize, h: usize, bps: u64) -> Option<bool> {
-        if self.hw_off || self.narrow {
+        if self.hw_off {
             return None;
         }
         let size = (u32::try_from(w).unwrap_or(0), u32::try_from(h).unwrap_or(0));
@@ -1041,10 +971,6 @@ impl H264Encoder {
                 self.key_reason = why;
             }
         }
-        // 窄带改用软件编码、宽了换回硬件（见 choose_narrow）
-        self.last_bps = self.budget_bps(budget);
-        let idle = !changed && self.refine_left == 0;
-        self.choose_narrow(size, self.last_bps, fresh || self.force_key, idle);
         if !fresh && !changed && !self.force_key {
             // 画面停下了：先等一会儿，确认真的停了再补清晰。
             self.still = self.still.saturating_add(1);
@@ -1436,11 +1362,6 @@ impl VideoEncoder for H264Encoder {
             || self.resize_reason.is_some()
             || self.refine_left > 0
             || !self.hw_sent.is_empty()
-            // 窄带用着软件编码、码率又够了：画面停着也要调用，好换回硬件
-            || (self.narrow
-                && self
-                    .encoded_size
-                    .is_some_and(|s| self.hw_key_us(s, self.last_bps) < HW_KEY_MAX_US / 2))
     }
 
     fn backend(&self) -> String {
@@ -2358,7 +2279,6 @@ mod tests {
         // 能用：一直用硬件，画面不变时照样停发
         let mut enc = H264Encoder::new(30).with_hardware(fake_ok);
         let big = picture(1280, 720);
-        // 预算 50 KB 一帧（12 Mbps）：硬件关键帧送得完，不算窄带
         let first = enc.encode(1, &big, true, 50_000).unwrap().unwrap();
         assert!(first.key);
         assert_eq!(enc.backend_name(), "硬件 假硬件");
@@ -2942,47 +2862,24 @@ mod tests {
         );
     }
 
-    /// 窄带：硬件关键帧按码率送不完 → 在要出关键帧时改用软件编码；码率够了、画面停下补完清晰时换回硬件
-    /// （出关键帧）；之后码率又不够、要出关键帧时再换软件。
+    /// 有硬件编码器就一直用硬件，码率再低也不换软件（软件编码只在硬件打不开或出错时兜底）。
+    /// 以前窄带时换软件：2026-11-26 用户实测 Mac 2880×1800，起步码率 1 Mbps 还没测过就判成窄带，
+    /// 软件编码每帧 100–250 ms、4–9 帧每秒，48 秒后才换回硬件。窄带上关键帧太大交给降分辨率。
     #[test]
-    fn narrow_links_use_the_software_encoder_until_hardware_keyframes_fit_again() {
+    fn hardware_stays_even_when_keyframes_are_too_big_for_the_rate() {
         let mut enc = H264Encoder::new(30).with_hardware(fake_ok);
         let screen = picture(640, 360);
-        // 第一帧照常先用硬件（还不知道有没有硬件）
         assert!(enc.encode(1, &screen, true, 100_000).unwrap().unwrap().key);
         assert!(enc.timing().hardware);
-        // 丢了帧要关键帧，预算只有 100 字节一帧（按最低码率 64 kbps 算）：硬件关键帧按实测大小要好几秒 → 改用软件
+        // 丢了帧要关键帧，预算只有 100 字节一帧：照样用硬件
         enc.on_lost(1);
-        let narrow = enc.encode(2, &screen, true, 100).unwrap().unwrap();
-        assert!(narrow.key);
-        assert!(!enc.timing().hardware);
+        assert!(enc.encode(2, &screen, true, 100).unwrap().is_some());
+        assert!(enc.timing().hardware);
         assert!(
-            enc.backend_name().contains("窄带"),
+            enc.backend_name().starts_with("硬件"),
             "{}",
             enc.backend_name()
         );
-        // 码率够了（100 KB 一帧）、画面停着：补完清晰后换回硬件，出关键帧
-        let mut back = None;
-        for id in 3..80 {
-            if !enc.wants_refine() {
-                break;
-            }
-            if let Some(f) = enc.encode(id, &screen, false, 100_000).unwrap() {
-                if enc.timing().hardware {
-                    back = Some(f);
-                    break;
-                }
-            }
-        }
-        let back = back.expect("换回硬件");
-        assert!(back.key);
-        assert_eq!(enc.timing().key_reason, "码率够了，换回硬件编码");
-        assert!(enc.backend_name().starts_with("硬件"));
-        // 码率又掉下来、要出关键帧（丢了帧）：再换软件
-        enc.on_lost(99);
-        let again = enc.encode(100, &screen, true, 100).unwrap().unwrap();
-        assert!(again.key);
-        assert!(!enc.timing().hardware);
     }
 
     /// 硬件编码器的码控丢掉了要求的关键帧（交出空帧）：下一帧接着要，直到真的出了关键帧。

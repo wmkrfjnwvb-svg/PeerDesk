@@ -45,6 +45,17 @@ OFFICE = [("idle", 30), ("typing", 90), ("idle", 30), ("scrolling", 60), ("idle"
 WORKLOAD = OFFICE + OFFICE
 
 
+# Wi-Fi 式抖动（秒，0 表示不加）：每个包额外晚到 0..N，但不乱序（真实 Wi-Fi 的抖动是一阵一阵的，基本不乱序）
+WIFI_JITTER_S = 0.0
+
+
+def trace_by_name(name):
+    """`const-<kbps>`：恒定速率、不丢包的合成链路（宽带）；其他名字按 crates/e2e/traces 里的真实轨迹。"""
+    if name.startswith("const-"):
+        return [(0.0, int(name.split("-", 1)[1]) * 1000, 0)]
+    return load_trace(ROOT / f"crates/e2e/traces/{name}.csv")
+
+
 def load_trace(path):
     rows = []
     for line in path.read_text().splitlines():
@@ -74,6 +85,7 @@ class Relay(threading.Thread):
         self.stop = threading.Event()
         self.busy = {"down": 0.0, "up": 0.0}
         self.heap = []
+        self.last_at = {"down": 0.0, "up": 0.0}
         self.seq = 0
         self.stats = {"sent": 0, "lost": 0, "queue_dropped": 0}
 
@@ -103,6 +115,9 @@ class Relay(threading.Thread):
         done = start + len(data) * 8 / rate
         self.busy[direction] = done
         at = done + DELAY_S + self.rng.random() * JITTER_S
+        if WIFI_JITTER_S > 0:
+            at = max(self.last_at[direction], at + self.rng.random() * WIFI_JITTER_S)
+            self.last_at[direction] = at
         self.seq += 1
         heapq.heappush(self.heap, (at, self.seq, direction, data))
 
@@ -305,9 +320,12 @@ def one_run(args, name, trace, mode, run, out):
     desk = Desktop(work, seed)
     desk.setup()
     env = {**os.environ, "DISPLAY": DISPLAY, "PEERDESK_FRAME_LOG": str(work / "host.frames")}
-    env["PEERDESK_PACE"] = "0" if mode == "off" else "1"
-    if mode != "off":
+    # 模式：off / 数字（节奏器关、开并按这个系数）；probe-on / probe-off（节奏器关，起步探测开、关）
+    env["PEERDESK_PACE"] = "0" if mode in ("off", "probe-on", "probe-off") else "1"
+    if mode not in ("off", "probe-on", "probe-off"):
         env["PEERDESK_PACE_FACTOR"] = mode
+    if mode == "probe-off":
+        env["PEERDESK_START_PROBE"] = "0"
     host_log = open(work / "host.log", "w")
     host = subprocess.Popen([args.bin, "host", "--listen", "127.0.0.1:0", "--data-dir", str(work / "host"), "--open", "--once",
                              "--fps", str(FPS), "--source", "screen"], env=env, stdout=host_log, stderr=subprocess.STDOUT)
@@ -346,37 +364,50 @@ def one_run(args, name, trace, mode, run, out):
     desk.close()
     first, waits = analyze(work / "host.frames", work / "ctrl.frames", start_unix, end_unix)
     freezes = sum(1 for w in waits if w > FREEZE_S)
+    # 开头的码率：被控端每秒一行统计里的“目标”，取前 3 秒；起步探测的结果
+    text = (work / "host.log").read_text(errors="replace")
+    targets = [int(x) for x in re.findall(r"stats: 发送 .*?目标 (\d+) kbps", text)][:3]
+    probe = re.search(r"(起步探测[^\n]*|不做起步探测[^\n]*)", text)
     return {
         "first": first, "freezes": freezes, "max": max(waits, default=0.0), "n": len(waits),
         "lost": relay.stats["lost"], "qdrop": relay.stats["queue_dropped"], "sent": relay.stats["sent"],
+        "start": "/".join(str(t) for t in targets), "probe": probe.group(1)[:60] if probe else "",
     }
 
 
 def main():
+    global W, H, DELAY_S, WIFI_JITTER_S
     ap = argparse.ArgumentParser()
     ap.add_argument("--bin", default=str(ROOT / "target/release/peerdesk"))
     ap.add_argument("--traces", default="")
     ap.add_argument("--modes", default="off,2500")
     ap.add_argument("--runs", type=int, default=1)
     ap.add_argument("--out", default=str(ROOT / "target/trace-lab"))
+    ap.add_argument("--size", default=f"{W}x{H}", help="被控端屏幕，例如 2880x1800")
+    ap.add_argument("--delay-ms", type=float, default=DELAY_S * 1000, help="单程延迟")
+    ap.add_argument("--wifi-jitter-ms", type=float, default=0.0, help="Wi-Fi 式抖动（不乱序）")
     args = ap.parse_args()
+    W, H = (int(x) for x in args.size.split("x"))
+    DELAY_S = args.delay_ms / 1000
+    WIFI_JITTER_S = args.wifi_jitter_ms / 1000
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     names = [n for n in args.traces.split(",") if n] or sorted(p.stem for p in (ROOT / "crates/e2e/traces").glob("ms-*.csv"))
     xvfb = subprocess.Popen(["Xvfb", DISPLAY, "-screen", "0", f"{W}x{H}x24"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(1.0)
     table = out / "trace-lab.md"
-    rows = ["| 轨迹 | 节奏器 | 次 | 冻结（>200 ms） | 最长等待 ms | 首帧 ms | 等待次数 | 丢包 / 排队丢 / 发出 |", "|---|---|---|---|---|---|---|---|"]
+    rows = ["| 轨迹 | 模式 | 次 | 冻结（>200 ms） | 最长等待 ms | 首帧 ms | 等待次数 | 丢包 / 排队丢 / 发出 | 前 3 秒码率 kbps | 起步探测 |",
+            "|---|---|---|---|---|---|---|---|---|---|"]
     totals = {}
     try:
         for name in names:
-            trace = load_trace(ROOT / f"crates/e2e/traces/{name}.csv")
+            trace = trace_by_name(name)
             for run in range(1, args.runs + 1):
                 for mode in args.modes.split(","):
                     r = one_run(args, name, trace, mode, run, out)
                     first = "无" if r["first"] is None else f"{r['first'] * 1000:.0f}"
                     row = (f"| {name} | {mode} | {run} | {r['freezes']} | {r['max'] * 1000:.0f} | {first} | {r['n']} | "
-                           f"{r['lost']} / {r['qdrop']} / {r['sent']} |")
+                           f"{r['lost']} / {r['qdrop']} / {r['sent']} | {r['start']} | {r['probe']} |")
                     rows.append(row)
                     print(row, flush=True)
                     t = totals.setdefault(mode, [0, 0, 0.0, 0.0])

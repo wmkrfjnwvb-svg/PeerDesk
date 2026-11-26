@@ -223,6 +223,46 @@ fn fast_ramp_on_a_fat_link() {
     });
 }
 
+/// 用户实测（2026-11-26，Mac 2880×1800 被控、Windows 控制）：会话开头画面很糊，要过好几秒才清楚。
+/// 宽链路（30 Mbps、往返 30 ms、Wi-Fi 抖动）、Retina 大屏、产品默认的起步码率，开头停着的画面要尽快变清晰。
+#[test]
+fn start_is_sharp_quickly_on_a_fat_link_with_a_big_screen() {
+    let o = run(&Scenario {
+        width: 2880,
+        height: 1800,
+        network: vec![(
+            0,
+            Link {
+                rate_bps: Some(30_000_000),
+                delay_us: 15_000,
+                // 用户的 Wi-Fi：零星小包的单程延迟比最低值高 12–25 ms，延迟趋势正常
+                jitter_us: 20_000,
+                ..Link::lan()
+            },
+        )],
+        ..Scenario::new(
+            "big-screen-start",
+            vec![
+                phase(Action::Idle, 60),
+                phase(Action::Typing, 90),
+                phase(Action::Idle, 30),
+                phase(Action::Typing, 90),
+                phase(Action::Idle, 30),
+            ],
+        )
+    })
+    .unwrap();
+    finish(&o);
+    // 开头的静止画面要尽快清晰（这个场景以前一直没清晰：码率被 Wi-Fi 抖动打到底、1 Mbps 起步爬得慢）
+    let start = o.phases.first().and_then(|p| p.sharp_ms);
+    gate(
+        &o,
+        "开头 2 秒内清晰",
+        start.is_some_and(|t| t <= 2000.0),
+        &format!("开头变清晰 {start:?} ms"),
+    );
+}
+
 /// Wi-Fi 上 3% 的随机丢包，但链路并不拥塞：估计器不该因此降码率。
 #[test]
 fn random_loss_without_congestion() {
