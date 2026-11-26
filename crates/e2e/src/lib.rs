@@ -30,6 +30,10 @@ const HOST: usize = 0;
 const VIEWER: usize = 1;
 /// 反馈间隔（微秒）。
 const FEEDBACK_US: u64 = 20_000;
+/// 没有新情况时多久也发一次反馈（微秒）。和产品的控制端一样（`crates/net/src/controller.rs`）：每 20 ms 看一次，
+/// 收到了新的画面包、要请求重传或者帧有了定论才发，否则 1 秒一次。以前仿真每 20 ms 无条件发，真实程序里
+/// 静止时 1 秒才一次：探测组靠“下一次报告没有新包”结束，仿真里晚 40 ms，真实程序里晚 2 秒（2026-11-26 审查发现）。
+const IDLE_FEEDBACK_US: u64 = 1_000_000;
 /// 亮度 PSNR 达到这个值算“清晰”（dB）。
 pub const SHARP_DB: f64 = 38.0;
 /// 两次画面更新间隔超过这么久算一次卡顿（微秒）。
@@ -141,6 +145,8 @@ pub struct Scenario {
     /// 调试：把发送端各模块的决定、每秒的网络控制状态、因为哪个闸门没编帧打到标准错误。
     /// 默认按环境变量 `PEERDESK_EVENTS` 打开。
     pub trace: bool,
+    /// 起步探测（见 `MediaSender::set_start_probe`）。默认打开（和产品一样），环境变量 `PEERDESK_START_PROBE=0` 关掉做对照。
+    pub start_probe: bool,
     /// 内容策略（现在只有办公；以后的游戏、电影模式各加场景守住）。
     pub policy: ContentPolicy,
 }
@@ -166,6 +172,7 @@ impl Scenario {
             pacing: peerdesk_core::pacer::enabled(),
             fec: fec_from(std::env::var_os("PEERDESK_FEC").as_deref()),
             trace: std::env::var_os("PEERDESK_EVENTS").is_some(),
+            start_probe: std::env::var("PEERDESK_START_PROBE").map_or(true, |v| v != "0"),
             policy: ContentPolicy::OFFICE,
         }
     }
@@ -404,6 +411,7 @@ pub fn run(s: &Scenario) -> Result<Outcome, Error> {
     rx.set_reports(tx.reports());
     // 静止时探测（产品里由握手的 PROBE_TRAIN 决定；新版本之间都打开）
     tx.set_idle_probe(true);
+    tx.set_start_probe(s.start_probe);
     let mut net: Net<Vec<u8>> = Net::new(s.seed);
     let mut network = s.network.clone();
     network.sort_by_key(|(t, _)| *t);
@@ -432,6 +440,10 @@ pub fn run(s: &Scenario) -> Result<Outcome, Error> {
 
     let mut now = Time::ZERO;
     let mut next_feedback = Time(FEEDBACK_US);
+    // 上次反馈以来收到的画面包数、上次报告的 floor、上次反馈的时间（反馈节奏和产品一样，见 IDLE_FEEDBACK_US）
+    let mut video_since_feedback = 0u32;
+    let mut reported_floor = 0u32;
+    let mut last_feedback = Time::ZERO;
     let mut next_tick = Time::ZERO;
     let mut pacer = peerdesk_core::pacer::Pacer::new(Time(0));
     let pacing = s.pacing;
@@ -565,7 +577,20 @@ pub fn run(s: &Scenario) -> Result<Outcome, Error> {
                     &mut seq,
                     &mut acc.bytes,
                 )?;
-                if next_feedback <= now {
+                let feedback_due = next_feedback <= now && {
+                    next_feedback = now.plus(FEEDBACK_US);
+                    let (floor, _) = rx.settle(now);
+                    let news =
+                        video_since_feedback > 0 || floor != reported_floor || rx.wants_nack(now);
+                    let due = news || now.since(last_feedback) >= IDLE_FEEDBACK_US;
+                    if due {
+                        video_since_feedback = 0;
+                        reported_floor = floor;
+                        last_feedback = now;
+                    }
+                    due
+                };
+                if feedback_due {
                     let fb = rx.feedback_datagram(now);
                     let header = Header {
                         channel: Channel::Control,
@@ -577,7 +602,6 @@ pub fn run(s: &Scenario) -> Result<Outcome, Error> {
                     fb_seq = fb_seq.wrapping_add(1);
                     let datagram = encode_datagram(&header, &fb)?;
                     net.send(VIEWER, HOST, datagram.len(), datagram);
-                    next_feedback = now.plus(FEEDBACK_US);
                 }
                 while net.peek_time().is_some_and(|t| t <= now) {
                     let Some(d) = net.pop() else { break };
@@ -619,6 +643,7 @@ pub fn run(s: &Scenario) -> Result<Outcome, Error> {
                         }
                         continue;
                     }
+                    video_since_feedback = video_since_feedback.saturating_add(1);
                     let Ok(Some(frame)) =
                         rx.on_datagram(now, header.send_time, header.seq, header.flags, body)
                     else {

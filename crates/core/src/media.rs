@@ -308,6 +308,45 @@ const IDLE_PROBE_SCALE: u64 = 4;
 /// 静止探测的组号从这里起（和网络控制器的探测组号分开）。
 const IDLE_PROBE_ID_BASE: u32 = 0x8000_0000;
 
+/// 第一个关键帧的送达速度（字节 ÷ 从发出到确认扣掉往返时间）至少是当时码率的这么多（千分比）才起步探测。
+/// 链路只比起步码率宽一点时探测包反而添堵：先探测再出画面时微软窄带轨迹卡顿 76 → 130 次，门槛 0.8 倍时
+/// 76 → 87 次（多在 1–8 Mbps 的轨迹），2 倍时和不探一样。不扣往返时间的话，小关键帧（十几 KB）测的主要是往返
+/// 时间：30 Mbps、往返 30 ms 的链路只算出 1.7 Mbps。
+const START_PROBE_GATE_PERMILLE: u64 = 2000;
+/// 起步探测（见 [`MediaSender::set_start_probe`]）：第一组按起步码率的几倍，达到目标的多少（千分比）就按
+/// 结果的几倍接着探；每组匀速发多久（微秒）；最多探多久（微秒，到时不管有没有探完都开始出画面）。
+/// 每组发 30 ms 而不是 WebRTC 的 15 ms：接收端是应用读数据报时打的时间戳，程序忙一下几十个包一次读走，
+/// 时间段太短测不准（2026-11-26 用户日志里帧的包串测出 Tbps）。
+const START_PROBE_FIRST_SCALE: u64 = 4;
+const START_PROBE_FURTHER_PERMILLE: u64 = 700;
+/// 之后每组按结果的几倍：4 倍时最坏过冲约 5.7 倍（4 ÷ 0.7），瓶颈多排约 140 ms（2026-11-26 独立审查）；
+/// WebRTC 第一轮之后也是 2 倍。第一组的 4 倍是对起步码率（只有十几 KB），不算过冲。
+const START_PROBE_STEP: u64 = 2;
+/// 会话循环多久交一次探测组给节奏器（微秒，被控端 `cc_tick`）：决定发探测组到它真的发出去最多差这么久。
+const START_PROBE_TICK_US: u64 = 25_000;
+const START_PROBE_SPAN_US: u64 = 30_000;
+/// 起步探测每组至少几个包（速率低时 30 ms 只有几个包，延迟回归不稳）。
+const START_PROBE_MIN_PACKETS: u32 = 16;
+const START_PROBE_MAX_US: u64 = 1_000_000;
+/// 起步探测的组号从这里起（和静止探测、网络控制器的探测组号分开）。
+const START_PROBE_ID_BASE: u32 = 0x4000_0000;
+
+/// 起步探测的进度。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StartProbe {
+    /// 发出第一组的时刻（还在等第一个关键帧送到时为 `None`）。
+    started: Option<Time>,
+    /// 现在这一组的组号、目标速率、发出的时刻，上一组的目标速率。
+    id: u32,
+    target_bps: u64,
+    sent_at: Time,
+    prev_target_bps: u64,
+    /// 测到的最高速率。
+    best_bps: u64,
+    /// 这一组发出之后收到的最高结果（可能混着上一组收尾的结果，到时间再用它下结论）。
+    round_bps: u64,
+}
+
 /// 帧率已经在最低档、帧还一直装不进预算这么久（微秒）就降分辨率（最后手段）。
 const OVERFLOW_DOWN_US: u64 = 2_000_000;
 
@@ -369,6 +408,8 @@ pub struct MediaSender {
     probing: Option<u32>,
     probes: u32,
     pending_probe: Option<ProbeCluster>,
+    /// 起步探测（探完之前不出画面）。
+    start_probe: Option<StartProbe>,
     /// 发出的包，等到达报告对账（见 [`crate::cc::report`]）。
     history: SendHistory,
 }
@@ -431,6 +472,7 @@ impl MediaSender {
             probing: None,
             probes: 0,
             pending_probe: None,
+            start_probe: None,
             history: SendHistory::new(),
             scale: if codec == Codec::H264 {
                 ScalePolicy::new()
@@ -496,6 +538,18 @@ impl MediaSender {
         if self.reports {
             self.rate.on_tick(now);
         }
+        if self
+            .start_probe
+            .and_then(|p| p.started)
+            .is_some_and(|at| now.since(at) >= START_PROBE_MAX_US)
+        {
+            self.finish_start_probe(now);
+        } else if self.start_probe.is_some_and(|p| p.started.is_some())
+            && self.start_probe_settled(now)
+        {
+            // 这一组的结果该回来了、后面再没有新结果：按这一轮收到的判，不干等到 1 秒
+            self.start_probe_decide(now);
+        }
         if self.idle_probe && self.next_probe.is_some_and(|t| now >= t) {
             self.probes = self.probes.wrapping_add(1);
             let id = IDLE_PROBE_ID_BASE | (self.probes & !IDLE_PROBE_ID_BASE);
@@ -512,6 +566,159 @@ impl MediaSender {
             self.next_probe = Some(now.plus(self.probe_gap));
             self.probe_gap = self.probe_gap.saturating_mul(2).min(IDLE_PROBE_MAX_GAP_US);
         }
+    }
+
+    /// 会话开头探测链路容量（对端支持 [`crate::proto::Caps::PROBE_TRAIN`]、估计器要时打开）。第一幅画面照常按
+    /// 起步码率出；第一个关键帧送到、送达速度（扣掉往返）是码率 2 倍以上时，按码率的 4 倍匀速发一组填充包，
+    /// 接收端测到的速率达到目标的七成就按结果的 2 倍接着探，直到探不上去或到上限，码率定为测得容量的九成；
+    /// 最多 1 秒。探的时候不出新帧（第一幅画面已经出来了，见 [`Self::due`]）。
+    /// 为什么（2026-11-26 用户实测，Mac 2880×1800 被控、30 Mbps Wi-Fi）：1 Mbps 起步、靠画面流量慢慢升，
+    /// 开头几秒每帧预算只有几 KB，大屏的字糊好几秒。先探测再出第一幅画面在窄带上更差（微软轨迹卡顿 76 → 130 次：
+    /// 探测包在瓶颈排几百毫秒、挤爆队列），所以按第一个关键帧的送达速度决定探不探。
+    pub fn set_start_probe(&mut self, on: bool) {
+        self.start_probe = (on && self.rate.wants_idle_probe()).then_some(StartProbe {
+            started: None,
+            id: START_PROBE_ID_BASE,
+            target_bps: 0,
+            sent_at: Time(0),
+            prev_target_bps: 0,
+            best_bps: 0,
+            round_bps: 0,
+        });
+    }
+
+    /// 起步探测还没结束（在等第一个关键帧送到，或者在探）。
+    #[must_use]
+    pub const fn start_probing(&self) -> bool {
+        self.start_probe.is_some()
+    }
+
+    /// 关键帧送到了（`bytes` 字节，从发出到确认 `took_us`）：第一个关键帧决定起步探测探不探。
+    fn key_delivered(&mut self, now: Time, bytes: u64, took_us: u64) {
+        if self.start_probe.is_none_or(|p| p.started.is_some()) {
+            return;
+        }
+        let transfer_us = took_us.saturating_sub(self.rtt_us).max(1_000);
+        let delivered_bps = bytes.saturating_mul(8_000_000) / transfer_us;
+        let rate = self.rate.rate_bps();
+        if delivered_bps.saturating_mul(1000) < rate.saturating_mul(START_PROBE_GATE_PERMILLE) {
+            self.start_probe = None;
+            self.event(format!(
+                "不做起步探测：第一个关键帧 {bytes} 字节送了 {} ms（扣掉往返 {} ms，约 {} kbps），链路不比起步码率 {} kbps 宽多少",
+                took_us / 1000,
+                self.rtt_us / 1000,
+                delivered_bps / 1000,
+                rate / 1000
+            ));
+            return;
+        }
+        if let Some(p) = self.start_probe.as_mut() {
+            p.started = Some(now);
+        }
+        let target = rate
+            .saturating_mul(START_PROBE_FIRST_SCALE)
+            .clamp(self.cfg.min_bps, self.cfg.max_bps);
+        self.start_cluster(now, target);
+    }
+
+    /// 发一组起步探测：按 `target_bps` 匀速发 [`START_PROBE_SPAN_US`]。
+    fn start_cluster(&mut self, now: Time, target_bps: u64) {
+        let Some(p) = self.start_probe.as_mut() else {
+            return;
+        };
+        p.id = p.id.wrapping_add(1) | START_PROBE_ID_BASE;
+        p.prev_target_bps = p.target_bps;
+        p.target_bps = target_bps;
+        p.sent_at = now;
+        p.round_bps = 0;
+        let bytes = target_bps.saturating_mul(START_PROBE_SPAN_US) / 8_000_000;
+        let packets = u32::try_from(bytes / u64::from(crate::cc::probe::PROBE_PACKET_BYTES))
+            .unwrap_or(u32::MAX)
+            .max(START_PROBE_MIN_PACKETS);
+        self.pending_probe = Some(ProbeCluster {
+            id: p.id,
+            target_bps,
+            packets,
+        });
+        self.event(format!(
+            "起步探测：按 {} kbps 发 {packets} 个包",
+            target_bps / 1000
+        ));
+    }
+
+    /// 起步探测有了一个结果（接收端测得的包串速率）。
+    fn start_probe_result(&mut self, now: Time, result_bps: u64) {
+        let Some(p) = self.start_probe.as_mut() else {
+            return;
+        };
+        // 反馈里的包串速率也可能是帧的：比这一组的发送速率高的不算（匀速发的组测不出更高）
+        let result_bps = result_bps.min(p.target_bps);
+        p.best_bps = p.best_bps.max(result_bps);
+        p.round_bps = p.round_bps.max(result_bps);
+        // 反馈不带组号：上一组收尾的结果可能在这一组之后才到。比上一组的目标高的一定是这一组的，马上判；
+        // 否则先记着，等这一组的结果有时间回来（见 `start_probe_settled`）再用这一轮收到的最高值判
+        if result_bps <= p.prev_target_bps && !self.start_probe_settled(now) {
+            self.event(format!(
+                "起步探测：收到 {} kbps，可能是上一组的，等这一组的结果",
+                result_bps / 1000
+            ));
+            return;
+        }
+        self.start_probe_decide(now);
+    }
+
+    /// 这一组的结果有时间回来了（往返 + 一组的时长 + 交给节奏器的等待 + 一次反馈间隔）。
+    fn start_probe_settled(&self, now: Time) -> bool {
+        let rtt = if self.rtt_us > 0 {
+            self.rtt_us
+        } else {
+            100_000
+        };
+        self.start_probe.is_some_and(|p| {
+            now.since(p.sent_at)
+                >= rtt.saturating_add(START_PROBE_SPAN_US + START_PROBE_TICK_US + 20_000)
+        })
+    }
+
+    /// 按这一轮收到的最高结果判：达到目标的七成就接着探，否则探完。
+    fn start_probe_decide(&mut self, now: Time) {
+        let Some(p) = self.start_probe else {
+            return;
+        };
+        let further = p.round_bps.saturating_mul(1000)
+            >= p.target_bps.saturating_mul(START_PROBE_FURTHER_PERMILLE);
+        if further && p.target_bps < self.cfg.max_bps {
+            let next = p
+                .round_bps
+                .saturating_mul(START_PROBE_STEP)
+                .min(self.cfg.max_bps);
+            self.start_cluster(now, next);
+        } else {
+            self.finish_start_probe(now);
+        }
+    }
+
+    /// 起步探测结束：按测得的容量定码率，开始出画面。
+    fn finish_start_probe(&mut self, now: Time) {
+        let Some(p) = self.start_probe.take() else {
+            return;
+        };
+        let took = p.started.map_or(0, |t| now.since(t) / 1000);
+        if p.best_bps == 0 {
+            self.event(format!(
+                "起步探测 {took} ms 没测到结果，按起步码率 {} kbps 出画面",
+                self.rate.rate_bps() / 1000
+            ));
+            return;
+        }
+        let from = self.rate.rate_bps();
+        self.rate.on_start_probe(now, p.best_bps);
+        self.event(format!(
+            "起步探测 {took} ms：链路容量至少 {} kbps，码率 {} → {} kbps",
+            p.best_bps / 1000,
+            from / 1000,
+            self.rate.rate_bps() / 1000
+        ));
     }
 
     /// 画面静止时定期探测链路（对端支持 [`crate::proto::Caps::PROBE_TRAIN`]、估计器要时打开）：停下 2 秒后
@@ -571,7 +778,9 @@ impl MediaSender {
     /// 按当前帧率，到时间编下一帧了吗。
     #[must_use]
     pub fn due(&self, now: Time) -> bool {
-        self.governor.due(now)
+        // 起步探测在探的时候不出新帧：反馈里的包串速率不分探测组和帧，帧混进来会把结果顶高
+        // （2026-11-26 独立审查）。第一幅画面已经出来了，探测最多 1 秒，一般两三百毫秒。
+        self.start_probe.is_none_or(|p| p.started.is_none()) && self.governor.due(now)
     }
 
     /// 编码线程报告这一帧编了多久（微秒）、是不是硬件编码（流水线的，CPU 过载门限放宽），
@@ -1091,6 +1300,21 @@ impl MediaSender {
             rtt_us: self.rtt_us,
             in_flight: self.in_flight(),
         };
+        // 还没开始起步探测就看到明显丢包：不探（有丢包的链路上探测结果不准，码率一下提上去之后在丢包里来回降：
+        // 微软轨迹 ms-02560，8 Mbps、12% 随机丢包，卡顿 0 → 3 次）
+        if self.start_probe.is_some_and(|p| p.started.is_none())
+            && feedback.loss_permille >= FEC_FROM_LOSS_PERMILLE
+        {
+            self.start_probe = None;
+            self.event(format!(
+                "不做起步探测：有丢包（{}‰），按画面流量慢慢升码率",
+                feedback.loss_permille
+            ));
+        }
+        // 起步探测有了结果（画面照常在发：反馈里的包串速率可能是帧的，见 start_probe_result）
+        if self.start_probe.is_some_and(|p| p.started.is_some()) && ext.train_bytes_per_s > 0 {
+            self.start_probe_result(now, u64::from(ext.train_bytes_per_s).saturating_mul(8));
+        }
         // 静止时的探测有了结果（探测之后没发过帧：这个包串速率就是探测组的）
         if self
             .probing
@@ -1157,7 +1381,7 @@ impl MediaSender {
             Some(encoder) => encoder.on_feedback(feedback.floor, feedback.delivered),
             None => self.notes.1 = Some((feedback.floor, feedback.delivered)),
         }
-        while let Some((id, _, _)) = self.unacked.front().copied() {
+        while let Some((id, _, bytes)) = self.unacked.front().copied() {
             if id > feedback.floor {
                 break;
             }
@@ -1171,6 +1395,7 @@ impl MediaSender {
             if let Some((_, sent)) = self.key_sent.filter(|(key, _)| *key == id) {
                 if delivered {
                     self.scale.on_key_delivered(now.since(sent));
+                    self.key_delivered(now, bytes, now.since(sent));
                 }
                 self.key_sent = None;
             }
@@ -1455,11 +1680,16 @@ impl MediaReceiver {
         if self.reports {
             self.arrivals.on_packet(now, seq);
         }
-        // 探测用的填充包：记到达时间；开头 4 字节是组号，按组测包串速率（起步探测，见 Caps::PROBE_TRAIN）
+        // 探测用的填充包：记到达时间；开头 4 字节是组号，按组测包串速率（见 Caps::PROBE_TRAIN），
+        // 第 9–12 字节是这一组一共几个包（老版本发的是 0：不知道）
         if flags & FLAG_PADDING != 0 {
             if let Some(id) = body.first_chunk::<4>() {
+                let total = body
+                    .get(8..12)
+                    .and_then(|b| b.first_chunk::<4>())
+                    .map_or(0, |b| u32::from_le_bytes(*b));
                 self.metrics
-                    .on_probe(now, u32::from_le_bytes(*id), body.len());
+                    .on_probe(now, send_time, u32::from_le_bytes(*id), total, body.len());
             }
             return Ok(Vec::new());
         }
@@ -2363,6 +2593,136 @@ mod tests {
         off.on_frame(Time(0), &screen, true, 10_000).unwrap();
         off.on_tick(Time(5_000_000));
         assert!(off.take_probes().is_empty());
+    }
+
+    /// 起步探测：第一个关键帧送得够快才探；按 4 倍逐组往上探，探不上去就停，码率定为测得容量的九成。
+    #[test]
+    fn the_start_probe_climbs_until_the_link_saturates_after_a_fast_first_keyframe() {
+        let train = |bps: u64| Extension {
+            train_bytes_per_s: u32::try_from(bps / 8).unwrap(),
+            ..Extension::default()
+        };
+        let acked = |id: u32| Feedback {
+            floor: id,
+            delivered: 1,
+            ..Feedback::default()
+        };
+        let screen = Screen::new(64, 64, 1);
+        // 第一个关键帧 `took` 微秒送到
+        let begin = |took: u64| {
+            let mut tx = MediaSender::new(cfg(), Box::new(FakeEncoder::default()));
+            tx.set_start_probe(true);
+            assert!(tx.start_probing());
+            assert!(tx.due(Time(0)), "第一幅画面照常出");
+            tx.on_tick(Time(0));
+            assert!(tx.take_probes().is_empty(), "关键帧送到之前不探");
+            tx.on_frame(Time(0), &screen, true, 10_000).unwrap();
+            tx.observe(Time(took), &acked(1), Extension::default());
+            tx
+        };
+        let mut tx = begin(10_000);
+        let start = tx.rate_bps();
+        // 第一组：码率的 4 倍，匀速发 30 ms
+        let first = tx.take_probes();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].target_bps, start * START_PROBE_FIRST_SCALE);
+        assert_eq!(first[0].id, START_PROBE_ID_BASE | 1);
+        let bytes = first[0].target_bps * START_PROBE_SPAN_US / 8_000_000;
+        assert_eq!(
+            first[0].packets,
+            u32::try_from(bytes / 1200)
+                .unwrap()
+                .max(START_PROBE_MIN_PACKETS)
+        );
+        // 探的时候不出新帧
+        assert!(!tx.due(Time(20_000)));
+        // 达到目标：按结果的 2 倍接着探
+        tx.observe(Time(60_000), &Feedback::default(), train(3_900_000));
+        let second = tx.take_probes();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].target_bps, 7_800_000);
+        // 上一组收尾的结果晚到（不比上一组目标高、这一组的结果还不可能回来）：不下结论
+        tx.observe(Time(70_000), &Feedback::default(), train(3_800_000));
+        assert!(tx.start_probing());
+        assert!(tx.take_probes().is_empty());
+        // 这一组的结果：只到 5 Mbps（不到七成）→ 探完，码率定为九成，又可以出帧了
+        tx.observe(Time(150_000), &Feedback::default(), train(5_000_000));
+        assert!(!tx.start_probing());
+        assert!(tx.take_probes().is_empty());
+        assert_eq!(tx.rate_bps(), 4_500_000);
+        assert!(tx.due(Time(150_000)));
+        assert!(tx
+            .take_events()
+            .iter()
+            .any(|e| e.contains("起步探测") && e.contains("5000 kbps")));
+        // 结果比上一组目标高：一定是这一组的，马上算；比这一组目标还高的（帧的包串）按目标算
+        let mut quick = begin(10_000);
+        quick.observe(Time(40_000), &Feedback::default(), train(4_000_000));
+        quick.take_probes();
+        quick.observe(Time(50_000), &Feedback::default(), train(5_000_000));
+        assert!(!quick.start_probing());
+        assert_eq!(quick.rate_bps(), 4_500_000);
+        let mut capped = begin(10_000);
+        capped.observe(Time(40_000), &Feedback::default(), train(4_000_000));
+        let target = capped.take_probes()[0].target_bps;
+        capped.observe(Time(500_000), &Feedback::default(), train(target * 10));
+        assert!(capped.take_probes()[0].target_bps <= cfg().max_bps);
+        // 1 秒还没探完：按测到的定；什么都没测到：码率不动，写明
+        // 一直没有结果：这一组的结果该回来的时候（往返 + 30 ms + 25 ms + 20 ms）就结束，码率不动，写明
+        let mut slow = begin(10_000);
+        slow.on_tick(Time(60_000));
+        assert!(slow.start_probing());
+        slow.on_tick(Time(120_000));
+        assert!(!slow.start_probing());
+        assert_eq!(slow.rate_bps(), start);
+        assert!(slow.take_events().iter().any(|e| e.contains("没测到结果")));
+        // 结果一直在来、一直达标（每组都按结果的 2 倍接着探）：最多 1 秒
+        let mut long = begin(10_000);
+        let mut t = 10_000;
+        while long.start_probing() && t < 2_000_000 {
+            t += 20_000;
+            let target = long.take_probes().first().map(|c| c.target_bps);
+            if let Some(target) = target {
+                long.observe(Time(t), &Feedback::default(), train(target.min(2_000_000)));
+            }
+            long.on_tick(Time(t));
+        }
+        assert!(t <= 1_100_000, "{t}");
+        // 上一组收尾的结果晚到、这一组再没有结果：到时间按这一轮收到的判（不干等到 1 秒）
+        let mut late = begin(10_000);
+        late.observe(Time(40_000), &Feedback::default(), train(4_000_000));
+        let target = late.take_probes()[0].target_bps;
+        late.observe(Time(50_000), &Feedback::default(), train(3_500_000));
+        assert!(late.start_probing());
+        late.on_tick(Time(40_000 + 90_000));
+        assert!(
+            !late.start_probing(),
+            "目标 {target}，这一轮最高 3.5 Mbps 不到七成"
+        );
+        assert_eq!(late.rate_bps(), 3_600_000);
+        // 第一个关键帧送得比起步码率还慢（窄带）：不探
+        let mut narrow = begin(5_000_000);
+        assert!(!narrow.start_probing());
+        assert!(narrow.take_probes().is_empty());
+        assert!(narrow
+            .take_events()
+            .iter()
+            .any(|e| e.contains("不做起步探测")));
+        // 开头的反馈有明显丢包：不探
+        let mut lossy = MediaSender::new(cfg(), Box::new(FakeEncoder::default()));
+        lossy.set_start_probe(true);
+        lossy.on_frame(Time(0), &screen, true, 10_000).unwrap();
+        let loss = Feedback {
+            loss_permille: 50,
+            ..Feedback::default()
+        };
+        lossy.observe(Time(5_000), &loss, Extension::default());
+        assert!(!lossy.start_probing());
+        assert!(lossy.take_events().iter().any(|e| e.contains("有丢包")));
+        // 对端不支持：不探
+        let mut off = MediaSender::new(cfg(), Box::new(FakeEncoder::default()));
+        off.set_start_probe(false);
+        assert!(!off.start_probing());
     }
 
     #[test]

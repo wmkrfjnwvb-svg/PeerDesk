@@ -125,14 +125,19 @@ impl Pacer {
                 u64::from(PROBE_PACKET_BYTES).saturating_mul(8_000_000) / cluster.target_bps.max(1);
             let mut due = next.unwrap_or(now);
             while *sent < cluster.packets && due <= now {
-                // 开头 4 字节是组号（接收端按组测包串速率，见 Caps::PROBE_TRAIN），其余填 0
+                // 开头 4 字节是组号（接收端按组测包串速率，见 Caps::PROBE_TRAIN），接着 4 字节是组里第几个、
+                // 4 字节是一共几个（接收端收到最后一个就结算，不用等之后没有新包；老版本只读组号），其余填 0
                 let mut body = vec![
                     0;
                     usize::try_from(PROBE_PACKET_BYTES)
                         .unwrap_or(0)
                         .saturating_sub(HEADER_LEN)
                 ];
-                for (b, v) in body.iter_mut().zip(cluster.id.to_le_bytes()) {
+                let stamp = [cluster.id, *sent, cluster.packets];
+                for (b, v) in body
+                    .iter_mut()
+                    .zip(stamp.iter().flat_map(|v| v.to_le_bytes()))
+                {
                     *b = v;
                 }
                 out.push(Outgoing {
