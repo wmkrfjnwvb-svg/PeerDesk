@@ -79,40 +79,73 @@ fn png_to_rgba_within(data: &[u8], max_pixels: u64) -> Result<(u32, u32, Vec<u8>
     Ok((width, height, rgba))
 }
 
+/// 打包的结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Packed {
+    /// 打包后的内容（[`peerdesk_core::clipboard::pack_files`] 的格式）。
+    pub data: Vec<u8>,
+    /// 打进去的文件数。
+    pub sent: u32,
+    /// 没打进去的文件和文件夹：`（路径，原因）`。读不了（例如 macOS 上没有“桌面”“文稿”“下载”文件夹的
+    /// 访问权限）、或者名字在别的系统上不能用（Windows 不允许 `:`、以点或空格结尾、`CON` 之类的名字）。
+    pub skipped: Vec<(std::path::PathBuf, String)>,
+}
+
 /// 把复制的文件和文件夹打包（[`peerdesk_core::clipboard::pack_files`]）。
-/// 总大小超过 `limit` 或文件太多时停止读取，返回 `Err(已经统计到的大小)`；读不了的文件跳过。
-pub fn pack_paths(paths: &[std::path::PathBuf], limit: u64) -> Result<Vec<u8>, u64> {
+/// 总大小超过 `limit` 或文件太多时停止读取，返回 `Err(已经统计到的大小)`。
+/// 读不了的、名字对方不能用的文件跳过，记在 [`Packed::skipped`] 里（由调用方告诉用户，不能悄悄少了文件）。
+pub fn pack_paths(paths: &[std::path::PathBuf], limit: u64) -> Result<Packed, u64> {
     use peerdesk_core::clipboard::{pack_files, PackedFile, MAX_FILES};
     let mut files = Vec::new();
+    let mut skipped = Vec::new();
     let mut total = 0u64;
     let mut stack: Vec<(std::path::PathBuf, String)> = paths
         .iter()
         .filter_map(|p| Some((p.clone(), p.file_name()?.to_string_lossy().into_owned())))
         .collect();
     while let Some((path, rel)) = stack.pop() {
-        let Ok(meta) = std::fs::symlink_metadata(&path) else {
-            continue;
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
+            Err(e) => {
+                skipped.push((path, format!("读不了：{e}")));
+                continue;
+            }
         };
         if meta.is_dir() {
-            let Ok(entries) = std::fs::read_dir(&path) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                stack.push((entry.path(), format!("{rel}/{name}")));
+            match std::fs::read_dir(&path) {
+                Ok(entries) => {
+                    for entry in entries.flatten() {
+                        let name = entry.file_name().to_string_lossy().into_owned();
+                        stack.push((entry.path(), format!("{rel}/{name}")));
+                    }
+                }
+                Err(e) => skipped.push((path, format!("读不了文件夹：{e}"))),
             }
         } else if meta.is_file() {
+            // 名字不能用的先跳过：以前一个这样的文件会让整次复制失败，还被当成“太大”报给用户
+            if peerdesk_core::file::check_path(&rel).is_err() {
+                skipped.push((path, "文件名在对方系统上不能用".to_owned()));
+                continue;
+            }
             total = total.saturating_add(meta.len());
             if total > limit || files.len() >= MAX_FILES {
                 return Err(total.max(limit.saturating_add(1)));
             }
-            if let Ok(data) = std::fs::read(&path) {
-                files.push(PackedFile { path: rel, data });
+            match std::fs::read(&path) {
+                Ok(data) => files.push(PackedFile { path: rel, data }),
+                Err(e) => skipped.push((path, format!("读不了：{e}"))),
             }
         }
         // 符号链接等跳过（不跟随，避免打包到复制范围以外的东西）
     }
-    pack_files(&files).map_err(|_| total)
+    let sent = u32::try_from(files.len()).unwrap_or(u32::MAX);
+    // 名字都检查过了，文件数也没超：这里不会失败；万一失败按“太大”处理
+    let data = pack_files(&files).map_err(|_| total.max(limit.saturating_add(1)))?;
+    Ok(Packed {
+        data,
+        sent,
+        skipped,
+    })
 }
 
 /// 把收到的文件解包到 `dir` 下，返回最上层的路径（放进剪贴板，粘贴时就是这些文件和文件夹）。
@@ -185,6 +218,12 @@ mod tests {
             1024,
         )
         .unwrap();
+        // 不存在（读不了）的那个要报出来，不能悄悄少了
+        assert_eq!(packed.sent, 3);
+        assert_eq!(packed.skipped.len(), 1);
+        assert_eq!(packed.skipped[0].0, src.join("missing"));
+        assert!(packed.skipped[0].1.contains("读不了"));
+        let packed = packed.data;
         let dst = temp("dst");
         let mut top = unpack_to(&packed, &dst).unwrap();
         top.sort();
@@ -203,6 +242,55 @@ mod tests {
         for d in [src, dst] {
             let _ = std::fs::remove_dir_all(d);
         }
+    }
+
+    /// Mac 上合法、Windows 上不能用的文件名（带冒号、以点结尾）：只跳过这些文件并报出来，
+    /// 其他文件照常同步。以前整次复制失败，提示成“内容太大”。
+    #[cfg(unix)]
+    #[test]
+    fn names_the_other_system_cannot_use_are_skipped_and_reported() {
+        let src = temp("names");
+        std::fs::create_dir_all(src.join("folder")).unwrap();
+        std::fs::write(src.join("folder/ok.txt"), b"ok").unwrap();
+        std::fs::write(src.join("folder/12:30 notes.txt"), b"x").unwrap();
+        std::fs::write(src.join("folder/trailing."), b"y").unwrap();
+        let packed = pack_paths(&[src.join("folder")], 1024).unwrap();
+        assert_eq!(packed.sent, 1);
+        assert_eq!(packed.skipped.len(), 2);
+        assert!(packed.skipped.iter().all(|(_, why)| why.contains("文件名")));
+        let files = peerdesk_core::clipboard::unpack_files(&packed.data).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "folder/ok.txt");
+        let _ = std::fs::remove_dir_all(src);
+    }
+
+    /// 没有权限读的文件和文件夹（macOS 上没给“桌面”“文稿”文件夹权限时就是这样）：报出来。
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_files_and_folders_are_reported() {
+        use std::os::unix::fs::PermissionsExt;
+        let src = temp("perm");
+        std::fs::write(src.join("secret.txt"), b"x").unwrap();
+        std::fs::create_dir_all(src.join("locked")).unwrap();
+        std::fs::write(src.join("locked/in.txt"), b"y").unwrap();
+        let deny = |p: &std::path::Path| {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o000)).unwrap();
+        };
+        deny(&src.join("secret.txt"));
+        deny(&src.join("locked"));
+        // 以 root 跑测试时权限不起作用，这个测试没有意义
+        if std::fs::read(src.join("secret.txt")).is_err() {
+            let packed = pack_paths(&[src.join("secret.txt"), src.join("locked")], 1024).unwrap();
+            assert_eq!(packed.sent, 0);
+            assert_eq!(packed.skipped.len(), 2);
+            assert!(packed.skipped.iter().all(|(_, why)| why.contains("读不了")));
+        }
+        let allow = |p: &std::path::Path| {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        allow(&src.join("secret.txt"));
+        allow(&src.join("locked"));
+        let _ = std::fs::remove_dir_all(src);
     }
 
     #[test]

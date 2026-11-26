@@ -222,6 +222,15 @@ pub fn clip_message(note: &peerdesk_net::clipsync::ClipNote, s: &Strings) -> Opt
             Some(s.clip_remote_too_large.replace("{mb}", &mb(*size)))
         }
         ClipNote::FilesUnsupported => Some(s.clip_files_unsupported.to_owned()),
+        ClipNote::FilesSkipped { skipped, sent: 0 } => {
+            Some(s.clip_files_unreadable.replace("{n}", &skipped.to_string()))
+        }
+        ClipNote::FilesSkipped { skipped, sent } => Some(
+            s.clip_files_skipped
+                .replace("{n}", &skipped.to_string())
+                .replace("{sent}", &sent.to_string()),
+        ),
+        ClipNote::PasteWaiting => Some(s.clip_paste_waiting.to_owned()),
         ClipNote::Received { .. } => None,
     }
 }
@@ -668,6 +677,22 @@ mod tests {
         assert!(clip_message(&ClipNote::FilesUnsupported, s)
             .unwrap()
             .contains("升级"));
+        // 读不了的文件：全都读不了和只有一部分读不了，说法不同，都带数量
+        let none = ClipNote::FilesSkipped {
+            skipped: 3,
+            sent: 0,
+        };
+        let text = clip_message(&none, s).unwrap();
+        assert!(text.contains('3') && text.contains("权限"), "{text}");
+        let some = ClipNote::FilesSkipped {
+            skipped: 2,
+            sent: 5,
+        };
+        let text = clip_message(&some, s).unwrap();
+        assert!(text.contains('2') && text.contains('5'), "{text}");
+        assert!(clip_message(&ClipNote::PasteWaiting, s)
+            .unwrap()
+            .contains("粘贴"));
         let ok = ClipNote::Received {
             kind: ClipKind::Text,
             size: 1,

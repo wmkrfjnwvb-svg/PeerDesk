@@ -501,7 +501,11 @@ pub async fn serve(
                     let root = opts.recv_root.clone();
                     let allowed = opts.permissions.files;
                     let clipboard = clipboard.clone();
-                    let files = caps.has(Caps::CLIPBOARD_FILES);
+                    let clip_opts = crate::clipsync::SyncOptions {
+                        files: caps.has(Caps::CLIPBOARD_FILES),
+                        ack: caps.has(Caps::CLIPBOARD_ACK),
+                        paste: None,
+                    };
                     let audio = audio.clone();
                     let view = Arc::clone(&view);
                     let link = Arc::clone(&link);
@@ -520,7 +524,7 @@ pub async fn serve(
                                     return Err(NetError::Protocol("没有协商剪贴板，或者本机不允许"));
                                 };
                                 tokio::select! {
-                                    r = crate::clipsync::run(send, recv, clipboard.0, Limits::DEFAULT, files) => r?,
+                                    r = crate::clipsync::run(send, recv, clipboard.0, Limits::DEFAULT, clip_opts) => r?,
                                     _ = clip_stopped.wait_for(|stop| *stop) => {}
                                 }
                                 Ok(Vec::new())

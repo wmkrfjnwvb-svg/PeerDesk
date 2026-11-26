@@ -33,3 +33,7 @@ igd-next = { version = "0.18", default-features = false, features = ["aio_tokio"
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+# 粘贴键等待的超时（10 秒）用暂停的时钟测，不真的等
+tokio = { version = "1", features = ["test-util"] }

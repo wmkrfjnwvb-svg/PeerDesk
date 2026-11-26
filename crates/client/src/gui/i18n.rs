@@ -253,6 +253,12 @@ pub struct Strings {
     pub clip_remote_too_large: &'static str,
     /// 复制了文件但对方版本不支持。
     pub clip_files_unsupported: &'static str,
+    /// 复制的文件一个都读不了（`{n}` 个）。
+    pub clip_files_unreadable: &'static str,
+    /// 复制的文件里有 `{n}` 个没有同步，`{sent}` 个同步了。
+    pub clip_files_skipped: &'static str,
+    /// 按了粘贴，刚复制的内容还在发给对方。
+    pub clip_paste_waiting: &'static str,
     /// 远程控制
     pub nav_home: &'static str,
     /// 设备
@@ -534,6 +540,9 @@ pub const ZH: Strings = Strings {
     account_token: "会员令牌（可选）",
     clip_local_too_large: "复制的内容太大（{mb} MB），没有同步到对方；文件超过 20 MB 请用文件传输",
     clip_files_unsupported: "对方的 PeerDesk 版本不支持复制粘贴文件，请升级对方，或用文件传输",
+    clip_files_unreadable: "复制的 {n} 个文件读不了，没有同步到对方。请检查 PeerDesk 有没有访问这个文件夹的权限（macOS：系统设置 → 隐私与安全性 → 文件和文件夹），或用文件传输",
+    clip_files_skipped: "复制的文件里有 {n} 个没有同步到对方（读不了，或文件名在对方系统上不能用），其余 {sent} 个已同步",
+    clip_paste_waiting: "刚复制的内容还在发给对方，发完后自动粘贴",
     nav_home: "远程控制",
     nav_devices: "设备",
     nav_settings: "设置",
@@ -738,6 +747,9 @@ pub const EN: Strings = Strings {
     account_token: "Member token (optional)",
     clip_local_too_large: "Copied content is too large ({mb} MB) to sync; use file transfer for files over 20 MB",
     clip_files_unsupported: "The remote PeerDesk is too old to copy and paste files; update it, or use file transfer",
+    clip_files_unreadable: "The {n} copied file(s) could not be read and were not synced. Check that PeerDesk may access this folder (macOS: System Settings → Privacy & Security → Files and Folders), or use file transfer",
+    clip_files_skipped: "{n} of the copied files were not synced (unreadable, or the name is not valid on the remote system); the other {sent} were synced",
+    clip_paste_waiting: "The copied content is still being sent; it will be pasted when it arrives",
     nav_home: "Remote control",
     nav_devices: "Devices",
     nav_settings: "Settings",

@@ -166,6 +166,7 @@ fn feature_bits_are_stable_and_negotiated_away_for_old_peers() {
     assert_eq!(Caps::CLIPBOARD.0, 1 << 16);
     assert_eq!(Caps::AUDIO.0, 1 << 17);
     assert_eq!(Caps::CLIPBOARD_FILES.0, 1 << 18);
+    assert_eq!(Caps::CLIPBOARD_ACK.0, 1 << 30);
     // 被控端的系统放在第 24–26 位，老版本收到也只看能力位
     use peerdesk_core::proto::PeerOs;
     for os in [PeerOs::Windows, PeerOs::Mac, PeerOs::Linux, PeerOs::Unknown] {

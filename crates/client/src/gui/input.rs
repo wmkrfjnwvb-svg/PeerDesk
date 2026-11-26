@@ -1,6 +1,8 @@
 //! 把观看窗口收到的 egui 事件翻译成发给被控端的输入事件。
 //!
 //! - 键盘按物理键位发送（HID 用途码），被控端按它自己的键盘布局出字；
+//! - 修饰键一一对应，跨系统也不对调：Control ↔ Ctrl，Option ↔ Alt，Command ↔ Win 键（HID 的 GUI）。
+//!   Mac 控制 Windows 时复制按 Control+C（和在 Windows 上一样），Command+C 发过去是 Win+C；
 //! - 输入法上屏的文字作为 [`InputEvent::Text`] 发送，组字过程中的按键不发；
 //! - 鼠标位置按显示出来的画面归一化，画面外的移动和按下不发；
 //! - 窗口失去焦点时发 [`InputEvent::ReleaseAll`]，避免对端按键卡住。
@@ -12,7 +14,6 @@ use eframe::egui::{
 };
 use num_traits::ToPrimitive;
 use peerdesk_core::input::{InputEvent, MAX_TEXT_LEN};
-use peerdesk_core::proto::PeerOs;
 
 use super::coords::normalize;
 use super::keys::{hid_of, MODIFIERS};
@@ -71,34 +72,6 @@ pub fn split_text(text: &str) -> Vec<String> {
         parts.push(current);
     }
     parts
-}
-
-/// 跨系统的修饰键对调：Windows、Linux 的 Ctrl 相当于 macOS 的 Command。
-///
-/// - 本机不是 macOS、对端是 macOS：Ctrl ↔ Command（在 Windows 上按 Ctrl+C，Mac 上就是 Command+C 复制）；
-/// - 本机是 macOS、对端不是：Command ↔ Ctrl（在 Mac 上按 Command+V，Windows 上就是 Ctrl+V）；
-/// - 两边一样或不知道对端是什么系统：不变。
-///
-/// 对调而不是单向映射：对端原来的那个键（Mac 的 Control、Windows 的 Win 键）仍然按得到。
-#[must_use]
-pub fn swap_ctrl_and_command(event: InputEvent, local: PeerOs, peer: PeerOs) -> InputEvent {
-    let local_mac = local == PeerOs::Mac;
-    let peer_mac = peer == PeerOs::Mac;
-    if local_mac == peer_mac || peer == PeerOs::Unknown || local == PeerOs::Unknown {
-        return event;
-    }
-    let InputEvent::Key { code, down } = event else {
-        return event;
-    };
-    // 左 Ctrl 0xE0 ↔ 左 GUI 0xE3，右 Ctrl 0xE4 ↔ 右 GUI 0xE7
-    let code = match code {
-        0xE0 => 0xE3,
-        0xE3 => 0xE0,
-        0xE4 => 0xE7,
-        0xE7 => 0xE4,
-        other => other,
-    };
-    InputEvent::Key { code, down }
 }
 
 impl InputState {
@@ -238,6 +211,17 @@ impl InputState {
                 }
                 let Some(code) = hid_of(key) else { return };
                 if !*pressed {
+                    // 本机剪贴板里没有文字（只有文件或图片）时，egui-winit 把粘贴快捷键的按下整个吞掉，
+                    // 不产生任何事件，只有抬起会到这里。抬起时补一次按下，否则复制了文件或图片以后
+                    // 在远程按粘贴没有反应。
+                    let swallowed_paste = key == Key::V
+                        && modifiers.command
+                        && !self.composing
+                        && !self.keys.contains(&code);
+                    if swallowed_paste {
+                        self.sync_modifiers(*modifiers, &mut out.events);
+                        self.key_down(code, &mut out.events);
+                    }
                     self.key_up(code, &mut out.events);
                 } else if !self.composing {
                     self.sync_modifiers(*modifiers, &mut out.events);
@@ -246,6 +230,7 @@ impl InputState {
             }
             // 复制、剪切、粘贴的快捷键被 egui 截成了专门的事件，按下的那个键要补上；
             // 抬起时仍是普通的按键事件。粘贴用的是被控端自己的剪贴板。
+            // 修饰键照当时按着的发：Mac 上截的是 Command+C，发出去是 GUI+C（对方的 Win+C），不换成 Ctrl。
             Event::Copy => self.shortcut(Key::C, frame_modifiers, &mut out.events),
             Event::Cut => self.shortcut(Key::X, frame_modifiers, &mut out.events),
             Event::Paste(_) => self.shortcut(Key::V, frame_modifiers, &mut out.events),
@@ -418,56 +403,65 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_and_command_swap_between_mac_and_others() {
-        let key = |code, down| InputEvent::Key { code, down };
-        let swap = |e, l, p| swap_ctrl_and_command(e, l, p);
-        // Windows 控制 Mac：Ctrl+C → Command+C；Win 键 → Control
-        assert_eq!(
-            swap(key(0xE0, true), PeerOs::Windows, PeerOs::Mac),
-            key(0xE3, true)
+    fn modifiers_map_one_to_one_without_swapping() {
+        // Mac 上按 Command+C：egui 截成 Copy，发出去是 GUI（对方的 Win 键）+C，不是 Ctrl+C
+        let mut s = InputState::new();
+        let cmd = Modifiers::MAC_CMD | Modifiers::COMMAND;
+        let t = s.translate(&[Event::Copy], cmd, None);
+        assert_eq!(t.events, vec![down(0xE3), down(0x06)]);
+        let t = s.translate(&[key(Key::C, false)], Modifiers::NONE, None);
+        assert_eq!(t.events, vec![up(0x06), up(0xE3)]);
+        // Mac 上按 Control+C：是普通按键，发出去是 Ctrl+C（Windows 上的复制）
+        let ev = Event::Key {
+            key: Key::C,
+            physical_key: Some(Key::C),
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::CTRL,
+        };
+        let t = s.translate(&[ev], Modifiers::CTRL, None);
+        assert_eq!(t.events, vec![down(0xE0), down(0x06)]);
+        // Option 是 Alt
+        let mut s = InputState::new();
+        let t = s.translate(&[], Modifiers::ALT, None);
+        assert_eq!(t.events, vec![down(0xE2)]);
+    }
+
+    #[test]
+    fn a_paste_swallowed_by_egui_is_sent_on_release() {
+        let release = |modifiers| Event::Key {
+            key: Key::V,
+            physical_key: Some(Key::V),
+            pressed: false,
+            repeat: false,
+            modifiers,
+        };
+        // 本机剪贴板里只有文件：按下 Ctrl+V 没有任何事件，只有抬起。补上按下，再抬起
+        let mut s = InputState::new();
+        let t = s.translate(&[], Modifiers::COMMAND | Modifiers::CTRL, None);
+        assert_eq!(t.events, vec![down(0xE0)]);
+        let ctrl = Modifiers::COMMAND | Modifiers::CTRL;
+        let t = s.translate(&[release(ctrl)], ctrl, None);
+        assert_eq!(t.events, vec![down(0x19), up(0x19)]);
+        // Mac 上是 Command+V：发出去是 GUI+V
+        let mut s = InputState::new();
+        let cmd = Modifiers::MAC_CMD | Modifiers::COMMAND;
+        let t = s.translate(&[release(cmd)], cmd, None);
+        assert_eq!(t.events, vec![down(0xE3), down(0x19), up(0x19)]);
+        // 正常的粘贴（剪贴板里有文字，egui 给了 Paste）：抬起时不重复
+        let mut s = InputState::new();
+        let t = s.translate(&[Event::Paste("x".into()), release(ctrl)], ctrl, None);
+        assert_eq!(t.events, vec![down(0xE0), down(0x19), up(0x19)]);
+        // 没按着命令键的 V 抬起（获得焦点前就按着）、组字时：不补
+        let mut s = InputState::new();
+        let t = s.translate(&[release(Modifiers::NONE)], Modifiers::NONE, None);
+        assert!(t.events.is_empty());
+        let t = s.translate(
+            &[Event::Ime(ImeEvent::Preedit("n".into())), release(ctrl)],
+            Modifiers::NONE,
+            None,
         );
-        assert_eq!(
-            swap(key(0xE4, false), PeerOs::Windows, PeerOs::Mac),
-            key(0xE7, false)
-        );
-        assert_eq!(
-            swap(key(0xE3, true), PeerOs::Linux, PeerOs::Mac),
-            key(0xE0, true)
-        );
-        // Mac 控制 Windows：Command → Ctrl
-        assert_eq!(
-            swap(key(0xE3, true), PeerOs::Mac, PeerOs::Windows),
-            key(0xE0, true)
-        );
-        assert_eq!(
-            swap(key(0xE7, true), PeerOs::Mac, PeerOs::Linux),
-            key(0xE4, true)
-        );
-        // 其他键、同系统、不知道对端：不变
-        assert_eq!(
-            swap(key(0x06, true), PeerOs::Windows, PeerOs::Mac),
-            key(0x06, true)
-        );
-        assert_eq!(
-            swap(key(0xE0, true), PeerOs::Windows, PeerOs::Linux),
-            key(0xE0, true)
-        );
-        assert_eq!(
-            swap(key(0xE0, true), PeerOs::Mac, PeerOs::Mac),
-            key(0xE0, true)
-        );
-        assert_eq!(
-            swap(key(0xE0, true), PeerOs::Windows, PeerOs::Unknown),
-            key(0xE0, true)
-        );
-        assert_eq!(
-            swap(key(0xE0, true), PeerOs::Unknown, PeerOs::Mac),
-            key(0xE0, true)
-        );
-        assert_eq!(
-            swap(InputEvent::ReleaseAll, PeerOs::Windows, PeerOs::Mac),
-            InputEvent::ReleaseAll
-        );
+        assert!(t.events.is_empty());
     }
 
     #[test]

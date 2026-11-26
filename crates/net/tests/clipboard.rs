@@ -2,11 +2,12 @@
 #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use peerdesk_core::clipboard::{pack_files, Clip, ClipKind, Limits, PackedFile};
 use peerdesk_core::crypto::Policy;
+use peerdesk_core::input::InputEvent;
 use peerdesk_core::proto::Caps;
 use peerdesk_core::session::SessionConfig;
 use peerdesk_net::clipsync::{ClipNote, ClipboardHandle, MemClipboard};
@@ -18,7 +19,7 @@ use tokio::sync::mpsc;
 
 struct NoInput;
 impl InputSink for NoInput {
-    fn inject(&mut self, _: &peerdesk_core::input::InputEvent) {}
+    fn inject(&mut self, _: &InputEvent) {}
 }
 
 fn session(id: &Identity, caps: Caps) -> SessionConfig {
@@ -55,6 +56,62 @@ async fn session_with<F, Fut>(
     F: FnOnce(Arc<MemClipboard>, Arc<MemClipboard>) -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
+    session_with_input(
+        host_caps,
+        host_allows,
+        host_has_clipboard,
+        |_| Box::new(NoInput),
+        |host, ctrl, _input| script(host, ctrl),
+    )
+    .await;
+}
+
+/// 被控端收到的按键，连同收到那一刻被控端剪贴板里的内容。
+type Typed = Arc<Mutex<Vec<(InputEvent, Option<Clip>)>>>;
+
+/// 记下收到的按键和当时剪贴板内容的被控端输入（不动真的键鼠）。
+struct Recorder {
+    clip: Arc<MemClipboard>,
+    typed: Typed,
+}
+impl InputSink for Recorder {
+    fn inject(&mut self, event: &InputEvent) {
+        if matches!(event, InputEvent::Key { .. }) {
+            let now = self.clip.get();
+            self.typed.lock().unwrap().push((event.clone(), now));
+        }
+    }
+}
+
+/// 等被控端收到 `n` 个按键。
+async fn typed_n(typed: &Typed, n: usize) -> Vec<(InputEvent, Option<Clip>)> {
+    let start = Instant::now();
+    loop {
+        let got = typed.lock().unwrap().clone();
+        if got.len() >= n {
+            return got;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(8),
+            "按键没有到达被控端：{}",
+            got.len()
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// 同上，另外给出控制端的输入通道；`sink` 用被控端的剪贴板造出被控端的输入。
+async fn session_with_input<S, F, Fut>(
+    host_caps: Caps,
+    host_allows: bool,
+    host_has_clipboard: bool,
+    sink: S,
+    script: F,
+) where
+    S: FnOnce(Arc<MemClipboard>) -> Box<dyn InputSink>,
+    F: FnOnce(Arc<MemClipboard>, Arc<MemClipboard>, mpsc::Sender<InputEvent>) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
     let any: SocketAddr = ([127, 0, 0, 1], 0).into();
     let (host_id, ctrl_id) = (Identity::generate().unwrap(), Identity::generate().unwrap());
     let policy = Policy::recommended();
@@ -77,17 +134,22 @@ async fn session_with<F, Fut>(
         host_link,
         opts,
         Box::new(DemoDesktop::new(320, 180, 1)),
-        Box::new(NoInput),
+        sink(host_clip.clone()),
     ));
-    let os_report = Arc::new(std::sync::Mutex::new(None));
+    let os_report = Arc::new(Mutex::new(None));
     let probe = controller::EstablishedHook(Arc::new(|_, _| {}));
     assert_eq!(format!("{probe:?}"), "EstablishedHook");
     let seen_os = Arc::clone(&os_report);
-    let (tx, rx) = mpsc::channel(4);
+    let (tx, rx) = mpsc::channel(64);
     let ctrl = tokio::spawn(controller::run(
         ctrl_link,
         ControllerOptions {
-            session: session(&ctrl_id, Caps::CLIPBOARD.with(Caps::CLIPBOARD_FILES)),
+            session: session(
+                &ctrl_id,
+                Caps::CLIPBOARD
+                    .with(Caps::CLIPBOARD_FILES)
+                    .with(Caps::CLIPBOARD_ACK),
+            ),
             deadline_us: 200_000,
             duration: None,
             clipboard: Some(ClipboardHandle(ctrl_clip.clone())),
@@ -115,7 +177,7 @@ async fn session_with<F, Fut>(
             "测试电脑 01".into()
         ))
     );
-    script(host_clip, ctrl_clip).await;
+    script(host_clip, ctrl_clip, tx.clone()).await;
     drop(tx);
     ctrl.abort();
     let _ = ctrl.await;
@@ -324,5 +386,107 @@ async fn a_large_copy_survives_writes_that_take_longer_than_a_poll() {
         ctrl.copy(after.clone());
         arrives(&host, &after).await;
     })
+    .await;
+}
+
+const fn key(code: u16, down: bool) -> InputEvent {
+    InputEvent::Key { code, down }
+}
+
+/// Ctrl+V 的四个按键事件。
+const CTRL_V: [InputEvent; 4] = [
+    key(0xE0, true),
+    key(0x19, true),
+    key(0x19, false),
+    key(0xE0, false),
+];
+
+/// 产品负责人报的问题（Mac 上复制文件，马上到 Windows 里粘贴，粘不出来）的时序：
+/// 输入走数据报，剪贴板内容要先被轮询到（最多 100 ms）、再读盘、传输、解包，粘贴键先到。
+/// 现在粘贴键等内容进了对方剪贴板（对方回确认）再发。
+#[tokio::test(flavor = "multi_thread")]
+async fn a_paste_right_after_a_copy_pastes_the_new_content() {
+    let typed = Typed::default();
+    let seen = Arc::clone(&typed);
+    session_with_input(
+        Caps::CLIPBOARD
+            .with(Caps::CLIPBOARD_FILES)
+            .with(Caps::CLIPBOARD_ACK),
+        true,
+        true,
+        move |clip| Box::new(Recorder { clip, typed: seen }),
+        |host, ctrl, input| async move {
+            // 文字：复制后马上粘贴（连轮询都还没轮到）
+            let text = Clip::text("刚复制的文字");
+            ctrl.copy(text.clone());
+            for event in CTRL_V {
+                input.send(event).await.unwrap();
+            }
+            let got = typed_n(&typed, 4).await;
+            let keys: Vec<InputEvent> = got.iter().map(|(e, _)| e.clone()).collect();
+            assert_eq!(keys, CTRL_V, "按键顺序不能变");
+            assert_eq!(got[1].1, Some(text), "按下 V 时新内容已经在对方剪贴板里");
+
+            // 5 MB 的文件：同样
+            let files = packed(&[("报告/a.txt", 10), ("视频.mp4", 5 << 20)]);
+            ctrl.copy(files.clone());
+            for event in CTRL_V {
+                input.send(event).await.unwrap();
+            }
+            let got = typed_n(&typed, 8).await;
+            assert_eq!(got[5].0, key(0x19, true));
+            assert_eq!(got[5].1, Some(files.clone()));
+            assert_eq!(host.get(), Some(files.clone()));
+
+            // 没有新复制的内容：粘贴键不耽搁（不到提示的时间）
+            let start = Instant::now();
+            for event in CTRL_V {
+                input.send(event).await.unwrap();
+            }
+            typed_n(&typed, 12).await;
+            let took = start.elapsed();
+            assert!(took < Duration::from_millis(300), "{took:?}");
+
+            // 复制的内容太大、不同步：粘贴键不白等
+            ctrl.copy_too_large(ClipKind::Files, 25 << 20);
+            let start = Instant::now();
+            for event in CTRL_V {
+                input.send(event).await.unwrap();
+            }
+            let got = typed_n(&typed, 16).await;
+            let took = start.elapsed();
+            assert!(took < Duration::from_secs(1), "{took:?}");
+            assert_eq!(got[13].1, Some(files));
+        },
+    )
+    .await;
+}
+
+/// 被控端是不回确认的老版本：粘贴键等内容写进流里就发（比原来晚，但不保证对方已经写进剪贴板），
+/// 不会卡住。
+#[tokio::test(flavor = "multi_thread")]
+async fn pastes_still_go_through_to_a_peer_without_acks() {
+    let typed = Typed::default();
+    let seen = Arc::clone(&typed);
+    session_with_input(
+        Caps::CLIPBOARD,
+        true,
+        true,
+        move |clip| Box::new(Recorder { clip, typed: seen }),
+        |host, ctrl, input| async move {
+            let text = Clip::text("old peer");
+            ctrl.copy(text.clone());
+            let start = Instant::now();
+            for event in CTRL_V {
+                input.send(event).await.unwrap();
+            }
+            let got = typed_n(&typed, 4).await;
+            let took = start.elapsed();
+            assert!(took < Duration::from_secs(1), "{took:?}");
+            let keys: Vec<InputEvent> = got.iter().map(|(e, _)| e.clone()).collect();
+            assert_eq!(keys, CTRL_V);
+            arrives(&host, &text).await;
+        },
+    )
     .await;
 }

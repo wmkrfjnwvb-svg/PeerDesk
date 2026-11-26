@@ -346,19 +346,35 @@ pub async fn run(
     }
 
     // 剪贴板同步：由控制端打开专用的流。对方是不支持剪贴板的老版本时不开。
-    let clip_task = match opts.clipboard.clone().filter(|_| caps.has(Caps::CLIPBOARD)) {
+    // 粘贴键等刚复制的内容到了对方再发（输入走数据报，会比剪贴板内容先到，见 clipsync 模块开头）。
+    let (clip_task, paste_gate) = match opts.clipboard.clone().filter(|_| caps.has(Caps::CLIPBOARD))
+    {
         Some(clipboard) => {
             let (mut send, recv) = link.open_stream().await?;
             write_kind(&mut send, StreamKind::Clipboard).await?;
-            Some(tokio::spawn(crate::clipsync::run(
+            let paste = crate::clipsync::PasteSync::new();
+            let sync = tokio::spawn(crate::clipsync::run(
                 send,
                 recv,
-                clipboard.0,
+                Arc::clone(&clipboard.0),
                 peerdesk_core::clipboard::Limits::DEFAULT,
-                caps.has(Caps::CLIPBOARD_FILES),
-            )))
+                crate::clipsync::SyncOptions {
+                    files: caps.has(Caps::CLIPBOARD_FILES),
+                    ack: caps.has(Caps::CLIPBOARD_ACK),
+                    paste: Some(paste.clone()),
+                },
+            ));
+            let (gated_tx, gated_rx) = mpsc::channel(1024);
+            let gate = tokio::spawn(crate::clipsync::gate_pastes(
+                input,
+                gated_tx,
+                paste,
+                clipboard.0,
+            ));
+            input = gated_rx;
+            (Some(sync), Some(gate))
         }
-        None => None,
+        None => (None, None),
     };
 
     // 画面区域：变了就写给被控端（第一次写时开流）。一开始就发一次当前值。
@@ -728,6 +744,9 @@ pub async fn run(
         task.abort();
     }
     if let Some(task) = clip_task {
+        task.abort();
+    }
+    if let Some(task) = paste_gate {
         task.abort();
     }
     let rtt = link.rtt();

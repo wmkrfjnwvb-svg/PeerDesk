@@ -92,6 +92,10 @@ impl SystemClipboard for SystemClip {
         {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
+            // 复制的文件也算进去：有的文件管理器复制文件时不带文本，只看文本和图片就发现不了
+            if let Ok(paths) = self.clipboard().get().file_list() {
+                paths.hash(&mut h);
+            }
             match self.clipboard().get_text() {
                 Ok(text) => text.hash(&mut h),
                 // 没有文本时看图片的尺寸和开头的像素（读整张图太贵）
@@ -121,16 +125,39 @@ impl SystemClipboard for SystemClip {
         if let Ok(paths) = board.get().file_list() {
             if !paths.is_empty() {
                 drop(board);
-                return Some(match pack_paths(&paths, FILES_LIMIT) {
-                    Ok(data) => Copied::Clip(Clip {
-                        kind: ClipKind::Files,
-                        data,
-                    }),
-                    Err(size) => Copied::TooLarge {
-                        kind: ClipKind::Files,
-                        size,
-                    },
-                });
+                peerdesk_net::note!(
+                    info,
+                    "剪贴板：本机复制了 {} 个文件或文件夹，第一个是 {:?}",
+                    paths.len(),
+                    paths.first()
+                );
+                let packed = match pack_paths(&paths, FILES_LIMIT) {
+                    Ok(packed) => packed,
+                    Err(size) => {
+                        return Some(Copied::TooLarge {
+                            kind: ClipKind::Files,
+                            size,
+                        })
+                    }
+                };
+                // 读不了的、名字对方不能用的：写进日志，并告诉用户（不能悄悄少了文件）
+                for (path, why) in &packed.skipped {
+                    peerdesk_net::note!(warn, "剪贴板：{path:?} 没有同步：{why}");
+                }
+                if !packed.skipped.is_empty() {
+                    (self.on_note)(ClipNote::FilesSkipped {
+                        skipped: u32::try_from(packed.skipped.len()).unwrap_or(u32::MAX),
+                        sent: packed.sent,
+                    });
+                }
+                // 一个都没读出来：没有可同步的（发一份空的过去，对方的剪贴板只会被清掉）
+                if packed.sent == 0 {
+                    return None;
+                }
+                return Some(Copied::Clip(Clip {
+                    kind: ClipKind::Files,
+                    data: packed.data,
+                }));
             }
         }
         // 同时有文本和图片时（例如从网页复制）用文本
@@ -181,7 +208,17 @@ impl SystemClipboard for SystemClip {
                             .map_or(0, |d| d.as_millis())
                     ));
                 let top = unpack_to(&clip.data, &dir)?;
-                board.set().file_list(&top).map_err(|e| e.to_string())
+                peerdesk_net::note!(
+                    info,
+                    "剪贴板：收到的 {} 个文件或文件夹解到 {dir:?}，放进剪贴板",
+                    top.len()
+                );
+                // 先清空再放：arboard 3.7 在 Windows 上放文件列表时不清空剪贴板（放文字、图片时会清），
+                // 之前复制的文字会留在里面，和文件并存，有的程序粘贴出来的是旧文字。
+                board.clear().map_err(|e| format!("清空剪贴板失败：{e}"))?;
+                board.set().file_list(&top).map_err(|e| {
+                    format!("把文件放进剪贴板失败（{} 个，在 {dir:?}）：{e}", top.len())
+                })
             }
         }
     }

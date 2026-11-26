@@ -213,6 +213,13 @@ pub enum ClipMsg {
         /// 大小。
         size: u64,
     },
+    /// 接收方处理完了一份内容（写进了自己的剪贴板，或者写不进去、放弃了）。只发给声明了
+    /// [`Caps::CLIPBOARD_ACK`](crate::proto::Caps::CLIPBOARD_ACK) 的对端。控制端据此知道
+    /// 什么时候可以把粘贴键发过去（输入走数据报，会比剪贴板内容先到）。
+    Applied {
+        /// 处理完的那一份的序号。
+        seq: u32,
+    },
 }
 
 impl ClipMsg {
@@ -232,6 +239,9 @@ impl ClipMsg {
             }
             Self::TooLarge { seq, kind, size } => {
                 body.u8(4).u32(*seq).u8(kind.id()).u64(*size);
+            }
+            Self::Applied { seq } => {
+                body.u8(5).u32(*seq);
             }
         }
         let body = body.into_vec();
@@ -267,6 +277,7 @@ impl ClipMsg {
                 kind: ClipKind::from_id(r.u8()?)?,
                 size: r.u64()?,
             },
+            5 => Self::Applied { seq: r.u32()? },
             other => return Err(Error::UnknownMessage(other)),
         })
     }
@@ -411,6 +422,12 @@ impl Sender {
     pub fn pending(&self) -> usize {
         self.queue.len()
     }
+
+    /// 最近一份内容的序号（还没发过时为 0）。
+    #[must_use]
+    pub const fn seq(&self) -> u32 {
+        self.seq
+    }
 }
 
 /// 接收方得到的结果。
@@ -524,6 +541,8 @@ impl Receiver {
                 self.current = None;
                 Ok(Some(Received::TooLarge { kind, size }))
             }
+            // 对方对我们发出去的内容的确认，和接收无关（由同步循环处理）
+            ClipMsg::Applied { .. } => Ok(None),
         }
     }
 }
@@ -800,6 +819,22 @@ mod tests {
         w.on_msg(offer(u32::MAX, 1)).unwrap();
         w.on_msg(offer(0, 1)).unwrap();
         assert_eq!(w.current.as_ref().map(|c| c.seq), Some(0));
+    }
+
+    #[test]
+    fn applied_ack_round_trips_and_is_ignored_by_the_receiver() {
+        let mut s = Sender::new(Limits::DEFAULT);
+        assert_eq!(s.seq(), 0);
+        assert_eq!(s.offer(&Clip::text("a")), Offered::Sending);
+        assert_eq!(s.seq(), 1);
+        let ack = ClipMsg::Applied { seq: s.seq() };
+        let mut d = Deframer::default();
+        assert_eq!(d.push(&ack.frame()).unwrap(), vec![ack.clone()]);
+        let mut r = Receiver::new(Limits::DEFAULT);
+        assert_eq!(r.on_msg(ack).unwrap(), None);
+        // 确认不影响正在收的内容
+        let got = deliver(&drain(&mut s), &mut r, 5);
+        assert_eq!(got, vec![Received::Clip(Clip::text("a"))]);
     }
 
     #[test]
