@@ -803,8 +803,12 @@ impl RateEstimator for ClassicV1 {
         // 丢包只有在排队也一直在时才算拥塞；单独的随机丢包交给纠错和重传，不降码率。
         // 发送端是不是在用满码率（没用满时送达速率只是“要发的量”，不代表链路能力）。看发送端实际发了多少：
         // 链路突然变窄时送达速率也低，按它判断会把真拥塞当成没用满、反应变慢。不知道发了多少时按送达速率。
-        let using =
+        let sending =
             obs.sent_bps.unwrap_or(recv_bps).saturating_mul(10) >= self.rate_bps.saturating_mul(6);
+        // 还有不少数据在路上（超过当前码率下四分之一个往返的量）也算用满：发送端是被拥塞拦着没发新帧
+        // （发不出去，不是没东西发）。不加这条时窄带轨迹 ms-05729 卡顿 3 次合计 19 → 22
+        let backlog = self.rate_bps.saturating_mul(obs.rtt_us.max(20_000)) / 8_000_000 / 4;
+        let using = sending || obs.in_flight > backlog;
         // 排队读数只在反馈不断档时才算数：和上一份反馈相隔不超过 [`CONTIGUOUS_US`]，说明这段时间包一直在到，
         // 排队读数是链路在忙时量的，这时的送达速率也就是链路能力，按它降不会过头。断档的那份（画面静止时零星的小包）
         // 不算：它的排队读数是 Wi-Fi 省电（空闲后网卡要醒）的延迟，那份反馈里只有一两个包、送达速率被空闲时间稀释。
@@ -1351,6 +1355,16 @@ mod tests {
         );
         feed(&mut v, &mut t, 30_000, 0);
         assert_eq!(v.rate_bps(), 7_500_000);
+        // 发出的少、但很多数据还在路上（被拥塞拦着）：算用满，一份就按送达速率降
+        let mut w = ClassicV1::new(Profile::STABLE, 2_000_000, 100_000, 50_000_000);
+        let busy = Observation {
+            sent_bps: Some(100_000),
+            in_flight: 60_000,
+            ..obs(fb(30_000, 0, 25_000), flat)
+        };
+        w.on_observation(Time(20_000), &busy);
+        w.on_observation(Time(40_000), &busy);
+        assert_eq!(w.rate_bps(), 170_000);
     }
 
     #[test]
