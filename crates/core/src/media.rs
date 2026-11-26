@@ -272,6 +272,8 @@ pub struct FrameJob {
     pub view: Option<(u16, u16)>,
     /// 码率估计过期了（见 [`VideoEncoder::set_rate_stale`]）。
     pub rate_stale: bool,
+    /// 采集时刻：调用 [`MediaSender::start_frame`] 的时刻（产品里紧跟在抓屏之后）。
+    pub captured: Time,
 }
 
 /// 在编码器所在的地方执行一个任务。返回编码结果，以及之后画面不变时还要不要继续交画面（补清晰、恢复）。
@@ -371,6 +373,8 @@ pub struct MediaSender {
     pending_probe: Option<ProbeCluster>,
     /// 发出的包，等到达报告对账（见 [`crate::cc::report`]）。
     history: SendHistory,
+    /// 给每一帧带上采集时刻（见 [`Self::set_capture_stamps`]）。
+    capture_stamps: bool,
 }
 
 impl std::fmt::Debug for MediaSender {
@@ -432,6 +436,7 @@ impl MediaSender {
             probes: 0,
             pending_probe: None,
             history: SendHistory::new(),
+            capture_stamps: false,
             scale: if codec == Codec::H264 {
                 ScalePolicy::new()
             } else {
@@ -455,6 +460,12 @@ impl MediaSender {
     #[must_use]
     pub const fn reports(&self) -> bool {
         self.reports
+    }
+
+    /// 给每一帧带上采集时刻（8 字节，见 [`crate::video::stamp_capture`]），控制端的音画同步和播放缓冲用。
+    /// 默认不带；握手时双方都支持 [`crate::proto::Caps::AV_SYNC`] 才打开（老版本不认带采集时刻的帧）。
+    pub const fn set_capture_stamps(&mut self, on: bool) {
+        self.capture_stamps = on;
     }
 
     /// 一个数据报交给了网络（`seq` 是数据报头里的序号）。到达报告据此对账。
@@ -762,6 +773,7 @@ impl MediaSender {
             scale_permille,
             view: self.view,
             rate_stale: self.rate_stale(now),
+            captured: now,
         }
     }
 
@@ -863,7 +875,12 @@ impl MediaSender {
             .saturating_sub(VIDEO_HEADER_LEN)
             // 按较长的 RS 校验分片头留出空间（异或的短 2 字节，不另算）
             .saturating_sub(RS_PARITY_PREFIX);
-        let mut packets = fragment(frame_id, ref_frame, &encoded.payload, max)?;
+        let mut packets = if self.capture_stamps {
+            let stamped = crate::video::stamp_capture(&encoded.payload, job.captured.micros());
+            fragment(frame_id, ref_frame, &stamped, max)?
+        } else {
+            fragment(frame_id, ref_frame, &encoded.payload, max)?
+        };
         let data_count = packets.len();
         let parity = match self.fec {
             Fec::Xor => parity_for(&packets, self.fec_permille()),
@@ -1219,6 +1236,8 @@ pub struct DecodeJob {
     pub header: FrameHeader,
     /// 码流。
     pub data: Vec<u8>,
+    /// 采集时刻（被控端时钟，微秒）；对方没带（老版本，或者没协商音画同步）时为 `None`。
+    pub capture_us: Option<u64>,
 }
 
 /// 解码线程上的解码器。自己也记着有没有失败过：失败之后、关键帧到来之前的帧都不解，
@@ -1503,7 +1522,7 @@ impl MediaReceiver {
             .stats
             .video_bytes
             .saturating_add(u64::try_from(frame.data.len()).unwrap_or(u64::MAX));
-        let Ok((fh, data)) = FrameHeader::parse(&frame.data) else {
+        let Ok((fh, capture_us, data)) = FrameHeader::parse_stamped(&frame.data) else {
             self.stats.bad = self.stats.bad.saturating_add(1);
             self.log.advance(frame.frame_id);
             return None;
@@ -1523,6 +1542,7 @@ impl MediaReceiver {
             frame_id: frame.frame_id,
             header: fh,
             data: data.to_vec(),
+            capture_us,
         })
     }
 
@@ -2222,6 +2242,50 @@ mod tests {
             .unwrap()
             .is_empty());
         assert!(!remote.wants_frame());
+    }
+
+    #[test]
+    fn capture_stamps_reach_the_decode_job_only_when_turned_on() {
+        let send = |stamps: bool| {
+            let mut tx = MediaSender::new(cfg(), Box::new(FakeEncoder::default()));
+            tx.set_capture_stamps(stamps);
+            let mut rx = MediaReceiver::detached(Time::ZERO, 250_000);
+            let out = tx
+                .on_frame(Time(123_456), &Screen::new(8, 8, 7), true, 0)
+                .unwrap();
+            let bytes: usize = out.iter().map(|o| o.body.len()).sum();
+            let mut jobs = Vec::new();
+            for (i, o) in out.iter().enumerate() {
+                let seq = u32::try_from(i).unwrap();
+                jobs.extend(
+                    rx.on_datagram_deferred(Time(130_000), Time(123_456), seq, o.flags, &o.body)
+                        .unwrap(),
+                );
+            }
+            (jobs, bytes, out)
+        };
+        // 默认不带：帧的字节和原来一样，解码任务里没有采集时刻
+        let (plain, plain_bytes, _) = send(false);
+        assert_eq!(plain[0].capture_us, None);
+        // 打开：采集时刻是交画面的时刻，码流不变
+        let (stamped, stamped_bytes, out) = send(true);
+        assert_eq!(stamped[0].capture_us, Some(123_456));
+        assert_eq!(
+            (stamped[0].header, &stamped[0].data),
+            (plain[0].header, &plain[0].data)
+        );
+        assert!(stamped_bytes > plain_bytes);
+        // 解码器在接收端里的一步式接口也照常解带采集时刻的帧
+        let mut rx = MediaReceiver::new(Time::ZERO, 250_000, Box::new(FakeDecoder::default()));
+        let mut shown = false;
+        for (i, o) in out.iter().enumerate() {
+            let seq = u32::try_from(i).unwrap();
+            shown |= rx
+                .on_datagram(Time(130_000), Time(123_456), seq, o.flags, &o.body)
+                .unwrap()
+                .is_some();
+        }
+        assert!(shown);
     }
 
     #[test]

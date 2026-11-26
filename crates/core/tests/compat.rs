@@ -166,6 +166,10 @@ fn feature_bits_are_stable_and_negotiated_away_for_old_peers() {
     assert_eq!(Caps::CLIPBOARD.0, 1 << 16);
     assert_eq!(Caps::AUDIO.0, 1 << 17);
     assert_eq!(Caps::CLIPBOARD_FILES.0, 1 << 18);
+    assert_eq!(Caps::AV_SYNC.0, 1 << 27);
+    // 对方没有音画同步（老版本）：交集里没有，画面帧和声音包保持老格式
+    let no_sync = Caps(Caps::ALL.0 & !Caps::AV_SYNC.0);
+    assert!(!Caps::ALL.common(no_sync).has(Caps::AV_SYNC));
     // 被控端的系统放在第 24–26 位，老版本收到也只看能力位
     use peerdesk_core::proto::PeerOs;
     for os in [PeerOs::Windows, PeerOs::Mac, PeerOs::Linux, PeerOs::Unknown] {

@@ -100,6 +100,7 @@ async fn session_with<F, Fut>(
             view: None,
             on_quality: None,
             audio: None,
+            playout_ms: None,
         },
         Box::new(CountSink::new()),
         rx,

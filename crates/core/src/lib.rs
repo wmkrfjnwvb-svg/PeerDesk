@@ -10,6 +10,7 @@
 //! - [`transport`]：视频帧的分片与按截止时间重组。
 //! - [`connect`] / [`probe`]：网络画像与直连方法规划、硬件档位。
 //! - [`region`] / [`cluster`]：区域优先的节点选择、服务端集群成员管理。
+//! - [`avsync`]：音画同步和画面的播放缓冲（看视频时用，默认关）。
 //! - [`input`]：输入事件与冗余传输。
 //! - [`file`]：文件传输协议与断点续传。
 //! - [`trace`]：业务链路追踪。
@@ -19,6 +20,7 @@
 pub mod adaptive;
 pub mod audio;
 pub mod auth;
+pub mod avsync;
 pub mod billing;
 pub mod browse;
 pub mod cc;

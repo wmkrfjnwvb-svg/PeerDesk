@@ -2,8 +2,8 @@
 #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
 
 use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use peerdesk_core::crypto::Policy;
 use peerdesk_core::proto::Caps;
@@ -11,7 +11,7 @@ use peerdesk_core::session::SessionConfig;
 use peerdesk_net::audio::{
     AudioCapture, AudioOut, CaptureHandle, PlaybackHandle, Recorder, ToneCapture,
 };
-use peerdesk_net::controller::{self, ControllerOptions};
+use peerdesk_net::controller::{self, ControllerOptions, ScreenSink};
 use peerdesk_net::demo::{CountSink, DemoDesktop};
 use peerdesk_net::host::{self, HostOptions, InputSink};
 use peerdesk_net::{Identity, Node};
@@ -64,6 +64,39 @@ async fn session_with_capture(
     host_caps: Caps,
     capture: Option<CaptureHandle>,
 ) -> (Arc<Recorder>, watch::Sender<bool>, impl FnOnce()) {
+    let (recorder, switch, stop, _) = session_full(
+        host_caps,
+        Caps::AUDIO,
+        capture,
+        None,
+        Box::new(CountSink::new()),
+    )
+    .await;
+    (recorder, switch, stop)
+}
+
+/// 记下每次显示画面的时刻。
+struct TimedSink(Arc<Mutex<Vec<Instant>>>);
+
+impl ScreenSink for TimedSink {
+    fn present(&mut self, _: &peerdesk_core::frame::Picture) {
+        self.0.lock().unwrap().push(Instant::now());
+    }
+}
+
+/// 跑一次会话：两端的能力、声音来源、播放延迟（音画同步）和画面去向都可以指定。
+async fn session_full(
+    host_caps: Caps,
+    ctrl_caps: Caps,
+    capture: Option<CaptureHandle>,
+    playout_ms: Option<watch::Receiver<u32>>,
+    sink: Box<dyn ScreenSink>,
+) -> (
+    Arc<Recorder>,
+    watch::Sender<bool>,
+    impl FnOnce(),
+    Arc<Mutex<Option<Caps>>>,
+) {
     let any: SocketAddr = ([127, 0, 0, 1], 0).into();
     let (host_id, ctrl_id) = (Identity::generate().unwrap(), Identity::generate().unwrap());
     let policy = Policy::recommended();
@@ -85,14 +118,19 @@ async fn session_with_capture(
     let recorder = Arc::new(Recorder::default());
     let (switch, on) = watch::channel(false);
     let (tx, rx) = mpsc::channel(4);
+    // 握手协商出的能力
+    let agreed = Arc::new(Mutex::new(None));
+    let seen = agreed.clone();
     let ctrl = tokio::spawn(controller::run(
         ctrl_link,
         ControllerOptions {
-            session: session(&ctrl_id, Caps::AUDIO),
+            session: session(&ctrl_id, ctrl_caps),
             deadline_us: 200_000,
             duration: None,
             clipboard: None,
-            on_established: None,
+            on_established: Some(controller::EstablishedHook(Arc::new(move |caps, _| {
+                *seen.lock().unwrap() = Some(caps);
+            }))),
             on_link: None,
             view: None,
             on_quality: None,
@@ -100,8 +138,9 @@ async fn session_with_capture(
                 playback: PlaybackHandle(recorder.clone()),
                 on,
             }),
+            playout_ms,
         },
-        Box::new(CountSink::new()),
+        sink,
         rx,
         None,
     ));
@@ -111,7 +150,7 @@ async fn session_with_capture(
         host_task.abort();
         drop((host_node, ctrl_node));
     };
-    (recorder, switch, stop)
+    (recorder, switch, stop, agreed)
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -180,5 +219,105 @@ async fn capture_that_ends_stops_the_sound_but_not_the_session() {
     let loud = frames.iter().filter(|f| energy(f) > 1e5).count();
     assert!((1..=20).contains(&loud), "有声音的帧 {loud}");
     assert!(frames.len() > loud, "来源结束后继续按时播放（静音）");
+    stop();
+}
+
+/// 音画同步用到的能力：声音加采集时刻。
+const SYNC_CAPS: Caps = Caps(Caps::AUDIO.0 | Caps::AV_SYNC.0);
+
+#[tokio::test(flavor = "multi_thread")]
+async fn playout_delay_holds_picture_and_sound_and_can_be_changed() {
+    let shown = Arc::new(Mutex::new(Vec::new()));
+    let (delay, delay_rx) = watch::channel(300u32);
+    let started = Instant::now();
+    let (recorder, switch, stop, agreed) = session_full(
+        SYNC_CAPS,
+        SYNC_CAPS,
+        Some(CaptureHandle(Arc::new(ToneCapture))),
+        Some(delay_rx),
+        Box::new(TimedSink(shown.clone())),
+    )
+    .await;
+    switch.send(true).unwrap();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(agreed.lock().unwrap().unwrap().has(Caps::AV_SYNC));
+    // 画面：第一幅等够了播放延迟才显示（关着时握手完几十毫秒就显示）
+    let times = shown.lock().unwrap().clone();
+    let first = times.first().unwrap().duration_since(started);
+    assert!(first >= Duration::from_millis(290), "第一幅画面 {first:?}");
+    assert!(times.len() >= 10, "只显示了 {} 幅", times.len());
+    // 声音：也等够了播放延迟才出声（按水位的话 100 ms 以内就出声），之后连续
+    let frames = recorder.frames();
+    let first_sound = frames.iter().position(|f| energy(f) > 1e5).unwrap();
+    assert!(first_sound >= 25, "第 {first_sound} 帧就出声了");
+    let silent_later = frames[first_sound..]
+        .iter()
+        .filter(|f| energy(f) < 1e5)
+        .count();
+    let played = frames.len() - first_sound;
+    assert!(
+        silent_later * 20 <= played,
+        "有声音以后出现 {silent_later}/{played} 帧静音"
+    );
+
+    // 中途关掉：压着的画面马上放出来，之后照常显示和播放
+    delay.send(0).unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let (pictures, sounds) = (shown.lock().unwrap().len(), recorder.frames().len());
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(shown.lock().unwrap().len() > pictures, "关掉以后画面停了");
+    let frames = recorder.frames();
+    assert!(frames.len() >= sounds + 30, "关掉以后声音停了");
+    assert!(frames.iter().rev().take(20).any(|f| energy(f) > 1e5));
+
+    // 再打开，然后界面把设置丢掉（窗口关了）：会话照常
+    delay.send(120).unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    drop(delay);
+    let pictures = shown.lock().unwrap().len();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(
+        shown.lock().unwrap().len() > pictures,
+        "设置丢掉以后画面停了"
+    );
+    stop();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn playout_delay_is_ignored_when_the_host_sends_no_capture_times() {
+    // 被控端是没有音画同步的老版本：播放延迟无效，声音照常按水位很快出声
+    let shown = Arc::new(Mutex::new(Vec::new()));
+    let (_delay, delay_rx) = watch::channel(400u32);
+    let (recorder, switch, stop, agreed) = session_full(
+        Caps::AUDIO,
+        SYNC_CAPS,
+        Some(CaptureHandle(Arc::new(ToneCapture))),
+        Some(delay_rx),
+        Box::new(TimedSink(shown.clone())),
+    )
+    .await;
+    switch.send(true).unwrap();
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let frames = recorder.frames();
+    let first_sound = frames.iter().position(|f| energy(f) > 1e5).unwrap();
+    assert!(first_sound <= 10, "开头等了 {first_sound} 帧才有声音");
+    assert!(!shown.lock().unwrap().is_empty());
+    assert!(!agreed.lock().unwrap().unwrap().has(Caps::AV_SYNC));
+    stop();
+
+    // 两端都支持，但这次会话没给播放延迟这个设置：不声明音画同步，被控端不带采集时刻（线上和以前一样）
+    let (recorder, switch, stop, agreed) = session_full(
+        SYNC_CAPS,
+        SYNC_CAPS,
+        Some(CaptureHandle(Arc::new(ToneCapture))),
+        None,
+        Box::new(CountSink::new()),
+    )
+    .await;
+    switch.send(true).unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let agreed = agreed.lock().unwrap().unwrap();
+    assert!(agreed.has(Caps::AUDIO) && !agreed.has(Caps::AV_SYNC));
+    assert!(recorder.frames().iter().any(|f| energy(f) > 1e5));
     stop();
 }

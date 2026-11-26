@@ -418,6 +418,9 @@ pub async fn serve(
     );
     crate::note!(info, "内容策略：{}", opts.policy.name);
     media.set_reports(caps.has(Caps::TRANSPORT_CC));
+    // 音画同步：对方也支持时，画面帧和声音包都带会话时钟的采集时刻（控制端打不打开播放缓冲由它自己定）
+    let av_sync = caps.has(Caps::AV_SYNC);
+    media.set_capture_stamps(av_sync);
     // 画面静止时定期探测链路（对端能测填充包的包串速率时）
     media.set_idle_probe(caps.has(Caps::PROBE_TRAIN));
     // 双方都支持 RS 纠错时用它（老版本只认异或）
@@ -533,7 +536,7 @@ pub async fn serve(
                                 let stopped = async move {
                                     let _ = clip_stopped.wait_for(|stop| *stop).await;
                                 };
-                                crate::audio::send(&link, audio.0.as_ref(), recv, stopped).await?;
+                                crate::audio::send(&link, audio.0.as_ref(), recv, stopped, av_sync).await?;
                                 drop(send);
                                 Ok(Vec::new())
                             }

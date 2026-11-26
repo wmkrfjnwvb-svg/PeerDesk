@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use peerdesk_core::audio::{
     loss_permille, AudioPacket, AudioStats, JitterBuffer, Play, Redundancy,
 };
+use peerdesk_core::avsync::AvSync;
 use peerdesk_core::proto::Channel;
 use peerdesk_media::audio::{
     merge_drop, AudioDecoder, AudioEncoder, DEFAULT_BPS, FRAME, FRAME_SAMPLES,
@@ -76,12 +77,19 @@ pub const REPORT_MS: u64 = 500;
 
 /// 被控端：采集、编码并发送，直到声音流关闭（控制端关掉声音）或 `stop` 完成（会话结束）。
 /// 控制端在声音流上每 [`REPORT_MS`] 报告一次丢包率（2 字节，千分比），据此决定带不带前一帧的副本。
+///
+/// `session_clock`：包里的采集时刻用会话时钟（和画面帧的采集时刻同一个时钟，控制端音画同步用；
+/// 握手时双方都有 [`Caps::AV_SYNC`] 才打开）。关着时和老版本一样从 0 开始每帧加 10 ms。
+///
+/// [`Caps::AV_SYNC`]: peerdesk_core::proto::Caps::AV_SYNC
 pub async fn send(
     link: &Link,
     capture: &dyn AudioCapture,
     mut reports: quinn::RecvStream,
     stop: impl std::future::Future<Output = ()>,
+    session_clock: bool,
 ) -> Result<(), NetError> {
+    let mut clock = session_clock.then(peerdesk_core::avsync::CaptureClock::default);
     let started = std::time::Instant::now();
     let mut redundancy = Redundancy::default();
     let mut report = Vec::with_capacity(2);
@@ -125,7 +133,9 @@ pub async fn send(
             .map_err(|e| NetError::Io(e.to_string()))?;
         let packet = AudioPacket {
             seq,
-            capture_us: u64::from(seq) * 10_000,
+            capture_us: clock.as_mut().map_or(u64::from(seq) * 10_000, |c| {
+                c.stamp(link.now().micros(), u64::from(seq), 10_000)
+            }),
             frame: frame.clone(),
             // 有丢包时带上前一帧：丢一个包时接收端用副本补回
             redundant: previous
@@ -176,17 +186,35 @@ impl Receiver {
         })
     }
 
-    /// 收到一个声音数据报（`now_us` 是本机时刻）。
-    pub fn on_datagram(&mut self, now_us: u64, payload: &[u8]) {
+    /// 收到一个声音数据报（`now_us` 是本机时刻）。返回包里的采集时刻（音画同步据此对时钟）；坏包返回 `None`。
+    pub fn on_datagram(&mut self, now_us: u64, payload: &[u8]) -> Option<u64> {
         match AudioPacket::decode(payload) {
-            Ok(packet) => self.jitter.push(now_us, packet),
-            Err(_) => self.bad = self.bad.saturating_add(1),
+            Ok(packet) => {
+                let capture_us = packet.capture_us;
+                self.jitter.push(now_us, packet);
+                Some(capture_us)
+            }
+            Err(_) => {
+                self.bad = self.bad.saturating_add(1);
+                None
+            }
         }
     }
 
     /// 每 10 ms 调用一次：取一帧解码播放。
     pub fn tick(&mut self) {
-        let pcm = match self.jitter.pop() {
+        self.tick_synced(0, None);
+    }
+
+    /// 每 10 ms 调用一次：取一帧解码播放。`sync` 不是 `None` 时（音画同步打开）按采集时刻的时间线播放，
+    /// 和画面对齐（`now_us` 是本机时刻）；否则和 [`Self::tick`] 一样按抖动缓冲的水位播放。
+    pub fn tick_synced(&mut self, now_us: u64, sync: Option<&AvSync>) {
+        let lead = sync.and_then(|s| s.lead_us(now_us, self.jitter.next_capture_us()?));
+        let play = match lead {
+            Some(lead) => self.jitter.pop_synced(lead),
+            None => self.jitter.pop(),
+        };
+        let pcm = match play {
             Play::Normal(frame) => self.decoder.decode(Some(&frame)),
             // 两帧都解码（解码器状态连续），再压成一帧
             Play::Accelerate(a, b) => self
@@ -343,6 +371,39 @@ mod tests {
         assert_eq!(rx.bad(), 2);
         assert!(rx.target_ms() >= peerdesk_core::audio::MIN_TARGET_MS);
         assert!(format!("{rx:?}").contains("Receiver"));
+    }
+
+    #[test]
+    fn synced_ticks_play_on_the_capture_timeline() {
+        let rec = Arc::new(Recorder::default());
+        let mut rx = Receiver::new(PlaybackHandle(rec.clone())).unwrap();
+        let mut sync = AvSync::new(100).unwrap();
+        let mut enc = AudioEncoder::new(DEFAULT_BPS).unwrap();
+        // 被控端时钟从 5 秒起，包 20 ms 到；每 10 ms 一拍
+        let mut first_sound = None;
+        for seq in 0..40u32 {
+            let now = u64::from(seq) * 10_000 + 20_000;
+            let frame = enc.encode(&[8000; FRAME_SAMPLES]).unwrap();
+            let p = AudioPacket {
+                seq,
+                capture_us: 5_000_000 + u64::from(seq) * 10_000,
+                frame,
+                redundant: vec![],
+            };
+            let capture = rx.on_datagram(now, &p.encode().unwrap()).unwrap();
+            sync.observe_sound(now, capture);
+            rx.tick_synced(now, Some(&sync));
+            let loud = rec.frames().last().unwrap().iter().any(|&s| s.abs() > 1000);
+            if loud && first_sound.is_none() {
+                first_sound = Some(now);
+            }
+        }
+        // 第 0 帧 20 ms 到，播放延迟 100 ms：120 ms 左右才出声（按水位的话 40 ms 就出声了）
+        let first = first_sound.unwrap();
+        assert!((110_000..=140_000).contains(&first), "{first}");
+        assert_eq!(rx.stats().concealed, 0, "{:?}", rx.stats());
+        // 坏包没有采集时刻
+        assert_eq!(rx.on_datagram(0, &[1]), None);
     }
 
     #[test]

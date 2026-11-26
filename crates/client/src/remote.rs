@@ -739,6 +739,7 @@ async fn connect_session(
             view: None,
             on_quality: None,
             audio: None,
+            playout_ms: None,
         },
         Box::new(sink.clone()),
         input_rx,

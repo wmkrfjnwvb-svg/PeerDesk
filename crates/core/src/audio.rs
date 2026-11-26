@@ -10,6 +10,10 @@
 //!   缓冲见底就先不取（等水位回到目标）。
 //!
 //! 第一版加速、减速都按整帧做；时间伸缩（WSOLA，听不出来的加速/减速）在下一步做。
+//!
+//! 音画同步打开时（看视频用，见 [`crate::avsync`]）播放时刻不由水位定，而由采集时刻定：
+//! [`JitterBuffer::pop_synced`] 按“下一帧离它的播放时刻还有多久”决定正常播、减速还是加速，
+//! 这样声音和画面走同一条时间线。关着时走 [`JitterBuffer::pop`]，行为不变。
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -30,6 +34,11 @@ const WINDOW_US: u64 = 2_000_000;
 const QUANTILE_PERCENT: usize = 95;
 /// 冗余副本最多几个。
 pub const MAX_REDUNDANCY: usize = 2;
+/// 音画同步时声音离时间线多远才调整（微秒）：一帧。调整一次挪一帧，所以稳定后偏差不超过一帧
+/// （远小于能察觉的音画差：声音早 45 ms、晚 125 ms，ITU-R BT.1359）。
+pub const SYNC_BAND_US: i64 = 10_000;
+/// 音画同步时离时间线超过这么远（微秒）就不一帧一帧挪，直接等或者跳过去（刚打开同步、播放延迟改了）。
+pub const SYNC_JUMP_US: i64 = 60_000;
 
 /// 一个声音数据报。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,6 +147,8 @@ pub struct JitterBuffer {
     refilling: bool,
     /// 上一帧是不是减速插入的：最多隔一帧插一次，保证时间线一直在前进。
     decelerated_last: bool,
+    /// 最近一个包的（序号，采集时刻）：据此推算任意一帧的采集时刻（每帧 [`FRAME_MS`]）。
+    anchor: Option<(u32, u64)>,
     stats: AudioStats,
 }
 
@@ -158,6 +169,7 @@ impl JitterBuffer {
             target_ms: START_TARGET_MS,
             refilling: true,
             decelerated_last: false,
+            anchor: None,
             stats: AudioStats {
                 normal: 0,
                 concealed: 0,
@@ -208,6 +220,7 @@ impl JitterBuffer {
             self.arrivals.pop_front();
         }
         self.update_target();
+        self.anchor = Some((packet.seq, packet.capture_us));
 
         let mut insert = |seq: u32, data: Vec<u8>, redundant: bool| {
             if let Some(next) = self.next {
@@ -296,6 +309,99 @@ impl JitterBuffer {
         }
         if self.frames.is_empty() {
             // 见底：后面一帧都没有，补偿一帧后进入等待
+            self.stats.underruns = self.stats.underruns.saturating_add(1);
+            self.refilling = true;
+        }
+        self.stats.concealed = self.stats.concealed.saturating_add(1);
+        Play::Expand
+    }
+}
+
+impl JitterBuffer {
+    /// 接下来要播的那一帧：正在播时是下一帧，还没开始（或见底后在等）时是缓冲里最早的一帧。
+    fn upcoming(&self) -> Option<u32> {
+        if self.refilling {
+            self.frames.keys().next().copied()
+        } else {
+            self.next
+        }
+    }
+
+    /// 接下来要播的那一帧的采集时刻（被控端时钟，微秒），按最近一个包的采集时刻和序号推算。
+    /// 缓冲是空的、还没开始时为 `None`。音画同步据此算它的播放时刻（[`crate::avsync::AvSync::lead_us`]）。
+    #[must_use]
+    pub fn next_capture_us(&self) -> Option<u64> {
+        let (seq, capture_us) = self.anchor?;
+        let next = self.upcoming()?;
+        // 序号差按有符号算：下一帧通常比最近的包早几帧
+        let ahead = next.wrapping_sub(seq);
+        let frame_us = FRAME_MS * 1000;
+        Some(if ahead > u32::MAX / 2 {
+            capture_us.saturating_sub(u64::from(seq.wrapping_sub(next)) * frame_us)
+        } else {
+            capture_us.saturating_add(u64::from(ahead) * frame_us)
+        })
+    }
+
+    /// 音画同步打开时每 10 ms 调用一次（代替 [`Self::pop`]）。`lead_us` 是接下来要播的那一帧
+    /// （[`Self::next_capture_us`]）离它的播放时刻还有多久：正数是还没到，负数是已经过了。
+    ///
+    /// - 在 ±[`SYNC_BAND_US`] 之内：正常播；
+    /// - 早了：多播一帧补偿、时间线不前进（减速）；早得多（超过 [`SYNC_JUMP_US`]）就播静音等；
+    /// - 晚了：两帧压成一帧（加速）；晚得多就把过了时刻的帧直接跳过。
+    pub fn pop_synced(&mut self, lead_us: i64) -> Play {
+        let Some(mut next) = self.upcoming() else {
+            return Play::Wait;
+        };
+        if self.refilling {
+            // 开头、见底之后：等最早的一帧到它的播放时刻
+            if self.frames.is_empty() || lead_us > SYNC_BAND_US / 2 {
+                return Play::Wait;
+            }
+            self.refilling = false;
+            self.next = Some(next);
+        }
+        let mut lead_us = lead_us;
+        if lead_us > SYNC_JUMP_US {
+            // 早得多：播静音等时间线追上来（一帧一帧减速要播很久的补偿音）
+            self.stats.decelerated = self.stats.decelerated.saturating_add(1);
+            return Play::Wait;
+        }
+        if lead_us < -SYNC_JUMP_US {
+            // 晚得多：过了时刻的帧直接跳过
+            let frame_us = i64::try_from(FRAME_MS * 1000).unwrap_or(i64::MAX);
+            let skip = u32::try_from(lead_us.saturating_neg() / frame_us).unwrap_or(u32::MAX);
+            next = next.wrapping_add(skip);
+            self.frames
+                .retain(|seq, _| seq.wrapping_sub(next) <= u32::MAX / 2);
+            self.next = Some(next);
+            self.stats.accelerated = self.stats.accelerated.saturating_add(u64::from(skip));
+            lead_us = lead_us.saturating_add(frame_us.saturating_mul(i64::from(skip)));
+        }
+        if lead_us < -SYNC_BAND_US {
+            let second = next.wrapping_add(1);
+            if let (Some(a), Some(b)) = (self.frames.get(&next), self.frames.get(&second)) {
+                let pair = (a.clone(), b.clone());
+                let _ = self.frames.remove(&next);
+                let _ = self.frames.remove(&second);
+                self.stats.accelerated = self.stats.accelerated.saturating_add(1);
+                self.decelerated_last = false;
+                self.next = Some(second.wrapping_add(1));
+                return Play::Accelerate(pair.0, pair.1);
+            }
+        }
+        if lead_us > SYNC_BAND_US && !self.decelerated_last && self.frames.contains_key(&next) {
+            self.decelerated_last = true;
+            self.stats.decelerated = self.stats.decelerated.saturating_add(1);
+            return Play::Expand;
+        }
+        self.decelerated_last = false;
+        self.next = Some(next.wrapping_add(1));
+        if let Some(frame) = self.frames.remove(&next) {
+            self.stats.normal = self.stats.normal.saturating_add(1);
+            return Play::Normal(frame);
+        }
+        if self.frames.is_empty() {
             self.stats.underruns = self.stats.underruns.saturating_add(1);
             self.refilling = true;
         }
@@ -494,6 +600,145 @@ mod tests {
         assert!(without.concealed >= 45, "{without:?}");
         assert!(with.concealed <= 2, "{with:?}");
         assert!(with.recovered >= 45, "{with:?}");
+    }
+
+    /// 音画同步的仿真：被控端时钟比本机晚 `HOST_AHEAD`，网络固定 30 ms 加抖动。每 10 ms 一拍，
+    /// `delay_ms(tick)` 是那一拍的播放延迟（`None` 表示同步关着，走水位）。
+    /// 返回每个正常播放的帧（拍号，序号，播放时刻 − 采集时刻换到本机时钟后的差，微秒）和抖动缓冲。
+    fn run_synced(
+        ticks: u64,
+        jitter_ms: impl Fn(u32) -> u64,
+        arrives: impl Fn(u32) -> bool,
+        delay_ms: impl Fn(u64) -> Option<u32>,
+    ) -> (Vec<(u64, u32, i64)>, JitterBuffer) {
+        const HOST_AHEAD: u64 = 7_000_000;
+        let mut jb = JitterBuffer::new();
+        let mut sync = crate::avsync::AvSync::new(1).unwrap();
+        let count = u32::try_from(ticks).unwrap();
+        let mut pending: Vec<(u64, AudioPacket)> = (0..count)
+            .filter(|&s| arrives(s))
+            .map(|s| {
+                let mut p = packet(s, 0);
+                p.frame = s.to_be_bytes().to_vec();
+                p.capture_us += HOST_AHEAD;
+                (u64::from(s) * 10_000 + 30_000 + jitter_ms(s) * 1000, p)
+            })
+            .collect();
+        pending.sort_by_key(|(t, _)| *t);
+        let mut it = pending.into_iter().peekable();
+        let mut played = Vec::new();
+        for tick in 0..ticks {
+            let now = tick * 10_000 + 3_000;
+            while let Some((t, _)) = it.peek() {
+                if *t > now {
+                    break;
+                }
+                let (t, p) = it.next().unwrap();
+                sync.observe_sound(t, p.capture_us);
+                jb.push(t, p);
+            }
+            let play = match delay_ms(tick) {
+                Some(d) => {
+                    sync.set_delay_ms(d);
+                    match jb.next_capture_us().and_then(|c| sync.lead_us(now, c)) {
+                        Some(lead) => jb.pop_synced(lead),
+                        None => jb.pop(),
+                    }
+                }
+                None => jb.pop(),
+            };
+            let seqs: Vec<u32> = match play {
+                Play::Normal(f) => vec![u32::from_be_bytes(f.try_into().unwrap())],
+                Play::Accelerate(_, b) => vec![u32::from_be_bytes(b.try_into().unwrap())],
+                Play::Expand | Play::Wait => vec![],
+            };
+            for seq in seqs {
+                // 这一帧的采集时刻换到本机时钟：序号 × 10 ms（被控端和本机的时钟差在这里抵消）
+                let capture_local = i64::from(seq) * 10_000;
+                played.push((tick, seq, i64::try_from(now).unwrap() - capture_local));
+            }
+        }
+        (played, jb)
+    }
+
+    #[test]
+    fn synced_playout_follows_the_capture_timeline() {
+        // 抖动 0–40 ms：水位自适应时延迟跟着抖动走；同步时固定在“最快的包 + 150 ms”= 180 ms
+        let jitter = |s: u32| u64::from(s * 7 % 5) * 10;
+        let (played, jb) = run_synced(600, jitter, |_| true, |_| Some(150));
+        let st = jb.stats();
+        assert!(st.normal >= 570, "{st:?}");
+        assert_eq!((st.concealed, st.late, st.underruns), (0, 0, 0), "{st:?}");
+        for (tick, seq, delay) in &played {
+            assert!(
+                (delay - 180_000).abs() <= SYNC_BAND_US,
+                "第 {tick} 拍播第 {seq} 帧，延迟 {delay} 微秒"
+            );
+        }
+        // 每一帧都按顺序播了一次
+        assert!(played.windows(2).all(|w| w[1].1 == w[0].1 + 1));
+    }
+
+    #[test]
+    fn turning_sync_on_and_changing_the_delay_realigns_the_audio() {
+        // 前 2 秒同步关着（水位，约 20–40 ms），然后 150 ms，再降到 60 ms，最后关掉
+        let delay = |tick: u64| match tick {
+            0..200 => None,
+            200..500 => Some(150),
+            500..800 => Some(60),
+            _ => None,
+        };
+        let (played, jb) = run_synced(1000, |_| 0, |_| true, delay);
+        let at = |tick: u64| played.iter().find(|(t, _, _)| *t >= tick).unwrap().2;
+        // 关着：水位决定，远小于 150 ms
+        assert!(at(150) < 100_000, "{}", at(150));
+        // 打开后 1 秒内对齐到 30 + 150 ms（差得多：播静音等，不是一帧帧减速）
+        assert!((at(300) - 180_000).abs() <= SYNC_BAND_US, "{}", at(300));
+        // 播放延迟降到 60 ms：跳过过了时刻的帧，对齐到 90 ms
+        assert!((at(600) - 90_000).abs() <= SYNC_BAND_US, "{}", at(600));
+        // 关掉：回到水位
+        assert!(at(950) < 80_000, "{}", at(950));
+        let st = jb.stats();
+        assert!(st.accelerated >= 9, "{st:?}");
+        assert!(st.decelerated >= 1, "{st:?}");
+        assert_eq!(st.underruns, 0, "{st:?}");
+    }
+
+    #[test]
+    fn synced_playout_nudges_by_one_frame_and_survives_gaps() {
+        // 播放延迟小幅变化（±25 ms）：一帧一帧减速、加速，不出静音
+        let delay = |tick: u64| match tick {
+            0..200 => Some(100),
+            200..400 => Some(125),
+            _ => Some(100),
+        };
+        let (played, jb) = run_synced(600, |_| 0, |_| true, delay);
+        let at = |tick: u64| played.iter().find(|(t, _, _)| *t >= tick).unwrap().2;
+        assert!((at(100) - 130_000).abs() <= SYNC_BAND_US, "{}", at(100));
+        assert!((at(300) - 155_000).abs() <= SYNC_BAND_US, "{}", at(300));
+        assert!((at(500) - 130_000).abs() <= SYNC_BAND_US, "{}", at(500));
+        let st = jb.stats();
+        assert!((1..=4).contains(&st.decelerated), "{st:?}");
+        assert!((1..=4).contains(&st.accelerated), "{st:?}");
+        // 断了 1 秒（第 200–299 帧没到）：见底一次，恢复后仍然对齐
+        let (played, jb) = run_synced(600, |_| 0, |s| !(200..300).contains(&s), |_| Some(100));
+        let st = jb.stats();
+        assert_eq!(st.underruns, 1, "{st:?}");
+        let (_, seq, delay) = *played.iter().find(|(t, _, _)| *t >= 400).unwrap();
+        assert!(
+            seq >= 300 && (delay - 130_000).abs() <= SYNC_BAND_US,
+            "{seq} {delay}"
+        );
+        // 单个包丢了：补偿一帧，时间线不乱
+        let (played, jb) = run_synced(300, |_| 0, |s| s != 100, |_| Some(100));
+        assert_eq!(jb.stats().concealed, 1, "{:?}", jb.stats());
+        assert!(played
+            .iter()
+            .all(|(_, _, d)| (d - 130_000).abs() <= SYNC_BAND_US));
+        // 还没收到包：等待
+        let mut empty = JitterBuffer::new();
+        assert_eq!(empty.next_capture_us(), None);
+        assert_eq!(empty.pop_synced(0), Play::Wait);
     }
 
     #[test]

@@ -1101,6 +1101,7 @@ async fn one_session(
                 on: sink.sound.clone(),
             }),
             view: Some(sink.view.clone()),
+            playout_ms: None,
         },
         Box::new(sink),
         input,

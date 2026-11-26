@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use peerdesk_core::avsync::{AvSync, FrameQueue};
 use peerdesk_core::crypto::Suite;
 use peerdesk_core::file::FileMeta;
 use peerdesk_core::frame::Picture;
@@ -68,6 +69,11 @@ pub struct ControllerOptions {
     /// 显示画面的区域（像素，0×0 表示不限）：变了就告诉被控端，被控端按这个大小编码。
     /// 对方不支持（老版本）时不发。
     pub view: Option<tokio::sync::watch::Receiver<(u16, u16)>>,
+    /// 音画同步和画面的播放缓冲（看视频用，见 [`peerdesk_core::avsync`]）：播放延迟的毫秒数，会话中途可以改。
+    /// `None` 或 0 表示关：画面收到就显示，声音走自己的抖动缓冲，和没有这个功能时一样。
+    /// 打开后画面和声音都按“采集时刻 + 播放延迟”播放。对方不带采集时刻（老版本）时无效。
+    /// 给了这个设置（哪怕现在是 0）握手时才声明 `Caps::AV_SYNC`，被控端才给每帧带采集时刻（多 8 字节）。
+    pub playout_ms: Option<tokio::sync::watch::Receiver<u32>>,
 }
 
 /// 交出连接的回调（见 [`ControllerOptions::on_link`]）。
@@ -229,9 +235,13 @@ pub struct ControllerReport {
     pub max_gap: Duration,
 }
 
-/// 解码线程交回的结果：帧号和解出的画面。
-/// 解码结果：帧号、画面、解码耗时（微秒）。
-type Decoded = (u32, Result<Option<Picture>, peerdesk_core::Error>, u64);
+/// 解码线程交回的结果：帧号、画面、解码耗时（微秒）、采集时刻（被控端时钟，对方没带时为 `None`）。
+type Decoded = (
+    u32,
+    Result<Option<Picture>, peerdesk_core::Error>,
+    u64,
+    Option<u64>,
+);
 
 /// 启动解码线程。解码一帧要好几毫秒到几十毫秒，放在会话循环里会让本地的键鼠输入排队等它。
 /// 任务通道关闭（会话结束）时线程退出。
@@ -257,7 +267,10 @@ fn spawn_decoder(
                     *b = name;
                 }
             }
-            if done_tx.send((job.frame_id, result, took)).is_err() {
+            if done_tx
+                .send((job.frame_id, result, took, job.capture_us))
+                .is_err()
+            {
                 break;
             }
         }
@@ -281,6 +294,10 @@ pub async fn run(
     let mut frame_log = crate::framelog::FrameLog::from_env();
     let mut config = opts.session.clone();
     config.binding = link.channel_binding()?;
+    if opts.playout_ms.is_none() {
+        // 这次会话用不到采集时刻：不声明音画同步，被控端就不给每帧多带 8 字节，线上和没有这个功能时一样
+        config.caps = Caps(config.caps.0 & !Caps::AV_SYNC.0);
+    }
     let mut session = Session::controller(config, trace);
 
     // 握手阶段对端拒绝时（例如屏幕暂时打不开）会带着原因关闭连接；流上的错误只有“连接断了”，
@@ -375,6 +392,15 @@ pub async fn run(
     let mut audio_changed = audio_switch.is_some();
     let mut audio_ticks = 0u64;
 
+    // 音画同步和播放缓冲（默认关）。对方带采集时刻时一直记时钟差（打开的那一刻就能用），
+    // 但只有播放延迟不是 0 时才按它排画面和声音。
+    let mut playout_rx = opts.playout_ms.clone().filter(|_| caps.has(Caps::AV_SYNC));
+    let mut playout_pending = playout_rx.is_some();
+    let mut sync = playout_rx.as_ref().and_then(|_| AvSync::new(1));
+    let mut playout_on = false;
+    // 解码好、等播放时刻的画面（关着时每一帧放进去马上取出来）
+    let mut held: FrameQueue<(u32, Picture)> = FrameQueue::default();
+
     let mut upload_task = upload.map(|u| {
         let link = Arc::clone(&link);
         tokio::spawn(async move { send_files(&link, &u.root, u.files).await })
@@ -436,44 +462,97 @@ pub async fn run(
     let mut max_gap_us = 0u64;
 
     let end = loop {
+        // 到了播放时刻的画面：显示（播放缓冲关着时就是刚解出来的那一帧）。
+        while let Some((frame_id, picture)) = held.pop_due(link.now().micros()) {
+            let now = link.now();
+            window.frames = window.frames.saturating_add(1);
+            window.max_gap_us = window.max_gap_us.max(now.since(last_shown));
+            if first_frame.is_some() {
+                max_gap_us = max_gap_us.max(now.since(last_shown));
+            } else {
+                first_frame = Some(now.since(session_start));
+            }
+            last_shown = now;
+            if let Some(at) = waiting_input.take() {
+                let took = now.since(at);
+                if took <= REACTION_LIMIT_US {
+                    window.reactions.push(took);
+                }
+            }
+            tracer.record(
+                link.now(),
+                trace,
+                Stage::FrameDelivered,
+                u64::from(frame_id),
+            );
+            let presenting = std::time::Instant::now();
+            sink.present(&picture);
+            frame_log.shown(frame_id, crate::framelog::unix_us());
+            window
+                .present
+                .add(u64::try_from(presenting.elapsed().as_micros()).unwrap_or(u64::MAX));
+            last_picture = Some(picture);
+        }
         if time_up && upload_task.is_none() {
             break "到达时长上限".to_owned();
         }
         tokio::select! {
             () = &mut time_limit, if !time_up => time_up = true,
-            // 解码线程交回一帧：显示。
+            // 解码线程交回一帧：放进播放缓冲（关着时下一轮循环开头马上显示）。
             done = decoded_rx.recv() => match done {
-                Some((frame_id, Ok(Some(picture)), took)) => {
+                Some((frame_id, Ok(Some(picture)), took, capture_us)) => {
                     window.decode_us = window.decode_us.max(took);
                     window.decode.add(took);
                     shown_size = picture.size();
                     media.decode_succeeded();
-                    let now = link.now();
-                    window.frames = window.frames.saturating_add(1);
-                    window.max_gap_us = window.max_gap_us.max(now.since(last_shown));
-                    if first_frame.is_some() {
-                        max_gap_us = max_gap_us.max(now.since(last_shown));
-                    } else {
-                        first_frame = Some(now.since(session_start));
-                    }
-                    last_shown = now;
-                    if let Some(at) = waiting_input.take() {
-                        let took = now.since(at);
-                        if took <= REACTION_LIMIT_US {
-                            window.reactions.push(took);
-                        }
-                    }
-                    tracer.record(link.now(), trace, Stage::FrameDelivered, u64::from(frame_id));
-                    let presenting = std::time::Instant::now();
-                    sink.present(&picture);
-                    frame_log.shown(frame_id, crate::framelog::unix_us());
-                    window.present.add(u64::try_from(presenting.elapsed().as_micros()).unwrap_or(u64::MAX));
-                    last_picture = Some(picture);
+                    let due = sync
+                        .as_ref()
+                        .filter(|_| playout_on)
+                        .zip(capture_us)
+                        .and_then(|(s, capture)| s.due_us(capture));
+                    held.push(link.now().micros(), due, (frame_id, picture));
                 }
-                Some((_, Ok(None), _)) => {}
-                Some((_, Err(_), _)) => media.decode_failed(),
+                Some((_, Ok(None), _, _)) => {}
+                Some((_, Err(_), _, _)) => media.decode_failed(),
                 None => break "解码线程结束".to_owned(),
             },
+            // 播放缓冲里最早的一帧到时间了：回到循环开头显示。
+            () = async {
+                match held.next_due() {
+                    Some(due) => {
+                        let wait = due.saturating_sub(link.now().micros());
+                        tokio::time::sleep(Duration::from_micros(wait)).await;
+                    }
+                    None => std::future::pending().await,
+                }
+            } => {}
+            // 播放延迟改了（一开始也走一次）。
+            ok = async {
+                match playout_rx.as_mut() {
+                    Some(_) if playout_pending => true,
+                    Some(rx) => rx.changed().await.is_ok(),
+                    None => std::future::pending().await,
+                }
+            } => {
+                playout_pending = false;
+                let Some(rx) = playout_rx.as_ref().filter(|_| ok) else {
+                    playout_rx = None;
+                    continue;
+                };
+                let delay_ms = *rx.borrow();
+                let was_on = playout_on;
+                playout_on = delay_ms > 0;
+                if let Some(s) = sync.as_mut().filter(|_| playout_on) {
+                    s.set_delay_ms(delay_ms);
+                }
+                if was_on && !playout_on {
+                    // 关掉：压着的画面不再等
+                    held.release();
+                }
+                if was_on || playout_on {
+                    crate::note!(info, "音画同步：播放延迟 {delay_ms} ms（0 表示关）");
+                }
+            }
             result = async {
                 match upload_task.as_mut() {
                     Some(task) => task.await,
@@ -540,7 +619,8 @@ pub async fn run(
             }
             _ = audio_tick.tick(), if audio_rx.is_some() => {
                 if let Some(rx) = audio_rx.as_mut() {
-                    rx.tick();
+                    // 音画同步打开时按采集时刻的时间线播放，和画面对齐；关着时按水位
+                    rx.tick_synced(link.now().micros(), sync.as_ref().filter(|_| playout_on));
                     // 每 500 ms 把丢包率报告给被控端（它据此决定带不带冗余）
                     audio_ticks = audio_ticks.wrapping_add(1);
                     if audio_ticks % (crate::audio::REPORT_MS / 10) == 0 {
@@ -555,7 +635,12 @@ pub async fn run(
                 Ok((header, payload)) => match header.channel {
                     Channel::Audio => {
                         if let Some(rx) = audio_rx.as_mut() {
-                            rx.on_datagram(link.now().micros(), &payload);
+                            let now_us = link.now().micros();
+                            let capture = rx.on_datagram(now_us, &payload);
+                            // 采集时刻记进时钟差（画面和声音共用一个，有声音时以声音包为准）
+                            if let Some((s, capture)) = sync.as_mut().zip(capture) {
+                                s.observe_sound(now_us, capture);
+                            }
                         }
                     }
                     Channel::Video => {
@@ -563,6 +648,12 @@ pub async fn run(
                         video_since_feedback = video_since_feedback.saturating_add(1);
                         match media.on_datagram_deferred(now, header.send_time, header.seq, header.flags, &payload) {
                             Ok(jobs) => {
+                                // 收齐的时刻记进时钟差（没有声音时用它）
+                                if let Some(s) = sync.as_mut() {
+                                    for capture in jobs.iter().filter_map(|job| job.capture_us) {
+                                        s.observe_picture(now.micros(), capture);
+                                    }
+                                }
                                 if jobs.into_iter().any(|job| decode_jobs.send(job).is_err()) { break "解码线程结束".to_owned(); }
                             }
                             Err(_) => bad_datagrams = bad_datagrams.saturating_add(1),
@@ -719,6 +810,10 @@ pub async fn run(
     if let Some(t) = &router_task {
         t.abort();
     }
+    // 还压在播放缓冲里的画面不再等：最后一幅留给报告
+    held.release();
+    let last_held = std::iter::from_fn(|| held.pop_due(u64::MAX)).last();
+    let last_picture = last_held.map(|(_, picture)| picture).or(last_picture);
     frame_log.flush();
 
     let bye = session.close(link.now(), &mut tracer);

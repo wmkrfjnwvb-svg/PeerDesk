@@ -77,30 +77,67 @@ impl FrameHeader {
         w.into_vec()
     }
 
-    /// 拆出帧头和码流。
+    /// 拆出帧头和码流。带采集时刻的帧（[`stamp_capture`]）也认，采集时刻丢掉。
     pub fn parse(frame: &[u8]) -> Result<(Self, &[u8]), Error> {
+        Self::parse_stamped(frame).map(|(header, _, data)| (header, data))
+    }
+
+    /// 拆出帧头、采集时刻（被控端时钟，微秒；没带时为 `None`）和码流。
+    pub fn parse_stamped(frame: &[u8]) -> Result<(Self, Option<u64>, &[u8]), Error> {
         let mut r = Reader::new(frame);
         let codec = Codec::from_id(r.u8()?)?;
-        let key = match r.u8()? {
-            0 => false,
-            1 => true,
-            other => return Err(Error::UnknownMessage(other)),
-        };
+        let flags = r.u8()?;
+        if flags & !(FLAG_KEY | FLAG_CAPTURE) != 0 {
+            return Err(Error::UnknownMessage(flags));
+        }
         let (width, height) = (r.u16()?, r.u16()?);
         if width == 0 || height == 0 {
             return Err(Error::Inconsistent("画面尺寸为 0"));
         }
-        let data = frame.get(FRAME_HEADER_LEN..).unwrap_or_default();
+        let capture_us = if flags & FLAG_CAPTURE == 0 {
+            None
+        } else {
+            Some(r.u64()?)
+        };
         Ok((
             Self {
                 codec,
-                key,
+                key: flags & FLAG_KEY != 0,
                 width,
                 height,
             },
-            data,
+            capture_us,
+            r.rest(),
         ))
     }
+}
+
+/// 帧头第二个字节的标志位：关键帧。
+const FLAG_KEY: u8 = 1;
+/// 帧头第二个字节的标志位：帧头后面跟着 8 字节的采集时刻。老版本不认这一位（会当成坏帧），
+/// 所以只在双方都有 [`crate::proto::Caps::AV_SYNC`] 时才带。
+const FLAG_CAPTURE: u8 = 2;
+
+/// 给编好的一帧（帧头 + 码流）带上采集时刻（被控端时钟，微秒）：音画同步和播放缓冲用
+/// （见 [`crate::avsync`]）。帧头不完整或者已经带了的原样返回。
+#[must_use]
+pub fn stamp_capture(frame: &[u8], capture_us: u64) -> Vec<u8> {
+    let (Some((head, body)), Some(flags)) = (
+        frame.split_at_checked(FRAME_HEADER_LEN),
+        frame.get(1).copied(),
+    ) else {
+        return frame.to_vec();
+    };
+    if flags & FLAG_CAPTURE != 0 {
+        return frame.to_vec();
+    }
+    let mut w = Writer::new();
+    w.bytes(head).u64(capture_us).bytes(body);
+    let mut out = w.into_vec();
+    if let Some(f) = out.get_mut(1) {
+        *f = flags | FLAG_CAPTURE;
+    }
+    out
 }
 
 /// 编码器的输出。
@@ -379,10 +416,49 @@ mod tests {
         assert!(FrameHeader::parse(&[9, 0, 0, 1, 0, 1]).is_err(), "未知编码");
         assert!(
             FrameHeader::parse(&[0, 2, 0, 1, 0, 1]).is_err(),
-            "关键帧标志只能是 0/1"
+            "标志说带了采集时刻，后面却没有"
+        );
+        assert!(
+            FrameHeader::parse(&[0, 4, 0, 1, 0, 1]).is_err(),
+            "不认识的标志位"
         );
         assert!(FrameHeader::parse(&[0, 0, 0, 0, 0, 1]).is_err(), "宽为 0");
         assert!(FrameHeader::parse(&[0, 0, 0, 1]).is_err(), "截断");
+    }
+
+    #[test]
+    fn capture_stamp_round_trip() {
+        let h = FrameHeader {
+            codec: Codec::H264,
+            key: true,
+            width: 1280,
+            height: 720,
+        };
+        let plain = h.frame(b"abc");
+        assert_eq!(
+            FrameHeader::parse_stamped(&plain).unwrap(),
+            (h, None, &b"abc"[..])
+        );
+        let stamped = stamp_capture(&plain, 0x0102_0304_0506_0708);
+        assert_eq!(stamped.len(), plain.len() + 8);
+        assert_eq!(
+            FrameHeader::parse_stamped(&stamped).unwrap(),
+            (h, Some(0x0102_0304_0506_0708), &b"abc"[..])
+        );
+        // 不关心采集时刻的调用方（解码器）照常拆
+        assert_eq!(FrameHeader::parse(&stamped).unwrap(), (h, &b"abc"[..]));
+        // 非关键帧
+        let delta = FrameHeader { key: false, ..h }.frame(b"");
+        let stamped_delta = stamp_capture(&delta, 7);
+        assert_eq!(
+            FrameHeader::parse_stamped(&stamped_delta).unwrap(),
+            (FrameHeader { key: false, ..h }, Some(7), &b""[..])
+        );
+        // 已经带了的不再带；帧头不完整的原样返回
+        assert_eq!(stamp_capture(&stamped, 9), stamped);
+        assert_eq!(stamp_capture(&[0, 1], 9), vec![0, 1]);
+        // 标志说带了采集时刻、实际被截断：坏帧
+        assert!(FrameHeader::parse_stamped(&stamped[..10]).is_err());
     }
 
     #[test]

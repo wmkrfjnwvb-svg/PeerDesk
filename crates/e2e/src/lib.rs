@@ -9,6 +9,7 @@
 //!
 //! 同一个场景同一个种子，结果逐字节相同，可以放进 CI 当回归门槛。
 
+pub mod avsync;
 pub mod content;
 pub mod report;
 

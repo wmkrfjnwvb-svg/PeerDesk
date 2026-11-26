@@ -286,6 +286,10 @@ impl Caps {
     /// 起步探测实测不如保守的起步码率，没用它（docs/research/L-framework.md T7）。
     pub const PROBE_TRAIN: Caps = Caps(1 << 24);
 
+    /// 音画同步：被控端给画面帧和声音包打同一个时钟的采集时刻，控制端打开播放缓冲时按它对齐
+    /// （见 [`crate::avsync`]）。第 24–26 位已经被“被控端的系统”占了，所以用第 27 位。
+    pub const AV_SYNC: Caps = Caps(1 << 27);
+
     // 第 24–26 位不是能力，是被控端在 Accept 里告诉控制端自己的系统（见 [`PeerOs`]），
     // 控制端据此把快捷键里的 Ctrl 换成 Cmd 等。老版本只看能力位，会忽略这几位。
     const OS_SHIFT: u32 = 24;
@@ -319,7 +323,8 @@ impl Caps {
             | Self::FILE_BROWSE.0
             | Self::VIEW_SIZE.0
             | Self::TRANSPORT_CC.0
-            | Self::PROBE_TRAIN.0,
+            | Self::PROBE_TRAIN.0
+            | Self::AV_SYNC.0,
     );
 
     /// 并集。
