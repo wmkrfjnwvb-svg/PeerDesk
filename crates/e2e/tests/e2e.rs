@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 
 use peerdesk_core::adaptive::Profile;
-use peerdesk_core::sim::{Link, Spikes};
+use peerdesk_core::sim::{Busy, Doze, Link, Spikes};
 use peerdesk_e2e::report::{markdown, save, TABLE_HEADER};
 use peerdesk_e2e::{run, Action, CodecKind, EstimatorKind, Outcome, Phase, Scenario};
 
@@ -113,6 +113,11 @@ fn gates(o: &Outcome) {
 
 fn finish(o: &Outcome) {
     save(&out_dir(), o).unwrap();
+    // 打开 PEERDESK_EVENTS 时把发送端的决定记下来（门槛没过时先看它）
+    if !o.trace.is_empty() {
+        let dir = out_dir().join(format!("{}-{}-{}", o.name, o.codec.name(), o.estimator));
+        std::fs::write(dir.join("trace.txt"), o.trace.join("\n")).unwrap();
+    }
     gates(o);
     println!("\n{TABLE_HEADER}{}", markdown(o));
     println!(
@@ -235,16 +240,23 @@ fn start_is_sharp_quickly_on_a_fat_link_with_a_big_screen() {
             Link {
                 rate_bps: Some(30_000_000),
                 delay_us: 15_000,
-                // 用户的 Wi-Fi（2026-11-26 日志）：大部分时候排队读数 0–2 ms，零星小包时常碰上 12–25 ms，
-                // 延迟趋势正常、没有丢包；接收端一批一批地读（一帧几十个包几乎同一时刻读到）
+                // 用户的 Wi-Fi（2026-11-26 日志）：连续发包时排队读数 0–2 ms，画面静止时零星小包几乎每次都是
+                // 12–25 ms（省电：空闲后网卡睡着），偶尔一阵尖峰；延迟趋势正常、没有丢包；接收端偶尔忙一下、一帧一起读走
                 jitter_us: 1_000,
                 fifo_jitter: true,
+                doze: Some(Doze {
+                    idle_us: 50_000,
+                    wake_us: 25_000,
+                }),
                 spikes: Some(Spikes {
-                    every_us: 600_000,
+                    every_us: 2_000_000,
                     length_us: 40_000,
                     max_us: 25_000,
                 }),
-                batch_us: 5_000,
+                busy: Some(Busy {
+                    every_us: 500_000,
+                    length_us: 20_000,
+                }),
                 ..Link::lan()
             },
         )],
@@ -266,6 +278,25 @@ fn start_is_sharp_quickly_on_a_fat_link_with_a_big_screen() {
             println!("{line}");
         }
     }
+    // 码率不能被 Wi-Fi 的零星延迟打到底（改前：30 Mbps → 100 kbps，之后一直贴着 100 kbps）：2 秒之后码率的中位数
+    // 不低于链路的四分之一
+    let mut later: Vec<u64> = o
+        .features
+        .iter()
+        .filter(|f| f.t_ms >= 2_000)
+        .map(|f| f.rate_bps)
+        .collect();
+    later.sort_unstable();
+    let median = later.get(later.len() / 2).copied().unwrap_or(0);
+    gate(
+        &o,
+        "码率不被 Wi-Fi 延迟打到底",
+        median >= 30_000_000 / 4,
+        &format!(
+            "2 秒之后码率中位数 {} kbps（链路 30000 kbps）",
+            median / 1000
+        ),
+    );
     // 开头的静止画面要尽快清晰（这个场景以前一直没清晰：码率被 Wi-Fi 抖动打到底、1 Mbps 起步爬得慢）
     let start = o.phases.first().and_then(|p| p.sharp_ms);
     gate(

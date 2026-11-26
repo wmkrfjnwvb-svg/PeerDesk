@@ -57,6 +57,27 @@ pub struct Spikes {
     pub max_us: u64,
 }
 
+/// Wi-Fi 省电：链路空闲一阵之后，接收端网卡睡着了，路由器把包攒着、等它醒来再送，空闲之后的第一个包要多等一会儿，
+/// 跟在它后面的包排在它后面（不乱序）；连续发包时网卡醒着，不多等。
+/// 2026-11-26 用户日志（Wi-Fi、约 30 Mbps）：画面静止时零星小包的排队读数几乎每次都是 12–25 ms，连续发包时 0–2 ms。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Doze {
+    /// 空闲多久（微秒）之后睡着。
+    pub idle_us: u64,
+    /// 醒来要多久（微秒）：每次在一半到全部之间随机。
+    pub wake_us: u64,
+}
+
+/// 接收端偶尔忙一阵：这段时间到的包等它忙完一起读走（逐个读，时间戳相差约 1 微秒）。
+/// 2026-11-26 用户日志：偶尔一帧几十个包几乎同一时刻读到，包串速率算成 Tbps；大部分时候排队读数 0–2 ms。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Busy {
+    /// 平均多久忙一次（微秒）；两次之间的间隔在 0 到 2 倍之间均匀随机。
+    pub every_us: u64,
+    /// 一次忙多久（微秒）。
+    pub length_us: u64,
+}
+
 /// 单向链路的特性。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Link {
@@ -70,6 +91,10 @@ pub struct Link {
     pub fifo_jitter: bool,
     /// Wi-Fi 式的延迟尖峰（见 [`Spikes`]），不乱序。默认没有。
     pub spikes: Option<Spikes>,
+    /// Wi-Fi 省电（见 [`Doze`]），不乱序。默认没有。
+    pub doze: Option<Doze>,
+    /// 接收端偶尔忙一阵（见 [`Busy`]），不乱序。默认没有。
+    pub busy: Option<Busy>,
     /// 接收端一批一批地收（微秒，0 表示随到随收）：到达时间向上取到这个间隔的整数倍。模拟 Wi-Fi 聚合、
     /// 网卡中断合并、程序忙时一次读走一批（2026-11-26 用户日志：一帧几十个包几乎同一时刻读到，包串测出 Tbps）。
     pub batch_us: u64,
@@ -93,6 +118,8 @@ impl Link {
             fifo_jitter: false,
             spikes: None,
             batch_us: 0,
+            doze: None,
+            busy: None,
             loss_permille: 0,
             rate_bps: None,
             max_queue_us: 200_000,
@@ -186,6 +213,12 @@ pub struct Net<T> {
     last_arrival: BTreeMap<(usize, usize), Time>,
     /// 每个方向的延迟尖峰：(下一次开始, 这一次结束, 这一次多晚)。
     spike: BTreeMap<(usize, usize), (Time, Time, u64)>,
+    /// 每个方向上一个包离开瓶颈的时间（省电用）。
+    last_depart: BTreeMap<(usize, usize), Time>,
+    /// 每个方向当前这一批：(批的时刻, 已经有几个包)。
+    batch: BTreeMap<(usize, usize), (Time, u64)>,
+    /// 每个方向接收端忙的时段：(下一次开始, 这一次开始, 这一次结束)。
+    busy: BTreeMap<(usize, usize), (Time, Time, Time)>,
     queue: BTreeMap<(Time, u64), Delivery<T>>,
     next_id: u64,
     stats: NetStats,
@@ -202,6 +235,9 @@ impl<T> Net<T> {
             busy_until: BTreeMap::new(),
             last_arrival: BTreeMap::new(),
             spike: BTreeMap::new(),
+            last_depart: BTreeMap::new(),
+            batch: BTreeMap::new(),
+            busy: BTreeMap::new(),
             queue: BTreeMap::new(),
             next_id: 0,
             stats: NetStats {
@@ -291,14 +327,35 @@ impl<T> Net<T> {
         if let Some(spikes) = link.spikes {
             at = at.plus(self.spike_delay(from, to, depart, spikes));
         }
+        if let Some(doze) = link.doze {
+            let asleep = self
+                .last_depart
+                .get(&(from, to))
+                .is_none_or(|t| depart.since(*t) >= doze.idle_us);
+            if asleep {
+                at = at.plus(doze.wake_us / 2 + self.rng.below(doze.wake_us / 2 + 1));
+            }
+            self.last_depart.insert((from, to), depart);
+        }
         if link.batch_us > 0 {
-            at = Time(
+            // 同一批里的包被程序逐个读走，时间戳相差约 1 微秒（真实程序里一帧几十个包的首尾间隔不到 1 微秒，
+            // 包串速率算成 Tbps；时间戳完全相同的话间隔是 0，反而被当成测不了）
+            let boundary = Time(
                 at.micros()
                     .div_ceil(link.batch_us)
                     .saturating_mul(link.batch_us),
             );
+            let index = match self.batch.get(&(from, to)) {
+                Some((b, n)) if *b == boundary => n.saturating_add(1),
+                Some(_) | None => 0,
+            };
+            self.batch.insert((from, to), (boundary, index));
+            at = boundary.plus(index);
         }
-        if link.fifo_jitter || link.spikes.is_some() {
+        if let Some(busy) = link.busy {
+            at = self.busy_read(from, to, at, busy);
+        }
+        if link.fifo_jitter || link.spikes.is_some() || link.doze.is_some() || link.busy.is_some() {
             if let Some(last) = self.last_arrival.get(&(from, to)) {
                 at = at.max(*last);
             }
@@ -315,6 +372,33 @@ impl<T> Net<T> {
                 payload,
             },
         );
+    }
+
+    /// `at` 时刻到的包什么时候被读走：接收端在忙就等它忙完，同一批逐个读（各差 1 微秒）。
+    fn busy_read(&mut self, from: usize, to: usize, at: Time, busy: Busy) -> Time {
+        let (mut next, mut start, mut end) =
+            self.busy
+                .get(&(from, to))
+                .copied()
+                .unwrap_or((Time::ZERO, Time::ZERO, Time::ZERO));
+        if next == Time::ZERO && end == Time::ZERO {
+            next = at.plus(self.rng.below(busy.every_us.saturating_mul(2)));
+        }
+        while next <= at {
+            start = next;
+            end = next.plus(busy.length_us);
+            next = next.plus(self.rng.below(busy.every_us.saturating_mul(2)).max(1));
+        }
+        self.busy.insert((from, to), (next, start, end));
+        if at < start || at >= end {
+            return at;
+        }
+        let index = match self.batch.get(&(from, to)) {
+            Some((b, n)) if *b == end => n.saturating_add(1),
+            Some(_) | None => 0,
+        };
+        self.batch.insert((from, to), (end, index));
+        end.plus(index)
     }
 
     /// `depart` 时刻离开瓶颈的包碰上的尖峰延迟（不在尖峰里为 0）。
@@ -538,6 +622,76 @@ mod tests {
         assert_ne!(order(false), sorted);
     }
 
+    /// 省电：空闲之后的第一个包多等一会儿，紧跟着的包不多等（排在它后面）。
+    #[test]
+    fn a_dozing_receiver_delays_the_first_packet_after_idle() {
+        let mut net: Net<u32> = Net::new(4);
+        net.set_link(
+            0,
+            1,
+            Link {
+                doze: Some(Doze {
+                    idle_us: 50_000,
+                    wake_us: 24_000,
+                }),
+                ..Link::lan()
+            },
+        );
+        // 一个包，空闲 200 ms，再连着三个包（各隔 1 ms）
+        net.send(0, 1, 1200, 0);
+        let first = net.pop().unwrap();
+        net.advance_to(Time(200_000));
+        for i in 1..4 {
+            net.send(0, 1, 1200, i);
+            net.advance_to(Time(200_000 + u64::from(i) * 1_000));
+        }
+        let rest: Vec<_> = std::iter::from_fn(|| net.pop()).collect();
+        let lan = Link::lan().delay_us + Link::lan().jitter_us;
+        assert!(first.at.micros() >= 12_000);
+        assert!(rest[0].at.since(Time(200_000)) >= 12_000);
+        // 后面两个包跟在醒来的那个后面到，自己不再多等一次
+        assert!(rest[2].at.since(rest[0].at) <= 2_000 + lan);
+        assert!(rest.windows(2).all(|w| w[0].payload < w[1].payload));
+    }
+
+    /// 接收端偶尔忙：忙的时候到的包在忙完时一起读走（各差 1 微秒），其余随到随收；顺序不变。
+    #[test]
+    fn a_busy_receiver_reads_a_burst_at_once_now_and_then() {
+        let mut net: Net<u32> = Net::new(6);
+        net.set_link(
+            0,
+            1,
+            Link {
+                busy: Some(Busy {
+                    every_us: 300_000,
+                    length_us: 20_000,
+                }),
+                rate_bps: Some(30_000_000),
+                ..Link::lan()
+            },
+        );
+        // 3 秒里每 33 ms 一帧、每帧 30 个包（30 Mbps 下约 10 ms 发完）
+        for f in 0..90u32 {
+            net.advance_to(Time(u64::from(f) * 33_000));
+            for p in 0..30 {
+                net.send(0, 1, 1200, f * 100 + p);
+            }
+        }
+        let got: Vec<_> = std::iter::from_fn(|| net.pop()).collect();
+        assert!(got.windows(2).all(|w| w[0].payload < w[1].payload));
+        // 有的帧整帧在 30 微秒内读完（忙完一起读），大多数帧照常按链路速度到
+        let span = |f: u32| {
+            let at: Vec<u64> = got
+                .iter()
+                .filter(|d| d.payload / 100 == f)
+                .map(|d| d.at.micros())
+                .collect();
+            at.last().unwrap() - at.first().unwrap()
+        };
+        let squeezed = (0..90).filter(|f| span(*f) < 100).count();
+        assert!((1..=30).contains(&squeezed), "{squeezed}");
+    }
+
     /// 一批一批地收：到达时间都是批间隔的整数倍，顺序不变。
     #[test]
     fn batched_arrivals_land_on_the_batch_boundaries() {
@@ -555,10 +709,11 @@ mod tests {
             net.send(0, 1, 1200, i);
         }
         let got: Vec<_> = std::iter::from_fn(|| net.pop()).collect();
-        assert!(got.iter().all(|d| d.at.micros() % 8_000 == 0));
+        // 同一批里逐个读：比批的时刻晚几微秒
+        assert!(got.iter().all(|d| d.at.micros() % 8_000 < 50));
         assert!(got.windows(2).all(|w| w[0].payload < w[1].payload));
         // 50 个包按 30 Mbps 要 16 ms：落在 3 个批次里
-        let mut batches: Vec<u64> = got.iter().map(|d| d.at.micros()).collect();
+        let mut batches: Vec<u64> = got.iter().map(|d| d.at.micros() / 8_000).collect();
         batches.dedup();
         assert_eq!(batches.len(), 3);
     }
