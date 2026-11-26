@@ -232,6 +232,8 @@ pub struct Outcome {
     pub first_picture_ms: Option<f64>,
     /// 全程卡顿次数。
     pub freezes: u32,
+    /// 发送端重传的分片数（和 `net.lost` 比：重传远多于丢包说明接收端在要还在路上的分片）。
+    pub retransmitted: u32,
     /// 带宽估计器的名字。
     pub estimator: &'static str,
     /// 每次反馈一行特征，带着仿真知道的真实情况（以后训练 AI 模型用）。
@@ -729,6 +731,7 @@ pub fn run(s: &Scenario) -> Result<Outcome, Error> {
         max_wait_ms: ms(overall_wait),
         first_picture_ms: first_picture.map(ms),
         freezes: overall_freezes,
+        retransmitted: tx_stats.retransmitted,
         estimator: tx.estimator(),
         features,
         trace,

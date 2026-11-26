@@ -109,6 +109,15 @@ fn gates(o: &Outcome) {
         slow == 0,
         &format!("{slow}/{} 次没做到", idle.len()),
     );
+    // 重传只补真丢了的：不超过实际丢包（含排队丢包）的 2 倍加 20 片。2026-11-26 用户日志：大帧后半段还在路上就被
+    // 要重传，两分钟里重传 2628 片、实际丢包 97 个，多出来的流量又把排队撑长
+    let lost = o.net.lost.saturating_add(o.net.queue_dropped);
+    gate(
+        o,
+        "不重传还在路上的分片",
+        u64::from(o.retransmitted) <= lost.saturating_mul(2).saturating_add(20),
+        &format!("重传 {} 片，实际丢包 {lost} 个", o.retransmitted),
+    );
 }
 
 fn finish(o: &Outcome) {
@@ -304,6 +313,94 @@ fn start_is_sharp_quickly_on_a_fat_link_with_a_big_screen() {
         "开头 2 秒内清晰",
         start.is_some_and(|t| t <= 2000.0),
         &format!("开头变清晰 {start:?} ms"),
+    );
+}
+
+/// 轻操作（打字、小改动，发送端用不满码率）时 Wi-Fi 的延迟尖峰不能把码率打到底。
+///
+/// 2026-11-26 用户日志（Mac 2880×1800 被控、Wi-Fi 约 30 Mbps、RTT 30 ms）：连上几分钟后反复“画面不动”。
+/// 轻操作时每秒只发 40–240 kbps，一次 13–27 ms 的排队读数（延迟趋势是平的）被当成拥塞，按送达速率的 85% 降，
+/// 码率从 17 Mbps 掉到底线 100 kbps；100 kbps 下编码器出 0 KB 的帧，帧照常到、内容不更新，6 秒后才爬回来。
+/// 那次会话 168 秒里降码率 59 次，39 次发生在发送端没用满码率时，11 次降到 300 kbps 以下。
+fn wifi_light_activity(name: &str) -> Scenario {
+    Scenario {
+        width: 2880,
+        height: 1800,
+        network: vec![(
+            0,
+            Link {
+                rate_bps: Some(30_000_000),
+                delay_us: 15_000,
+                jitter_us: 1_000,
+                fifo_jitter: true,
+                doze: Some(Doze {
+                    idle_us: 50_000,
+                    wake_us: 25_000,
+                }),
+                // 按那次会话的排队读数标定：p50 3 ms、p90 11、p99 57 ms，每秒都有机会碰上一次尖峰
+                spikes: Some(Spikes {
+                    every_us: 1_000_000,
+                    length_us: 30_000,
+                    max_us: 60_000,
+                }),
+                busy: Some(Busy {
+                    every_us: 500_000,
+                    length_us: 20_000,
+                }),
+                ..Link::lan()
+            },
+        )],
+        ..Scenario::new(
+            name,
+            // 轻操作（指针每帧动一点）20 秒，中间切一次窗口、打字、滚动
+            vec![
+                phase(Action::Idle, 60),
+                phase(Action::Pointer, 600),
+                phase(Action::Switching, 15),
+                phase(Action::Idle, 30),
+                phase(Action::Pointer, 300),
+                phase(Action::Typing, 90),
+                phase(Action::Scrolling, 60),
+                phase(Action::Idle, 30),
+            ],
+        )
+    }
+}
+
+#[test]
+fn light_activity_on_wifi_keeps_the_rate() {
+    let o = run(&wifi_light_activity("wifi-light")).unwrap();
+    finish(&o);
+    if std::env::var_os("PEERDESK_EVENTS").is_some() {
+        for line in o
+            .trace
+            .iter()
+            .filter(|l| l.contains("降码率") || l.contains("升码率"))
+            .take(60)
+        {
+            println!("{line}");
+        }
+    }
+    // 2 秒之后（起步结束）：尖峰只是延迟，链路容量一直是 30 Mbps。中位数看不见塌陷（改前 22% 的时间
+    // 低于 10 Mbps 中位数照样过），看最低值和 5% 分位
+    let mut after: Vec<u64> = o
+        .features
+        .iter()
+        .filter(|f| f.t_ms >= 2_000)
+        .map(|f| f.rate_bps)
+        .collect();
+    after.sort_unstable();
+    let min = after.first().copied().unwrap_or(0);
+    let p5 = after.get(after.len() / 20).copied().unwrap_or(0);
+    gate(
+        &o,
+        "轻操作时码率不被 Wi-Fi 尖峰打到底",
+        min >= 3_000_000 && p5 >= 15_000_000,
+        &format!(
+            "2 秒之后最低 {} kbps、5% 分位 {} kbps（链路 30000 kbps，要求不低于 3000 和 15000）",
+            min / 1000,
+            p5 / 1000
+        ),
     );
 }
 

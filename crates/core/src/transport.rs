@@ -225,6 +225,8 @@ struct Partial {
     ref_frame: u32,
     parts: Vec<Option<Vec<u8>>>,
     have: usize,
+    /// 收到的最大数据分片序号（还没收到数据分片时为 `None`）：比它小的缺片是“空洞”，比它大的是“尾部”。
+    top: Option<u16>,
     /// 校验分片，按组号存放；长度就是组数。还没收到任何校验分片时为空。
     parity: Vec<Option<Parity>>,
 }
@@ -361,7 +363,16 @@ pub struct Reassembler {
     /// 我们按帧号和分片序号请求，整帧丢了以前只能等下一帧发现接不上、再出关键帧（2026-11 微软轨迹 8 Mbps、
     /// 12–40% 丢包时每次一两个小帧整个丢掉，各出一个关键帧）。
     wanted: BTreeMap<u32, Time>,
+    /// 收到过分片的最新帧号：更新的帧已经在到，说明发送端发完了旧帧，旧帧的尾部没到就是丢了。
+    newest: u32,
 }
+
+/// 空洞后面又到了这么多个序号的分片，空洞就算丢了，不用再等（RFC 9002 第 6.1.1 节的包数门限 kPacketThreshold）。
+const REORDER_PACKETS: u16 = 3;
+/// 尾部缺片：这一帧这么多个平均分片间隔没再来新分片，才算停了（窄带上分片本来就隔得开）。
+const TAIL_GAPS: u64 = 3;
+/// 尾部等待的上限。
+const TAIL_MAX_US: u64 = 150_000;
 
 impl Reassembler {
     /// 创建。`deadline_us` 是一帧从首个分片到收齐允许的最长时间；
@@ -379,6 +390,7 @@ impl Reassembler {
             held: BTreeMap::new(),
             ready: VecDeque::new(),
             wanted: BTreeMap::new(),
+            newest: 0,
         }
     }
 
@@ -414,8 +426,15 @@ impl Reassembler {
         self.floor = Some(self.floor.map_or(frame_id, |f| f.max(frame_id)));
     }
 
-    /// 等了至少 `min_age_us` 仍然缺失的数据分片，最多返回 `limit` 个 `(帧号, 分片序号)`。
-    /// 接收端据此请求重传。
+    /// 判定丢了的数据分片，最多返回 `limit` 个 `(帧号, 分片序号)`，接收端据此请求重传。
+    ///
+    /// 按空洞判断（RFC 9002 第 6.1 节、WebRTC 按包序号的空洞请求重传），不按“这一帧第一片到了多久”：
+    /// - 空洞（比已收到的最大序号小）：后面又到了 [`REORDER_PACKETS`] 个序号，或者这一帧 `min_age_us` 没来新分片，算丢；
+    /// - 尾部（比最大序号大）：这一帧停了（[`TAIL_GAPS`] 个平均分片间隔、至少 `2 × min_age_us` 没来新分片），
+    ///   或者更新的帧已经在到、这一帧也 `min_age_us` 没来新分片，算丢。
+    ///
+    /// 以前一帧的第一片到了 10 ms 就把所有没到的分片都要一遍：大帧（30 Mbps 下 70 KB 以上）后半段还在路上就被要重传。
+    /// 2026-11-26 用户日志：两分钟里请求重传 5293 片、实际丢包 97 个，大帧把排队撑到 100–320 ms。
     #[must_use]
     pub fn missing(&self, now: Time, min_age_us: u64, limit: usize) -> Vec<(u32, u16)> {
         let whole = self
@@ -423,17 +442,30 @@ impl Reassembler {
             .iter()
             .filter(|(_, at)| now.since(**at) >= min_age_us)
             .map(|(frame_id, _)| (*frame_id, WHOLE_FRAME));
-        let parts = self
-            .pending
-            .iter()
-            .filter(|(_, p)| now.since(p.first_seen) >= min_age_us)
-            .flat_map(|(frame_id, p)| {
-                p.parts
-                    .iter()
-                    .zip(0u16..)
-                    .filter(|(part, _)| part.is_none())
-                    .map(|(_, index)| (*frame_id, index))
-            });
+        let parts = self.pending.iter().flat_map(|(frame_id, p)| {
+            let quiet = now.since(p.last_seen);
+            let received = u64::try_from(p.have).unwrap_or(u64::MAX);
+            let gap = p.last_seen.since(p.first_seen) / received.saturating_sub(1).max(1);
+            let tail_after = gap
+                .saturating_mul(TAIL_GAPS)
+                .max(min_age_us.saturating_mul(2))
+                .min(TAIL_MAX_US);
+            let tail_lost = quiet >= tail_after || (self.newest > *frame_id && quiet >= min_age_us);
+            let top = p.top;
+            p.parts
+                .iter()
+                .zip(0u16..)
+                .filter(move |(part, index)| {
+                    part.is_none()
+                        && match top {
+                            Some(top) if *index < top => {
+                                top - *index >= REORDER_PACKETS || quiet >= min_age_us
+                            }
+                            Some(_) | None => tail_lost,
+                        }
+                })
+                .map(|(_, index)| (*frame_id, index))
+        });
         whole.chain(parts).take(limit).collect()
     }
 
@@ -443,6 +475,7 @@ impl Reassembler {
     pub fn push(&mut self, now: Time, packet: VideoPacket) -> Result<Option<Frame>, Error> {
         let header = packet.header;
         header.validate()?;
+        self.newest = self.newest.max(header.frame_id);
         // 校验分片的数据区开头带着数据分片总数。
         let (data_count, parity) = if packet.parity {
             let mut r = Reader::new(&packet.data);
@@ -540,6 +573,7 @@ impl Reassembler {
                 ref_frame: header.ref_frame,
                 parts: vec![None; usize::from(data_count)],
                 have: 0,
+                top: None,
                 parity: Vec::new(),
             });
         partial.last_seen = now;
@@ -579,6 +613,7 @@ impl Reassembler {
             }
             *slot = Some(packet.data);
             partial.have = partial.have.saturating_add(1);
+            partial.top = partial.top.max(Some(header.frag_index));
         }
 
         if partial.have < partial.parts.len() && !partial.parity.is_empty() {
@@ -1249,6 +1284,39 @@ mod tests {
         assert_eq!(r.stats().recovered, 0);
     }
 
+    /// 大帧还在陆续到的时候不要它的后半段（2026-11-26 用户日志：大帧后半段还在路上就被要重传，重传是实际丢包的几十倍）。
+    #[test]
+    fn the_tail_of_a_frame_still_arriving_is_not_requested() {
+        let mut r = Reassembler::new(500_000, 4);
+        let big = packets(1, 100 * 1000, 1000);
+        assert_eq!(big.len(), 100);
+        // 前 50 片每 400 µs 到一片（30 Mbps 左右的节奏）
+        for (i, p) in big.iter().take(50).enumerate() {
+            let at = u64::try_from(i).unwrap() * 400;
+            r.push(Time(at), p.clone()).unwrap();
+        }
+        let last = 49 * 400;
+        assert!(r.missing(Time(last + 1_000), 10_000, 200).is_empty(), "还在到");
+        // 停了：3 个平均间隔、至少 2 倍最短等待（20 ms）没来新分片，尾部算丢
+        assert!(r.missing(Time(last + 19_000), 10_000, 200).is_empty());
+        assert_eq!(r.missing(Time(last + 20_000), 10_000, 200).len(), 50);
+        // 更新的帧已经在到：发送端发完了这一帧，再等 10 ms 没来就算丢
+        let mut r = Reassembler::new(500_000, 4);
+        for p in big.iter().take(50) {
+            r.push(Time(0), p.clone()).unwrap();
+        }
+        r.push(Time(1_000), packets(2, 400, 100)[0].clone()).unwrap();
+        assert!(r.missing(Time(9_000), 10_000, 200).is_empty());
+        assert_eq!(r.missing(Time(10_000), 10_000, 200).len(), 50, "第 2 帧自己的尾部还没到时候");
+        // 窄带：分片本来就隔 30 ms，尾部按 3 个间隔（90 ms）才算停
+        let mut r = Reassembler::new(500_000, 4);
+        for (i, p) in big.iter().take(3).enumerate() {
+            r.push(Time(u64::try_from(i).unwrap() * 30_000), p.clone()).unwrap();
+        }
+        assert!(r.missing(Time(60_000 + 80_000), 10_000, 200).is_empty());
+        assert_eq!(r.missing(Time(60_000 + 90_000), 10_000, 200).len(), 97);
+    }
+
     #[test]
     fn missing_respects_age_and_limit() {
         let mut r = Reassembler::new(50_000, 4);
@@ -1256,12 +1324,18 @@ mod tests {
         let b = packets(2, 400, 100);
         r.push(Time(0), a[0].clone()).unwrap();
         r.push(Time(900), b[3].clone()).unwrap();
-        assert_eq!(r.missing(Time(1000), 500, 10), vec![(1, 1), (1, 2), (1, 3)]);
+        // 第 1 帧只到了第 0 片、之后 1000 µs 没动静，更新的第 2 帧也在到了：尾部算丢。
+        // 第 2 帧到了第 3 片：第 0 片后面已经隔了 3 个序号，算丢；第 1、2 片刚 100 µs，可能只是乱序
+        assert_eq!(
+            r.missing(Time(1000), 500, 10),
+            vec![(1, 1), (1, 2), (1, 3), (2, 0)]
+        );
         assert_eq!(
             r.missing(Time(1000), 0, 4),
             vec![(1, 1), (1, 2), (1, 3), (2, 0)]
         );
-        assert!(r.missing(Time(1000), 5000, 10).is_empty());
+        // 等得再久（5 ms）也不用等的：后面已经隔了 3 个序号的空洞
+        assert_eq!(r.missing(Time(1000), 5000, 10), vec![(2, 0)]);
         assert_eq!(r.floor(), None);
         r.expire(Time(60_000));
         assert_eq!(r.floor(), Some(2));
