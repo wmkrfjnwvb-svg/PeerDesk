@@ -377,7 +377,6 @@ fn wifi_light_activity(name: &str) -> Scenario {
 }
 
 #[test]
-#[ignore = "暂时：状态机三步做完后再决定（第 1 步之后实测能过：2 秒后最低 23.9 Mbps、5% 分位 23.9 Mbps；基线 360 kbps、10.2 Mbps）"]
 fn light_activity_on_wifi_keeps_the_rate() {
     let o = run(&wifi_light_activity("wifi-light")).unwrap();
     finish(&o);

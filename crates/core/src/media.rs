@@ -835,7 +835,7 @@ impl MediaSender {
 
     /// 现在为什么不能发运行中探测（能发时为 `None`）。真拥塞时不探：探测是满速的流量，只会添堵。
     fn probe_blocked(&self, now: Time) -> Option<&'static str> {
-        let p = self.rate.profile();
+        // （排队平不平静由估计器判：它知道哪些读数是断档的零星小包，不算数）
         let fb = self.last_obs.map(|o| o.feedback);
         if self.pending_probe.is_some() || self.probing.is_some() {
             Some("另一组探测还没完")
@@ -845,8 +845,6 @@ impl MediaSender {
             Some("在途数据满了")
         } else if self.pacer_busy {
             Some("上一帧还没发完")
-        } else if fb.is_some_and(|f| f.queue_delay_us >= p.low_delay_us) {
-            Some("最近的反馈里还有排队")
         } else if fb.is_some_and(|f| f.loss_permille >= FEC_FROM_LOSS_PERMILLE) {
             // 和起步探测一样：有丢包的链路上探测结果不准（ms-02560，8 Mbps、12% 丢包，按探测升码率后卡顿 0 → 3 次）
             Some("有丢包")
@@ -3604,8 +3602,6 @@ mod tests {
             loss_permille: loss,
             ..Feedback::default()
         };
-        tx.observe(Time(0), &fb(5_000, 0), Extension::default());
-        assert_eq!(tx.probe_blocked(Time(0)), Some("最近的反馈里还有排队"));
         tx.observe(Time(0), &fb(0, 20), Extension::default());
         assert_eq!(tx.probe_blocked(Time(0)), Some("有丢包"));
         tx.observe(Time(0), &fb(0, 0), Extension::default());

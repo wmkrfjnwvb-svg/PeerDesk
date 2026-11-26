@@ -1209,7 +1209,14 @@ impl ClassicV1 {
         match (self.phase, obs.limit) {
             // 起步由发送端的起步探测结束（见 `set_startup`）
             (Phase::Startup, _) => {}
-            (Phase::Tracking, SendLimit::App) => self.go(
+            // （从跟踪降下来的排空只是标记，规则就是跟踪：发送端报应用受限时一样直接进）
+            (
+                Phase::Tracking
+                | Phase::Drain {
+                    from_app: false, ..
+                },
+                SendLimit::App,
+            ) => self.go(
                 Phase::AppLimited { floor_since: None },
                 "发送端 500 ms 没有任何网络受限的原因，发出的量也明显少于码率",
             ),
@@ -1456,7 +1463,8 @@ impl RateEstimator for ClassicV1 {
                             < c.saturating_mul(PERIODIC_BELOW_PERMILLE)
                     });
                 let target = self.rate_bps.saturating_mul(PROBE_STEP).min(self.max_bps);
-                if long_enough && low && target > self.rate_bps && self.probe_fits(target) {
+                let calm = self.probing.calm_since.is_some();
+                if long_enough && low && calm && target > self.rate_bps && self.probe_fits(target) {
                     return self.ask(ProbeKind::Periodic, target);
                 }
                 None
@@ -1681,7 +1689,9 @@ impl RateEstimator for ClassicV1 {
             STANDING_US.max(obs.rtt_us),
         );
         self.probing.rtt_us = obs.rtt_us;
-        if fb.queue_delay_us < p.low_delay_us {
+        // 平静：排队低于 low。断档的那份反馈不算数（和判拥塞时一样：零星小包的读数是 Wi-Fi 省电的延迟，
+        // 几乎每份都是十几毫秒；算上的话轻操作时永远“不平静”，核实要干等——大屏 Wi-Fi 场景实测等了 2 秒）
+        if fb.queue_delay_us < p.low_delay_us || !contiguous {
             self.probing.calm_since.get_or_insert(now);
         } else {
             self.probing.calm_since = None;
@@ -1998,16 +2008,22 @@ mod tests {
         f.put(1_000, 0, 250_000, FLAT, NET);
         f.put(20_000, 0, 250_000, FLAT, NET);
         assert_eq!(f.v.state(), RateState::Drain);
-        // 排空期间发送端报应用受限：先排完再说（一份反馈只走一步）
-        f.put(5_000, 0, 250_000, FLAT, SendLimit::App);
+        f.put(5_000, 0, 250_000, FLAT, NET);
         assert_eq!(f.v.state(), RateState::Drain);
-        f.put(1_000, 0, 250_000, FLAT, SendLimit::App);
+        f.put(1_000, 0, 250_000, FLAT, NET);
         assert_eq!(f.v.state(), RateState::Tracking);
         assert!(f
             .notes()
             .contains("码率状态 排空（跟踪） → 跟踪：队列排掉了（排队 1 ms，低于 3 ms）"));
         f.put(1_000, 0, 250_000, FLAT, SendLimit::App);
         assert_eq!(f.v.state(), RateState::AppLimited);
+        // 出口三：排空期间发送端报应用受限 → 直接进应用受限（这种排空只是标记，规则就是跟踪）
+        let mut e = Feed::new(Profile::STABLE, 2_400_000);
+        e.put(1_000, 0, 250_000, FLAT, NET);
+        e.put(20_000, 0, 250_000, FLAT, NET);
+        assert_eq!(e.v.state(), RateState::Drain);
+        e.put(5_000, 0, 250_000, FLAT, SendLimit::App);
+        assert_eq!(e.v.state(), RateState::AppLimited);
         // 出口二：排队一直不低于 low，到 1 秒 → 跟踪。一个往返（至少 100 ms）过后还过载就再降，排空重新计时
         let mut g = Feed::new(Profile::STABLE, 2_400_000);
         g.put(1_000, 0, 250_000, FLAT, NET);
