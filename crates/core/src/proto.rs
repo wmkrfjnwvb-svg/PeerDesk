@@ -650,6 +650,28 @@ mod tests {
             assert_eq!(caps.os(), os);
         }
         assert_eq!(Caps::PROBE_ID.0, 1 << 31);
+        // 握手的能力位怎么流：被控端取自己和控制端 Hello 的交集（Hello 不带系统位），Accept 里带上自己的系统；
+        // 控制端取自己和 Accept 的交集、保留被控端的系统。被控端是哪个系统，两边看到的 PROBE_ID 都对；
+        // PROBE_TRAIN（第 24 位）只有被控端读得准——控制端那边这一位是系统位，Mac 是 0（所以控制端不许读它，
+        // 见 peerdesk_net::controller）。
+        for os in [PeerOs::Windows, PeerOs::Mac, PeerOs::Linux] {
+            let host = Caps::ALL.common(Caps::ALL);
+            assert!(host.has(Caps::PROBE_TRAIN) && host.has(Caps::PROBE_ID));
+            let accept = host.with_os(os);
+            let controller = Caps::ALL.common(accept).with_os(accept.os());
+            assert!(controller.has(Caps::PROBE_ID), "{os:?}");
+            assert_eq!(controller.os(), os);
+            assert_eq!(
+                controller.has(Caps::PROBE_TRAIN),
+                os != PeerOs::Mac,
+                "控制端读到的第 24 位是系统位"
+            );
+            // 对端是老版本（没有 PROBE_ID）：两边都协商不出来
+            let old = Caps(Caps::ALL.0 & !Caps::PROBE_ID.0);
+            assert!(!old.common(Caps::ALL).has(Caps::PROBE_ID));
+            let from_old_host = Caps::ALL.common(old.with_os(os)).with_os(os);
+            assert!(!from_old_host.has(Caps::PROBE_ID));
+        }
         // 老版本没有这一位：协商出来就没有
         let old = Caps(Caps::ALL.0 & !Caps::PROBE_ID.0);
         assert!(!Caps::ALL.common(old).has(Caps::PROBE_ID));

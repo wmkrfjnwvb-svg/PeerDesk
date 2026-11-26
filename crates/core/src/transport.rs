@@ -217,11 +217,6 @@ enum Parity {
     },
 }
 
-/// 这一帧分片的平均到达间隔（微秒）；只到了一片时为 0。
-fn now_gap(p: &Partial) -> u64 {
-    p.last_new.since(p.first_seen) / u64::from(p.arrived.saturating_sub(1).max(1))
-}
-
 #[derive(Debug, Clone)]
 struct Partial {
     first_seen: Time,
@@ -232,9 +227,8 @@ struct Partial {
     have: usize,
     /// 校验分片，按组号存放；长度就是组数。还没收到任何校验分片时为空。
     parity: Vec<Option<Parity>>,
-    /// 收到了几个分片（数据加校验，不算重复的；靠纠错恢复的不算），最近一次收到新分片的时间。
+    /// 收到了几个分片（数据加校验，不算重复的；靠纠错恢复的不算）。
     arrived: u32,
-    last_new: Time,
 }
 
 impl Partial {
@@ -341,10 +335,6 @@ pub const WHOLE_FRAME: u16 = u16::MAX;
 /// “这一帧我还在收，已经到了低 15 位这么多个分片”。发送端据此知道这一帧还活着、在进展（不按超时判丢、
 /// 继续拦着新帧），不用再靠“被要求重传”来推断。只在双方都支持新反馈格式时发（老发送端会把它当成越界的分片序号忽略）。
 pub const PROGRESS: u16 = 0x8000;
-/// 分片后面又到了这么多个分片还没到，就判丢（RFC 9002 第 6.1.1 节的包数门限 3）。
-pub const LOSS_PACKET_THRESHOLD: u32 = 3;
-/// 这么多分片以内的小帧，仍按“第一片到了之后等一个乱序窗口”判（见 [`Reassembler::lost`]）。
-pub const SMALL_FRAME: usize = 5;
 
 /// 一帧从第一个分片算起最多等这么多个截止时间（关键帧除外，见 [`Reassembler::expire`]）。
 const MAX_FRAME_LIFETIME_FACTOR: u64 = 8;
@@ -451,80 +441,6 @@ impl Reassembler {
                     .map(|(_, index)| (*frame_id, index))
             });
         whole.chain(parts).take(limit).collect()
-    }
-
-    /// 判定丢了、要请求重传的数据分片（最多 `limit` 个），按 RFC 9002 的思路：有证据才判丢，不按“第一片到了多久”。
-    ///
-    /// - **空洞**（第 6.1 节）：缺的分片后面已经到了 [`LOSS_PACKET_THRESHOLD`] 个（同一帧序号更大的数据分片、校验分片，
-    ///   或更新的帧的分片）就判丢；到了不足 3 个时，再等一个乱序窗口 `reorder_us`（这一帧没有新分片到）也判丢。
-    /// - **尾部**（第 6.2 节，超时探测 PTO 的思路）：后面什么都没到时没有空洞可看，只能按时间——这一帧最近一次有
-    ///   分片到之后过了 max(`reorder_us`, 2 × 这一帧的平均到达间隔)。窄带上分片本来就隔十几毫秒才到一个，
-    ///   固定等 10 ms 会把还在路上的都要一遍；宽带上间隔不到 1 ms，就是 10 ms。
-    /// - **小帧**（不超过 [`SMALL_FRAME`] 片）照旧：第一片到了 `reorder_us` 之后缺的都要。小帧几乎全是尾部，
-    ///   到达间隔也算不准；它只有几片，多要也多不了多少。
-    /// - 整帧没到的（[`WHOLE_FRAME`]）照旧。
-    ///
-    /// 以前的规则是“这一帧第一片到了 10 ms，缺的全要”：大帧后半段还在路上就被要重传（2026-11-26 用户日志
-    /// 两分钟重传 2628 片、实际丢包 97 个）。
-    #[must_use]
-    pub fn lost(&self, now: Time, reorder_us: u64, limit: usize) -> Vec<(u32, u16)> {
-        let whole = self
-            .wanted
-            .iter()
-            .filter(|(_, at)| now.since(**at) >= reorder_us)
-            .map(|(frame_id, _)| (*frame_id, WHOLE_FRAME));
-        let mut out: Vec<(u32, u16)> = whole.collect();
-        // 每一帧之后（帧号更大）的帧一共到了多少分片；收齐了在等参考帧的帧算够门限
-        let held = if self.held.is_empty() {
-            0
-        } else {
-            LOSS_PACKET_THRESHOLD
-        };
-        let mut newer: u32 = self
-            .pending
-            .values()
-            .fold(held, |n, p| n.saturating_add(p.arrived));
-        // 旧的帧先要（它挡着后面的帧）
-        for (frame_id, p) in &self.pending {
-            newer = newer.saturating_sub(p.arrived);
-            if p.parts.len() <= SMALL_FRAME {
-                if now.since(p.first_seen) >= reorder_us {
-                    out.extend(Self::holes(p).map(|i| (*frame_id, i)));
-                }
-                continue;
-            }
-            let quiet = now.since(p.last_new);
-            let tail_wait = reorder_us.max(now_gap(p).saturating_mul(2));
-            let parity = u32::try_from(p.parity.iter().flatten().count()).unwrap_or(u32::MAX);
-            // 序号比它大、已经到了的数据分片数：先数出总数，从小到大边走边减
-            let mut later = u32::try_from(p.have).unwrap_or(u32::MAX);
-            let behind = parity.saturating_add(newer);
-            for index in Self::all(p) {
-                if p.parts.get(usize::from(index)).is_some_and(Option::is_some) {
-                    later = later.saturating_sub(1);
-                    continue;
-                }
-                let after = later.saturating_add(behind);
-                let lost = after >= LOSS_PACKET_THRESHOLD
-                    || (after > 0 && quiet >= reorder_us)
-                    || (after == 0 && quiet >= tail_wait);
-                if lost {
-                    out.push((*frame_id, index));
-                }
-            }
-        }
-        out.truncate(limit);
-        out
-    }
-
-    /// 一帧的全部数据分片序号（低 15 位以内；更大的序号和 [`PROGRESS`] 标记冲突，不请求）。
-    fn all(p: &Partial) -> impl Iterator<Item = u16> {
-        (0u16..PROGRESS).take(p.parts.len())
-    }
-
-    /// 一帧里还缺的数据分片序号（从小到大）。
-    fn holes(p: &Partial) -> impl Iterator<Item = u16> + '_ {
-        Self::all(p).filter(|i| p.parts.get(usize::from(*i)).is_some_and(Option::is_none))
     }
 
     /// 正在收的帧的进度：`(帧号, PROGRESS | 已到的分片数)`，最新的 `limit` 帧。随重传请求一起发给发送端
@@ -647,7 +563,6 @@ impl Reassembler {
                 have: 0,
                 parity: Vec::new(),
                 arrived: 0,
-                last_new: now,
             });
         partial.last_seen = now;
         if partial.parts.len() != usize::from(data_count) {
@@ -674,7 +589,6 @@ impl Reassembler {
                 return Ok(None);
             }
             *slot = Some(parity);
-            partial.last_new = now;
             partial.arrived = partial.arrived.saturating_add(1);
         } else {
             // validate() 已保证序号小于总数；这里仍然不索引，越界时按错误返回而不是 panic。
@@ -688,7 +602,6 @@ impl Reassembler {
             }
             *slot = Some(packet.data);
             partial.have = partial.have.saturating_add(1);
-            partial.last_new = now;
             partial.arrived = partial.arrived.saturating_add(1);
         }
 
@@ -1358,6 +1271,24 @@ mod tests {
         lying.data[2..4].copy_from_slice(&[0xff, 0xff]);
         assert_eq!(r.push(Time(0), lying).unwrap(), None);
         assert_eq!(r.stats().recovered, 0);
+    }
+
+    #[test]
+    fn progress_reports_how_many_fragments_of_each_pending_frame_arrived() {
+        let mut r = Reassembler::new(50_000, 8);
+        assert!(r.progress(4).is_empty());
+        let a = packets(1, 400, 100);
+        let b = packets(2, 400, 100);
+        r.push(Time(0), a[0].clone()).unwrap();
+        r.push(Time(10), a[2].clone()).unwrap();
+        // 重复的分片不算
+        r.push(Time(20), a[2].clone()).unwrap();
+        r.push(Time(30), b[1].clone()).unwrap();
+        // 最新的帧在前；标记的最高位是 1，低 15 位是到了几片
+        assert_eq!(r.progress(4), vec![(2, PROGRESS | 1), (1, PROGRESS | 2)]);
+        assert_eq!(r.progress(1), vec![(2, PROGRESS | 1)]);
+        // 重传请求不受影响：照旧缺的全要
+        assert_eq!(r.missing(Time(1_000), 500, 10).len(), 5);
     }
 
     #[test]
