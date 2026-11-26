@@ -235,6 +235,8 @@ pub struct Strings {
     pub saved: &'static str,
     /// 打开日志文件夹。
     pub open_logs: &'static str,
+    /// 没找到兜底用的系统中文字体：原因和办法。
+    pub font_fallback_missing: &'static str,
     /// 网络体检。
     pub network_check: &'static str,
     /// 网络重连中。
@@ -526,6 +528,8 @@ pub const ZH: Strings = Strings {
     save: "保存",
     saved: "服务器设置已保存",
     open_logs: "打开日志文件夹",
+    font_fallback_missing:
+        "系统里没找到中文字体，文件名里的生僻字会显示成方框。装上思源黑体（Linux 上是 fonts-noto-cjk 包）再重新打开程序。",
     network_check: "网络体检（NAT、路由器、服务器、IPv6、端口映射）",
     reconnecting: "网络重连中，正在切换到其他通道",
     busy_title: "免费服务器拥挤",
@@ -730,6 +734,8 @@ pub const EN: Strings = Strings {
     save: "Save",
     saved: "Server settings saved",
     open_logs: "Open log folder",
+    font_fallback_missing:
+        "No system CJK font was found, so rare characters in file names show as boxes. Install Noto Sans CJK (fonts-noto-cjk on Linux), then reopen the app.",
     network_check: "Network check (NAT, router, server, IPv6, port mapping)",
     reconnecting: "Network lost, reconnecting through another channel",
     busy_title: "Free servers are busy",

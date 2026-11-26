@@ -310,7 +310,9 @@ impl InputState {
             Event::MouseMoved(_)
             | Event::Zoom(_)
             | Event::Touch { .. }
-            | Event::Screenshot { .. } => {}
+            | Event::Screenshot { .. }
+            // 读屏软件发来的操作由 egui 自己处理，不是给远端的输入
+            | Event::AccessKitActionRequest(_) => {}
         }
     }
 

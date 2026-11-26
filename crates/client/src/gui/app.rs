@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use eframe::egui::{self, Align, Color32, Layout, RichText, TextEdit};
+use eframe::egui::{self, Align, Layout, RichText, TextEdit};
 use peerdesk_core::proto::PeerOs;
 use peerdesk_core::signal::format_code;
 use peerdesk_net::identity::to_hex;
@@ -26,11 +26,12 @@ use super::settings::ServerSettings;
 use super::state::{HostPhase, Status};
 use super::stats::short_fingerprint;
 use super::theme::{
-    big_input, card, card_title, icon, icon_button, muted, nav_item, pill, primary_button, toggle,
-    Appearance, Palette,
+    big_input, font, icon, icon_button, muted, nav_item, notice, pad, panel, pill, primary_button,
+    radius, section_title, size, space, text, toggle, Appearance, ControlSize, Palette, Signal,
+    Weight, ON_DANGER,
 };
 use super::viewer::Viewer;
-use super::{fonts, guide_art, password, theme};
+use super::{guide_art, password, theme};
 use crate::remote::default_data_dir;
 use crate::{EXIT_FAILED, EXIT_OK};
 
@@ -141,6 +142,8 @@ struct App {
     service_checked: Option<Instant>,
     /// 本机电脑名（首页“本机”卡片上显示）。
     name: String,
+    /// 没找到兜底用的系统中文字体（生僻字会显示成方框）：设置页里一直提示。
+    font_fallback_missing: bool,
 }
 
 /// 用户手动关闭被控后留下的标记文件。
@@ -179,9 +182,7 @@ impl App {
     }
 
     fn new(ctx: &egui::Context, s: &'static Strings) -> Self {
-        let (defs, _font) = fonts::definitions();
-        ctx.set_fonts(defs);
-        theme::install(ctx);
+        let fonts = theme::install(ctx);
         let appearance = Appearance::load(&default_data_dir());
         appearance.apply(ctx);
         let data_dir = default_data_dir();
@@ -263,6 +264,7 @@ impl App {
             service: None,
             service_checked: None,
             name: crate::local::device_name(),
+            font_fallback_missing: fonts.system_cjk.is_none(),
         }
     }
 
@@ -388,67 +390,57 @@ impl App {
         }
         // macOS：首页只放一条提示，点进专门的引导页（有示意图和分步操作）
         if matches!(self.os, Os::MacOs { .. }) {
-            egui::Frame::new()
-                .fill(p.warning.gamma_multiply(0.12))
-                .stroke(egui::Stroke::new(1.0_f32, p.warning.gamma_multiply(0.5)))
-                .corner_radius(10)
-                .inner_margin(14)
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new(icon::SHIELD_WARNING)
-                                .size(20.0)
-                                .color(p.warning),
-                        );
-                        ui.label(RichText::new(self.s.perm_banner).strong());
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if primary_button(ui, p, self.s.perm_start, 110.0, true).clicked() {
-                                self.page = Page::Permissions;
-                            }
-                        });
-                    });
-                });
-            ui.add_space(12.0);
-            return;
-        }
-        egui::Frame::new()
-            .fill(p.warning.gamma_multiply(0.12))
-            .stroke(egui::Stroke::new(1.0_f32, p.warning.gamma_multiply(0.5)))
-            .corner_radius(10)
-            .inner_margin(14)
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
+            notice(ui, p, Signal::Relay, |ui, _| {
                 ui.horizontal(|ui| {
                     ui.label(
                         RichText::new(icon::SHIELD_WARNING)
-                            .size(18.0)
-                            .color(p.warning),
+                            .size(font::ICON_LARGE)
+                            .color(p.relay.text),
                     );
-                    ui.label(RichText::new(&self.guide.title).strong().color(p.warning));
-                });
-                for step in self.guide.steps.clone() {
-                    ui.horizontal_wrapped(|ui| {
-                        let (mark, color) = if step.done {
-                            (icon::CHECK_CIRCLE, p.success)
-                        } else {
-                            (icon::WARNING, p.warning)
-                        };
-                        ui.label(RichText::new(mark).color(color));
-                        ui.label(&step.text);
-                        if let Some((label, action)) = step.button {
-                            if ui.button(label).clicked() {
-                                if let Err(e) = peerdesk_platform::perform(action) {
-                                    self.status = Status::error(e);
-                                }
-                                // 授权对话框关掉后马上重新检查。
-                                self.guide_checked = Instant::now() - GUIDE_REFRESH;
-                            }
+                    ui.label(text(self.s.perm_banner, font::BODY, Weight::Semibold));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if primary_button(ui, p, self.s.perm_start, ControlSize::Medium, true)
+                            .clicked()
+                        {
+                            self.page = Page::Permissions;
                         }
                     });
-                }
+                });
             });
-        ui.add_space(12.0);
+            ui.add_space(space::S12);
+            return;
+        }
+        notice(ui, p, Signal::Relay, |ui, _| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(icon::SHIELD_WARNING)
+                        .size(font::ICON)
+                        .color(p.relay.text),
+                );
+                ui.label(text(&self.guide.title, font::BODY, Weight::Semibold).color(p.relay.text));
+            });
+            for step in self.guide.steps.clone() {
+                ui.horizontal_wrapped(|ui| {
+                    let (mark, color) = if step.done {
+                        (icon::CHECK_CIRCLE, p.direct.text)
+                    } else {
+                        (icon::WARNING, p.relay.text)
+                    };
+                    ui.label(RichText::new(mark).color(color));
+                    ui.label(&step.text);
+                    if let Some((label, action)) = step.button {
+                        if ui.button(label).clicked() {
+                            if let Err(e) = peerdesk_platform::perform(action) {
+                                self.status = Status::error(e);
+                            }
+                            // 授权对话框关掉后马上重新检查。
+                            self.guide_checked = Instant::now() - GUIDE_REFRESH;
+                        }
+                    }
+                });
+            }
+        });
+        ui.add_space(space::S12);
     }
 
     fn copy(&mut self, ui: &egui::Ui, text: &str, shown: &str) {
@@ -472,36 +464,32 @@ impl App {
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
                 egui::Frame::new()
-                    .fill(if p.dark {
-                        Color32::from_rgb(0x2A, 0x31, 0x3D)
-                    } else {
-                        Color32::from_rgb(0x1B, 0x23, 0x30)
-                    })
-                    .corner_radius(18)
-                    .inner_margin(egui::Margin::symmetric(16, 8))
+                    .fill(p.ink)
+                    .corner_radius(radius::PILL)
+                    .inner_margin(pad(space::S16, space::S8))
                     .show(ui, |ui| {
                         ui.label(
                             RichText::new(format!("{}  {text}", icon::CHECK_CIRCLE))
-                                .color(Color32::WHITE),
+                                .color(p.on_ink),
                         );
                     });
             });
         ctx.request_repaint_after(Duration::from_millis(100));
     }
 
-    fn host_state(&self, p: &Palette) -> (&'static str, Color32) {
+    fn host_state(&self) -> (&'static str, Signal) {
         let s = self.s;
         match &self.phase {
-            HostPhase::Off => (s.host_off, p.muted),
-            HostPhase::Starting => (s.host_starting, p.warning),
-            HostPhase::Listening { .. } => (s.host_listening, p.success),
+            HostPhase::Off => (s.host_off, Signal::Idle),
+            HostPhase::Starting => (s.host_starting, Signal::Idle),
+            HostPhase::Listening { .. } => (s.host_listening, Signal::Direct),
             HostPhase::Busy {
                 established: false, ..
-            } => (s.host_handshaking, p.warning),
+            } => (s.host_handshaking, Signal::Idle),
             HostPhase::Busy {
                 established: true, ..
-            } => (s.host_controlled, p.accent),
-            HostPhase::Stopping => (s.host_stopping, p.muted),
+            } => (s.host_controlled, Signal::Direct),
+            HostPhase::Stopping => (s.host_stopping, Signal::Idle),
         }
     }
 
@@ -513,23 +501,23 @@ impl App {
         } else {
             format!("{} · {}", s.this_device, self.name)
         };
-        card_title(ui, p, os_icon(PeerOs::current()), &title, |ui| {
-            let _ = pill(ui, s.unattended, p.success);
+        section_title(ui, &title, |ui| {
+            let _ = pill(ui, p, s.unattended, Signal::Direct);
         });
-        ui.add_space(4.0);
+        ui.add_space(space::S4);
         let _ = muted(ui, p, s.unattended_hint);
-        ui.add_space(8.0);
+        ui.add_space(space::S8);
         let _ = muted(ui, p, s.device_code);
         ui.horizontal(|ui| {
             ui.set_min_height(40.0);
             if let Some(code) = code {
                 let shown = format_code(code);
-                ui.label(RichText::new(&shown).monospace().size(30.0).strong());
-                if icon_button(ui, icon::COPY, s.copy).clicked() {
+                ui.label(text(&shown, font::CODE_COMPACT, Weight::Semibold));
+                if icon_button(ui, p, icon::COPY, s.copy, ControlSize::Small).clicked() {
                     self.copy(ui, &code.to_string(), &shown);
                 }
             } else {
-                ui.add(egui::Spinner::new().size(16.0).color(p.muted));
+                ui.add(egui::Spinner::new().size(font::SUBTITLE).color(p.muted));
                 let _ = muted(ui, p, s.code_pending);
             }
         });
@@ -568,18 +556,18 @@ impl App {
         // 权限不全时不能开启被控（关闭总是可以）。
         let enabled = !matches!(self.phase, HostPhase::Stopping | HostPhase::Starting)
             && (self.guide.ready || self.phase.is_on());
-        let (state, color) = self.host_state(p);
+        let (state, signal) = self.host_state();
         let mut toggled = false;
         let title = if self.name.is_empty() {
             s.this_device.to_owned()
         } else {
             format!("{} · {}", s.this_device, self.name)
         };
-        card_title(ui, p, os_icon(PeerOs::current()), &title, |ui| {
-            toggled = toggle(ui, p, &mut on, enabled)
+        section_title(ui, &title, |ui| {
+            toggled = toggle(ui, p, &mut on, s.allow_control, enabled)
                 .on_hover_text(s.allow_control)
                 .changed();
-            let _ = pill(ui, state, color);
+            let _ = pill(ui, p, state, signal);
         });
         if toggled {
             // 记住用户的选择：手动关了，下次打开不再自动开启
@@ -602,10 +590,10 @@ impl App {
                 log::warn!("记住被控开关失败：{e}");
             }
         }
-        ui.add_space(4.0);
+        ui.add_space(space::S4);
         if !self.phase.is_on() {
             let _ = muted(ui, p, s.host_off_hint);
-            ui.add_space(8.0);
+            ui.add_space(space::S8);
         }
 
         // 设备码（登记到服务器后才有）
@@ -615,8 +603,8 @@ impl App {
             match self.device_code {
                 Some(code) => {
                     let shown = format_code(code);
-                    ui.label(RichText::new(&shown).monospace().size(30.0).strong());
-                    if icon_button(ui, icon::COPY, s.copy).clicked() {
+                    ui.label(text(&shown, font::CODE_COMPACT, Weight::Semibold));
+                    if icon_button(ui, p, icon::COPY, s.copy, ControlSize::Small).clicked() {
                         self.copy(ui, &code.to_string(), &shown);
                     }
                 }
@@ -624,8 +612,8 @@ impl App {
                 None if !self.server.is_set() => {
                     let link = egui::Button::new(
                         RichText::new(format!("{}  {}", s.server_unset, icon::ARROW_RIGHT))
-                            .size(14.0)
-                            .color(p.accent),
+                            .size(font::BODY)
+                            .color(p.ink),
                     )
                     .frame(false);
                     if ui.add(link).clicked() {
@@ -633,15 +621,19 @@ impl App {
                     }
                 }
                 None if self.phase.is_on() => {
-                    ui.add(egui::Spinner::new().size(16.0).color(p.muted));
+                    ui.add(egui::Spinner::new().size(font::SUBTITLE).color(p.muted));
                     let _ = muted(ui, p, s.code_pending);
                 }
                 None => {
-                    ui.label(RichText::new(s.host_off).size(16.0).color(p.muted));
+                    ui.label(
+                        RichText::new(s.host_off)
+                            .size(font::SUBTITLE)
+                            .color(p.muted),
+                    );
                 }
             }
         });
-        ui.add_space(10.0);
+        ui.add_space(space::S10);
 
         // 密码
         let _ = muted(ui, p, s.password);
@@ -652,19 +644,27 @@ impl App {
             } else {
                 "•".repeat(password.chars().count())
             };
-            ui.label(RichText::new(shown).monospace().size(22.0).strong());
+            ui.label(text(shown, font::TITLE, Weight::Semibold));
             let (eye, tip) = if self.show_password {
                 (icon::EYE_SLASH, s.hide_password)
             } else {
                 (icon::EYE, s.show_password)
             };
-            if icon_button(ui, eye, tip).clicked() {
+            if icon_button(ui, p, eye, tip, ControlSize::Small).clicked() {
                 self.show_password = !self.show_password;
             }
-            if icon_button(ui, icon::COPY, s.copy).clicked() {
+            if icon_button(ui, p, icon::COPY, s.copy, ControlSize::Small).clicked() {
                 self.copy(ui, &password, s.password);
             }
-            if icon_button(ui, icon::ARROWS_CLOCKWISE, s.new_password).clicked() {
+            if icon_button(
+                ui,
+                p,
+                icon::ARROWS_CLOCKWISE,
+                s.new_password,
+                ControlSize::Small,
+            )
+            .clicked()
+            {
                 // 用户主动换：生成并保存（重启后还是这个）
                 match password::generate().and_then(|pw| {
                     password::save(&self.data_dir, &pw)?;
@@ -680,21 +680,21 @@ impl App {
                 }
             }
         });
-        ui.add_space(8.0);
+        ui.add_space(space::S8);
         let _ = muted(ui, p, s.this_device_hint);
 
         // 正在被控制：谁、断开
         if let HostPhase::Busy { addr, peer, .. } = &self.phase {
             let (addr, peer) = (*addr, peer.clone());
-            ui.add_space(10.0);
+            ui.add_space(space::S10);
             egui::Frame::new()
-                .fill(p.accent_soft)
-                .corner_radius(8)
-                .inner_margin(10)
+                .fill(p.hover)
+                .corner_radius(radius::CONTROL)
+                .inner_margin(pad(space::S10, space::S10))
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new(icon::HAND_EYE).color(p.accent));
+                        ui.label(RichText::new(icon::HAND_EYE).color(p.ink));
                         // 先放右侧的断开按钮，地址和指纹用剩下的宽度（放不下截断）
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             let stop = egui::Button::new(
@@ -703,9 +703,9 @@ impl App {
                                     icon::PHONE_DISCONNECT,
                                     s.disconnect
                                 ))
-                                .color(Color32::WHITE),
+                                .color(ON_DANGER),
                             )
-                            .fill(p.danger);
+                            .fill(p.danger_fill);
                             if ui.add(stop).clicked() {
                                 if let Some(host) = &self.host {
                                     host.kick();
@@ -726,32 +726,31 @@ impl App {
     /// “远程控制设备”卡片：设备码、密码、连接。
     fn remote_card(&mut self, ui: &mut egui::Ui, p: &Palette) {
         let s = self.s;
-        card_title(ui, p, icon::LINK, s.remote_card, |_| {});
-        ui.add_space(4.0);
+        section_title(ui, s.remote_card, |_| {});
+        ui.add_space(space::S4);
         let mut go = false;
         let r = big_input(ui, p, &mut self.form.addr, s.code_hint, false);
         go |= r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
         if r.changed() {
             self.form_error = None;
         }
-        ui.add_space(4.0);
+        ui.add_space(space::S4);
         let r = big_input(ui, p, &mut self.form_password, s.password_input_hint, true);
         go |= r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-        egui::CollapsingHeader::new(RichText::new(s.advanced).size(12.5).color(p.muted))
+        egui::CollapsingHeader::new(RichText::new(s.advanced).size(font::SMALL).color(p.muted))
             .id_salt("advanced")
             .show(ui, |ui| {
                 let _ = muted(ui, p, s.pin);
                 let r = big_input(ui, p, &mut self.form.pin, "", false);
                 go |= r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             });
-        ui.add_space(6.0);
+        ui.add_space(space::S6);
         let ready = !self.form.addr.trim().is_empty();
-        let width = ui.available_width();
         if primary_button(
             ui,
             p,
             &format!("{}  {}", s.connect_this, icon::ARROW_RIGHT),
-            width,
+            ControlSize::Large,
             ready,
         )
         .clicked()
@@ -760,10 +759,10 @@ impl App {
             self.connect_from_form();
         }
         if let Some(e) = &self.form_error {
-            ui.add_space(4.0);
+            ui.add_space(space::S4);
             ui.horizontal(|ui| {
-                ui.label(RichText::new(icon::WARNING).color(p.danger));
-                ui.label(RichText::new(e).size(12.5).color(p.danger));
+                ui.label(RichText::new(icon::WARNING).color(p.problem.text));
+                ui.label(RichText::new(e).size(font::SMALL).color(p.problem.text));
             });
         }
     }
@@ -790,20 +789,27 @@ impl App {
                     .memory(|m| m.data.get_temp::<bool>(id))
                     .unwrap_or(false);
                 let response = egui::Frame::new()
-                    .fill(p.card)
+                    .fill(p.surface)
                     .stroke(egui::Stroke::new(
                         1.0_f32,
-                        if hovered { p.accent } else { p.border },
+                        if hovered { p.ink } else { p.line },
                     ))
-                    .corner_radius(10)
-                    .inner_margin(12)
+                    .corner_radius(radius::PANEL)
+                    .inner_margin(pad(space::S12, space::S12))
                     .show(ui, |ui| {
                         ui.set_width(196.0);
                         ui.set_height(40.0);
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new(os_icon(item.os)).size(24.0).color(p.accent));
+                            ui.label(
+                                RichText::new(os_icon(item.os))
+                                    .size(font::ICON_LARGE)
+                                    .color(p.ink),
+                            );
                             ui.vertical(|ui| {
-                                ui.add(egui::Label::new(RichText::new(&title).strong()).truncate());
+                                ui.add(
+                                    egui::Label::new(text(&title, font::BODY, Weight::Semibold))
+                                        .truncate(),
+                                );
                                 let _ = muted(ui, p, &kind);
                             });
                         });
@@ -835,41 +841,41 @@ impl App {
 
     fn home_page(&mut self, ui: &mut egui::Ui, p: &Palette) {
         let s = self.s;
-        ui.label(RichText::new(s.nav_home).size(22.0).strong());
-        ui.add_space(14.0);
+        ui.label(text(s.nav_home, font::TITLE, Weight::Semibold));
+        ui.add_space(space::S14);
         self.permission_guide(ui, p);
         // 窗口够宽时两张卡片并排，否则上下排：并排时每张卡片至少要 CARD_MIN_WIDTH，
         // 不够时内容会溢出到旁边那张卡片上（Windows 高缩放比例下窗口逻辑宽度更小）。
         if ui.available_width() >= 2.0 * CARD_MIN_WIDTH + 8.0 {
             ui.columns(2, |cols| {
                 if let [left, right] = cols {
-                    card(left, p, |ui| {
+                    panel(left, p, |ui| {
                         ui.set_min_height(CARD_HEIGHT);
                         self.this_device_card(ui, p);
                     });
-                    card(right, p, |ui| {
+                    panel(right, p, |ui| {
                         ui.set_min_height(CARD_HEIGHT);
                         self.remote_card(ui, p);
                     });
                 }
             });
         } else {
-            card(ui, p, |ui| self.this_device_card(ui, p));
-            ui.add_space(12.0);
-            card(ui, p, |ui| self.remote_card(ui, p));
+            panel(ui, p, |ui| self.this_device_card(ui, p));
+            ui.add_space(space::S12);
+            panel(ui, p, |ui| self.remote_card(ui, p));
         }
-        ui.add_space(18.0);
-        ui.label(RichText::new(s.recent).size(15.0).strong());
-        ui.add_space(6.0);
+        ui.add_space(space::S20);
+        ui.label(text(s.recent, font::BODY, Weight::Semibold));
+        ui.add_space(space::S6);
         self.recent_strip(ui, p, 6);
     }
 
     fn devices_page(&mut self, ui: &mut egui::Ui, p: &Palette) {
         let s = self.s;
-        ui.label(RichText::new(s.nav_devices).size(22.0).strong());
-        ui.add_space(4.0);
+        ui.label(text(s.nav_devices, font::TITLE, Weight::Semibold));
+        ui.add_space(space::S4);
         let _ = muted(ui, p, s.devices_hint);
-        ui.add_space(14.0);
+        ui.add_space(space::S14);
         let items: Vec<_> = self.recent.items().to_vec();
         if items.is_empty() {
             empty_state(ui, p, icon::CLOCK_COUNTER_CLOCKWISE, s.no_recent);
@@ -878,7 +884,7 @@ impl App {
         let mut connect = None;
         let mut forget = None;
         let mut files = None;
-        card(ui, p, |ui| {
+        panel(ui, p, |ui| {
             for (i, item) in items.iter().enumerate() {
                 if i > 0 {
                     ui.separator();
@@ -886,9 +892,13 @@ impl App {
                 let (title, kind) = item.heading(s.device_code, s.ip_direct);
                 ui.horizontal(|ui| {
                     ui.set_min_height(44.0);
-                    ui.label(RichText::new(os_icon(item.os)).size(24.0).color(p.accent));
+                    ui.label(
+                        RichText::new(os_icon(item.os))
+                            .size(font::ICON_LARGE)
+                            .color(p.ink),
+                    );
                     ui.vertical(|ui| {
-                        ui.label(RichText::new(&title).strong());
+                        ui.label(text(&title, font::BODY, Weight::Semibold));
                         let detail = if item.pin.is_empty() {
                             kind.to_owned()
                         } else {
@@ -897,14 +907,24 @@ impl App {
                         let _ = muted(ui, p, &detail);
                     });
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if icon_button(ui, icon::TRASH, s.forget).clicked() {
+                        if icon_button(ui, p, icon::TRASH, s.forget, ControlSize::Small).clicked() {
                             forget = Some(item.addr.clone());
                         }
                         // 文件传输：先连上这台设备，连上后自动打开文件管理
-                        if icon_button(ui, icon::FOLDER_OPEN, s.file_transfer).clicked() {
+                        if icon_button(
+                            ui,
+                            p,
+                            icon::FOLDER_OPEN,
+                            s.file_transfer,
+                            ControlSize::Small,
+                        )
+                        .clicked()
+                        {
                             files = Some(item.clone());
                         }
-                        if primary_button(ui, p, s.connect_this, 88.0, true).clicked() {
+                        if primary_button(ui, p, s.connect_this, ControlSize::Medium, true)
+                            .clicked()
+                        {
                             connect = Some(item.clone());
                         }
                     });
@@ -931,26 +951,26 @@ impl App {
 
     fn settings_page(&mut self, ui: &mut egui::Ui, p: &Palette) {
         let s = self.s;
-        ui.label(RichText::new(s.nav_settings).size(22.0).strong());
-        ui.add_space(14.0);
+        ui.label(text(s.nav_settings, font::TITLE, Weight::Semibold));
+        ui.add_space(space::S14);
 
-        card(ui, p, |ui| {
-            card_title(ui, p, icon::PLUG, s.section_server, |_| {});
+        panel(ui, p, |ui| {
+            section_title(ui, s.section_server, |_| {});
             let _ = muted(ui, p, s.via_server);
-            ui.add_space(6.0);
+            ui.add_space(space::S6);
             let mut save = false;
             for (label, value, secret) in [
                 (s.server_addr, &mut self.server.addr, false),
                 (s.server_pin, &mut self.server.pin, false),
                 (s.account_token, &mut self.server.account, true),
             ] {
-                ui.add_space(4.0);
+                ui.add_space(space::S4);
                 let _ = muted(ui, p, label);
                 let r = big_input(ui, p, value, "", secret);
                 save |= r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             }
-            ui.add_space(8.0);
-            save |= primary_button(ui, p, s.save, 120.0, true).clicked();
+            ui.add_space(space::S8);
+            save |= primary_button(ui, p, s.save, ControlSize::Medium, true).clicked();
             if save {
                 self.status = match self.server.server(s) {
                     Err(e) => Status::error(e),
@@ -965,11 +985,13 @@ impl App {
                 };
             }
         });
-        ui.add_space(12.0);
+        ui.add_space(space::S12);
 
-        card(ui, p, |ui| {
-            card_title(ui, p, icon::WIFI_HIGH, s.section_network, |ui| {
-                if icon_button(ui, icon::ARROWS_CLOCKWISE, s.refresh).clicked() {
+        panel(ui, p, |ui| {
+            section_title(ui, s.section_network, |ui| {
+                if icon_button(ui, p, icon::ARROWS_CLOCKWISE, s.refresh, ControlSize::Small)
+                    .clicked()
+                {
                     self.addrs = lan_addresses();
                 }
             });
@@ -979,13 +1001,13 @@ impl App {
             let field = ui.add_enabled(
                 editable,
                 TextEdit::singleline(&mut self.port)
-                    .margin(egui::Margin::symmetric(10, 8))
+                    .margin(pad(space::S10, space::S8))
                     .desired_width(120.0),
             );
             if !editable {
                 let _ = field.on_disabled_hover_text(s.port_locked);
             }
-            ui.add_space(6.0);
+            ui.add_space(space::S6);
             let port = self.phase.port();
             let shown_port = port.map_or_else(
                 || parse_port(&self.port, s).unwrap_or(DEFAULT_PORT),
@@ -1005,13 +1027,13 @@ impl App {
             for addr in addrs {
                 ui.horizontal(|ui| {
                     ui.monospace(&addr);
-                    if icon_button(ui, icon::COPY, s.copy).clicked() {
+                    if icon_button(ui, p, icon::COPY, s.copy, ControlSize::Small).clicked() {
                         self.copy(ui, &addr, &addr);
                     }
                 });
             }
             if let Some(report) = self.net.clone() {
-                ui.add_space(6.0);
+                ui.add_space(space::S6);
                 egui::CollapsingHeader::new(s.network_check)
                     .id_salt("network-check")
                     .show(ui, |ui| {
@@ -1028,10 +1050,19 @@ impl App {
                     });
             }
         });
-        ui.add_space(12.0);
+        ui.add_space(space::S12);
 
-        card(ui, p, |ui| {
-            card_title(ui, p, icon::GEAR_SIX, s.section_general, |_| {});
+        panel(ui, p, |ui| {
+            section_title(ui, s.section_general, |_| {});
+            if self.font_fallback_missing {
+                notice(ui, p, Signal::Relay, |ui, colors| {
+                    ui.add(
+                        egui::Label::new(RichText::new(s.font_fallback_missing).color(colors.text))
+                            .wrap(),
+                    );
+                });
+                ui.add_space(space::S8);
+            }
             ui.horizontal(|ui| {
                 ui.label(format!("{}:", s.language));
                 self.language_switch(ui);
@@ -1060,10 +1091,10 @@ impl App {
                 };
             }
         });
-        ui.add_space(12.0);
+        ui.add_space(space::S12);
 
-        card(ui, p, |ui| {
-            card_title(ui, p, icon::INFO, s.section_about, |_| {});
+        panel(ui, p, |ui| {
+            section_title(ui, s.section_about, |_| {});
             ui.label(format!(
                 "PeerDesk {} {}",
                 s.version,
@@ -1074,13 +1105,13 @@ impl App {
                     ui.horizontal(|ui| {
                         let _ = muted(ui, p, s.fingerprint);
                         ui.monospace(short_fingerprint(&fp));
-                        if icon_button(ui, icon::COPY, s.copy).clicked() {
+                        if icon_button(ui, p, icon::COPY, s.copy, ControlSize::Small).clicked() {
                             self.copy(ui, &fp, s.fingerprint);
                         }
                     });
                 }
                 Err(e) => {
-                    ui.colored_label(p.danger, e);
+                    ui.colored_label(p.problem.text, e);
                 }
             }
             if let HostPhase::Listening { port, .. } = self.phase {
@@ -1130,10 +1161,10 @@ impl App {
         };
         let english = std::ptr::eq(s, strings(Lang::En));
         let names = mac_settings_names(major, english);
-        ui.label(RichText::new(s.perm_title).size(22.0).strong());
-        ui.add_space(4.0);
+        ui.label(text(s.perm_title, font::TITLE, Weight::Semibold));
+        ui.add_space(space::S4);
         let _ = muted(ui, p, s.perm_subtitle);
-        ui.add_space(14.0);
+        ui.add_space(space::S14);
 
         // 两项权限的状态
         let items = [
@@ -1156,27 +1187,27 @@ impl App {
         ui.columns(2, |cols| {
             for (i, (col, (name, what, ok, glyph))) in cols.iter_mut().zip(items).enumerate() {
                 let screen = i == 0;
-                card(col, p, |ui| {
+                panel(col, p, |ui| {
                     ui.set_min_height(120.0);
                     // 标题一行，状态单独一行：英文标题很长，放同一行会和状态标签重叠
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new(glyph).size(22.0).color(p.accent));
-                        ui.add(egui::Label::new(RichText::new(name).size(15.0).strong()).wrap());
+                        ui.label(RichText::new(glyph).size(font::TITLE).color(p.ink));
+                        ui.add(egui::Label::new(text(name, font::BODY, Weight::Semibold)).wrap());
                     });
-                    ui.add_space(6.0);
+                    ui.add_space(space::S6);
                     ui.horizontal(|ui| {
                         if ok {
-                            let _ = pill(ui, s.perm_granted, p.success);
+                            let _ = pill(ui, p, s.perm_granted, Signal::Direct);
                         } else {
-                            let _ = pill(ui, s.perm_missing, p.warning);
+                            let _ = pill(ui, p, s.perm_missing, Signal::Relay);
                         }
                     });
-                    ui.add_space(6.0);
+                    ui.add_space(space::S6);
                     let _ = muted(ui, p, what);
                     if ok {
                         return;
                     }
-                    ui.add_space(10.0);
+                    ui.add_space(space::S10);
                     ui.horizontal(|ui| {
                         // 先做的那一项用主按钮，另一项用普通按钮，引导用户按顺序来
                         let request = if screen {
@@ -1191,7 +1222,7 @@ impl App {
                         };
                         let primary = screen == screen_first;
                         let r = if primary {
-                            primary_button(ui, p, s.perm_request, 120.0, true)
+                            primary_button(ui, p, s.perm_request, ControlSize::Medium, true)
                         } else {
                             ui.add(
                                 egui::Button::new(s.perm_request).min_size(egui::vec2(120.0, 40.0)),
@@ -1216,18 +1247,18 @@ impl App {
         if let Some(action) = clicked {
             self.perform(action);
         }
-        ui.add_space(14.0);
+        ui.add_space(space::S14);
 
         if self.perms.screen_capture && self.perms.input_injection {
-            card(ui, p, |ui| {
+            panel(ui, p, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
                         RichText::new(icon::CHECK_CIRCLE)
-                            .size(36.0)
-                            .color(p.success),
+                            .size(font::ICON_HERO)
+                            .color(p.direct.text),
                     );
                     ui.vertical(|ui| {
-                        ui.label(RichText::new(s.perm_done_title).size(18.0).strong());
+                        ui.label(text(s.perm_done_title, font::ICON, Weight::Semibold));
                         let _ = muted(ui, p, s.perm_done);
                     });
                 });
@@ -1237,21 +1268,21 @@ impl App {
         // 先做屏幕录制，再做辅助功能
         let screen = !self.perms.screen_capture;
         let item = if screen { names.screen } else { names.input };
-        card(ui, p, |ui| {
+        panel(ui, p, |ui| {
             let step_no = if screen { 1 } else { 2 };
             ui.label(
                 RichText::new(format!(
                     "{}  ·  {item}",
                     s.perm_step.replace("{n}", &step_no.to_string())
                 ))
-                .size(16.0)
+                .size(font::SUBTITLE)
                 .strong(),
             );
-            ui.add_space(10.0);
+            ui.add_space(space::S10);
             ui.vertical_centered(|ui| {
                 guide_art::mac_settings(ui, p, &names, item, false, s.perm_callout, s.perm_unlock);
             });
-            ui.add_space(12.0);
+            ui.add_space(space::S12);
             let mut texts = vec![s.perm_open_hint];
             if names.unlock {
                 texts.push(s.perm_unlock_hint);
@@ -1265,19 +1296,19 @@ impl App {
                 ui.horizontal(|ui| {
                     let n = (i + 1).to_string();
                     egui::Frame::new()
-                        .fill(p.accent)
-                        .corner_radius(11)
-                        .inner_margin(egui::Margin::symmetric(7, 1))
+                        .fill(p.ink)
+                        .corner_radius(radius::PILL)
+                        .inner_margin(pad(space::S8, space::S2))
                         .show(ui, |ui| {
-                            ui.label(RichText::new(&n).strong().color(Color32::WHITE));
+                            ui.label(theme::text(&n, font::BODY, Weight::Semibold).color(p.on_ink));
                         });
                     ui.add(egui::Label::new(text).wrap());
                 });
-                ui.add_space(4.0);
+                ui.add_space(space::S4);
             }
             if screen {
                 // 屏幕录制授权后要重新打开程序才生效
-                ui.add_space(6.0);
+                ui.add_space(space::S6);
                 if ui
                     .add(egui::Button::new(s.perm_relaunch).min_size(egui::vec2(0.0, 40.0)))
                     .clicked()
@@ -1291,13 +1322,17 @@ impl App {
     /// 左侧导航栏：品牌、页面、服务器状态。
     fn sidebar(&mut self, ui: &mut egui::Ui, p: &Palette) {
         let s = self.s;
-        ui.add_space(18.0);
+        ui.add_space(space::S20);
         ui.horizontal(|ui| {
-            ui.add_space(6.0);
-            ui.label(RichText::new(icon::MONITOR).size(24.0).color(p.accent));
-            ui.label(RichText::new("PeerDesk").size(19.0).strong());
+            ui.add_space(space::S6);
+            ui.label(
+                RichText::new(icon::MONITOR)
+                    .size(font::ICON_LARGE)
+                    .color(p.ink),
+            );
+            ui.label(text("PeerDesk", font::TITLE, Weight::Semibold));
         });
-        ui.add_space(22.0);
+        ui.add_space(space::S24);
         for (page, glyph, text) in [
             (Page::Home, icon::DESKTOP, s.nav_home),
             (Page::Devices, icon::CLOCK_COUNTER_CLOCKWISE, s.nav_devices),
@@ -1306,19 +1341,19 @@ impl App {
             if nav_item(ui, p, glyph, text, self.page == page).clicked() {
                 self.page = page;
             }
-            ui.add_space(2.0);
+            ui.add_space(space::S2);
         }
         ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
-            ui.add_space(14.0);
-            let (text, color) = if !self.server.is_set() {
-                (s.server_unset, p.muted)
+            ui.add_space(space::S14);
+            let (text, signal) = if !self.server.is_set() {
+                (s.server_unset, Signal::Idle)
             } else if self.device_code.is_some() {
-                (s.server_online, p.success)
+                (s.server_online, Signal::Direct)
             } else {
-                (s.server_offline, p.warning)
+                (s.server_offline, Signal::Relay)
             };
             ui.horizontal(|ui| {
-                ui.add_space(8.0);
+                ui.add_space(space::S8);
                 let _ = muted(
                     ui,
                     p,
@@ -1329,10 +1364,10 @@ impl App {
                     ),
                 );
             });
-            ui.add_space(4.0);
+            ui.add_space(space::S4);
             ui.horizontal(|ui| {
-                ui.add_space(6.0);
-                let _ = pill(ui, text, color);
+                ui.add_space(space::S6);
+                let _ = pill(ui, p, text, signal);
             });
         });
     }
@@ -1350,13 +1385,17 @@ impl App {
         }
         ui.ctx().request_repaint_after(STATUS_FADE);
         let (glyph, color) = if self.status.error {
-            (icon::WARNING, p.danger)
+            (icon::WARNING, p.problem.text)
         } else {
             (icon::INFO, p.muted)
         };
         ui.horizontal(|ui| {
             ui.label(RichText::new(glyph).color(color));
-            ui.label(RichText::new(&self.status.text).size(12.5).color(color));
+            ui.label(
+                RichText::new(&self.status.text)
+                    .size(font::SMALL)
+                    .color(color),
+            );
         });
     }
 }
@@ -1397,11 +1436,11 @@ impl eframe::App for App {
         egui::SidePanel::left("nav")
             .resizable(false)
             .show_separator_line(false)
-            .exact_width(200.0)
+            .exact_width(size::SIDEBAR - 2.0 * space::S12)
             .frame(
                 egui::Frame::new()
-                    .fill(p.sidebar)
-                    .inner_margin(egui::Margin::symmetric(12, 0)),
+                    .fill(p.surface)
+                    .inner_margin(pad(space::S12, 0.0)),
             )
             .show(ctx, |ui| {
                 // 右侧一条细分隔线（画在面板里面，不留缝）
@@ -1409,7 +1448,7 @@ impl eframe::App for App {
                 ui.painter().vline(
                     r.right() + 11.5,
                     r.y_range(),
-                    egui::Stroke::new(1.0_f32, p.border),
+                    egui::Stroke::new(1.0_f32, p.line),
                 );
                 self.sidebar(ui, &p);
             });
@@ -1418,7 +1457,7 @@ impl eframe::App for App {
             .frame(
                 egui::Frame::new()
                     .fill(p.bg)
-                    .inner_margin(egui::Margin::symmetric(28, 8)),
+                    .inner_margin(pad(space::S44, space::S8)),
             )
             .show(ctx, |ui| {
                 ui.set_min_height(20.0);
@@ -1428,7 +1467,7 @@ impl eframe::App for App {
             .frame(
                 egui::Frame::new()
                     .fill(p.bg)
-                    .inner_margin(egui::Margin::symmetric(28, 22)),
+                    .inner_margin(pad(space::S44, space::S36)),
             )
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| match self.page {
@@ -1505,17 +1544,17 @@ const fn os_icon(os: PeerOs) -> &'static str {
 
 /// 空列表时的提示：大图标 + 一句话，居中。
 fn empty_state(ui: &mut egui::Ui, p: &Palette, glyph: &str, text: &str) {
-    card(ui, p, |ui| {
+    panel(ui, p, |ui| {
         ui.vertical_centered(|ui| {
-            ui.add_space(12.0);
+            ui.add_space(space::S12);
             ui.label(
                 RichText::new(glyph)
-                    .size(36.0)
+                    .size(font::ICON_HERO)
                     .color(p.muted.gamma_multiply(0.7)),
             );
-            ui.add_space(6.0);
+            ui.add_space(space::S6);
             let _ = muted(ui, p, text);
-            ui.add_space(12.0);
+            ui.add_space(space::S12);
         });
     });
 }

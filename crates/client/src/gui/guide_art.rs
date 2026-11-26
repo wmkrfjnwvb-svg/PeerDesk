@@ -87,7 +87,7 @@ pub fn mac_settings(
         window,
         CornerRadius::same(10),
         w.window,
-        Stroke::new(1.0_f32, p.border),
+        Stroke::new(1.0_f32, p.line),
         StrokeKind::Inside,
     );
 
@@ -142,7 +142,7 @@ pub fn mac_settings(
         let y = sidebar.top() + 14.0 + f32::from(i) * row_h;
         let row = Rect::from_min_size(pos2(sidebar.left() + 10.0, y), vec2(130.0, 20.0));
         if i == 3 {
-            painter.rect_filled(row, 6.0, p.accent);
+            painter.rect_filled(row, 6.0, p.ink);
             let _ = painter.text(
                 row.left_center() + vec2(10.0, 0.0),
                 Align2::LEFT_CENTER,
@@ -170,14 +170,14 @@ pub fn mac_settings(
             Align2::CENTER_CENTER,
             egui_phosphor::regular::LOCK_SIMPLE,
             FontId::proportional(16.0),
-            p.warning,
+            p.relay.solid,
         );
         let _ = painter.text(
             lock + vec2(14.0, 0.0),
             Align2::LEFT_CENTER,
             unlock_hint,
             FontId::proportional(10.5),
-            p.warning,
+            p.relay.solid,
         );
     }
 
@@ -225,15 +225,11 @@ pub fn mac_settings(
             painter.rect(
                 row.shrink(2.0),
                 6.0,
-                p.accent_soft,
-                Stroke::new(1.5_f32, p.accent),
+                p.hover,
+                Stroke::new(1.5_f32, p.ink),
                 StrokeKind::Inside,
             );
-            painter.rect_filled(
-                Rect::from_center_size(icon, vec2(18.0, 18.0)),
-                4.0,
-                p.accent,
-            );
+            painter.rect_filled(Rect::from_center_size(icon, vec2(18.0, 18.0)), 4.0, p.ink);
             let _ = painter.text(
                 icon,
                 Align2::CENTER_CENTER,
@@ -276,13 +272,13 @@ pub fn mac_settings(
         painter.circle_stroke(
             toggle,
             16.0 + 4.0 * pulse,
-            Stroke::new(2.0_f32, p.accent.gamma_multiply(0.4 + 0.5 * pulse)),
+            Stroke::new(2.0_f32, p.ink.gamma_multiply(0.4 + 0.5 * pulse)),
         );
         let tip = toggle + vec2(22.0, 10.0);
         let from = pos2(outer.right() - 60.0, toggle.y + 60.0);
-        painter.arrow(from, tip - from, Stroke::new(2.5_f32, p.accent));
+        painter.arrow(from, tip - from, Stroke::new(2.5_f32, p.ink));
         let bubble = Rect::from_center_size(from + vec2(0.0, 18.0), vec2(112.0, 28.0));
-        painter.rect_filled(bubble, 8.0, p.accent);
+        painter.rect_filled(bubble, 8.0, p.ink);
         let _ = painter.text(
             bubble.center(),
             Align2::CENTER_CENTER,

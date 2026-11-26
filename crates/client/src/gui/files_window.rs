@@ -15,7 +15,7 @@ use peerdesk_core::browse::{Reply, Request};
 use peerdesk_net::Link;
 
 use super::files::{child, duration_text, parent, size_text, time_text, Pane};
-use super::theme::{icon, Palette};
+use super::theme::{font, icon, space, Palette};
 use super::transfers::{Direction, Queue, Runner, State};
 
 /// 哪一栏。
@@ -276,7 +276,7 @@ impl FilesWindow {
         }
 
         egui::TopBottomPanel::top("files-top").show(ctx, |ui| {
-            ui.add_space(6.0);
+            ui.add_space(space::S6);
             ui.horizontal(|ui| {
                 ui.label("对方设备");
                 let current = self
@@ -304,14 +304,15 @@ impl FilesWindow {
                     );
                 } else if link.is_none() {
                     ui.label(
-                        RichText::new("对方版本太旧（不支持文件管理）或还没连上").color(p.warning),
+                        RichText::new("对方版本太旧（不支持文件管理）或还没连上")
+                            .color(p.relay.text),
                     );
                 }
                 if let Some(note) = &self.note {
-                    ui.label(RichText::new(note).color(p.warning));
+                    ui.label(RichText::new(note).color(p.relay.text));
                 }
             });
-            ui.add_space(4.0);
+            ui.add_space(space::S4);
         });
 
         egui::TopBottomPanel::bottom("files-transfers")
@@ -350,7 +351,7 @@ impl FilesWindow {
             Side::Remote => "对方",
         };
         ui.horizontal(|ui| {
-            ui.label(RichText::new(title).strong().size(16.0));
+            ui.label(RichText::new(title).strong().size(font::SUBTITLE));
             // 预置位置
             let places = self.pane(side).places.clone();
             egui::ComboBox::from_id_salt(("places", title))
@@ -438,7 +439,7 @@ impl FilesWindow {
             }
         }
         if let Some(err) = self.pane(side).error.clone() {
-            ui.label(RichText::new(err).color(p.danger));
+            ui.label(RichText::new(err).color(p.problem.text));
         }
         if self.pane(side).loading {
             ui.add(egui::Spinner::new());
@@ -461,7 +462,7 @@ impl FilesWindow {
             self.enqueue(dir, &l, &r, selected);
         }
         if self.pane(side).truncated {
-            ui.label(RichText::new("文件太多，只显示了前 20000 项").color(p.warning));
+            ui.label(RichText::new("文件太多，只显示了前 20000 项").color(p.relay.text));
         }
         // 列表；整栏是放下区：从另一栏拖过来的条目传到这里
         let entries = self.pane(side).entries.clone();
@@ -531,11 +532,11 @@ impl FilesWindow {
     }
 
     fn transfers_ui(&mut self, ui: &mut egui::Ui, p: &Palette) {
-        ui.add_space(4.0);
+        ui.add_space(space::S4);
         ui.horizontal(|ui| {
-            ui.label(RichText::new("传输").strong().size(16.0));
+            ui.label(RichText::new("传输").strong().size(font::SUBTITLE));
             if let Err(why) = &self.runner {
-                ui.label(RichText::new(why).color(p.danger));
+                ui.label(RichText::new(why).color(p.problem.text));
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button(format!("{}  清空记录", icon::TRASH)).clicked() {
@@ -597,13 +598,14 @@ impl FilesWindow {
                                         size_text(done),
                                         size_text(total)
                                     ),
-                                    p.accent,
+                                    p.ink,
                                 )
                             }
-                            State::Done(n) => {
-                                (format!("完成：{n} 个文件，{}", size_text(total)), p.success)
-                            }
-                            State::Failed(why) => (format!("失败：{why}"), p.danger),
+                            State::Done(n) => (
+                                format!("完成：{n} 个文件，{}", size_text(total)),
+                                p.direct.text,
+                            ),
+                            State::Failed(why) => (format!("失败：{why}"), p.problem.text),
                             State::Cancelled => ("已取消".to_owned(), p.muted),
                         };
                         ui.add(egui::ProgressBar::new(frac).desired_width(220.0));
