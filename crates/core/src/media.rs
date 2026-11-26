@@ -1260,7 +1260,18 @@ impl MediaSender {
             rtt_us: self.rtt_us,
             in_flight: self.in_flight(),
         };
-        // 起步探测有了结果（探完之前不出画面：这个包串速率就是探测组的）
+        // 还没开始起步探测就看到明显丢包：不探（有丢包的链路上探测结果不准，码率一下提上去之后在丢包里来回降：
+        // 微软轨迹 ms-02560，8 Mbps、12% 随机丢包，卡顿 0 → 3 次）
+        if self.start_probe.is_some_and(|p| p.started.is_none())
+            && feedback.loss_permille >= FEC_FROM_LOSS_PERMILLE
+        {
+            self.start_probe = None;
+            self.event(format!(
+                "不做起步探测：有丢包（{}‰），按画面流量慢慢升码率",
+                feedback.loss_permille
+            ));
+        }
+        // 起步探测有了结果（画面照常在发：反馈里的包串速率可能是帧的，见 start_probe_result）
         if self.start_probe.is_some_and(|p| p.started.is_some()) && ext.train_bytes_per_s > 0 {
             self.start_probe_result(now, u64::from(ext.train_bytes_per_s).saturating_mul(8));
         }
@@ -2624,6 +2635,17 @@ mod tests {
             .take_events()
             .iter()
             .any(|e| e.contains("不做起步探测")));
+        // 开头的反馈有明显丢包：不探
+        let mut lossy = MediaSender::new(cfg(), Box::new(FakeEncoder::default()));
+        lossy.set_start_probe(true);
+        lossy.on_frame(Time(0), &screen, true, 10_000).unwrap();
+        let loss = Feedback {
+            loss_permille: 50,
+            ..Feedback::default()
+        };
+        lossy.observe(Time(5_000), &loss, Extension::default());
+        assert!(!lossy.start_probing());
+        assert!(lossy.take_events().iter().any(|e| e.contains("有丢包")));
         // 对端不支持：不探
         let mut off = MediaSender::new(cfg(), Box::new(FakeEncoder::default()));
         off.set_start_probe(false);

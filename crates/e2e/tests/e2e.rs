@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 
 use peerdesk_core::adaptive::Profile;
-use peerdesk_core::sim::Link;
+use peerdesk_core::sim::{Link, Spikes};
 use peerdesk_e2e::report::{markdown, save, TABLE_HEADER};
 use peerdesk_e2e::{run, Action, CodecKind, EstimatorKind, Outcome, Phase, Scenario};
 
@@ -235,8 +235,16 @@ fn start_is_sharp_quickly_on_a_fat_link_with_a_big_screen() {
             Link {
                 rate_bps: Some(30_000_000),
                 delay_us: 15_000,
-                // 用户的 Wi-Fi：零星小包的单程延迟比最低值高 12–25 ms，延迟趋势正常
-                jitter_us: 20_000,
+                // 用户的 Wi-Fi（2026-11-26 日志）：大部分时候排队读数 0–2 ms，零星小包时常碰上 12–25 ms，
+                // 延迟趋势正常、没有丢包；接收端一批一批地读（一帧几十个包几乎同一时刻读到）
+                jitter_us: 1_000,
+                fifo_jitter: true,
+                spikes: Some(Spikes {
+                    every_us: 600_000,
+                    length_us: 40_000,
+                    max_us: 25_000,
+                }),
+                batch_us: 5_000,
                 ..Link::lan()
             },
         )],
@@ -253,6 +261,11 @@ fn start_is_sharp_quickly_on_a_fat_link_with_a_big_screen() {
     })
     .unwrap();
     finish(&o);
+    if std::env::var_os("PEERDESK_EVENTS").is_some() {
+        for line in o.trace.iter().filter(|l| !l.contains("大帧")).take(40) {
+            println!("{line}");
+        }
+    }
     // 开头的静止画面要尽快清晰（这个场景以前一直没清晰：码率被 Wi-Fi 抖动打到底、1 Mbps 起步爬得慢）
     let start = o.phases.first().and_then(|p| p.sharp_ms);
     gate(
