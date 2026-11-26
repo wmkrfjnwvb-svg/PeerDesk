@@ -792,13 +792,14 @@ impl RateEstimator for ClassicV1 {
         };
         self.high_streak = streak(fb.queue_delay_us > p.high_delay_us, self.high_streak);
         self.low_streak = streak(fb.queue_delay_us > p.low_delay_us, self.low_streak);
-        let queue_high = self.high_streak >= PERSIST_FEEDBACKS;
+        let persist: u32 = std::env::var("XP_PERSIST").ok().and_then(|v| v.parse().ok()).unwrap_or(PERSIST_FEEDBACKS);
+        let queue_high = self.high_streak >= persist;
         // 固有丢包慢慢跟（每份反馈 1/128，反馈 20 ms 一次时约 2.5 秒）
         let loss = u64::from(fb.loss_permille).saturating_mul(1000);
         self.inherent_loss = self.inherent_loss - self.inherent_loss / 128 + loss / 128;
         let inherent = u16::try_from(self.inherent_loss / 1000).unwrap_or(u16::MAX);
         let lossy_and_queued = fb.loss_permille > p.loss_permille.saturating_add(inherent)
-            && self.low_streak >= PERSIST_FEEDBACKS;
+            && self.low_streak >= persist;
         let congested = self.usage == Usage::Over || queue_high || lossy_and_queued;
         // 一个往返（至少 100 ms）之内只降一次：同一次拥塞的反馈会连着来好几条。
         let hold = obs.rtt_us.max(100_000);
@@ -847,7 +848,12 @@ impl RateEstimator for ClassicV1 {
         }
         // 排队在消退，或者排队连着几份反馈都在（和降码率一样要持续才算）：先不升。只看一份时，Wi-Fi 省电下零星的帧
         // 几乎每份都是 12–25 ms（空闲后网卡要醒），码率永远升不上去（仿真：大屏 Wi-Fi 一直停在 1.36 Mbps）。
-        if self.usage == Usage::Under || self.low_streak >= PERSIST_FEEDBACKS {
+        let inc_block = match std::env::var("XP_INC").ok().as_deref() {
+            Some("single") => fb.queue_delay_us >= p.low_delay_us,
+            Some("contig") => fb.queue_delay_us >= p.low_delay_us && contiguous,
+            _ => self.low_streak >= persist,
+        };
+        if self.usage == Usage::Under || inc_block {
             return;
         }
         // 只有真在用这个码率时才升：屏幕静止时没有数据，估计冻结，不凭空上涨。
