@@ -371,7 +371,7 @@ fn wifi_light_activity(name: &str) -> Scenario {
 }
 
 #[test]
-#[ignore = "码率控制退回了 ui-bugs 的行为（状态机重写的基线），这个场景不过（实测 2 秒后最低 360 kbps、5% 分位 10.2 Mbps，要求 3 和 15 Mbps）；状态机第 1、2 步修好后去掉"]
+#[ignore = "暂时：状态机三步做完后再决定（第 1 步之后实测能过：2 秒后最低 23.9 Mbps、5% 分位 23.9 Mbps；基线 360 kbps、10.2 Mbps）"]
 fn light_activity_on_wifi_keeps_the_rate() {
     let o = run(&wifi_light_activity("wifi-light")).unwrap();
     finish(&o);

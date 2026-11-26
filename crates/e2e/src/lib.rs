@@ -584,11 +584,9 @@ pub fn run(s: &Scenario) -> Result<Outcome, Error> {
                     gate.2 += 1;
                 }
             }
-            if (pending || tx.wants_frame())
-                && !tx.in_flight_full(now)
-                && !pacer.busy(tx.pacing_bps(pacing), 1_000_000 / u64::from(s.fps.max(1)))
-                && tx.due(now)
-            {
+            let wanted = pending || tx.wants_frame();
+            let pacer_busy = pacer.busy(tx.pacing_bps(pacing), 1_000_000 / u64::from(s.fps.max(1)));
+            if tx.frame_gate(now, wanted, pacer_busy) {
                 let rtt = link.delay_us.saturating_mul(2).saturating_add(1_000);
                 let before = tx.stats().frames;
                 let out = tx.on_frame(now, desk.screen(), std::mem::take(&mut pending), rtt)?;
@@ -919,7 +917,9 @@ mod tests {
         assert_eq!(o.states.state_us.iter().sum::<u64>(), 30 * 33_333);
         assert!(FeatureRow::HEADER.ends_with("true_queue_us,state"));
         let row = o.features.first().unwrap();
-        assert!(row.csv().ends_with(&format!(",{},跟踪", row.true_queue_us)));
+        assert!(row
+            .csv()
+            .ends_with(&format!(",{},{}", row.true_queue_us, row.state.name())));
     }
 
     #[test]

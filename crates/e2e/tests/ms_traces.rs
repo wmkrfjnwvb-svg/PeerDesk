@@ -12,7 +12,7 @@
 use peerdesk_core::adaptive::Profile;
 use peerdesk_core::sim::Link;
 use peerdesk_e2e::{
-    run, Action, ContentPolicy, EstimatorKind, Outcome, Phase, Scenario, StateShare,
+    run, Action, ContentPolicy, EstimatorKind, FeatureRow, Outcome, Phase, Scenario, StateShare,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -153,6 +153,17 @@ fn one(name: &str, csv: &str, seed: u64, estimator: EstimatorKind) -> Sample {
     .unwrap();
     if std::env::var_os("PEERDESK_SAVE").is_some() {
         peerdesk_e2e::report::save(std::path::Path::new("../../target/e2e-ms"), &o).unwrap();
+    }
+    // 逐行对比用（例如核对“跟踪状态和基线逐字节相同”）：只存特征表，不存截图
+    if let Some(dir) = std::env::var_os("PEERDESK_FEATURES_DIR") {
+        let dir = std::path::PathBuf::from(dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut csv = String::from(FeatureRow::HEADER);
+        for f in &o.features {
+            csv.push('\n');
+            csv.push_str(&f.csv());
+        }
+        std::fs::write(dir.join(format!("{name}-{seed}.csv")), csv).unwrap();
     }
     let row = row(&format!("{name}#{seed}"), &o);
     Sample {
@@ -346,6 +357,9 @@ fn limit((mean, sd): (f64, f64), n: u64, count: bool) -> f64 {
 /// - 改进之后把基线换成新的实测（均值和标准差一起换）。
 /// - 没过时先跑完整的 12 条 × 12 个种子（上面的 `microsoft_traces`）和基线比。确实变差就改代码；144 次里看不出
 ///   变差（合计的差在两倍标准误之内）才可以按新实测重定这里的基线，并在提交信息里写上 144 次的数据。
+/// - 防基线漂移：144 次的比较一律对照固定的文件 `docs/research/data/ms-traces-baseline-2026-11-26.md`
+///   （或者以后正式改进之后存下的新基线文件），不对照上一次“重定”的数字——否则一连串“看不出变差”的改动
+///   每次把线往上推一点，累计起来就退步了。
 ///
 /// 用时见 [`GATE_SEEDS`]：发布构建和调试构建都和以前持平。
 #[test]

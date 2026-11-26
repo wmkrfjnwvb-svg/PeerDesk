@@ -10,10 +10,13 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use crate::adaptive::{DelayTracker, DeliveryLog, Feedback, Profile};
+use crate::cc::alr::Alr;
 use crate::cc::probe::ProbeCluster;
 use crate::cc::report::{ArrivalRecorder, ArrivalReport, PacketKind, SendHistory, SentPacket};
 use crate::error::Error;
-use crate::estimator::{EstimatorKind, Extension, Observation, RateEstimator, ReceiverMetrics};
+use crate::estimator::{
+    EstimatorKind, Extension, NetCause, Observation, RateEstimator, ReceiverMetrics, SendLimit,
+};
 use crate::frame::{Frame, Picture};
 use crate::governor::FpsGovernor;
 use crate::pacer::FLAG_PADDING;
@@ -347,6 +350,12 @@ struct StartProbe {
     round_bps: u64,
 }
 
+/// 连续这么久（微秒）没有任何网络受限的原因、预算桶也判成受限，才算应用受限（进慢）；一出现网络受限的原因
+/// 马上不算（出快）。500 ms 是预算桶攒满的时间（[`crate::cc::alr`]，WebRTC 同值）。
+const APP_LIMITED_AFTER_US: u64 = 500_000;
+/// 编出的帧达到预算的这么多（千分比）就算编码器被码率卡着。
+const NEAR_BUDGET_PERMILLE: usize = 800;
+
 /// 帧率已经在最低档、帧还一直装不进预算这么久（微秒）就降分辨率（最后手段）。
 const OVERFLOW_DOWN_US: u64 = 2_000_000;
 
@@ -412,6 +421,9 @@ pub struct MediaSender {
     start_probe: Option<StartProbe>,
     /// 发出的包，等到达报告对账（见 [`crate::cc::report`]）。
     history: SendHistory,
+    /// 发送量受谁限制（见 [`SendLimit`]）：预算桶（发出的量是不是明显少于码率），和最近一次网络受限的原因。
+    alr: Alr,
+    net_limited: Option<(Time, NetCause)>,
 }
 
 impl std::fmt::Debug for MediaSender {
@@ -474,6 +486,8 @@ impl MediaSender {
             pending_probe: None,
             start_probe: None,
             history: SendHistory::new(),
+            alr: Alr::new(cfg.start_bps),
+            net_limited: None,
             scale: if codec == Codec::H264 {
                 ScalePolicy::new()
             } else {
@@ -501,6 +515,11 @@ impl MediaSender {
 
     /// 一个数据报交给了网络（`seq` 是数据报头里的序号）。到达报告据此对账。
     pub fn on_packet_sent(&mut self, now: Time, seq: u32, out: &Outgoing) {
+        // 发出的每个字节（画面、重传、探测）都从“应用受限”的预算桶里扣
+        self.alr.on_sent(
+            now,
+            u64::try_from(out.body.len().saturating_add(HEADER_LEN)).unwrap_or(u64::MAX),
+        );
         match (out.kind, out.fragment) {
             (PacketKind::Retransmit, Some(key)) => {
                 if let Some(state) = self.resent.get_mut(&key) {
@@ -535,6 +554,9 @@ impl MediaSender {
 
     /// 定时调用（约 25 ms）：网络控制器的定时任务（应用受限的预算、定期探测）。
     pub fn on_tick(&mut self, now: Time) {
+        // 没有包发时预算桶照常累积
+        self.alr.set_estimate(self.rate.rate_bps());
+        self.alr.on_tick(now);
         if self.reports {
             self.rate.on_tick(now);
         }
@@ -585,6 +607,10 @@ impl MediaSender {
             best_bps: 0,
             round_bps: 0,
         });
+        if self.start_probe.is_some() {
+            self.rate
+                .set_startup(true, "会话开头，等第一个关键帧送到再决定探不探");
+        }
     }
 
     /// 起步探测还没结束（在等第一个关键帧送到，或者在探）。
@@ -603,6 +629,8 @@ impl MediaSender {
         let rate = self.rate.rate_bps();
         if delivered_bps.saturating_mul(1000) < rate.saturating_mul(START_PROBE_GATE_PERMILLE) {
             self.start_probe = None;
+            self.rate
+                .set_startup(false, "不做起步探测：链路不比起步码率宽多少");
             self.event(format!(
                 "不做起步探测：第一个关键帧 {bytes} 字节送了 {} ms（扣掉往返 {} ms，约 {} kbps），链路不比起步码率 {} kbps 宽多少",
                 took_us / 1000,
@@ -704,6 +732,14 @@ impl MediaSender {
             return;
         };
         let took = p.started.map_or(0, |t| now.since(t) / 1000);
+        self.rate.set_startup(
+            false,
+            if p.best_bps == 0 {
+                "起步探测没测到结果"
+            } else {
+                "起步探测有结论了"
+            },
+        );
         if p.best_bps == 0 {
             self.event(format!(
                 "起步探测 {took} ms 没测到结果，按起步码率 {} kbps 出画面",
@@ -814,6 +850,53 @@ impl MediaSender {
             .sum();
         // 最近的关键帧还没确认：之后的帧都依赖它，发了也解不了，先等它送到。
         recent > by_rate.max(floor) || self.key_pending()
+    }
+
+    /// 这一帧现在能不能编：`wanted` 是有东西要编（画面变了，或 [`Self::wants_frame`]），`pacer_busy` 是节奏器里
+    /// 上一帧还没发完。到了该编的时间、却被在途上限或节奏器拦下时，记一次“网络受限”（见 [`SendLimit`]）：
+    /// 发送端有东西要发、是网络不让发，这时不能算应用受限。会话循环每一拍调用一次。
+    pub fn frame_gate(&mut self, now: Time, wanted: bool, pacer_busy: bool) -> bool {
+        if !wanted || !self.due(now) {
+            return false;
+        }
+        let full = self.in_flight_full(now);
+        if full || pacer_busy {
+            self.net_event(
+                now,
+                if self.key_pending() {
+                    NetCause::KeyPending
+                } else {
+                    NetCause::FrameBlocked
+                },
+            );
+        }
+        !full && !pacer_busy
+    }
+
+    /// 记一次网络受限的原因，马上告诉估计器（应用受限进慢出快，不等下一份反馈）。
+    fn net_event(&mut self, now: Time, cause: NetCause) {
+        self.net_limited = Some((now, cause));
+        self.rate.on_net_limited(cause);
+    }
+
+    /// 发送量现在是被谁限制的（每份反馈判一次，交给估计器）。
+    fn send_limit(&mut self, now: Time) -> SendLimit {
+        // 持续性的原因：只要还成立，就一直算网络受限
+        if self.key_pending() {
+            self.net_event(now, NetCause::KeyPending);
+        } else if self.governor.fit_limited() {
+            self.net_event(now, NetCause::FpsReduced);
+        } else if self.scale.permille() < crate::scale::FULL_PERMILLE {
+            self.net_event(now, NetCause::ScaleReduced);
+        }
+        let (at, cause) = *self.net_limited.get_or_insert((now, NetCause::Start));
+        if now.since(at) < APP_LIMITED_AFTER_US {
+            SendLimit::Network(cause)
+        } else if self.alr.in_alr() {
+            SendLimit::App
+        } else {
+            SendLimit::Network(NetCause::UsingRate)
+        }
     }
 
     /// 采集到的画面变了（编码器在别的线程时由会话循环调用；[`Self::on_frame`] 自己会调）。
@@ -1036,6 +1119,12 @@ impl MediaSender {
             encoded.payload.len(),
             job.budget,
         );
+        // 这一帧用掉了预算的八成以上：编码器是被码率卡着的（网络受限）
+        if encoded.payload.len().saturating_mul(1000)
+            >= job.budget.saturating_mul(NEAR_BUDGET_PERMILLE)
+        {
+            self.net_event(now, NetCause::FrameNearBudget);
+        }
         if let Some(change) = self.governor.take_change() {
             self.event(change);
         }
@@ -1167,6 +1256,10 @@ impl MediaSender {
             .saturating_add(u32::try_from(nacks.len()).unwrap_or(u32::MAX));
         for (i, (frame, frag)) in nacks.iter().copied().enumerate() {
             if resent_bytes >= allowance.max(1) {
+                // 有要补的分片这一轮发不出去：网络受限。只是“接收端在要重传”不算：要补的马上就发了，发送端没被拦着；
+                // 而且现在的重传请求在一次延迟尖峰里就会发（按第一片到达计时），算上的话尖峰一来就退出应用受限、
+                // 同一份反馈的高读数接着把码率打到底——实测 wifi-light 2 秒后最低 175 kbps（不算是 23.9 Mbps）
+                self.net_event(now, NetCause::ResendCapped);
                 self.stats.resend_capped = self
                     .stats
                     .resend_capped
@@ -1305,6 +1398,7 @@ impl MediaSender {
             ext,
             rtt_us: self.rtt_us,
             in_flight: self.in_flight(),
+            limit: self.send_limit(now),
         };
         // 还没开始起步探测就看到明显丢包：不探（有丢包的链路上探测结果不准，码率一下提上去之后在丢包里来回降：
         // 微软轨迹 ms-02560，8 Mbps、12% 随机丢包，卡顿 0 → 3 次）
@@ -1312,6 +1406,7 @@ impl MediaSender {
             && feedback.loss_permille >= FEC_FROM_LOSS_PERMILLE
         {
             self.start_probe = None;
+            self.rate.set_startup(false, "不做起步探测：有丢包");
             self.event(format!(
                 "不做起步探测：有丢包（{}‰），按画面流量慢慢升码率",
                 feedback.loss_permille
@@ -1890,6 +1985,208 @@ mod tests {
             events.iter().any(|e| e.contains("降分辨率是最后手段")),
             "{events:?}"
         );
+    }
+
+    /// 发送量受谁限制按原因判：有任何网络受限的原因就不算应用受限，500 ms 都没有、发出的量也少才算。
+    #[test]
+    fn the_send_limit_is_judged_by_cause_not_by_ratio() {
+        use crate::estimator::RateState;
+        let screen = Screen::new(64, 64, 1);
+        let acked = |id: u32| Feedback {
+            floor: id,
+            delivered: 1,
+            ..Feedback::default()
+        };
+        let mut tx = MediaSender::new(cfg(), Box::new(FakeEncoder::default()));
+        tx.scale = ScalePolicy::full();
+        assert_eq!(
+            tx.send_limit(Time(0)),
+            SendLimit::Network(NetCause::Start),
+            "会话刚开始：还没观察够"
+        );
+        // 没东西要编、没到时间：不编，也不算被网络拦下
+        assert!(!tx.frame_gate(Time(0), false, false));
+        assert!(tx.frame_gate(Time(0), true, false));
+        let key = tx.on_frame(Time(0), &screen, true, 10_000).unwrap();
+        assert!(!tx.frame_gate(Time(1_000), true, false), "没到下一帧的时间");
+        assert_eq!(tx.net_limited, Some((Time(0), NetCause::FrameNearBudget)));
+        // 关键帧没确认：该编帧时被拦下，记“关键帧还没确认”
+        assert!(!tx.frame_gate(Time(40_000), true, false));
+        assert_eq!(tx.net_limited, Some((Time(40_000), NetCause::KeyPending)));
+        tx.observe(Time(50_000), &acked(1), Extension::default());
+        assert_eq!(
+            tx.last_observation().unwrap().limit,
+            SendLimit::Network(NetCause::KeyPending)
+        );
+        // 之后 500 ms 什么原因都没有、几乎不发（预算桶攒满）：应用受限，估计器进应用受限
+        let mut t = 50_000;
+        while t < 525_000 {
+            t += 25_000;
+            tx.on_tick(Time(t));
+            assert_eq!(
+                tx.send_limit(Time(t)),
+                SendLimit::Network(NetCause::KeyPending),
+                "{t}"
+            );
+        }
+        tx.on_tick(Time(550_000));
+        tx.observe(Time(550_000), &acked(1), Extension::default());
+        assert_eq!(tx.last_observation().unwrap().limit, SendLimit::App);
+        assert_eq!(tx.rate_state(), RateState::AppLimited);
+        // 小帧（远不到预算的八成）照常发：还是应用受限
+        assert!(tx.frame_gate(Time(560_000), true, false));
+        let small = tx.on_frame(Time(560_000), &screen, true, 10_000).unwrap();
+        tx.on_packet_sent(Time(560_000), 1, &small[0]);
+        tx.observe(Time(580_000), &acked(2), Extension::default());
+        assert_eq!(tx.rate_state(), RateState::AppLimited);
+        // 节奏器里上一帧没发完：记一次网络受限，估计器不等反馈马上回跟踪
+        assert!(!tx.frame_gate(Time(600_000), true, true));
+        assert_eq!(
+            tx.net_limited,
+            Some((Time(600_000), NetCause::FrameBlocked))
+        );
+        assert_eq!(tx.rate_state(), RateState::Tracking);
+        let events = tx.take_events().join("\n");
+        assert!(
+            events.contains("码率状态 跟踪 → 应用受限")
+                && events.contains(
+                    "码率状态 应用受限 → 跟踪：网络受限：该编帧时在途数据满了或上一帧没发完"
+                ),
+            "{events}"
+        );
+        // 500 ms 没有原因，但发出的量接近码率（预算桶没判受限）：算网络受限
+        let big = Outgoing {
+            body: vec![0u8; 1_200],
+            ..key[0].clone()
+        };
+        let mut t = 600_000;
+        while t < 1_200_000 {
+            t += 5_000;
+            tx.on_packet_sent(Time(t), 2, &big);
+        }
+        assert_eq!(
+            tx.send_limit(Time(t)),
+            SendLimit::Network(NetCause::UsingRate)
+        );
+        // 编码分辨率低于原尺寸：一直算网络受限
+        tx.scale = ScalePolicy::new();
+        assert_eq!(
+            tx.send_limit(Time(t)),
+            SendLimit::Network(NetCause::ScaleReduced)
+        );
+    }
+
+    /// 内容装不进预算（帧率降档）、重传被额度截断，都是网络受限的原因。
+    #[test]
+    fn overflowing_frames_and_capped_resends_are_network_limits() {
+        let mut tx = MediaSender::new(
+            SenderConfig {
+                start_bps: 200_000,
+                min_bps: 200_000,
+                max_bps: 200_000,
+                ..cfg()
+            },
+            Box::new(HugeEncoder),
+        );
+        tx.scale = ScalePolicy::full();
+        let mut t = Time::ZERO;
+        let mut first = Vec::new();
+        for i in 0..20u32 {
+            t = t.plus(33_334);
+            if tx.frame_gate(t, true, false) {
+                let out = tx
+                    .on_frame(t, &Screen::new(16, 16, i), true, 40_000)
+                    .unwrap();
+                assert_eq!(tx.net_limited, Some((t, NetCause::FrameNearBudget)));
+                if first.is_empty() {
+                    first = out;
+                }
+            }
+        }
+        assert!(tx.fps() < 30, "装不进预算，帧率降档了");
+        assert_eq!(
+            tx.send_limit(t),
+            SendLimit::Network(NetCause::FpsReduced),
+            "降档期间一直算网络受限"
+        );
+        // 第一帧的分片都发出去了，接收端全要重传：额度（码率 × 40 ms = 1000 字节）只够补 3 片，其余截断
+        for (i, o) in first.iter().enumerate() {
+            tx.on_packet_sent(Time(40_000), u32::try_from(i).unwrap(), o);
+        }
+        let nacks: Vec<(u32, u16)> = (0..10).map(|i| (1, i)).collect();
+        let fb = encode_feedback(&Feedback::default(), &Extension::default(), &nacks);
+        let at = t.plus(1_000_000);
+        let again = tx.on_feedback_datagram(at, &fb).unwrap();
+        assert_eq!(again.len(), 3);
+        assert_eq!(tx.stats().resend_capped, 7);
+        assert_eq!(tx.net_limited, Some((at, NetCause::ResendCapped)));
+    }
+
+    /// 起步探测的三种结束（链路不够宽、有丢包、探完）都告诉估计器，状态从起步回到跟踪。
+    #[test]
+    fn the_start_probe_drives_the_startup_state() {
+        use crate::estimator::RateState;
+        let screen = Screen::new(64, 64, 1);
+        let acked = |id: u32, loss: u16| Feedback {
+            floor: id,
+            delivered: 1,
+            loss_permille: loss,
+            ..Feedback::default()
+        };
+        let begin = || {
+            let mut tx = MediaSender::new(cfg(), Box::new(FakeEncoder::default()));
+            tx.set_start_probe(true);
+            assert_eq!(tx.rate_state(), RateState::Startup);
+            tx.on_frame(Time(0), &screen, true, 10_000).unwrap();
+            tx
+        };
+        // 第一个关键帧送得慢：不探
+        let mut tx = begin();
+        tx.observe(Time(900_000), &acked(1, 0), Extension::default());
+        assert_eq!(tx.rate_state(), RateState::Tracking);
+        assert!(tx
+            .take_events()
+            .join("\n")
+            .contains("码率状态 起步 → 跟踪：不做起步探测：链路不比起步码率宽多少"));
+        // 有丢包：不探
+        let mut tx = begin();
+        tx.observe(Time(5_000), &acked(0, 50), Extension::default());
+        assert_eq!(tx.rate_state(), RateState::Tracking);
+        assert!(tx
+            .take_events()
+            .join("\n")
+            .contains("码率状态 起步 → 跟踪：不做起步探测：有丢包"));
+        // 探了，到 1 秒没测到结果
+        let mut tx = begin();
+        tx.observe(Time(10_000), &acked(1, 0), Extension::default());
+        assert_eq!(tx.rate_state(), RateState::Startup, "在探");
+        tx.on_tick(Time(10_000 + START_PROBE_MAX_US));
+        assert_eq!(tx.rate_state(), RateState::Tracking);
+        assert!(tx
+            .take_events()
+            .join("\n")
+            .contains("码率状态 起步 → 跟踪：起步探测没测到结果"));
+        // 探了，有结论
+        let mut tx = begin();
+        tx.observe(Time(10_000), &acked(1, 0), Extension::default());
+        tx.observe(
+            Time(60_000),
+            &Feedback::default(),
+            Extension {
+                train_bytes_per_s: 125_000,
+                ..Extension::default()
+            },
+        );
+        tx.on_tick(Time(10_000 + START_PROBE_MAX_US));
+        assert_eq!(tx.rate_state(), RateState::Tracking);
+        assert!(tx
+            .take_events()
+            .join("\n")
+            .contains("码率状态 起步 → 跟踪：起步探测有结论了"));
+        // 不开起步探测：一直是跟踪
+        let mut tx = MediaSender::new(cfg(), Box::new(FakeEncoder::default()));
+        tx.set_start_probe(false);
+        assert_eq!(tx.rate_state(), RateState::Tracking);
     }
 
     #[test]

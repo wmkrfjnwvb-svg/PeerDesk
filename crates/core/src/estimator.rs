@@ -15,6 +15,8 @@
 //!
 //! 以后的 AI 模型也实现 [`RateEstimator`]，在同一套端到端测试里和经典算法比较。
 
+use std::collections::VecDeque;
+
 use crate::adaptive::{Feedback, Profile, RateController};
 use crate::cc::probe::ProbeCluster;
 use crate::cc::report::{PacketResult, SentPacket};
@@ -392,6 +394,69 @@ pub struct Observation {
     pub rtt_us: u64,
     /// 还没确认的字节数。
     pub in_flight: u64,
+    /// 发送量现在是被谁限制的（发送端按原因判，见 [`SendLimit`]）。
+    pub limit: SendLimit,
+}
+
+/// 发送量被网络限制的原因（发送端记下最近一次，见 [`crate::media::MediaSender`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NetCause {
+    /// 不知道（老的调用方不报原因）：一律当成网络受限，行为和没有状态机时一样。
+    #[default]
+    Unknown,
+    /// 会话刚开始，还没观察够。
+    Start,
+    /// 该编帧时被拦下：在途数据满了，或者节奏器里上一帧还没发完。
+    FrameBlocked,
+    /// 关键帧还没确认，之后的帧先不发。
+    KeyPending,
+    /// 编出的帧用掉了预算的八成以上：编码器是被码率卡着的。
+    FrameNearBudget,
+    /// 内容装不进预算，帧率在降档。
+    FpsReduced,
+    /// 编码分辨率低于原尺寸。
+    ScaleReduced,
+    /// 重传被额度截断：有要补的分片这一轮没发出去。
+    ResendCapped,
+    /// 发出的量接近码率（预算桶没有判成受限）。
+    UsingRate,
+}
+
+impl NetCause {
+    /// 写进日志的说明。
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Unknown => "发送端没报原因",
+            Self::Start => "会话刚开始",
+            Self::FrameBlocked => "该编帧时在途数据满了或上一帧没发完",
+            Self::KeyPending => "关键帧还没确认",
+            Self::FrameNearBudget => "编出的帧用掉了预算的八成以上",
+            Self::FpsReduced => "内容装不进预算，帧率在降档",
+            Self::ScaleReduced => "编码分辨率低于原尺寸",
+            Self::ResendCapped => "重传被额度截断",
+            Self::UsingRate => "发出的量接近码率",
+        }
+    }
+}
+
+/// 发送量是被谁限制的。**按原因判，不按“发出量 ÷ 码率”判**：发出量本身被拥塞信号节流（每帧预算随排队缩小、
+/// 在途满了整帧不发），越拥塞发出量占码率的比例越低；按比例判会把真拥塞判成“没用满”。
+/// 2026-11-26 实测，1 Mbps 链路上排队超过 30 ms 的反馈里 44% 发出量低于码率的 60%、35% 低于 25%，
+/// 按比例放宽拥塞判断的五个版本窄带卡顿都变多（`docs/research/L-framework.md` 6.5、6.6）。
+/// BBR / Linux 的定义也是按原因：没有数据要发、没被拥塞窗口拦着、丢的都重传了，才算应用受限。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendLimit {
+    /// 网络受限：最近有网络这边的原因在限制发送量。
+    Network(NetCause),
+    /// 应用受限：一段时间里没有任何网络受限的原因，发出的量也明显少于码率——发送端只是没那么多要发。
+    App,
+}
+
+impl Default for SendLimit {
+    fn default() -> Self {
+        Self::Network(NetCause::Unknown)
+    }
 }
 
 /// 码率控制所处的状态。量尺按它统计各状态的时间占比、核对“真实队列高时有没有被判成应用受限”；
@@ -508,6 +573,12 @@ pub trait RateEstimator: Send + std::fmt::Debug {
     fn state(&self) -> RateState {
         RateState::Tracking
     }
+
+    /// 发送端的起步探测开始（`on` 为真）或结束了（`why` 是结束的原因，写进状态切换的日志）。
+    fn set_startup(&mut self, _on: bool, _why: &str) {}
+
+    /// 发送端刚出现一个网络受限的原因（不等下一份反馈：应用受限进慢出快）。
+    fn on_net_limited(&mut self, _cause: NetCause) {}
 }
 
 /// 照 WebRTC GoogCC 组织的网络控制器（见 [`crate::cc`]）。
@@ -688,7 +759,89 @@ pub struct ClassicV1 {
     /// 固有丢包率（千分比 × 1000，慢速平均）：随机丢包（Wi-Fi 干扰、链路本身）的底，高出它的丢包才算拥塞
     /// （WebRTC `LossBasedBweV2` 的“固有丢包”）。
     inherent_loss: u64,
+    /// 状态机现在的状态。
+    phase: Phase,
+    /// 这一段不断档的反馈里，各份的时间和排队读数（只留最近一个窗口加一份，见 [`ClassicV1::standing_queue`]）。
+    queue_run: VecDeque<(Time, u32)>,
 }
+
+/// [`ClassicV1`] 的状态机。码率控制要回答三件事，证据各不相同，所以分开：
+/// 是否拥塞（排队、趋势）、链路容量（包串、探测）、发送量受谁限制（[`SendLimit`]，发送端按原因判）。
+///
+/// | 状态 | 降 | 升 | 出口 |
+/// |---|---|---|---|
+/// | 起步 | 和跟踪相同 | 和跟踪相同，另按起步探测的结论 | 发送端报告起步探测结束（探测自己最多 1 秒）→ 跟踪 |
+/// | 跟踪 | 一份反馈的排队、趋势、丢包加排队 | 送达速率 ≥ 码率 60% 时升 | 降了 → 排空；应用受限 → 应用受限 |
+/// | 排空 | 同来源状态（一个往返内不重复降） | 同来源状态 | 排队低于 low → 回来源状态；max(1 秒, 4 个往返) → 跟踪；来源是应用受限时一有网络受限 → 跟踪 |
+/// | 应用受限 | 只认常驻队列或趋势过载，一次最多降一半 | 不升 | 网络受限 → 跟踪（无时间上限）；降了 → 排空；在底线停满 1 秒 → 核实 |
+/// | 核实 | 同应用受限 | 不升（第 2 步按探测结论） | 网络受限 → 跟踪；降了 → 排空；1 秒 → 应用受限 |
+///
+/// 不变量：
+/// - I1：任何状态下过载证据都优先，这一份反馈不会升。
+/// - I2：码率只在三处变：拥塞降、跟踪（含起步、来源是跟踪的排空）的升、探测结论。
+/// - I3：发送端一直是网络受限时（从不进应用受限），每一步的码率和没有状态机的版本完全相同。
+///   所以来源是跟踪的“排空”只是一个标记，升降规则就是跟踪的规则；窄带不变差由这一条保证。
+/// - I4：每轮探测必然在时限内有结论（第 2 步）。
+/// - I5：应用受限时码率停在底线超过 1 秒必须进核实，不允许“底线、不升、没人管”。
+///
+/// 和 WebRTC 不一样的地方：WebRTC 应用受限时不放宽过载反应（`DelayBasedBwe::MaybeUpdateEstimate` 的 `in_alr`
+/// 参数没有用），只用它限制升码率、触发探测。这里放宽，因为我们的过载信号是单份 20 ms 反馈的排队读数，不是
+/// 趋势线：轻操作时一次 Wi-Fi 尖峰（13–27 ms）就会被当成拥塞，按“送达速率 × 0.85”降，而应用受限时送达速率
+/// 只是要发的量，一下就到底（2026-11-26 用户日志：168 秒里这样降了 39 次，11 次降到 300 kbps 以下）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    Startup,
+    Tracking,
+    /// 刚降过。`from_app`：降的时候是应用受限（或核实）；`since`：什么时候降的。
+    Drain {
+        from_app: bool,
+        since: Time,
+    },
+    /// `floor_since`：从什么时候起码率一直在底线。
+    AppLimited {
+        floor_since: Option<Time>,
+    },
+    /// `since`：什么时候开始核实的。
+    Verify {
+        since: Time,
+    },
+}
+
+impl Phase {
+    const fn state(self) -> RateState {
+        match self {
+            Self::Startup => RateState::Startup,
+            Self::Tracking => RateState::Tracking,
+            Self::Drain { .. } => RateState::Drain,
+            Self::AppLimited { .. } => RateState::AppLimited,
+            Self::Verify { .. } => RateState::Verify,
+        }
+    }
+
+    /// 拥塞判断放宽（只认常驻队列、一次最多降一半、不升）：应用受限、核实，和从它们降下来的排空。
+    const fn relaxed(self) -> bool {
+        match self {
+            Self::AppLimited { .. } | Self::Verify { .. } | Self::Drain { from_app: true, .. } => {
+                true
+            }
+            Self::Startup
+            | Self::Tracking
+            | Self::Drain {
+                from_app: false, ..
+            } => false,
+        }
+    }
+}
+
+/// 应用受限时，排队要持续这么久（这段时间里的最小读数；往返更长时按往返）才算常驻队列。取 RFC 8289（CoDel）
+/// 判断常驻队列的间隔 100 ms：一次 Wi-Fi 尖峰只影响几份反馈，最小值低；真有队列时这段时间每份都高。
+const STANDING_US: u64 = 100_000;
+/// 排空最多这么久（往返很长时按 4 个往返），到时不管队列排没排掉都回跟踪。
+const DRAIN_MAX_US: u64 = 1_000_000;
+/// 应用受限时码率在底线停这么久就进核实（I5）。
+const FLOOR_VERIFY_US: u64 = 1_000_000;
+/// 核实最多这么久。
+const VERIFY_MAX_US: u64 = 1_000_000;
 
 /// 门限的上下界（0.1 毫秒）和调整速度（每毫秒千万分之一）：WebRTC 的 6–600 毫秒、k_up 0.0087、k_down 0.039。
 const THRESHOLD_MIN: i64 = 60;
@@ -719,6 +872,117 @@ impl ClassicV1 {
             noted_bps: start_bps,
             usage: Usage::Normal,
             inherent_loss: 0,
+            phase: Phase::Tracking,
+            queue_run: VecDeque::new(),
+        }
+    }
+
+    /// 切换状态，写一条带原因的说明（状态没变时不写）。
+    fn go(&mut self, to: Phase, why: &str) {
+        let (from, next) = (self.phase.state(), to.state());
+        self.phase = to;
+        // 状态切换的说明比码率变化的说明多留一倍的位置：码率在抖时也要看得出状态机在哪
+        if from != next && self.notes.len() < MAX_NOTES * 2 {
+            self.notes.push(format!(
+                "码率状态 {} → {}：{why}（码率 {} kbps）",
+                from.name(),
+                next.name(),
+                self.rate_bps / 1000
+            ));
+        }
+    }
+
+    /// 记下这份反馈的排队读数，返回最近 `window_us` 里的最小读数（常驻队列）。这一段不断档的反馈还不够这么长时
+    /// 返回 `None`：证据不够，不算常驻队列。断档时从头记。
+    fn standing_queue(
+        &mut self,
+        now: Time,
+        queue_us: u32,
+        contiguous: bool,
+        window_us: u64,
+    ) -> Option<u32> {
+        if !contiguous {
+            self.queue_run.clear();
+        }
+        self.queue_run.push_back((now, queue_us));
+        // 最老的一份留在窗口左边界上或之前（代表窗口开始时的队列），更早的丢掉
+        while self
+            .queue_run
+            .get(1)
+            .is_some_and(|(t, _)| now.since(*t) >= window_us)
+        {
+            self.queue_run.pop_front();
+        }
+        let (oldest, _) = self.queue_run.front()?;
+        if now.since(*oldest) < window_us {
+            return None;
+        }
+        self.queue_run.iter().map(|(_, q)| *q).min()
+    }
+
+    /// 按发送端报告的受限原因和时间走状态机的出口（降码率引起的切换在 [`RateEstimator::on_observation`] 里）。
+    /// 一份反馈最多走一步。
+    fn step(&mut self, now: Time, obs: &Observation) {
+        let low = self.profile.low_delay_us;
+        let queue = obs.feedback.queue_delay_us;
+        match (self.phase, obs.limit) {
+            // 起步由发送端的起步探测结束（见 `set_startup`）
+            (Phase::Startup, _) => {}
+            (Phase::Tracking, SendLimit::App) => self.go(
+                Phase::AppLimited { floor_since: None },
+                "发送端 500 ms 没有任何网络受限的原因，发出的量也明显少于码率",
+            ),
+            (Phase::Tracking, SendLimit::Network(_)) => {}
+            (
+                Phase::AppLimited { .. }
+                | Phase::Verify { .. }
+                | Phase::Drain { from_app: true, .. },
+                SendLimit::Network(cause),
+            ) => self.go(Phase::Tracking, &format!("网络受限：{}", cause.name())),
+            (Phase::Drain { from_app, since }, _) => {
+                if queue < low {
+                    let back = if from_app {
+                        Phase::AppLimited { floor_since: None }
+                    } else {
+                        Phase::Tracking
+                    };
+                    self.go(
+                        back,
+                        &format!(
+                            "队列排掉了（排队 {} ms，低于 {} ms）",
+                            queue / 1000,
+                            low / 1000
+                        ),
+                    );
+                } else if now.since(since) >= DRAIN_MAX_US.max(obs.rtt_us.saturating_mul(4)) {
+                    self.go(
+                        Phase::Tracking,
+                        &format!("排空到时限了，排队还有 {} ms，按网络受限处理", queue / 1000),
+                    );
+                }
+            }
+            (Phase::AppLimited { floor_since }, SendLimit::App) => {
+                // I5：码率在底线、又不升，不能就这么停着
+                let at_floor = self.rate_bps <= self.min_bps;
+                let since = floor_since.filter(|_| at_floor).or(at_floor.then_some(now));
+                if since.is_some_and(|t| now.since(t) >= FLOOR_VERIFY_US) {
+                    self.go(
+                        Phase::Verify { since: now },
+                        "应用受限时码率在底线停了 1 秒，要核实链路是不是真的这么窄",
+                    );
+                } else {
+                    self.phase = Phase::AppLimited { floor_since: since };
+                }
+            }
+            (Phase::Verify { since }, SendLimit::App) => {
+                if now.since(since) >= VERIFY_MAX_US {
+                    // 这一步还没有运行中探测：核实只能超时。从头计时，下一秒再核实
+                    self.go(
+                        Phase::AppLimited { floor_since: None },
+                        "核实超时：没有探测结论，码率不变",
+                    );
+                }
+            }
         }
     }
 
@@ -794,6 +1058,24 @@ impl RateEstimator for ClassicV1 {
         self.noted_bps = self.rate_bps;
     }
 
+    fn state(&self) -> RateState {
+        self.phase.state()
+    }
+
+    fn on_net_limited(&mut self, cause: NetCause) {
+        if self.phase.relaxed() {
+            self.go(Phase::Tracking, &format!("网络受限：{}", cause.name()));
+        }
+    }
+
+    fn set_startup(&mut self, on: bool, why: &str) {
+        if on {
+            self.go(Phase::Startup, why);
+        } else if self.phase == Phase::Startup {
+            self.go(Phase::Tracking, why);
+        }
+    }
+
     fn rate_bps(&self) -> u64 {
         self.rate_bps
     }
@@ -837,13 +1119,31 @@ impl RateEstimator for ClassicV1 {
             .last_feedback
             .is_some_and(|t| now.since(t) <= CONTIGUOUS_US);
         self.last_feedback = Some(now);
-        let queue_high = fb.queue_delay_us > p.high_delay_us && contiguous;
+        let standing = self.standing_queue(
+            now,
+            fb.queue_delay_us,
+            contiguous,
+            STANDING_US.max(obs.rtt_us),
+        );
+        // 以上是各状态共用的测量（和状态无关，每份反馈都一样算）。下面先走状态机的出口，再按状态判断。
+        self.step(now, obs);
+        let relaxed = self.phase.relaxed();
+        // 应用受限时自己的流量堆不出队列，单次高读数多半是 Wi-Fi 的延迟尖峰，要常驻（持续一个窗口）才算；
+        // 网络受限时照旧一份就算：窄带上要求持续会让真拥塞反应慢（连着 3 份才算时卡顿 31 → 58）。
+        let queue_us = if relaxed {
+            standing.unwrap_or(0)
+        } else {
+            fb.queue_delay_us
+        };
+        let queue_high = queue_us > p.high_delay_us && contiguous;
         // 固有丢包慢慢跟（每份反馈 1/128，反馈 20 ms 一次时约 2.5 秒）
         let loss = u64::from(fb.loss_permille).saturating_mul(1000);
         self.inherent_loss = self.inherent_loss - self.inherent_loss / 128 + loss / 128;
         let inherent = u16::try_from(self.inherent_loss / 1000).unwrap_or(u16::MAX);
+        // 丢包也按上面的读数：应用受限时一份反馈里只有几个包，丢一个就是几百‰（用户日志：2 个包丢 1 个，500‰），
+        // 没有常驻队列就不算
         let lossy_and_queued = fb.loss_permille > p.loss_permille.saturating_add(inherent)
-            && fb.queue_delay_us > p.low_delay_us
+            && queue_us > p.low_delay_us
             && contiguous;
         let congested = self.usage == Usage::Over || queue_high || lossy_and_queued;
         // 一个往返（至少 100 ms）之内只降一次：同一次拥塞的反馈会连着来好几条。
@@ -858,6 +1158,13 @@ impl RateEstimator for ClassicV1 {
                     recv_bps.saturating_mul(u64::from(p.decrease_permille)) / 1000
                 } else {
                     self.rate_bps.saturating_mul(u64::from(p.decrease_permille)) / 1000
+                };
+                // 应用受限时送达速率只是“要发的量”，不是链路能力：一次最多降一半（每个往返一次，真拥塞时
+                // 几个往返也就降下来了），不一下降到要发的量的 85%（轻操作时就是底线）
+                let target = if relaxed {
+                    target.max(self.rate_bps / 2)
+                } else {
+                    target
                 };
                 let from_bps = self.rate_bps;
                 self.rate_bps = self.rate_bps.min(target).clamp(self.min_bps, self.max_bps);
@@ -888,12 +1195,30 @@ impl RateEstimator for ClassicV1 {
                     ));
                 }
                 self.noted_bps = self.rate_bps;
+                // 降了：进排空（起步期间不切，起步什么时候结束由发送端的探测决定）
+                if self.phase != Phase::Startup {
+                    self.go(
+                        Phase::Drain {
+                            from_app: relaxed,
+                            since: now,
+                        },
+                        if relaxed {
+                            "应用受限时降了码率（常驻队列或趋势过载）"
+                        } else {
+                            "降了码率，等队列排掉"
+                        },
+                    );
+                }
             }
             return;
         }
         // 排队在消退，或者（不断档的反馈里）还有排队：先不升。断档的那份不算：Wi-Fi 省电下零星的帧几乎每份都是
         // 12–25 ms（空闲后网卡要醒），算上的话码率永远升不上去（仿真：大屏 Wi-Fi 一直停在 1.36 Mbps）。
         if self.usage == Usage::Under || (fb.queue_delay_us >= p.low_delay_us && contiguous) {
+            return;
+        }
+        // 应用受限（和它的核实、排空）不自己升：送达速率只是要发的量，证明不了链路能承载更多（升靠探测结论）
+        if relaxed {
             return;
         }
         // 只有真在用这个码率时才升：屏幕静止时没有数据，估计冻结，不凭空上涨。
@@ -969,6 +1294,7 @@ mod tests {
             ext,
             rtt_us: 20_000,
             in_flight: 0,
+            limit: SendLimit::default(),
         }
     }
 
@@ -982,6 +1308,657 @@ mod tests {
         // 还没有显式状态机的估计器一律报告“跟踪”
         let v = ClassicV1::new(Profile::STABLE, 1_000_000, 100_000, 10_000_000);
         assert_eq!(v.state(), RateState::Tracking);
+        // 没有状态机的估计器：起步、网络受限的通知都不理，一直报告“跟踪”
+        let mut old = EstimatorKind::Legacy.build(Profile::STABLE, 1_000_000, 100_000, 10_000_000);
+        old.set_startup(true, "测试");
+        old.on_net_limited(NetCause::FrameBlocked);
+        assert_eq!(old.state(), RateState::Tracking);
+    }
+
+    // ---- 状态机（每个状态的每条出口、不变量 I1–I5）----
+
+    const FLAT: Extension = Extension {
+        trend_tenth_ms: 0,
+        train_bytes_per_s: 0,
+        groups: 10,
+    };
+    const OVER: Extension = Extension {
+        trend_tenth_ms: 3000,
+        train_bytes_per_s: 0,
+        groups: 20,
+    };
+    const NET: SendLimit = SendLimit::Network(NetCause::FrameNearBudget);
+
+    /// 每 20 ms 喂一份反馈（不断档）。
+    struct Feed {
+        v: ClassicV1,
+        t: u64,
+    }
+
+    impl Feed {
+        fn new(profile: Profile, start_bps: u64) -> Self {
+            Self {
+                v: ClassicV1::new(profile, start_bps, 100_000, 50_000_000),
+                t: 0,
+            }
+        }
+        fn put(&mut self, queue: u32, loss: u16, recv: u32, ext: Extension, limit: SendLimit) {
+            self.t += 20_000;
+            let o = Observation {
+                limit,
+                ..obs(fb(queue, loss, recv), ext)
+            };
+            self.v.on_observation(Time(self.t), &o);
+        }
+        /// 进入应用受限（先喂一份平静的反馈）。
+        fn app_limited(profile: Profile, start_bps: u64) -> Self {
+            let mut f = Self::new(profile, start_bps);
+            f.put(1_000, 0, 25_000, FLAT, SendLimit::App);
+            assert_eq!(f.v.state(), RateState::AppLimited);
+            f
+        }
+        fn notes(&mut self) -> String {
+            self.v.take_notes().join("\n")
+        }
+    }
+
+    #[test]
+    fn startup_ends_only_when_the_sender_says_so() {
+        let mut f = Feed::new(Profile::STABLE, 2_400_000);
+        f.v.set_startup(false, "没在起步");
+        assert_eq!(f.v.state(), RateState::Tracking, "不在起步时结束起步不做事");
+        f.v.set_startup(true, "会话开头");
+        assert_eq!(f.v.state(), RateState::Startup);
+        // 起步里发送端报应用受限、出现网络受限的原因：都不切
+        f.put(1_000, 0, 25_000, FLAT, SendLimit::App);
+        f.v.on_net_limited(NetCause::KeyPending);
+        assert_eq!(f.v.state(), RateState::Startup);
+        // 起步里过载照样降（I1），但不进排空：起步什么时候结束由探测决定
+        f.put(20_000, 0, 250_000, FLAT, NET);
+        assert_eq!(f.v.rate_bps(), 1_700_000);
+        assert_eq!(f.v.state(), RateState::Startup);
+        // 探测结论：码率按它定（I2 的第三处），然后发送端宣布结束
+        f.v.on_start_probe(Time(f.t), 10_000_000);
+        assert_eq!(f.v.rate_bps(), 9_000_000);
+        f.v.set_startup(false, "起步探测有结论了");
+        assert_eq!(f.v.state(), RateState::Tracking);
+        let notes = f.notes();
+        assert!(notes.contains("码率状态 跟踪 → 起步：会话开头"), "{notes}");
+        assert!(
+            notes.contains("码率状态 起步 → 跟踪：起步探测有结论了"),
+            "{notes}"
+        );
+    }
+
+    #[test]
+    fn tracking_leaves_on_a_cut_or_when_the_sender_is_app_limited() {
+        // 出口一：降了 → 排空
+        let mut f = Feed::new(Profile::STABLE, 2_400_000);
+        f.put(1_000, 0, 250_000, FLAT, NET);
+        assert_eq!(f.v.state(), RateState::Tracking);
+        f.put(20_000, 0, 250_000, FLAT, NET);
+        assert_eq!(f.v.rate_bps(), 1_700_000);
+        assert_eq!(f.v.state(), RateState::Drain);
+        assert!(f.notes().contains("码率状态 跟踪 → 排空：降了码率"));
+        // 出口二：发送端报应用受限 → 应用受限
+        let mut g = Feed::new(Profile::STABLE, 2_400_000);
+        g.put(1_000, 0, 25_000, FLAT, SendLimit::App);
+        assert_eq!(g.v.state(), RateState::AppLimited);
+        assert!(g
+            .notes()
+            .contains("码率状态 跟踪 → 应用受限：发送端 500 ms"));
+        // 网络受限的原因出现在跟踪里：不切，也不写日志
+        g.v.on_net_limited(NetCause::FrameBlocked);
+        g.v.on_net_limited(NetCause::FrameBlocked);
+        assert_eq!(g.notes().matches("码率状态").count(), 1);
+    }
+
+    #[test]
+    fn drain_from_tracking_returns_when_the_queue_empties_or_after_the_time_limit() {
+        // 出口一：排队低于 low → 跟踪
+        let mut f = Feed::new(Profile::STABLE, 2_400_000);
+        f.put(1_000, 0, 250_000, FLAT, NET);
+        f.put(20_000, 0, 250_000, FLAT, NET);
+        assert_eq!(f.v.state(), RateState::Drain);
+        // 排空期间发送端报应用受限：先排完再说（一份反馈只走一步）
+        f.put(5_000, 0, 250_000, FLAT, SendLimit::App);
+        assert_eq!(f.v.state(), RateState::Drain);
+        f.put(1_000, 0, 250_000, FLAT, SendLimit::App);
+        assert_eq!(f.v.state(), RateState::Tracking);
+        assert!(f
+            .notes()
+            .contains("码率状态 排空 → 跟踪：队列排掉了（排队 1 ms，低于 3 ms）"));
+        f.put(1_000, 0, 250_000, FLAT, SendLimit::App);
+        assert_eq!(f.v.state(), RateState::AppLimited);
+        // 出口二：排队一直不低于 low，到 1 秒 → 跟踪。一个往返（至少 100 ms）过后还过载就再降，排空重新计时
+        let mut g = Feed::new(Profile::STABLE, 2_400_000);
+        g.put(1_000, 0, 250_000, FLAT, NET);
+        g.put(20_000, 0, 250_000, FLAT, NET);
+        let cut_at = g.t;
+        for _ in 0..4 {
+            g.put(20_000, 0, 125_000, FLAT, NET);
+        }
+        assert_eq!(
+            g.v.rate_bps(),
+            1_700_000,
+            "一个往返（至少 100 ms）之内只降一次"
+        );
+        g.put(20_000, 0, 125_000, FLAT, NET);
+        assert_eq!(g.v.rate_bps(), 850_000, "过了一个往返还过载：再降（I1）");
+        let again_at = g.t;
+        assert_eq!(again_at - cut_at, 100_000);
+        // 之后排队在 low 和 high 之间：不降不升，也排不掉
+        while g.t < again_at + 980_000 {
+            g.put(5_000, 0, 125_000, FLAT, NET);
+            assert_eq!(g.v.state(), RateState::Drain, "{} ms", g.t / 1000);
+        }
+        g.put(5_000, 0, 125_000, FLAT, NET);
+        assert_eq!(g.v.state(), RateState::Tracking);
+        assert!(g
+            .notes()
+            .contains("排空 → 跟踪：排空到时限了，排队还有 5 ms"));
+        assert_eq!(g.v.rate_bps(), 850_000);
+        // 往返很长时时限是 4 个往返
+        let mut h = Feed::new(Profile::STABLE, 2_400_000);
+        let slow = |h: &mut Feed, queue| {
+            h.t += 20_000;
+            let o = Observation {
+                rtt_us: 400_000,
+                ..obs(fb(queue, 0, 250_000), FLAT)
+            };
+            h.v.on_observation(Time(h.t), &o);
+        };
+        slow(&mut h, 1_000);
+        slow(&mut h, 20_000);
+        let cut_at = h.t;
+        while h.t < cut_at + 1_580_000 {
+            slow(&mut h, 5_000);
+            assert_eq!(h.v.state(), RateState::Drain);
+        }
+        slow(&mut h, 5_000);
+        assert_eq!(h.v.state(), RateState::Tracking);
+    }
+
+    #[test]
+    fn app_limited_ignores_spikes_and_cuts_at_most_half_on_a_standing_queue() {
+        // 2026-11-26 用户日志：轻操作时一次 Wi-Fi 尖峰把码率从 17 Mbps 降到底线，画面 6 秒不动
+        let mut f = Feed::app_limited(Profile::STABLE, 30_000_000);
+        for _ in 0..10 {
+            f.put(1_000, 0, 25_000, FLAT, SendLimit::App);
+        }
+        // 一阵尖峰：三份排队 25 ms，其中一份 2 个包丢 1 个
+        f.put(25_000, 0, 25_000, FLAT, SendLimit::App);
+        f.put(25_000, 500, 25_000, FLAT, SendLimit::App);
+        f.put(25_000, 0, 25_000, FLAT, SendLimit::App);
+        for _ in 0..10 {
+            f.put(1_000, 0, 25_000, FLAT, SendLimit::App);
+        }
+        assert_eq!(f.v.rate_bps(), 30_000_000, "尖峰不是常驻队列");
+        assert_eq!(f.v.state(), RateState::AppLimited);
+        // 断档以后重新开始攒：刚开始的几份不够 100 ms，排队再高也不算
+        f.t += 1_000_000;
+        for _ in 0..5 {
+            f.put(30_000, 0, 25_000, FLAT, SendLimit::App);
+        }
+        assert_eq!(f.v.rate_bps(), 30_000_000, "不断档的反馈还不到 100 ms");
+        // 出口：排队持续 100 ms 以上是常驻队列，降，但一次最多降一半 → 排空
+        f.put(30_000, 0, 25_000, FLAT, SendLimit::App);
+        assert_eq!(f.v.rate_bps(), 15_000_000);
+        assert_eq!(f.v.state(), RateState::Drain);
+        assert!(f.notes().contains("应用受限 → 排空：应用受限时降了码率"));
+        for _ in 0..4 {
+            f.put(30_000, 0, 25_000, FLAT, SendLimit::App);
+        }
+        assert_eq!(f.v.rate_bps(), 15_000_000, "一个往返之内只降一次");
+        f.put(30_000, 0, 25_000, FLAT, SendLimit::App);
+        assert_eq!(f.v.rate_bps(), 7_500_000, "队列还在：下一个往返再降一半");
+        // 丢包明显、常驻队列高于 low：也算拥塞
+        let mut g = Feed::app_limited(Profile::STABLE, 30_000_000);
+        for _ in 0..6 {
+            g.put(5_000, 300, 25_000, FLAT, SendLimit::App);
+        }
+        assert_eq!(g.v.rate_bps(), 15_000_000);
+        // 趋势过载：不用等常驻队列，马上降一半
+        let mut h = Feed::app_limited(Profile::STABLE, 30_000_000);
+        h.put(0, 0, 25_000, OVER, SendLimit::App);
+        assert_eq!(h.v.rate_bps(), 15_000_000);
+        assert_eq!(h.v.state(), RateState::Drain);
+        // 往返比 100 ms 长时，常驻队列的窗口按往返
+        let mut k = Feed::app_limited(Profile::STABLE, 30_000_000);
+        for i in 0..12 {
+            k.t += 20_000;
+            let o = Observation {
+                rtt_us: 200_000,
+                limit: SendLimit::App,
+                ..obs(fb(30_000, 0, 25_000), FLAT)
+            };
+            k.v.on_observation(Time(k.t), &o);
+            // 进应用受限时喂过一份低读数：要等它滑出 200 ms 的窗口（之后的第 11 份），最小值才高
+            assert_eq!(k.v.rate_bps() < 30_000_000, i >= 10, "第 {i} 份");
+        }
+    }
+
+    #[test]
+    fn app_limited_returns_to_tracking_on_any_network_limit() {
+        // 出口：下一份反馈报网络受限
+        let mut f = Feed::app_limited(Profile::STABLE, 30_000_000);
+        f.put(
+            1_000,
+            0,
+            25_000,
+            FLAT,
+            SendLimit::Network(NetCause::ResendCapped),
+        );
+        assert_eq!(f.v.state(), RateState::Tracking);
+        assert!(f
+            .notes()
+            .contains("应用受限 → 跟踪：网络受限：重传被额度截断"));
+        // 出口：不等反馈，原因一出现就退出（进慢出快）
+        let mut g = Feed::app_limited(Profile::STABLE, 30_000_000);
+        g.v.on_net_limited(NetCause::FrameBlocked);
+        assert_eq!(g.v.state(), RateState::Tracking);
+        assert!(g
+            .notes()
+            .contains("应用受限 → 跟踪：网络受限：该编帧时在途数据满了或上一帧没发完"));
+        // 回到跟踪以后一份高读数就降，按送达速率，不再“最多一半”
+        g.put(20_000, 0, 250_000, FLAT, NET);
+        assert_eq!(g.v.rate_bps(), 1_700_000);
+        // 每个原因都有说明
+        for cause in [
+            NetCause::Unknown,
+            NetCause::Start,
+            NetCause::FrameBlocked,
+            NetCause::KeyPending,
+            NetCause::FrameNearBudget,
+            NetCause::FpsReduced,
+            NetCause::ScaleReduced,
+            NetCause::ResendCapped,
+            NetCause::UsingRate,
+        ] {
+            assert!(!cause.name().is_empty());
+        }
+        assert_eq!(SendLimit::default(), SendLimit::Network(NetCause::Unknown));
+    }
+
+    #[test]
+    fn drain_from_app_limited_goes_back_or_to_tracking() {
+        let cut = || {
+            let mut f = Feed::app_limited(Profile::STABLE, 30_000_000);
+            f.put(0, 0, 25_000, OVER, SendLimit::App);
+            assert_eq!(
+                (f.v.state(), f.v.rate_bps()),
+                (RateState::Drain, 15_000_000)
+            );
+            f.notes();
+            f
+        };
+        // 出口一：排队低于 low → 回应用受限
+        let mut f = cut();
+        f.put(5_000, 0, 25_000, FLAT, SendLimit::App);
+        assert_eq!(f.v.state(), RateState::Drain);
+        f.put(1_000, 0, 25_000, FLAT, SendLimit::App);
+        assert_eq!(f.v.state(), RateState::AppLimited);
+        assert!(f.notes().contains("排空 → 应用受限：队列排掉了"));
+        // 出口二：下一份反馈报网络受限 → 跟踪
+        let mut g = cut();
+        g.put(5_000, 0, 25_000, FLAT, NET);
+        assert_eq!(g.v.state(), RateState::Tracking);
+        // 出口三：原因一出现就 → 跟踪
+        let mut h = cut();
+        h.v.on_net_limited(NetCause::KeyPending);
+        assert_eq!(h.v.state(), RateState::Tracking);
+        assert!(h.notes().contains("排空 → 跟踪：网络受限：关键帧还没确认"));
+        // 出口四：1 秒还没排掉 → 跟踪
+        let mut k = cut();
+        let cut_at = k.t;
+        while k.t < cut_at + 980_000 {
+            k.put(5_000, 0, 25_000, FLAT, SendLimit::App);
+            assert_eq!(k.v.state(), RateState::Drain);
+        }
+        k.put(5_000, 0, 25_000, FLAT, SendLimit::App);
+        assert_eq!(k.v.state(), RateState::Tracking);
+        assert_eq!(k.v.rate_bps(), 15_000_000, "排空里不升");
+    }
+
+    /// I5：应用受限时码率停在底线超过 1 秒必须进核实；核实有时限（这一步没有探测，只能超时），每次切换都有日志。
+    #[test]
+    fn i5_app_limited_at_the_floor_must_be_verified_within_a_second() {
+        let mut f = Feed::app_limited(Profile::STABLE, 100_000);
+        let start = f.t;
+        while f.t < start + 980_000 {
+            f.put(1_000, 0, 1_000, FLAT, SendLimit::App);
+            assert_eq!(f.v.state(), RateState::AppLimited, "{} ms", f.t / 1000);
+        }
+        f.put(1_000, 0, 1_000, FLAT, SendLimit::App);
+        f.put(1_000, 0, 1_000, FLAT, SendLimit::App);
+        assert_eq!(f.v.state(), RateState::Verify);
+        assert!(f
+            .notes()
+            .contains("应用受限 → 核实：应用受限时码率在底线停了 1 秒"));
+        // 核实的出口一：到时限 → 应用受限（从头计时，一秒后再核实，不会停死）
+        let verify_at = f.t;
+        while f.t < verify_at + 980_000 {
+            f.put(1_000, 0, 1_000, FLAT, SendLimit::App);
+            assert_eq!(f.v.state(), RateState::Verify);
+        }
+        f.put(1_000, 0, 1_000, FLAT, SendLimit::App);
+        f.put(1_000, 0, 1_000, FLAT, SendLimit::App);
+        assert_eq!(f.v.state(), RateState::AppLimited);
+        assert!(f.notes().contains("核实 → 应用受限：核实超时"));
+        for _ in 0..60 {
+            f.put(1_000, 0, 1_000, FLAT, SendLimit::App);
+        }
+        assert_eq!(f.v.state(), RateState::Verify, "一秒后又进核实");
+        // 核实的出口二：网络受限 → 跟踪
+        f.put(1_000, 0, 1_000, FLAT, NET);
+        assert_eq!(f.v.state(), RateState::Tracking);
+        // 核实的出口三：过载（I1）→ 排空
+        let mut g = Feed::app_limited(Profile::STABLE, 100_000);
+        for _ in 0..60 {
+            g.put(1_000, 0, 1_000, FLAT, SendLimit::App);
+        }
+        assert_eq!(g.v.state(), RateState::Verify);
+        g.put(0, 0, 1_000, OVER, SendLimit::App);
+        assert_eq!(g.v.state(), RateState::Drain);
+        assert_eq!(g.v.rate_bps(), 100_000);
+        // 码率不在底线：不核实；中途离开底线（探测结论把码率提上去）就从头计时
+        let mut h = Feed::app_limited(Profile::STABLE, 100_000);
+        for _ in 0..30 {
+            h.put(1_000, 0, 1_000, FLAT, SendLimit::App);
+        }
+        h.v.on_start_probe(Time(h.t), 10_000_000);
+        for _ in 0..100 {
+            h.put(1_000, 0, 1_000, FLAT, SendLimit::App);
+        }
+        assert_eq!(h.v.state(), RateState::AppLimited);
+        assert_eq!(h.v.rate_bps(), 9_000_000);
+    }
+
+    /// 把估计器摆到某个状态（码率 30 Mbps）。
+    fn in_state(state: RateState) -> Feed {
+        let mut f = match state {
+            RateState::Startup => {
+                let mut f = Feed::new(Profile::STABLE, 30_000_000);
+                f.v.set_startup(true, "测试");
+                f
+            }
+            RateState::Tracking => Feed::new(Profile::STABLE, 30_000_000),
+            RateState::Drain => {
+                let mut f = Feed::new(Profile::STABLE, 35_000_000);
+                f.put(1_000, 0, 4_400_000, FLAT, NET);
+                f.put(20_000, 0, 4_411_765, FLAT, NET);
+                f.t += 200_000;
+                f
+            }
+            RateState::AppLimited => Feed::app_limited(Profile::STABLE, 30_000_000),
+            RateState::Verify => {
+                let mut f = Feed::app_limited(Profile::STABLE, 30_000_000);
+                f.v.phase = Phase::Verify { since: Time(f.t) };
+                f
+            }
+        };
+        // 排空以外的状态再喂两份平静的反馈（排空一见排队低就结束了）
+        if state != RateState::Drain {
+            let limit = if f.v.phase.relaxed() {
+                SendLimit::App
+            } else {
+                NET
+            };
+            f.put(1_000, 0, 1_000, FLAT, limit);
+            f.put(1_000, 0, 1_000, FLAT, limit);
+        }
+        assert_eq!(f.v.state(), state);
+        f
+    }
+
+    /// I1：任何状态下，过载证据都让码率降、这一份反馈不升。
+    #[test]
+    fn i1_overload_always_cuts_in_every_state() {
+        for state in RateState::ALL {
+            let mut f = in_state(state);
+            let before = f.v.rate_bps();
+            let limit = if f.v.phase.relaxed() {
+                SendLimit::App
+            } else {
+                NET
+            };
+            // 趋势过载，同时送达速率很高（没过载的话这一份会升）
+            f.put(0, 0, 3_500_000, OVER, limit);
+            assert!(
+                f.v.rate_bps() < before,
+                "{}：{} → {}",
+                state.name(),
+                before,
+                f.v.rate_bps()
+            );
+        }
+    }
+
+    /// I2：码率只在三处变——拥塞降、跟踪（含起步、来源是跟踪的排空）的升、探测结论。
+    /// 应用受限、核实和它们的排空里，没有过载就一动不动，送达速率再高也不升。
+    #[test]
+    fn i2_the_rate_moves_only_on_a_cut_a_tracking_increase_or_a_probe() {
+        for state in RateState::ALL {
+            let mut f = in_state(state);
+            let before = f.v.rate_bps();
+            let relaxed = f.v.phase.relaxed();
+            let limit = if relaxed { SendLimit::App } else { NET };
+            for _ in 0..20 {
+                f.put(1_000, 0, 3_500_000, FLAT, limit);
+            }
+            if relaxed {
+                assert_eq!(f.v.rate_bps(), before, "{} 不自己升", state.name());
+            } else {
+                assert!(f.v.rate_bps() > before, "{} 用满了码率就升", state.name());
+            }
+        }
+        // 来源是应用受限的排空也不升
+        let mut f = Feed::app_limited(Profile::STABLE, 30_000_000);
+        f.put(0, 0, 25_000, OVER, SendLimit::App);
+        for _ in 0..4 {
+            f.put(5_000, 0, 3_500_000, FLAT, SendLimit::App);
+        }
+        assert_eq!(
+            (f.v.state(), f.v.rate_bps()),
+            (RateState::Drain, 15_000_000)
+        );
+        // 探测结论在任何状态下都能改码率
+        for state in RateState::ALL {
+            let mut f = in_state(state);
+            f.v.on_idle_probe(Time(f.t), 2_000_000);
+            assert_eq!(f.v.rate_bps(), 1_800_000, "{}", state.name());
+        }
+    }
+
+    /// 没有状态机的版本（ui-bugs 分支的 `ClassicV1::on_observation`，原样抄下来，只去掉写日志）。I3 拿它当参照。
+    struct Reference {
+        p: Profile,
+        rate_bps: u64,
+        min_bps: u64,
+        max_bps: u64,
+        threshold: i64,
+        last_threshold_update: Option<Time>,
+        capacity: Option<(u64, Time)>,
+        last_decrease: Option<Time>,
+        last_feedback: Option<Time>,
+        usage: Usage,
+        inherent_loss: u64,
+    }
+
+    impl Reference {
+        fn detect(&mut self, now: Time, ext: &Extension) -> Usage {
+            let trend = i64::from(ext.trend_tenth_ms);
+            let dt_ms = self
+                .last_threshold_update
+                .map_or(0, |t| i64::try_from(now.since(t) / 1000).unwrap_or(0))
+                .min(100);
+            self.last_threshold_update = Some(now);
+            if trend.abs() < self.threshold + 150 {
+                let k = if trend.abs() < self.threshold {
+                    K_DOWN_E7
+                } else {
+                    K_UP_E7
+                };
+                self.threshold += k * (trend.abs() - self.threshold) * dt_ms / 10_000_000;
+                self.threshold = self.threshold.clamp(THRESHOLD_MIN, THRESHOLD_MAX);
+            }
+            if ext.groups < 2 {
+                Usage::Normal
+            } else if trend > self.threshold {
+                Usage::Over
+            } else if trend < -self.threshold {
+                Usage::Under
+            } else {
+                Usage::Normal
+            }
+        }
+
+        fn on_observation(&mut self, now: Time, obs: &Observation) {
+            let p = self.p;
+            let fb = &obs.feedback;
+            let recv_bps = u64::from(fb.recv_bytes_per_s).saturating_mul(8);
+            let train_bps = u64::from(obs.ext.train_bytes_per_s).saturating_mul(8);
+            if train_bps > 0 {
+                self.capacity = Some((train_bps, now));
+            }
+            let capacity = self
+                .capacity
+                .filter(|(_, at)| now.since(*at) < CAPACITY_TTL_US)
+                .map(|(c, _)| c);
+            self.usage = self.detect(now, &obs.ext);
+            let using = recv_bps.saturating_mul(10) >= self.rate_bps.saturating_mul(6);
+            let contiguous = self
+                .last_feedback
+                .is_some_and(|t| now.since(t) <= CONTIGUOUS_US);
+            self.last_feedback = Some(now);
+            let queue_high = fb.queue_delay_us > p.high_delay_us && contiguous;
+            let loss = u64::from(fb.loss_permille).saturating_mul(1000);
+            self.inherent_loss = self.inherent_loss - self.inherent_loss / 128 + loss / 128;
+            let inherent = u16::try_from(self.inherent_loss / 1000).unwrap_or(u16::MAX);
+            let lossy_and_queued = fb.loss_permille > p.loss_permille.saturating_add(inherent)
+                && fb.queue_delay_us > p.low_delay_us
+                && contiguous;
+            let congested = self.usage == Usage::Over || queue_high || lossy_and_queued;
+            let hold = obs.rtt_us.max(100_000);
+            if congested {
+                if self.last_decrease.is_none_or(|t| now.since(t) >= hold) {
+                    let target = if recv_bps > 0 {
+                        recv_bps.saturating_mul(u64::from(p.decrease_permille)) / 1000
+                    } else {
+                        self.rate_bps.saturating_mul(u64::from(p.decrease_permille)) / 1000
+                    };
+                    self.rate_bps = self.rate_bps.min(target).clamp(self.min_bps, self.max_bps);
+                    self.last_decrease = Some(now);
+                }
+                return;
+            }
+            if self.usage == Usage::Under || (fb.queue_delay_us >= p.low_delay_us && contiguous) {
+                return;
+            }
+            if !using {
+                return;
+            }
+            let target = capacity.map(|c| c.saturating_mul(u64::from(p.safety_permille)) / 1000);
+            let step = match target {
+                Some(t) if self.rate_bps < t => (t - self.rate_bps) / 2,
+                Some(_) | None => {
+                    self.rate_bps.saturating_mul(u64::from(p.increase_permille)) / 1000
+                }
+            };
+            self.rate_bps = self
+                .rate_bps
+                .saturating_add(step.max(1))
+                .clamp(self.min_bps, self.max_bps);
+        }
+    }
+
+    /// I3：发送端一直是网络受限时，每一步的码率、过载判断都和没有状态机的版本完全相同
+    /// （随机的反馈序列，三种画像各两万份；状态在起步、跟踪、排空之间来回）。
+    #[test]
+    fn i3_tracking_is_identical_to_the_version_without_a_state_machine() {
+        let causes = [
+            NetCause::Unknown,
+            NetCause::FrameBlocked,
+            NetCause::KeyPending,
+            NetCause::FrameNearBudget,
+            NetCause::UsingRate,
+        ];
+        for (seed, profile) in [Profile::STABLE, Profile::WIRELESS, Profile::CELLULAR]
+            .into_iter()
+            .enumerate()
+        {
+            let mut rng = crate::sim::Rng::new(seed as u64 + 7);
+            let mut v = ClassicV1::new(profile, 1_000_000, 100_000, 30_000_000);
+            let mut r = Reference {
+                p: profile,
+                rate_bps: 1_000_000,
+                min_bps: 100_000,
+                max_bps: 30_000_000,
+                threshold: THRESHOLD_START,
+                last_threshold_update: None,
+                capacity: None,
+                last_decrease: None,
+                last_feedback: None,
+                usage: Usage::Normal,
+                inherent_loss: 0,
+            };
+            let mut t = 0u64;
+            let mut seen = [false; 5];
+            for i in 0..20_000u32 {
+                // 多数 20 ms 一份，偶尔断档；排队、丢包、送达、趋势、包串都随机
+                t += if rng.chance(50) { 1_000_000 } else { 20_000 };
+                let queue = if rng.chance(300) {
+                    rng.below(80_000)
+                } else {
+                    rng.below(4_000)
+                };
+                let loss = if rng.chance(200) { rng.below(400) } else { 0 };
+                let recv = rng.below(v.rate_bps() / 4 + 1);
+                let o = Observation {
+                    feedback: fb(
+                        u32::try_from(queue).unwrap(),
+                        u16::try_from(loss).unwrap(),
+                        u32::try_from(recv).unwrap(),
+                    ),
+                    ext: Extension {
+                        trend_tenth_ms: i32::try_from(rng.below(400)).unwrap() - 200,
+                        train_bytes_per_s: if rng.chance(100) {
+                            u32::try_from(rng.below(2_000_000)).unwrap()
+                        } else {
+                            0
+                        },
+                        groups: u16::try_from(rng.below(30)).unwrap(),
+                    },
+                    rtt_us: 20_000 + rng.below(300_000),
+                    in_flight: 0,
+                    limit: SendLimit::Network(causes[usize::try_from(rng.below(5)).unwrap()]),
+                };
+                // 起步探测开始、结束、出结论也随机穿插（参照版本里结论就是直接定码率）
+                if i % 5_000 == 10 {
+                    v.set_startup(true, "测试");
+                }
+                if i % 5_000 == 60 {
+                    v.on_start_probe(Time(t), 8_000_000);
+                    r.capacity = Some((8_000_000, Time(t)));
+                    r.rate_bps = (8_000_000 * u64::from(profile.safety_permille) / 1000)
+                        .clamp(r.min_bps, r.max_bps);
+                    v.set_startup(false, "测试");
+                }
+                v.on_net_limited(NetCause::FrameBlocked);
+                v.on_observation(Time(t), &o);
+                r.on_observation(Time(t), &o);
+                assert_eq!(v.rate_bps(), r.rate_bps, "第 {i} 份（{}）", profile.name);
+                assert_eq!(v.usage(), r.usage, "第 {i} 份");
+                assert!(!v.phase.relaxed());
+                seen[v.state().index()] = true;
+                v.take_notes();
+            }
+            assert_eq!(
+                seen,
+                [true, true, true, false, false],
+                "走到过起步、跟踪、排空"
+            );
+        }
     }
 
     #[test]

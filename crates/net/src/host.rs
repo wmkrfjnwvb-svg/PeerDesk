@@ -744,7 +744,10 @@ pub async fn serve(
                     source.set_target_size(target);
                 }
                 // 在途数据超过上限：这一帧不编，变化攒着，等确认之后编最新的画面。
-                if encoding || pacer.busy(media.pacing_bps(pacing), 1_000_000 / u64::from(opts.fps.max(1))) || media.in_flight_full(link.now()) || !media.due(link.now()) || (!pending_change && !media.wants_frame()) {
+                // （被在途上限、节奏器拦下时 frame_gate 记一次“网络受限”，码率控制据此判断发送端是不是应用受限）
+                let pacer_busy = pacer.busy(media.pacing_bps(pacing), 1_000_000 / u64::from(opts.fps.max(1)));
+                let wanted = pending_change || media.wants_frame();
+                if encoding || !media.frame_gate(link.now(), wanted, pacer_busy) {
                     continue;
                 }
                 let rtt = u64::try_from(link.rtt().as_micros()).unwrap_or(u64::MAX);
