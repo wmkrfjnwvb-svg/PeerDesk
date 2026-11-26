@@ -803,12 +803,12 @@ impl RateEstimator for ClassicV1 {
         // 丢包只有在排队也一直在时才算拥塞；单独的随机丢包交给纠错和重传，不降码率。
         // 发送端是不是在用满码率（没用满时送达速率只是“要发的量”，不代表链路能力）。看发送端实际发了多少：
         // 链路突然变窄时送达速率也低，按它判断会把真拥塞当成没用满、反应变慢。不知道发了多少时按送达速率。
-        let sending =
+        let using =
             obs.sent_bps.unwrap_or(recv_bps).saturating_mul(10) >= self.rate_bps.saturating_mul(6);
-        // 还有不少数据在路上（超过当前码率下四分之一个往返的量）也算用满：发送端是被拥塞拦着没发新帧
-        // （发不出去，不是没东西发）。不加这条时窄带轨迹 ms-05729 卡顿 3 次合计 19 → 22
-        let backlog = self.rate_bps.saturating_mul(obs.rtt_us.max(20_000)) / 8_000_000 / 4;
-        let using = sending || obs.in_flight > backlog;
+        // 明显没用满（发出的不到码率的四分之一，轻操作时的样子）才按“没用满”放宽拥塞判断（见下面的 `queue_us`）。
+        // 用户日志里轻操作时发出的不到码率的 2%；窄带上被预算、在途上限拦着时一般是码率的 30–60%，按 60% 划线时
+        // 窄带轨迹 ms-05729 卡顿 3 次合计 19 → 22，再加“在途多算用满”反而 75 → 94（36 次合计）
+        let idle_ish = obs.sent_bps.unwrap_or(recv_bps).saturating_mul(4) < self.rate_bps;
         // 排队读数只在反馈不断档时才算数：和上一份反馈相隔不超过 [`CONTIGUOUS_US`]，说明这段时间包一直在到，
         // 排队读数是链路在忙时量的，这时的送达速率也就是链路能力，按它降不会过头。断档的那份（画面静止时零星的小包）
         // 不算：它的排队读数是 Wi-Fi 省电（空闲后网卡要醒）的延迟，那份反馈里只有一两个包、送达速率被空闲时间稀释。
@@ -824,10 +824,10 @@ impl RateEstimator for ClassicV1 {
         // 要持续 [`STANDING_US`] 才算。2026-11-26 用户日志（Wi-Fi 30 Mbps、轻操作）：趋势是平的，一次 13–27 ms 的读数
         // 就按送达速率降，17 Mbps 掉到底线 100 kbps，编码器出 0 KB 的帧，画面 6 秒不动；168 秒里降码率 59 次，
         // 39 次在没用满码率时。用满码率时照旧一份就算：窄带上要求持续会让真拥塞反应慢（连着 3 份才算时卡顿 31 → 58）。
-        let queue_us = if using {
-            fb.queue_delay_us
-        } else {
+        let queue_us = if idle_ish {
             standing.unwrap_or(0)
+        } else {
+            fb.queue_delay_us
         };
         let queue_high = queue_us > p.high_delay_us && contiguous;
         // 固有丢包慢慢跟（每份反馈 1/128，反馈 20 ms 一次时约 2.5 秒）
@@ -854,10 +854,10 @@ impl RateEstimator for ClassicV1 {
                 };
                 // 没用满码率时送达速率只是“要发的量”，不是链路能力：一次最多降一半（每个往返一次，真拥塞时
                 // 几个往返也就降下来了），不一下降到要发的量的 85%（轻操作时就是底线）
-                let target = if using {
-                    target
-                } else {
+                let target = if idle_ish {
                     target.max(self.rate_bps / 2)
+                } else {
+                    target
                 };
                 let from_bps = self.rate_bps;
                 self.rate_bps = self.rate_bps.min(target).clamp(self.min_bps, self.max_bps);
@@ -1355,16 +1355,6 @@ mod tests {
         );
         feed(&mut v, &mut t, 30_000, 0);
         assert_eq!(v.rate_bps(), 7_500_000);
-        // 发出的少、但很多数据还在路上（被拥塞拦着）：算用满，一份就按送达速率降
-        let mut w = ClassicV1::new(Profile::STABLE, 2_000_000, 100_000, 50_000_000);
-        let busy = Observation {
-            sent_bps: Some(100_000),
-            in_flight: 60_000,
-            ..obs(fb(30_000, 0, 25_000), flat)
-        };
-        w.on_observation(Time(20_000), &busy);
-        w.on_observation(Time(40_000), &busy);
-        assert_eq!(w.rate_bps(), 170_000);
     }
 
     #[test]
