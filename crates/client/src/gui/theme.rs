@@ -519,6 +519,8 @@ pub fn install(ctx: &egui::Context) -> fonts::Installed {
         style.spacing.interact_size.y = size::CONTROL_SMALL;
         style.spacing.text_edit_width = size::INPUT_WIDTH;
         style.spacing.menu_margin = pad(space::S6, space::S6);
+        // 滚动条：细的，浮在内容上面，不滚动时不占地方
+        style.spacing.scroll = egui::style::ScrollStyle::thin();
         style.animation_time = motion::FAST;
         for (style_name, size, weight) in [
             (egui::TextStyle::Small, font::CAPTION, Weight::Regular),
@@ -1102,8 +1104,6 @@ mod tests {
                 ("次要/面", p.muted, p.surface),
                 ("次要/停留", p.muted, p.hover),
                 ("次要/槽", p.muted, p.track),
-                ("不能点/底", p.disabled, p.bg),
-                ("不能点/槽", p.disabled, p.track),
                 ("链接/底", p.link(), p.bg),
                 ("链接/面", p.link(), p.surface),
                 ("危险按钮", ON_DANGER, p.danger_fill),
@@ -1117,6 +1117,11 @@ mod tests {
             for (what, fg, bg) in pairs {
                 let ratio = contrast(fg, bg);
                 assert!(ratio >= 4.5, "dark={} {what}: {ratio:.2}", p.dark);
+            }
+            // 不能点的控件不在 4.5:1 的要求之内（WCAG 1.4.3 把停用的控件排除在外），
+            // 设计稿的取值在底色上是 4.4:1；这里只要求还认得出字（3:1）
+            for bg in [p.bg, p.track] {
+                assert!(contrast(p.disabled, bg) >= 3.0, "dark={} 不能点", p.dark);
             }
             // 圆点、图标这类图形要和底色分得开（WCAG 1.4.11：3:1）
             for signal in [Signal::Direct, Signal::Relay, Signal::Problem, Signal::Idle] {
