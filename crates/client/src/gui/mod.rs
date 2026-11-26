@@ -17,6 +17,7 @@ pub mod input;
 pub mod keys;
 pub mod netinfo;
 pub mod password;
+pub mod presence;
 pub mod recent;
 pub mod session;
 pub mod settings;

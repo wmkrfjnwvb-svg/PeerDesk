@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use peerdesk_core::paths::{Candidate, Limits, PathKind, NAT_PENALTY_US};
 use peerdesk_core::relay::{parse_notice, unwrap, wrap, SessionId, RELAY_HEADER};
 use peerdesk_core::signal::{
-    format_code, observe_packet, PunchInfo, PunchPlan, RelayGrant, SignalMsg,
+    format_code, observe_packet, DeviceId, PunchInfo, PunchPlan, RelayGrant, SignalMsg, MAX_PRESENCE,
 };
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
@@ -496,6 +496,54 @@ pub async fn dial_via(
     Err(last)
 }
 
+/// 问服务器这些设备现在在不在线（最近连接、设备列表里显示）：按设备码问 `codes`、按指纹问 `devices`，
+/// 一次最多 [`MAX_PRESENCE`] 台（多的截掉）。返回和请求一一对应的结果，先设备码、后指纹。
+/// 依次试 `servers`，用第一个连得上的。老版本服务器不认识这个请求，会断开连接：返回错误，界面显示“状态未知”。
+pub async fn presence(
+    node: &Node,
+    servers: &[Server],
+    codes: &[u32],
+    devices: &[DeviceId],
+) -> Result<Vec<bool>, NetError> {
+    let codes = codes.get(..codes.len().min(MAX_PRESENCE)).unwrap_or_default();
+    let room = MAX_PRESENCE.saturating_sub(codes.len());
+    let devices = devices.get(..devices.len().min(room)).unwrap_or_default();
+    let mut last = NetError::Connect("没有配置服务器".into());
+    for server in servers {
+        match node
+            .connect_within(server.addr, server.pin.as_ref(), SERVER_TIMEOUT)
+            .await
+        {
+            Ok(link) => {
+                let (mut send, mut recv) = link.open_stream().await?;
+                write_kind(&mut send, StreamKind::Signal).await?;
+                let ask = SignalMsg::Presence {
+                    codes: codes.to_vec(),
+                    devices: devices.to_vec(),
+                };
+                write_signal(&mut send, &ask).await?;
+                let reply = tokio::time::timeout(SERVER_TIMEOUT, read_signal(&mut recv)).await;
+                link.close("done");
+                return match reply {
+                    Ok(Ok(SignalMsg::PresenceReply { online }))
+                        if online.len() == codes.len() + devices.len() =>
+                    {
+                        Ok(online)
+                    }
+                    Ok(Ok(_)) => Err(NetError::Protocol("服务器的在线状态应答不对")),
+                    Ok(Err(e)) => Err(e),
+                    Err(_) => Err(NetError::Connect("服务器没有回答在线状态".into())),
+                };
+            }
+            Err(e) => {
+                crate::note!(warn, "服务器 {} 连不上，换下一个：{e}", server.addr);
+                last = e;
+            }
+        }
+    }
+    Err(last)
+}
+
 /// 问一个服务器集群里有哪些节点（用于故障切换）。节点的指纹来自这个已经核对过身份的服务器。
 pub async fn fetch_nodes(node: &Node, server: &Server) -> Result<Vec<Server>, NetError> {
     let link = node
@@ -580,7 +628,9 @@ async fn dial_on(
         | SignalMsg::Registered { .. }
         | SignalMsg::Connect { .. }
         | SignalMsg::ConnectCode { .. }
-        | SignalMsg::Incoming { .. } => return Err(NetError::Protocol("服务器的应答不是地址")),
+        | SignalMsg::Incoming { .. }
+        | SignalMsg::Presence { .. }
+        | SignalMsg::PresenceReply { .. } => return Err(NetError::Protocol("服务器的应答不是地址")),
     };
     timing.lookup = asked.elapsed();
     if let Lookup::Device(target) = lookup {

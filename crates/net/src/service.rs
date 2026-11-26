@@ -1,7 +1,7 @@
 //! 服务器一侧的信令服务和中继服务。
 
 use std::collections::BTreeMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -270,6 +270,29 @@ struct SignalState {
     codes: Option<PathBuf>,
     /// 每台设备上一次传崩溃报告的时间（限频）。
     crash_seen: Mutex<BTreeMap<[u8; 32], Instant>>,
+    /// 每个来源 IP 这一分钟里问过多少台设备的在线状态（限频，见 [`PRESENCE_PER_MINUTE`]）。
+    presence_seen: Mutex<BTreeMap<IpAddr, (Instant, usize)>>,
+}
+
+/// 每个来源 IP 每分钟最多问这么多台设备的在线状态：正常客户端 30 秒问一次、一次最多 64 台，
+/// 这里留了 5 倍余量；挡住拿它批量试探设备码。
+const PRESENCE_PER_MINUTE: usize = 640;
+
+/// 记下 `ip` 这次要问 `count` 台设备；这一分钟超额时返回 `false`。顺手清掉过期的记录。
+fn presence_allowed(
+    seen: &mut BTreeMap<IpAddr, (Instant, usize)>,
+    ip: IpAddr,
+    count: usize,
+    now: Instant,
+) -> bool {
+    const WINDOW: Duration = Duration::from_secs(60);
+    seen.retain(|_, (since, _)| now.duration_since(*since) < WINDOW);
+    let (_, used) = seen.entry(ip).or_insert((now, 0));
+    if used.saturating_add(count) > PRESENCE_PER_MINUTE {
+        return false;
+    }
+    *used = used.saturating_add(count);
+    true
 }
 
 /// 同一台设备两次崩溃报告至少隔这么久。
@@ -639,6 +662,28 @@ async fn serve_device(state: Arc<SignalState>, link: Link) -> Result<(), NetErro
                     }
                     if let Err(e) = introduce(&state, &link, target, locals, account, &mut probed, &mut send).await { break Err(e); }
                 }
+                Ok(SignalMsg::Presence { codes, devices }) => {
+                    let count = codes.len().saturating_add(devices.len());
+                    let allowed = presence_allowed(
+                        &mut lock(&state.presence_seen),
+                        link.remote_addr().ip(),
+                        count,
+                        Instant::now(),
+                    );
+                    if !allowed {
+                        crate::note!(warn, "在线状态查询太频繁，断开：{}", link.remote_addr());
+                        break Err(NetError::Protocol("在线状态查询太频繁"));
+                    }
+                    let online = {
+                        let registry = lock(&state.registry);
+                        codes
+                            .iter()
+                            .map(|c| registry.device_of(*c).is_some_and(|d| registry.is_online(&d)))
+                            .chain(devices.iter().map(|d| registry.is_online(d)))
+                            .collect()
+                    };
+                    if let Err(e) = write_signal(&mut send, &SignalMsg::PresenceReply { online }).await { break Err(e); }
+                }
                 Ok(
                     SignalMsg::Registered { .. }
                     | SignalMsg::NodeList { .. }
@@ -646,7 +691,8 @@ async fn serve_device(state: Arc<SignalState>, link: Link) -> Result<(), NetErro
                     | SignalMsg::Probe { .. }
                     | SignalMsg::Peer { .. }
                     | SignalMsg::Incoming { .. }
-                    | SignalMsg::NotFound,
+                    | SignalMsg::NotFound
+                    | SignalMsg::PresenceReply { .. },
                 ) => break Err(NetError::Protocol("设备不该发这种信令")),
             },
         }
@@ -708,6 +754,7 @@ impl SignalService {
             next_conn: AtomicU64::new(1),
             codes,
             crash_seen: Mutex::new(BTreeMap::new()),
+            presence_seen: Mutex::new(BTreeMap::new()),
         });
         let accept_state = Arc::clone(&state);
         let task = tokio::spawn(async move {
