@@ -269,6 +269,8 @@ pub struct Strings {
     pub code_hint: &'static str,
     /// 连接密码
     pub password_input_hint: &'static str,
+    /// “记住密码”勾选框。
+    pub remember_password: &'static str,
     /// 高级选项
     pub advanced: &'static str,
     /// 显示密码
@@ -399,6 +401,10 @@ pub struct Strings {
     pub sc_select_all: &'static str,
     /// 助手：撤销。
     pub sc_undo: &'static str,
+    /// macOS 上的“开始菜单”：聚焦搜索。
+    pub sc_spotlight: &'static str,
+    /// macOS 上的“任务管理器”：强制退出。
+    pub sc_force_quit: &'static str,
     /// 助手：未知（按 Windows 发送）。
     pub os_unknown: &'static str,
     /// 助手：对方系统。
@@ -411,8 +417,7 @@ pub struct Strings {
     pub fullscreen: &'static str,
     /// 原始大小（1:1）的提示。
     pub original_size: &'static str,
-    /// 助手：对方系统没有这个操作。
-    pub not_on_this_os: &'static str,
+
     pub err_port_in_use: &'static str,
     pub err_timeout: &'static str,
     pub err_refused: &'static str,
@@ -545,6 +550,7 @@ pub const ZH: Strings = Strings {
     this_device_hint: "把设备码和密码告诉对方，对方就能连接本机",
     code_hint: "输入对方设备码或 IP 地址",
     password_input_hint: "连接密码",
+    remember_password: "记住密码（加密保存在本机）",
     advanced: "高级选项",
     show_password: "显示密码",
     hide_password: "隐藏密码",
@@ -611,13 +617,14 @@ pub const ZH: Strings = Strings {
     sc_paste: "粘贴",
     sc_select_all: "全选",
     sc_undo: "撤销",
+    sc_spotlight: "聚焦搜索",
+    sc_force_quit: "强制退出",
     os_unknown: "未知（按 Windows 发送）",
     remote_os: "对方系统",
     sound: "声音",
     clipboard_sync: "剪贴板同步",
     fullscreen: "全屏",
     original_size: "原始大小（1:1，最清楚）；再点一下铺满窗口",
-    not_on_this_os: "对方系统没有这个操作",
     err_port_in_use: "端口已被占用（也许另一个 PeerDesk 正在运行），换一个端口试试",
     err_timeout: "对方没有响应。请检查地址和端口、防火墙，以及对方是否打开了“允许远程控制”",
     err_refused: "连接失败",
@@ -751,6 +758,7 @@ pub const EN: Strings = Strings {
     this_device_hint: "Share this code and password so others can connect",
     code_hint: "Enter a device code or IP address",
     password_input_hint: "Password",
+    remember_password: "Remember password (encrypted on this computer)",
     advanced: "Advanced",
     show_password: "Show password",
     hide_password: "Hide password",
@@ -817,13 +825,14 @@ pub const EN: Strings = Strings {
     sc_paste: "Paste",
     sc_select_all: "Select all",
     sc_undo: "Undo",
+    sc_spotlight: "Spotlight",
+    sc_force_quit: "Force Quit",
     os_unknown: "unknown (sent as Windows)",
     remote_os: "Remote system",
     sound: "Sound",
     clipboard_sync: "Clipboard sync",
     fullscreen: "Full screen",
     original_size: "Original size (1:1, sharpest); click again to fill the window",
-    not_on_this_os: "Not available on the remote system",
     err_port_in_use:
         "The port is already in use (maybe another PeerDesk is running). Try another port",
     err_timeout: "No response. Check the address, the port, the firewall, and that \

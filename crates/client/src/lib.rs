@@ -7,6 +7,7 @@ use std::io::Write;
 
 pub mod crashreport;
 pub mod gui;
+pub mod keychain;
 pub mod libcheck;
 pub mod logfile;
 
@@ -21,6 +22,7 @@ mod remote;
 mod screen_check;
 mod source;
 pub mod unattended;
+pub mod vault;
 
 use peerdesk_core::config::ClientConfig;
 use peerdesk_core::crypto::{Policy, Suite};

@@ -96,6 +96,16 @@ pub fn run() -> u8 {
     }
 }
 
+/// 连上之后要记进最近连接的内容（认证通过、握手完成之后才记）。
+struct Remember {
+    /// 地址（设备码或 `IP:端口`）。
+    addr: String,
+    /// 核对过的指纹。
+    pin: String,
+    /// 要加密保存的密码；`None` 表示不保存（并删掉以前保存的）。
+    password: Option<String>,
+}
+
 struct App {
     s: &'static Strings,
     data_dir: PathBuf,
@@ -113,8 +123,12 @@ struct App {
     addrs: Vec<IpAddr>,
     form: ConnectForm,
     form_password: String,
+    /// 连上之后把密码加密保存（见 `crate::vault`）。
+    remember_password: bool,
+    /// 保存的密码：用到时才打开（打开要读系统钥匙串，有的系统会弹授权框），打不开时记着原因。
+    vault: Option<Result<crate::vault::Vault, crate::vault::VaultError>>,
     recent: RecentStore,
-    views: Vec<(Viewer, Option<(String, String)>)>,
+    views: Vec<(Viewer, Option<Remember>)>,
     /// 文件管理窗口。
     files: super::files_window::FilesWindow,
     /// 在设备列表里点了“文件传输”的设备地址：连上之后自动打开它的文件管理。
@@ -233,6 +247,8 @@ impl App {
             addrs: lan_addresses(),
             form: ConnectForm::default(),
             form_password: String::new(),
+            remember_password: true,
+            vault: None,
             views: Vec::new(),
             files: {
                 // PEERDESK_GUI_FILES=1：启动就打开文件管理（截图用）
@@ -302,7 +318,29 @@ impl App {
         }
     }
 
-    fn connect(&mut self, target: Target, remember: Option<(String, String)>) {
+    /// 保存的密码（打开一次，之后复用；打不开时返回原因）。
+    fn vault(&mut self) -> Result<&mut crate::vault::Vault, crate::vault::VaultError> {
+        let data_dir = self.data_dir.clone();
+        self.vault
+            .get_or_insert_with(|| {
+                crate::vault::Vault::open(&data_dir, &crate::keychain::SystemKeyStore)
+            })
+            .as_mut()
+            .map_err(|e| e.clone())
+    }
+
+    /// `addr` 保存的密码；没有或打不开时为空。
+    fn saved_password(&mut self, addr: &str) -> String {
+        match self.vault() {
+            Ok(v) => v.get(addr).unwrap_or_default().to_owned(),
+            Err(e) => {
+                log::warn!("{e}");
+                String::new()
+            }
+        }
+    }
+
+    fn connect(&mut self, target: Target, remember: Option<Remember>) {
         self.serial += 1;
         let title = match &target {
             Target::Addr { addr, .. } => format!("PeerDesk — {addr}"),
@@ -336,7 +374,11 @@ impl App {
                     Target::Addr { .. } => self.form.pin.clone(),
                     Target::Device { .. } => String::new(),
                 };
-                let remember = Some((self.form.remembered(), pin));
+                let remember = Some(Remember {
+                    addr: self.form.remembered(),
+                    pin,
+                    password: self.remember_password.then(|| self.form_password.clone()),
+                });
                 self.connect(target, remember);
             }
             Err(e) => {
@@ -737,6 +779,18 @@ impl App {
         ui.add_space(space::S4);
         let r = big_input(ui, p, &mut self.form_password, s.password_input_hint, true);
         go |= r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        // 记住密码：加密保存在本机（系统钥匙串用不了时不能勾，悬停说明原因）
+        let blocked = match &self.vault {
+            Some(Err(e)) => Some(e.to_string()),
+            Some(Ok(_)) | None => None,
+        };
+        let r = ui.add_enabled(
+            blocked.is_none(),
+            egui::Checkbox::new(&mut self.remember_password, s.remember_password),
+        );
+        if let Some(why) = blocked {
+            let _ = r.on_disabled_hover_text(why);
+        }
         egui::CollapsingHeader::new(RichText::new(s.advanced).size(font::SMALL).color(p.muted))
             .id_salt("advanced")
             .show(ui, |ui| {
@@ -830,6 +884,7 @@ impl App {
             }
         });
         if let Some(item) = pick {
+            self.form_password = self.saved_password(&item.addr);
             self.form.addr = item.addr;
             self.form.pin = item.pin;
             self.page = Page::Home;
@@ -935,6 +990,12 @@ impl App {
             if let Err(e) = self.recent.forget(&addr) {
                 self.status = Status::error(e.to_string());
             }
+            // 删掉记录时一起删掉保存的密码
+            if let Ok(v) = self.vault() {
+                if let Err(e) = v.remove(&addr) {
+                    self.status = Status::error(e.to_string());
+                }
+            }
         }
         if let Some(item) = files {
             self.files_after = Some(item.addr.clone());
@@ -942,7 +1003,8 @@ impl App {
             connect = Some(item);
         }
         if let Some(item) = connect {
-            // 回到首页、填好表单：可能要输入密码
+            // 回到首页、填好表单（有保存的密码就填上）
+            self.form_password = self.saved_password(&item.addr);
             self.form.addr = item.addr;
             self.form.pin = item.pin;
             self.page = Page::Home;
@@ -1492,13 +1554,17 @@ impl eframe::App for App {
                 // 从设备列表点的“文件传输”：连上了就打开这台设备的文件管理
                 if remember
                     .as_ref()
-                    .is_some_and(|(addr, _)| files_after.as_deref() == Some(addr.as_str()))
+                    .is_some_and(|r| files_after.as_deref() == Some(r.addr.as_str()))
                 {
                     open_files = Some(viewer.title().to_owned());
                     files_after = None;
                 }
-                if let Some((addr, pin)) = remember.take() {
-                    remembered.push((addr, pin, outcome.peer.0, outcome.peer.1));
+            }
+            // 认证通过、握手完成（对方的系统和电脑名到了）才记进最近连接：以前链路一通就记，
+            // 那时名字还没到，记录里一直没有电脑名；密码输错的连接也被记了进去
+            if outcome.established {
+                if let Some(r) = remember.take() {
+                    remembered.push((r, outcome.peer.0, outcome.peer.1));
                 }
             }
             outcome.open
@@ -1517,8 +1583,16 @@ impl eframe::App for App {
             })
             .collect();
         self.files.show(ctx, &sessions);
-        for (addr, pin, os, name) in remembered {
-            if let Err(e) = self.recent.remember(&addr, &pin, os, &name) {
+        for (r, os, name) in remembered {
+            if let Err(e) = self.recent.remember(&r.addr, &r.pin, os, &name) {
+                self.status = Status::error(e.to_string());
+            }
+            // 记住密码：加密保存；没勾时删掉以前保存的
+            let saved = self.vault().and_then(|v| match &r.password {
+                Some(pw) => v.put(&r.addr, pw),
+                None => v.remove(&r.addr),
+            });
+            if let Err(e) = saved {
                 self.status = Status::error(e.to_string());
             }
         }
