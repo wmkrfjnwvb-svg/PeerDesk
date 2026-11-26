@@ -8,6 +8,8 @@
 	<string>PeerDesk</string>
 	<key>CFBundleExecutable</key>
 	<string>peerdesk</string>
+	<key>CFBundleIconFile</key>
+	<string>peerdesk</string>
 	<key>CFBundleIdentifier</key>
 	<string>org.peerdesk.client</string>
 	<key>CFBundleInfoDictionaryVersion</key>

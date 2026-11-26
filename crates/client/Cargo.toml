@@ -44,5 +44,9 @@ default = ["crash-upload"]
 # 崩溃后下次启动时把日志的最后一段传给服务器（测试版默认打开）。正式版打包时用 --no-default-features 关掉。
 crash-upload = []
 
+# 把图标编进 Windows 的 exe（build.rs）。构建依赖的 cfg 看的是编译机器：Windows 包都在 Windows 上编。
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "3.0"
+
 [lints]
 workspace = true

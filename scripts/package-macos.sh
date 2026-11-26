@@ -27,6 +27,8 @@ rm -rf "$stage" && mkdir -p "$stage"
 app="$stage/PeerDesk.app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$universal/peerdesk" "$app/Contents/MacOS/peerdesk"
+# 图标由 scripts/make-icons.py 生成（苹果图标网格），Info.plist 里的 CFBundleIconFile 指向它
+cp packaging/icons/peerdesk.icns "$app/Contents/Resources/peerdesk.icns"
 sed -e "s/@VERSION@/$version/" -e "s/@BUILD@/$build/" packaging/macos/Info.plist > "$app/Contents/Info.plist"
 plutil -lint "$app/Contents/Info.plist"
 printf 'APPL????' > "$app/Contents/PkgInfo"
