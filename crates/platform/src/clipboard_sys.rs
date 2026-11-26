@@ -4,11 +4,12 @@
 //! 测试构建不会创建它（不碰开发者电脑的剪贴板），在各平台实机上验证。
 #![cfg_attr(windows, allow(unsafe_code))]
 
-use std::sync::{Mutex, PoisonError};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use peerdesk_core::clipboard::FILES_LIMIT;
 use peerdesk_core::clipboard::{Clip, ClipKind};
-use peerdesk_net::clipsync::{ClipNote, ClipboardHandle, Copied, SystemClipboard};
+use peerdesk_net::clipsync::{ClipNote, ClipboardHandle, Copied, Peeked, SystemClipboard};
 
 use crate::clipboard::{pack_paths, png_to_rgba, rgba_to_png, unpack_to};
 
@@ -19,6 +20,8 @@ pub type OnNote = Box<dyn Fn(ClipNote) + Send + Sync>;
 pub struct SystemClip {
     inner: Mutex<arboard::Clipboard>,
     on_note: OnNote,
+    /// 用户在界面上点了“取消”（界面置位，同步循环取走）。
+    cancel: Arc<AtomicBool>,
     /// Linux 上用内容哈希当计数：（上次的哈希，计数）。
     #[cfg_attr(any(windows, target_os = "macos"), allow(dead_code))]
     hashed: Mutex<(u64, u64)>,
@@ -31,18 +34,50 @@ impl std::fmt::Debug for SystemClip {
 }
 
 impl SystemClip {
-    /// 打开系统剪贴板。
-    pub fn open(on_note: OnNote) -> Result<Self, String> {
+    /// 打开系统剪贴板。`cancel`：界面在用户点“取消传输”时置位。
+    pub fn open(on_note: OnNote, cancel: Arc<AtomicBool>) -> Result<Self, String> {
         let inner = arboard::Clipboard::new().map_err(|e| format!("打不开剪贴板：{e}"))?;
         Ok(Self {
             inner: Mutex::new(inner),
             on_note,
+            cancel,
             hashed: Mutex::new((0, 0)),
         })
     }
 
     fn clipboard(&self) -> std::sync::MutexGuard<'_, arboard::Clipboard> {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// 剪贴板里有没有图片。只看有没有这种格式，不把像素取出来（一张 4K 截图有 30 多 MB）。
+    fn has_image(&self) -> bool {
+        #[cfg(windows)]
+        {
+            use windows::Win32::System::DataExchange::IsClipboardFormatAvailable;
+            // CF_BITMAP = 2，CF_DIB = 8，CF_DIBV5 = 17（有其中一种时系统会按需合成另外两种）
+            // SAFETY: 只读剪贴板状态，参数是常数。
+            unsafe {
+                [2u32, 8, 17]
+                    .into_iter()
+                    .any(|f| IsClipboardFormatAvailable(f).is_ok())
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            objc2_app_kit::NSPasteboard::generalPasteboard()
+                .types()
+                .is_some_and(|types| {
+                    types.iter().any(|t| {
+                        let t = t.to_string();
+                        t == "public.png" || t == "public.tiff"
+                    })
+                })
+        }
+        #[cfg(not(any(windows, target_os = "macos")))]
+        {
+            // X11 没有便宜的办法只问格式（arboard 不提供），只能取一次；Linux 做控制端时每次复制图片多这一步
+            self.clipboard().get_image().is_ok()
+        }
     }
 }
 
@@ -181,6 +216,28 @@ impl SystemClipboard for SystemClip {
         }
     }
 
+    fn peek(&self) -> Option<Peeked> {
+        if concealed() {
+            return None;
+        }
+        // 顺序和 read 一样：文件、文字、图片。文件只看有没有，不读盘；图片只看格式，不取像素
+        let mut board = self.clipboard();
+        if board.get().file_list().is_ok_and(|paths| !paths.is_empty()) {
+            return Some(Peeked::Later(ClipKind::Files));
+        }
+        if let Ok(text) = board.get_text() {
+            if !text.is_empty() {
+                return Some(Peeked::Text(Clip::text(&text)));
+            }
+        }
+        drop(board);
+        self.has_image().then_some(Peeked::Later(ClipKind::Png))
+    }
+
+    fn take_cancel(&self) -> bool {
+        self.cancel.swap(false, Ordering::Relaxed)
+    }
+
     fn write(&self, clip: &Clip) -> Result<(), String> {
         let mut board = self.clipboard();
         match clip.kind {
@@ -230,9 +287,9 @@ impl SystemClipboard for SystemClip {
 
 /// 打开系统剪贴板，放进会话选项；打不开时记日志并返回 `None`（会话照常，只是不同步剪贴板）。
 #[must_use]
-pub fn open_clipboard(on_note: OnNote) -> Option<ClipboardHandle> {
-    match SystemClip::open(on_note) {
-        Ok(clip) => Some(ClipboardHandle(std::sync::Arc::new(clip))),
+pub fn open_clipboard(on_note: OnNote, cancel: Arc<AtomicBool>) -> Option<ClipboardHandle> {
+    match SystemClip::open(on_note, cancel) {
+        Ok(clip) => Some(ClipboardHandle(Arc::new(clip))),
         Err(e) => {
             peerdesk_net::note!(warn, "剪贴板不可用，不同步：{e}");
             None

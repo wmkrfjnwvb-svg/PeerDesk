@@ -346,33 +346,34 @@ pub async fn run(
     }
 
     // 剪贴板同步：由控制端打开专用的流。对方是不支持剪贴板的老版本时不开。
-    // 粘贴键等刚复制的内容到了对方再发（输入走数据报，会比剪贴板内容先到，见 clipsync 模块开头）。
+    // 对方支持“粘贴时才传”时，粘贴键先过一道闸门：刚复制的内容到了对方再执行（见 clipsync 模块开头）。
+    // 对方是老版本时不过闸门，和原来一样。
     let (clip_task, paste_gate) = match opts.clipboard.clone().filter(|_| caps.has(Caps::CLIPBOARD))
     {
         Some(clipboard) => {
             let (mut send, recv) = link.open_stream().await?;
             write_kind(&mut send, StreamKind::Clipboard).await?;
-            let paste = crate::clipsync::PasteSync::new();
+            let lazy = caps.has(Caps::CLIPBOARD_LAZY);
+            let (paste, requests) = crate::clipsync::paste_channel();
+            let rtt_link = Arc::clone(&link);
             let sync = tokio::spawn(crate::clipsync::run(
                 send,
                 recv,
-                Arc::clone(&clipboard.0),
+                clipboard.0,
                 peerdesk_core::clipboard::Limits::DEFAULT,
                 crate::clipsync::SyncOptions {
                     files: caps.has(Caps::CLIPBOARD_FILES),
-                    ack: caps.has(Caps::CLIPBOARD_ACK),
-                    paste: Some(paste.clone()),
+                    lazy,
+                    paste: lazy.then_some(requests),
+                    rtt: Some(crate::clipsync::RttProbe(Arc::new(move || rtt_link.rtt()))),
                 },
             ));
-            let (gated_tx, gated_rx) = mpsc::channel(1024);
-            let gate = tokio::spawn(crate::clipsync::gate_pastes(
-                input,
-                gated_tx,
-                paste,
-                clipboard.0,
-            ));
-            input = gated_rx;
-            (Some(sync), Some(gate))
+            let gate = lazy.then(|| {
+                let (gated_tx, gated_rx) = mpsc::channel(1024);
+                let raw = std::mem::replace(&mut input, gated_rx);
+                tokio::spawn(crate::clipsync::gate_pastes(raw, gated_tx, paste))
+            });
+            (Some(sync), gate)
         }
         None => (None, None),
     };

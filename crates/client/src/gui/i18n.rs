@@ -257,8 +257,26 @@ pub struct Strings {
     pub clip_files_unreadable: &'static str,
     /// 复制的文件里有 `{n}` 个没有同步，`{sent}` 个同步了。
     pub clip_files_skipped: &'static str,
-    /// 按了粘贴，刚复制的内容还在发给对方。
-    pub clip_paste_waiting: &'static str,
+    /// 按了粘贴，正在把 `{n}` 个文件（`{mb}` MB）传给对方，已传 `{pct}`%。
+    pub clip_sending_files: &'static str,
+    /// 同上，传的是图片或长文字（`{what}`）。
+    pub clip_sending_other: &'static str,
+    /// 取消传输的按钮。
+    pub clip_cancel: &'static str,
+    /// 用户取消了传输。
+    pub clip_send_cancelled: &'static str,
+    /// 按了粘贴，本机剪贴板里的内容读不出来。
+    pub clip_send_unreadable: &'static str,
+    /// 传到了，对方的剪贴板写不进去。
+    pub clip_send_remote_write: &'static str,
+    /// 对方复制了 `{what}`，没有同步过来。
+    pub clip_remote_held: &'static str,
+    /// `{what}`：文件。
+    pub clip_what_files: &'static str,
+    /// `{what}`：图片。
+    pub clip_what_image: &'static str,
+    /// `{what}`：长文字。
+    pub clip_what_text: &'static str,
     /// 远程控制
     pub nav_home: &'static str,
     /// 设备
@@ -542,7 +560,16 @@ pub const ZH: Strings = Strings {
     clip_files_unsupported: "对方的 PeerDesk 版本不支持复制粘贴文件，请升级对方，或用文件传输",
     clip_files_unreadable: "复制的 {n} 个文件读不了，没有同步到对方。请检查 PeerDesk 有没有访问这个文件夹的权限（macOS：系统设置 → 隐私与安全性 → 文件和文件夹），或用文件传输",
     clip_files_skipped: "复制的文件里有 {n} 个没有同步到对方（读不了，或文件名在对方系统上不能用），其余 {sent} 个已同步",
-    clip_paste_waiting: "刚复制的内容还在发给对方，发完后自动粘贴",
+    clip_sending_files: "正在把 {n} 个文件（{mb} MB）传给对方，已传 {pct}%，传完自动粘贴",
+    clip_sending_other: "正在把{what}（{mb} MB）传给对方，已传 {pct}%，传完自动粘贴",
+    clip_cancel: "取消",
+    clip_send_cancelled: "已取消传输，没有粘贴。再按一次粘贴会重新传",
+    clip_send_unreadable: "剪贴板里的内容读不出来，没有粘贴。请重新复制再粘贴；如果是文件，请检查 PeerDesk 有没有访问那个文件夹的权限（macOS：系统设置 → 隐私与安全性 → 文件和文件夹），或用文件传输",
+    clip_send_remote_write: "内容已经传到，但对方的剪贴板写不进去（可能被别的程序占用），没有粘贴。请再按一次粘贴",
+    clip_remote_held: "对方复制了{what}，没有同步到本机：从对方到本机目前只同步短文字。文件请用文件传输取回",
+    clip_what_files: "文件",
+    clip_what_image: "图片",
+    clip_what_text: "一段长文字",
     nav_home: "远程控制",
     nav_devices: "设备",
     nav_settings: "设置",
@@ -749,7 +776,16 @@ pub const EN: Strings = Strings {
     clip_files_unsupported: "The remote PeerDesk is too old to copy and paste files; update it, or use file transfer",
     clip_files_unreadable: "The {n} copied file(s) could not be read and were not synced. Check that PeerDesk may access this folder (macOS: System Settings → Privacy & Security → Files and Folders), or use file transfer",
     clip_files_skipped: "{n} of the copied files were not synced (unreadable, or the name is not valid on the remote system); the other {sent} were synced",
-    clip_paste_waiting: "The copied content is still being sent; it will be pasted when it arrives",
+    clip_sending_files: "Sending {n} file(s) ({mb} MB) to the remote, {pct}% done; they will be pasted when the transfer finishes",
+    clip_sending_other: "Sending {what} ({mb} MB) to the remote, {pct}% done; it will be pasted when the transfer finishes",
+    clip_cancel: "Cancel",
+    clip_send_cancelled: "Transfer cancelled; nothing was pasted. Paste again to resend",
+    clip_send_unreadable: "The clipboard content could not be read, so nothing was pasted. Copy it again and paste; for files, check that PeerDesk may access that folder (macOS: System Settings → Privacy & Security → Files and Folders), or use file transfer",
+    clip_send_remote_write: "The content arrived, but the remote clipboard could not be written (another program may be using it), so nothing was pasted. Press paste again",
+    clip_remote_held: "The remote copied {what}; it was not synced to this computer (only short text is synced in this direction). Use file transfer to fetch files",
+    clip_what_files: "files",
+    clip_what_image: "an image",
+    clip_what_text: "a long text",
     nav_home: "Remote control",
     nav_devices: "Devices",
     nav_settings: "Settings",

@@ -1014,6 +1014,8 @@ impl InputSink for MacInput {
             }
             InputEvent::Text(text) => self.type_text(text),
             InputEvent::ReleaseAll => self.release_all(),
+            // 会话在交给这里之前已经把它展开成按键（peerdesk_core::input::KeyState::paste），不会到这里
+            InputEvent::Paste { .. } => {}
         }
     }
 }

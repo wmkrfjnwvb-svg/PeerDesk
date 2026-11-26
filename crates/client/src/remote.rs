@@ -69,7 +69,7 @@ pub(crate) fn session(identity: &Identity, policy: &Policy, auth: Auth) -> Sessi
             .with(Caps::CLIPBOARD)
             .with(Caps::AUDIO)
             .with(Caps::CLIPBOARD_FILES)
-            .with(Caps::CLIPBOARD_ACK)
+            .with(Caps::CLIPBOARD_LAZY)
             .with(Caps::FEC_RS)
             .with(Caps::HOST_STATS)
             .with(Caps::FILE_BROWSE)

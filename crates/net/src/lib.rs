@@ -54,6 +54,7 @@ pub mod safety;
 pub mod service;
 pub mod sidechannel;
 pub mod stream;
+pub mod throttle;
 mod tls;
 mod tls_verifier;
 

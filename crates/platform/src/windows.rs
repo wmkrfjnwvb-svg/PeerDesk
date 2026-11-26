@@ -801,6 +801,8 @@ impl InputSink for WinInput {
                 }
             }
             InputEvent::ReleaseAll => self.push_release_all(),
+            // 会话在交给这里之前已经把它展开成按键（peerdesk_core::input::KeyState::paste），不会到这里
+            InputEvent::Paste { .. } => {}
         }
         self.flush();
     }

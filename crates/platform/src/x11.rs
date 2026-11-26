@@ -705,6 +705,8 @@ impl X11Input {
                 c.key(kc, *down)?;
             }
             InputEvent::Text(text) => c.type_text(text)?,
+            // 会话在交给这里之前已经把它展开成按键（peerdesk_core::input::KeyState::paste），不会到这里
+            InputEvent::Paste { .. } => {}
             InputEvent::ReleaseAll => {
                 for kc in self.keys.drain() {
                     c.key(kc, false)?;

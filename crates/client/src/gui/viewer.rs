@@ -57,6 +57,8 @@ pub struct Viewer {
     show_upgrade: bool,
     /// 剪贴板提示和它出现的时刻（显示几秒后消失）。
     clip_toast: Option<(String, Instant)>,
+    /// 剪贴板传输的进度（粘贴时才传的文件、图片），传完或取消后收起。
+    clip_progress: Option<String>,
     /// 被控端的系统（握手后得知），助手据此选快捷键。
     peer_os: PeerOs,
     /// 被控端的电脑名（老版本为空）。
@@ -96,6 +98,7 @@ impl Viewer {
             started: Instant::now(),
             show_upgrade: false,
             clip_toast: None,
+            clip_progress: None,
             peer_os: PeerOs::Unknown,
             peer_name: String::new(),
             net: NetMeter::default(),
@@ -147,6 +150,9 @@ impl Viewer {
             if let super::session::ViewEvent::Clipboard(note) = &event {
                 if let Some(text) = super::state::clip_message(note, s) {
                     self.clip_toast = Some((text, Instant::now()));
+                }
+                if let Some(progress) = super::state::clip_progress(note, s) {
+                    self.clip_progress = progress;
                 }
             }
             if let super::session::ViewEvent::Quality(q) = &event {
@@ -392,6 +398,22 @@ impl Viewer {
                         }
                     });
                 });
+                // 剪贴板传输进度：工具条下方一直显示到传完，可以取消
+                if let Some(text) = &self.clip_progress {
+                    ui.add_space(6.0);
+                    Frame::new()
+                        .fill(p.warning.gamma_multiply(0.9))
+                        .corner_radius(10)
+                        .inner_margin(egui::Margin::symmetric(12, 6))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(text).color(Color32::BLACK));
+                                if ui.button(s.clip_cancel).clicked() {
+                                    self.handle.cancel_clipboard();
+                                }
+                            });
+                        });
+                }
                 // 剪贴板提示：工具条下方显示 6 秒
                 if let Some((text, at)) = &self.clip_toast {
                     if at.elapsed() < Duration::from_secs(6) {

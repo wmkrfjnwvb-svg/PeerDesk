@@ -55,6 +55,18 @@ pub enum InputEvent {
     Text(String),
     /// 释放所有按下的键和鼠标按键。
     ReleaseAll,
+    /// 推迟执行的粘贴：原子地按一次用户当时按的那个组合键（例如 Ctrl+V）。
+    ///
+    /// 控制端按粘贴时刚复制的内容还没到被控端，这一下按键被扣住，内容到了再用这个事件补上。
+    /// 这时用户手上的修饰键可能已经松开、也可能按着别的键，所以由被控端一次做完：
+    /// 先抬起现在按着的其他修饰键，按下 `modifiers`，敲一下 `code`，再恢复原样（见 [`KeyState::paste`]）。
+    /// 只发给声明了 [`Caps::CLIPBOARD_LAZY`](crate::proto::Caps::CLIPBOARD_LAZY) 的对端。
+    Paste {
+        /// 要按着的修饰键：第 i 位对应 HID 用途码 `0xE0 + i`（和 HID 键盘报告的修饰键字节一样）。
+        modifiers: u8,
+        /// 要敲的键（V 或 Insert）。
+        code: u16,
+    },
 }
 
 impl InputEvent {
@@ -81,6 +93,9 @@ impl InputEvent {
             }
             InputEvent::ReleaseAll => {
                 w.u8(7);
+            }
+            InputEvent::Paste { modifiers, code } => {
+                w.u8(8).u8(*modifiers).u16(*code);
             }
         }
         Ok(())
@@ -116,6 +131,10 @@ impl InputEvent {
             },
             6 => InputEvent::Text(r.string(MAX_TEXT_LEN)?),
             7 => InputEvent::ReleaseAll,
+            8 => InputEvent::Paste {
+                modifiers: r.u8()?,
+                code: r.u16()?,
+            },
             other => return Err(Error::UnknownMessage(other)),
         })
     }
@@ -156,7 +175,8 @@ impl InputSender {
             | InputEvent::MouseButton { .. }
             | InputEvent::Wheel { .. }
             | InputEvent::Text(_)
-            | InputEvent::ReleaseAll => false,
+            | InputEvent::ReleaseAll
+            | InputEvent::Paste { .. } => false,
         };
         if is_move(&event) && self.unacked.len() > self.unsent_from {
             if let Some((_, last)) = self.unacked.back_mut() {
@@ -271,6 +291,11 @@ impl InputReceiver {
     }
 }
 
+/// 修饰键的 HID 用途码范围：左 Ctrl、左 Shift、左 Alt、左 GUI、右 Ctrl、右 Shift、右 Alt、右 GUI。
+pub const MODIFIER_FIRST: u16 = 0xE0;
+/// 见 [`MODIFIER_FIRST`]。
+pub const MODIFIER_LAST: u16 = 0xE7;
+
 /// 被控端记录哪些键和鼠标按键处于按下状态，用于断线或失焦时全部释放。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct KeyState {
@@ -310,10 +335,12 @@ impl KeyState {
                 self.keys.clear();
                 self.buttons.clear();
             }
+            // 粘贴由 [`KeyState::paste`] 展开成按键再记，本身不改状态
             InputEvent::MouseMove { .. }
             | InputEvent::MouseRelative { .. }
             | InputEvent::Wheel { .. }
-            | InputEvent::Text(_) => {}
+            | InputEvent::Text(_)
+            | InputEvent::Paste { .. } => {}
         }
     }
 
@@ -321,6 +348,39 @@ impl KeyState {
     #[must_use]
     pub fn is_idle(&self) -> bool {
         self.keys.is_empty() && self.buttons.is_empty()
+    }
+
+    /// 把 [`InputEvent::Paste`] 展开成一串按键：抬起现在按着、组合键里没有的修饰键，按下组合键里
+    /// 还没按着的修饰键，敲一下 `code`，再把修饰键恢复成原来的样子。状态不变（前后按着的键一样）。
+    ///
+    /// 例子：用户按 Ctrl+V 后已经松手，接着按住 Shift 选东西，这时粘贴到了：
+    /// 抬起 Shift → 按下 Ctrl → V 按下、抬起 → 抬起 Ctrl → 按下 Shift。
+    #[must_use]
+    pub fn paste(&self, modifiers: u8, code: u16) -> Vec<InputEvent> {
+        let key = |code, down| InputEvent::Key { code, down };
+        let wanted = |m: u16| modifiers & (1u8 << (m - MODIFIER_FIRST)) != 0;
+        let all = MODIFIER_FIRST..=MODIFIER_LAST;
+        let lift: Vec<u16> = all
+            .clone()
+            .filter(|m| self.keys.contains(m) && !wanted(*m))
+            .collect();
+        let press: Vec<u16> = all
+            .filter(|m| !self.keys.contains(m) && wanted(*m))
+            .collect();
+        let mut out: Vec<InputEvent> = lift.iter().map(|m| key(*m, false)).collect();
+        out.extend(press.iter().map(|m| key(*m, true)));
+        // 这个键本来就按着（不应该发生：控制端扣住了它的按下）：先抬起，不然系统只当它是重复
+        if self.keys.contains(&code) {
+            out.push(key(code, false));
+        }
+        out.push(key(code, true));
+        out.push(key(code, false));
+        out.extend(press.iter().rev().map(|m| key(*m, false)));
+        out.extend(lift.iter().rev().map(|m| key(*m, true)));
+        if self.keys.contains(&code) {
+            out.push(key(code, true));
+        }
+        out
     }
 
     /// 生成把所有按下的键和按键抬起的事件，并清空状态。
@@ -364,6 +424,10 @@ mod tests {
             },
             InputEvent::Text("你好 hello".into()),
             InputEvent::ReleaseAll,
+            InputEvent::Paste {
+                modifiers: 0b0001_0001,
+                code: 0x19,
+            },
         ]
     }
 
@@ -379,7 +443,7 @@ mod tests {
         let packet = tx.packet().unwrap().unwrap();
         assert!(!tx.has_unsent());
         assert_eq!(rx.on_packet(&packet).unwrap(), all_kinds());
-        assert_eq!(rx.next_expected(), 8);
+        assert_eq!(rx.next_expected(), 9);
         // 同一个包再来一次：全部是重复的
         assert!(rx.on_packet(&packet).unwrap().is_empty());
         tx.ack(rx.next_expected());
@@ -572,5 +636,68 @@ mod tests {
         state.apply(&key(1, true));
         state.apply(&InputEvent::ReleaseAll);
         assert_eq!(state, KeyState::default());
+    }
+
+    #[test]
+    fn a_paste_expands_to_keys_and_restores_the_modifiers() {
+        let apply = |state: &mut KeyState, events: &[InputEvent]| {
+            for e in events {
+                state.apply(e);
+            }
+        };
+        // 什么都没按着：Ctrl+V
+        let mut state = KeyState::new();
+        let keys = state.paste(0b0000_0001, 0x19);
+        assert_eq!(
+            keys,
+            vec![
+                key(0xE0, true),
+                key(0x19, true),
+                key(0x19, false),
+                key(0xE0, false)
+            ]
+        );
+        apply(&mut state, &keys);
+        assert_eq!(state, KeyState::new());
+        // Ctrl 还按着：不重复按，也不抬起
+        state.apply(&key(0xE0, true));
+        assert_eq!(
+            state.paste(0b0000_0001, 0x19),
+            vec![key(0x19, true), key(0x19, false)]
+        );
+        // 现在按着 Shift 和右 Alt，要的是 Command+V：先抬起它们，粘贴完按原样恢复
+        let mut state = KeyState::new();
+        apply(&mut state, &[key(0xE1, true), key(0xE6, true)]);
+        let before = state.clone();
+        let keys = state.paste(0b0000_1000, 0x19);
+        assert_eq!(
+            keys,
+            vec![
+                key(0xE1, false),
+                key(0xE6, false),
+                key(0xE3, true),
+                key(0x19, true),
+                key(0x19, false),
+                key(0xE3, false),
+                key(0xE6, true),
+                key(0xE1, true),
+            ]
+        );
+        apply(&mut state, &keys);
+        assert_eq!(state, before);
+        // 粘贴事件本身不改状态；要敲的键本来按着时先抬起、最后按回去
+        state.apply(&InputEvent::Paste {
+            modifiers: 1,
+            code: 0x19,
+        });
+        assert_eq!(state, before);
+        let mut state = KeyState::new();
+        state.apply(&key(0x49, true));
+        let before = state.clone();
+        let keys = state.paste(0b0000_0010, 0x49);
+        assert_eq!(keys.first(), Some(&key(0xE1, true)));
+        assert_eq!(keys.last(), Some(&key(0x49, true)));
+        apply(&mut state, &keys);
+        assert_eq!(state, before);
     }
 }

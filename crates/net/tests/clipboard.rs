@@ -10,7 +10,7 @@ use peerdesk_core::crypto::Policy;
 use peerdesk_core::input::InputEvent;
 use peerdesk_core::proto::Caps;
 use peerdesk_core::session::SessionConfig;
-use peerdesk_net::clipsync::{ClipNote, ClipboardHandle, MemClipboard};
+use peerdesk_net::clipsync::{ClipNote, ClipboardHandle, MemClipboard, SendFail};
 use peerdesk_net::controller::{self, ControllerOptions};
 use peerdesk_net::demo::{CountSink, DemoDesktop};
 use peerdesk_net::host::{self, HostOptions, InputSink};
@@ -66,35 +66,54 @@ async fn session_with<F, Fut>(
     .await;
 }
 
-/// 被控端收到的按键，连同收到那一刻被控端剪贴板里的内容。
+/// 被控端收到的输入，连同收到那一刻被控端剪贴板里的内容。
 type Typed = Arc<Mutex<Vec<(InputEvent, Option<Clip>)>>>;
 
-/// 记下收到的按键和当时剪贴板内容的被控端输入（不动真的键鼠）。
+/// 记下收到的输入和当时剪贴板内容的被控端输入（不动真的键鼠）。
 struct Recorder {
     clip: Arc<MemClipboard>,
     typed: Typed,
 }
 impl InputSink for Recorder {
     fn inject(&mut self, event: &InputEvent) {
-        if matches!(event, InputEvent::Key { .. }) {
-            let now = self.clip.get();
-            self.typed.lock().unwrap().push((event.clone(), now));
-        }
+        let now = self.clip.get();
+        self.typed.lock().unwrap().push((event.clone(), now));
     }
+}
+
+/// 被控端到现在收到的按键（不含鼠标）。
+fn keys_of(typed: &Typed) -> Vec<(InputEvent, Option<Clip>)> {
+    let all = typed.lock().unwrap();
+    all.iter()
+        .filter(|(e, _)| matches!(e, InputEvent::Key { .. }))
+        .cloned()
+        .collect()
 }
 
 /// 等被控端收到 `n` 个按键。
 async fn typed_n(typed: &Typed, n: usize) -> Vec<(InputEvent, Option<Clip>)> {
     let start = Instant::now();
     loop {
-        let got = typed.lock().unwrap().clone();
+        let got = keys_of(typed);
         if got.len() >= n {
             return got;
         }
         assert!(
-            start.elapsed() < Duration::from_secs(8),
+            start.elapsed() < Duration::from_secs(15),
             "按键没有到达被控端：{}",
             got.len()
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// 等 `clip` 收到一条满足条件的提示。
+async fn noted(clip: &MemClipboard, what: &str, want: impl Fn(&ClipNote) -> bool) {
+    let start = Instant::now();
+    while !clip.notes().iter().any(&want) {
+        assert!(
+            start.elapsed() < Duration::from_secs(15),
+            "没有等到：{what}"
         );
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
@@ -148,7 +167,7 @@ async fn session_with_input<S, F, Fut>(
                 &ctrl_id,
                 Caps::CLIPBOARD
                     .with(Caps::CLIPBOARD_FILES)
-                    .with(Caps::CLIPBOARD_ACK),
+                    .with(Caps::CLIPBOARD_LAZY),
             ),
             deadline_us: 200_000,
             duration: None,
@@ -401,91 +420,309 @@ const CTRL_V: [InputEvent; 4] = [
     key(0xE0, false),
 ];
 
-/// 产品负责人报的问题（Mac 上复制文件，马上到 Windows 里粘贴，粘不出来）的时序：
-/// 输入走数据报，剪贴板内容要先被轮询到（最多 100 ms）、再读盘、传输、解包，粘贴键先到。
-/// 现在粘贴键等内容进了对方剪贴板（对方回确认）再发。
-#[tokio::test(flavor = "multi_thread")]
-async fn a_paste_right_after_a_copy_pastes_the_new_content() {
+/// 支持“粘贴时才传”的被控端。
+const LAZY: Caps = Caps(Caps::CLIPBOARD.0 | Caps::CLIPBOARD_FILES.0 | Caps::CLIPBOARD_LAZY.0);
+
+/// 跑一次“粘贴时才传”的会话，被控端记下收到的输入。
+async fn lazy_session<F, Fut>(script: F)
+where
+    F: FnOnce(Arc<MemClipboard>, Arc<MemClipboard>, mpsc::Sender<InputEvent>, Typed) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
     let typed = Typed::default();
     let seen = Arc::clone(&typed);
     session_with_input(
-        Caps::CLIPBOARD
-            .with(Caps::CLIPBOARD_FILES)
-            .with(Caps::CLIPBOARD_ACK),
+        LAZY,
         true,
         true,
         move |clip| Box::new(Recorder { clip, typed: seen }),
-        |host, ctrl, input| async move {
-            // 文字：复制后马上粘贴（连轮询都还没轮到）
-            let text = Clip::text("刚复制的文字");
-            ctrl.copy(text.clone());
-            for event in CTRL_V {
-                input.send(event).await.unwrap();
-            }
-            let got = typed_n(&typed, 4).await;
-            let keys: Vec<InputEvent> = got.iter().map(|(e, _)| e.clone()).collect();
-            assert_eq!(keys, CTRL_V, "按键顺序不能变");
-            assert_eq!(got[1].1, Some(text), "按下 V 时新内容已经在对方剪贴板里");
-
-            // 5 MB 的文件：同样
-            let files = packed(&[("报告/a.txt", 10), ("视频.mp4", 5 << 20)]);
-            ctrl.copy(files.clone());
-            for event in CTRL_V {
-                input.send(event).await.unwrap();
-            }
-            let got = typed_n(&typed, 8).await;
-            assert_eq!(got[5].0, key(0x19, true));
-            assert_eq!(got[5].1, Some(files.clone()));
-            assert_eq!(host.get(), Some(files.clone()));
-
-            // 没有新复制的内容：粘贴键不耽搁（不到提示的时间）
-            let start = Instant::now();
-            for event in CTRL_V {
-                input.send(event).await.unwrap();
-            }
-            typed_n(&typed, 12).await;
-            let took = start.elapsed();
-            assert!(took < Duration::from_millis(300), "{took:?}");
-
-            // 复制的内容太大、不同步：粘贴键不白等
-            ctrl.copy_too_large(ClipKind::Files, 25 << 20);
-            let start = Instant::now();
-            for event in CTRL_V {
-                input.send(event).await.unwrap();
-            }
-            let got = typed_n(&typed, 16).await;
-            let took = start.elapsed();
-            assert!(took < Duration::from_secs(1), "{took:?}");
-            assert_eq!(got[13].1, Some(files));
-        },
+        |host, ctrl, input| script(host, ctrl, input, typed),
     )
     .await;
 }
 
-/// 被控端是不回确认的老版本：粘贴键等内容写进流里就发（比原来晚，但不保证对方已经写进剪贴板），
-/// 不会卡住。
+async fn send(input: &mpsc::Sender<InputEvent>, events: &[InputEvent]) {
+    for event in events {
+        input.send(event.clone()).await.unwrap();
+    }
+}
+
+fn received(clip: &MemClipboard) -> usize {
+    clip.notes()
+        .iter()
+        .filter(|n| matches!(n, ClipNote::Received { .. }))
+        .count()
+}
+
+/// 产品负责人报的问题：复制了文件，鼠标移到远程窗口还没粘贴就卡。原因是一复制就读盘、整份传。
+/// 现在复制时什么都不读、不传；按粘贴时才传，传完对方才执行粘贴；传输期间鼠标照常；
+/// 同一份内容只传一次。
 #[tokio::test(flavor = "multi_thread")]
-async fn pastes_still_go_through_to_a_peer_without_acks() {
+async fn files_are_sent_when_pasted_not_when_copied() {
+    lazy_session(|host, ctrl, input, typed| async move {
+        // 复制 5 MB 的文件，不粘贴：不读（真实剪贴板上是读盘、打包），对方什么都没收到，
+        // 只知道“对方复制了文件”
+        let files = packed(&[("报告/a.txt", 10), ("视频.mp4", 5 << 20)]);
+        ctrl.copy(files.clone());
+        noted(&host, "对方复制了文件", |n| {
+            *n == ClipNote::RemoteHeld {
+                kind: ClipKind::Files,
+            }
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(ctrl.reads(), 0, "复制时不能读剪贴板里的文件");
+        assert_eq!(host.get(), None, "复制时不能把内容传给对方");
+        assert_eq!(received(&host), 0);
+
+        // 在远程窗口按 Ctrl+V，然后一边传一边动鼠标、松开按键
+        send(&input, &[key(0xE0, true), key(0x19, true)]).await;
+        noted(
+            &ctrl,
+            "传输进度",
+            |n| matches!(n, ClipNote::Sending { sent, .. } if *sent > 0),
+        )
+        .await;
+        send(&input, &[key(0x19, false), key(0xE0, false)]).await;
+        let mut moves = 0u16;
+        while host.get().is_none() {
+            moves += 1;
+            send(&input, &[InputEvent::MouseMove { x: moves, y: 7 }]).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // 被控端：Ctrl 按下、抬起照常到；内容进了剪贴板以后才有 V（由被控端按 Ctrl+V 再松开）
+        let got = typed_n(&typed, 6).await;
+        let keys: Vec<InputEvent> = got.iter().map(|(e, _)| e.clone()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                key(0xE0, true),
+                key(0xE0, false),
+                key(0xE0, true),
+                key(0x19, true),
+                key(0x19, false),
+                key(0xE0, false),
+            ]
+        );
+        assert_eq!(got[0].1, None);
+        assert_eq!(got[1].1, None, "Ctrl 的抬起没有被推迟");
+        assert_eq!(
+            got[3].1,
+            Some(files.clone()),
+            "按下 V 时文件已经在对方剪贴板里"
+        );
+        // 传输期间鼠标照常送达（到的时候对方剪贴板还是空的），没有排在粘贴后面
+        let early_moves = typed
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(e, clip)| matches!(e, InputEvent::MouseMove { .. }) && clip.is_none())
+            .count();
+        assert!(early_moves >= 5, "传输期间只到了 {early_moves} 次鼠标移动");
+        // 界面：先有进度（2 个文件、总大小），最后是完成
+        let notes = ctrl.notes();
+        let total = u64::try_from(files.data.len()).unwrap();
+        assert!(notes.contains(&ClipNote::Sending {
+            kind: ClipKind::Files,
+            files: 2,
+            sent: 0,
+            total
+        }));
+        assert_eq!(notes.last(), Some(&ClipNote::SendDone));
+        assert_eq!((ctrl.reads(), received(&host)), (1, 1));
+
+        // 再粘贴一次：剪贴板没变，不读、不传，按键原样马上到
+        let start = Instant::now();
+        send(&input, &CTRL_V[..2]).await;
+        typed_n(&typed, 8).await;
+        send(&input, &CTRL_V[2..]).await;
+        let got = typed_n(&typed, 10).await;
+        assert!(start.elapsed() < Duration::from_millis(500));
+        let keys: Vec<InputEvent> = got[6..].iter().map(|(e, _)| e.clone()).collect();
+        assert_eq!(keys, CTRL_V);
+        assert_eq!((ctrl.reads(), received(&host)), (1, 1));
+
+        // 又复制了一遍同样的文件：粘贴时要读出来比对，内容一样（哈希相同）就不再传
+        ctrl.copy(files.clone());
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        send(&input, &CTRL_V[..2]).await;
+        typed_n(&typed, 12).await;
+        send(&input, &CTRL_V[2..]).await;
+        typed_n(&typed, 14).await;
+        assert_eq!((ctrl.reads(), received(&host)), (2, 1));
+
+        // 对方自己复制了别的东西以后，再粘贴本机这份：对方剪贴板里已经不是它，重新传
+        host.copy(Clip::text("被控端自己复制的"));
+        arrives(&ctrl, &Clip::text("被控端自己复制的")).await;
+        ctrl.copy(files.clone());
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        send(&input, &CTRL_V).await;
+        arrives_within(&host, &files, Duration::from_secs(10)).await;
+        assert_eq!(received(&host), 2);
+    })
+    .await;
+}
+
+/// 等 `clip` 里出现 `want`（大内容限速传，给够时间）。
+async fn arrives_within(clip: &MemClipboard, want: &Clip, limit: Duration) {
+    let start = Instant::now();
+    while clip.get().as_ref() != Some(want) {
+        assert!(start.elapsed() < limit, "剪贴板内容没有到达");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// 传到一半取消、读不出来、太大、对方写不进去：这次粘贴不执行（不粘贴出旧内容），告诉用户原因；
+/// 之后再按粘贴照常。
+#[tokio::test(flavor = "multi_thread")]
+async fn a_transfer_that_fails_drops_the_paste_and_says_why() {
+    lazy_session(|host, ctrl, input, typed| async move {
+        let failed = |why: SendFail| move |n: &ClipNote| *n == ClipNote::SendFailed(why);
+        let files = packed(&[("大文件.bin", 6 << 20)]);
+        // 1. 取消
+        ctrl.copy(files.clone());
+        send(&input, &CTRL_V).await;
+        noted(
+            &ctrl,
+            "传输进度",
+            |n| matches!(n, ClipNote::Sending { sent, .. } if *sent > 0),
+        )
+        .await;
+        ctrl.cancel();
+        noted(&ctrl, "已取消", failed(SendFail::Cancelled)).await;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(host.get(), None, "取消以后对方不能收到内容");
+        // 2. 读不出来（文件没有权限）
+        ctrl.set_unreadable(true);
+        send(&input, &CTRL_V).await;
+        noted(&ctrl, "读不出来", failed(SendFail::Unreadable)).await;
+        ctrl.set_unreadable(false);
+        // 3. 对方的剪贴板写不进去（重试 5 次都失败）
+        host.fail_next_writes(5);
+        send(&input, &CTRL_V).await;
+        noted(&ctrl, "对方写不进去", failed(SendFail::RemoteWrite)).await;
+        assert_eq!(host.get(), None);
+        // 4. 太大
+        ctrl.copy_too_large(ClipKind::Files, 25 << 20);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        send(&input, &CTRL_V).await;
+        noted(&ctrl, "太大", |n| {
+            matches!(n, ClipNote::LocalTooLarge { .. })
+        })
+        .await;
+        // 到这里四次粘贴都没有执行：被控端只收到 Ctrl 的按下和抬起，没有 V
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let keys = keys_of(&typed);
+        assert_eq!(keys.len(), 8);
+        assert!(keys
+            .iter()
+            .all(|(e, _)| matches!(e, InputEvent::Key { code: 0xE0, .. })));
+        // 5. 取消、失败以后同一份内容再按粘贴：重新传，传完粘贴
+        ctrl.copy(files.clone());
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        send(&input, &CTRL_V).await;
+        noted(&ctrl, "完成", |n| *n == ClipNote::SendDone).await;
+        let got = typed_n(&typed, 14).await;
+        assert_eq!(got[11].0, key(0x19, true));
+        assert_eq!(got[11].1, Some(files));
+    })
+    .await;
+}
+
+/// 短文字照旧一复制就同步（远程右键菜单里点“粘贴”拿得到）；复制后马上按粘贴，等它到了再执行。
+/// 长文字（超过 64 KB）和图片与文件一样，粘贴时才传。
+#[tokio::test(flavor = "multi_thread")]
+async fn short_text_syncs_at_once_and_long_text_and_images_when_pasted() {
+    lazy_session(|host, ctrl, input, typed| async move {
+        // 不按粘贴也会到
+        let text = Clip::text("短文字");
+        ctrl.copy(text.clone());
+        let took = arrives(&host, &text).await;
+        assert!(took < Duration::from_millis(300), "文本同步用了 {took:?}");
+        // 复制后马上粘贴（连轮询都还没轮到）：按下 V 时新内容已经在对方剪贴板里
+        let second = Clip::text("刚复制的文字");
+        ctrl.copy(second.clone());
+        send(&input, &CTRL_V[..2]).await;
+        let got = typed_n(&typed, 2).await;
+        assert_eq!(got[1].1, Some(second.clone()));
+        send(&input, &CTRL_V[2..]).await;
+        typed_n(&typed, 4).await;
+        // 长文字、图片：复制时不传
+        let long = Clip::text(&"字".repeat(40_000));
+        let png = Clip {
+            kind: ClipKind::Png,
+            data: vec![9; 300_000],
+        };
+        for clip in [long, png] {
+            let had = received(&host);
+            ctrl.copy(clip.clone());
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            assert_eq!(received(&host), had, "复制时不能传");
+            let before = keys_of(&typed).len();
+            send(&input, &[key(0xE1, true), key(0x49, true)]).await;
+            // Shift+Insert 也是粘贴；传完由被控端按原来的组合键
+            let got = typed_n(&typed, before + 2).await;
+            assert_eq!(got[before + 1].0, key(0x49, true));
+            assert_eq!(got[before + 1].1, Some(clip));
+            send(&input, &[key(0x49, false), key(0xE1, false)]).await;
+            typed_n(&typed, before + 4).await;
+        }
+    })
+    .await;
+}
+
+/// 被控端复制文件、图片：这个方向目前不传（没有粘贴的时机，方案见 docs/research/clipboard-lazy.md），
+/// 不读、不推送，告诉控制端；文字照常同步。
+#[tokio::test(flavor = "multi_thread")]
+async fn the_host_only_pushes_text() {
+    lazy_session(|host, ctrl, _input, _typed| async move {
+        let png = Clip {
+            kind: ClipKind::Png,
+            data: vec![3; 2_000_000],
+        };
+        host.copy(png);
+        noted(&ctrl, "对方复制了图片", |n| {
+            *n == ClipNote::RemoteHeld {
+                kind: ClipKind::Png,
+            }
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!((host.reads(), ctrl.get()), (0, None));
+        let text = Clip::text("被控端复制的文字");
+        host.copy(text.clone());
+        arrives(&ctrl, &text).await;
+    })
+    .await;
+}
+
+/// 被控端是老版本（不支持“粘贴时才传”）：和原来一样，复制后马上整份同步，粘贴键原样发、不过闸门。
+#[tokio::test(flavor = "multi_thread")]
+async fn an_old_peer_gets_the_old_behaviour() {
     let typed = Typed::default();
     let seen = Arc::clone(&typed);
     session_with_input(
-        Caps::CLIPBOARD,
+        Caps::CLIPBOARD.with(Caps::CLIPBOARD_FILES),
         true,
         true,
         move |clip| Box::new(Recorder { clip, typed: seen }),
         |host, ctrl, input| async move {
-            let text = Clip::text("old peer");
-            ctrl.copy(text.clone());
+            // 不粘贴也整份同步
+            let files = packed(&[("a.bin", 1 << 20)]);
+            ctrl.copy(files.clone());
+            arrives(&host, &files).await;
+            assert_eq!(ctrl.reads(), 1);
+            // 粘贴键原样、按顺序到，没有粘贴事件展开出来的多余按键
             let start = Instant::now();
-            for event in CTRL_V {
-                input.send(event).await.unwrap();
-            }
+            send(&input, &CTRL_V).await;
             let got = typed_n(&typed, 4).await;
-            let took = start.elapsed();
-            assert!(took < Duration::from_secs(1), "{took:?}");
+            assert!(start.elapsed() < Duration::from_millis(500));
             let keys: Vec<InputEvent> = got.iter().map(|(e, _)| e.clone()).collect();
             assert_eq!(keys, CTRL_V);
-            arrives(&host, &text).await;
+            assert!(!ctrl
+                .notes()
+                .iter()
+                .any(|n| matches!(n, ClipNote::Sending { .. })));
         },
     )
     .await;

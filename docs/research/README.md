@@ -16,6 +16,7 @@
 | [J-keyboard.md](J-keyboard.md) | 远程键盘：跨系统快捷键映射、输入法、键盘布局、系统快捷键捕获 |
 | [K-pipeline.md](K-pipeline.md) | 编解码与传输链路排查（2026-11-25）：模块互相影响的根因、业内做法、模块边界、分步修改计划 |
 | [L-framework.md](L-framework.md) | 传输与画质控制的总框架（按 WebRTC 流程）：三种时钟、每个信号一个主人、每个算法的触发条件和保持时间、分步计划 |
+| [clipboard-lazy.md](clipboard-lazy.md) | 剪贴板“粘贴时才传”（2026-11-26）：已实现的控制端 → 被控端方向；反方向用各系统延迟提供数据机制（Windows 延迟渲染和 IDataObject、macOS 数据提供者、X11 选区）的可行性和工作量 |
 
 ## 实现状态总表（2026-11-24 晚）
 

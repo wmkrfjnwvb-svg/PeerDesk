@@ -417,7 +417,7 @@ async fn host_main(
             .clone();
         let opts = HostOptions {
             limiter: Arc::clone(&limiter),
-            clipboard: system_clipboard(Box::new(|_| {})),
+            clipboard: system_clipboard(Box::new(|_| {}), Arc::default()),
             audio: SYSTEM_AUDIO.0(),
             name: crate::local::device_name(),
             ..HostOptions::new(
@@ -548,6 +548,8 @@ struct GuiSink {
     view: watch::Receiver<(u16, u16)>,
     /// 当前连接（对方支持文件管理时有），文件管理在上面开浏览流；重连后换成新连接。
     files: FilesLink,
+    /// 用户点了“取消”剪贴板传输（剪贴板同步取走）；重连后的新会话也看它。
+    clip_cancel: Arc<AtomicBool>,
 }
 
 /// 文件管理用的当前连接。
@@ -611,18 +613,26 @@ pub enum ViewEvent {
 }
 
 /// 打开本机系统剪贴板。测试构建里没有（测试不碰开发者电脑的剪贴板）。
-const SYSTEM_CLIPBOARD: fn(peerdesk_platform::OnNote) -> Option<ClipboardHandle> = if cfg!(test) {
+type OpenClipboard = fn(peerdesk_platform::OnNote, Arc<AtomicBool>) -> Option<ClipboardHandle>;
+const SYSTEM_CLIPBOARD: OpenClipboard = if cfg!(test) {
     no_clipboard
 } else {
     peerdesk_platform::open_clipboard
 };
 
-fn no_clipboard(_on_note: peerdesk_platform::OnNote) -> Option<ClipboardHandle> {
+fn no_clipboard(
+    _on_note: peerdesk_platform::OnNote,
+    _cancel: Arc<AtomicBool>,
+) -> Option<ClipboardHandle> {
     None
 }
 
-fn system_clipboard(on_note: peerdesk_platform::OnNote) -> Option<ClipboardHandle> {
-    SYSTEM_CLIPBOARD(on_note)
+/// `cancel`：用户点“取消传输”时由界面置位（见 [`ViewHandle::cancel_clipboard`]）。
+fn system_clipboard(
+    on_note: peerdesk_platform::OnNote,
+    cancel: Arc<AtomicBool>,
+) -> Option<ClipboardHandle> {
+    SYSTEM_CLIPBOARD(on_note, cancel)
 }
 
 type OpenCapture = fn() -> Option<peerdesk_net::audio::CaptureHandle>;
@@ -698,9 +708,15 @@ pub struct ViewHandle {
     sound: watch::Sender<bool>,
     view: watch::Sender<(u16, u16)>,
     files: FilesLink,
+    clip_cancel: Arc<AtomicBool>,
 }
 
 impl ViewHandle {
+    /// 取消正在进行的剪贴板传输（粘贴时才传的文件、图片）。这次粘贴不执行。
+    pub fn cancel_clipboard(&self) {
+        self.clip_cancel.store(true, Ordering::Relaxed);
+    }
+
     /// 打开或关闭远程声音（默认关）。
     pub fn set_sound(&self, on: bool) {
         let _ = self.sound.send(on);
@@ -778,12 +794,14 @@ pub fn start_view(
     let (sound, sound_rx) = watch::channel(false);
     let (view, view_rx) = watch::channel((0, 0));
     let files = FilesLink::default();
+    let clip_cancel = Arc::new(AtomicBool::new(false));
     let sink = GuiSink {
         slot: Arc::clone(&slot),
         repaint: Arc::clone(&emitter.repaint),
         sound: sound_rx,
         view: view_rx,
         files: Arc::clone(&files),
+        clip_cancel: Arc::clone(&clip_cancel),
     };
     let task = view_main(
         target,
@@ -803,6 +821,7 @@ pub fn start_view(
         sound,
         view,
         files,
+        clip_cancel,
     }
 }
 
@@ -1074,7 +1093,10 @@ async fn one_session(
             duration: None,
             clipboard: {
                 let ev = ev.clone();
-                system_clipboard(Box::new(move |note| ev.send(ViewEvent::Clipboard(note))))
+                system_clipboard(
+                    Box::new(move |note| ev.send(ViewEvent::Clipboard(note))),
+                    Arc::clone(&sink.clip_cancel),
+                )
             },
             on_established: {
                 let ev = ev.clone();

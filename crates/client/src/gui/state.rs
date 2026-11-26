@@ -212,7 +212,7 @@ pub enum ViewPhase {
 /// 剪贴板事件要给用户看的话；不需要提示的返回 `None`。
 #[must_use]
 pub fn clip_message(note: &peerdesk_net::clipsync::ClipNote, s: &Strings) -> Option<String> {
-    use peerdesk_net::clipsync::ClipNote;
+    use peerdesk_net::clipsync::{ClipNote, SendFail};
     let mb = |size: u64| format!("{:.1}", size as f64 / 1_048_576.0);
     match note {
         ClipNote::LocalTooLarge { size, .. } => {
@@ -230,8 +230,61 @@ pub fn clip_message(note: &peerdesk_net::clipsync::ClipNote, s: &Strings) -> Opt
                 .replace("{n}", &skipped.to_string())
                 .replace("{sent}", &sent.to_string()),
         ),
-        ClipNote::PasteWaiting => Some(s.clip_paste_waiting.to_owned()),
-        ClipNote::Received { .. } => None,
+        ClipNote::SendFailed(SendFail::Cancelled) => Some(s.clip_send_cancelled.to_owned()),
+        ClipNote::SendFailed(SendFail::Unreadable) => Some(s.clip_send_unreadable.to_owned()),
+        ClipNote::SendFailed(SendFail::RemoteWrite) => Some(s.clip_send_remote_write.to_owned()),
+        ClipNote::RemoteHeld { kind } => {
+            Some(s.clip_remote_held.replace("{what}", clip_what(*kind, s)))
+        }
+        // 进度单独显示（见 clip_progress）；传完、收到不用提示
+        ClipNote::Sending { .. } | ClipNote::SendDone | ClipNote::Received { .. } => None,
+    }
+}
+
+const fn clip_what(kind: peerdesk_core::clipboard::ClipKind, s: &Strings) -> &'static str {
+    use peerdesk_core::clipboard::ClipKind;
+    match kind {
+        ClipKind::Files => s.clip_what_files,
+        ClipKind::Png => s.clip_what_image,
+        ClipKind::Text => s.clip_what_text,
+    }
+}
+
+/// 剪贴板传输的进度条（粘贴时才传的文件、图片）：`Some(Some(文字))` 显示或更新，
+/// `Some(None)` 收起（传完、取消、失败），`None` 和进度无关。
+#[must_use]
+pub fn clip_progress(
+    note: &peerdesk_net::clipsync::ClipNote,
+    s: &Strings,
+) -> Option<Option<String>> {
+    use peerdesk_core::clipboard::ClipKind;
+    use peerdesk_net::clipsync::ClipNote;
+    match note {
+        ClipNote::Sending {
+            kind,
+            files,
+            sent,
+            total,
+        } => {
+            let mb = format!("{:.1}", *total as f64 / 1_048_576.0);
+            let pct = sent.saturating_mul(100) / (*total).max(1);
+            let text = match kind {
+                ClipKind::Files => s.clip_sending_files.replace("{n}", &files.to_string()),
+                ClipKind::Png | ClipKind::Text => {
+                    s.clip_sending_other.replace("{what}", clip_what(*kind, s))
+                }
+            };
+            Some(Some(
+                text.replace("{mb}", &mb).replace("{pct}", &pct.to_string()),
+            ))
+        }
+        ClipNote::SendDone | ClipNote::SendFailed(_) => Some(None),
+        ClipNote::LocalTooLarge { .. }
+        | ClipNote::RemoteTooLarge { .. }
+        | ClipNote::FilesUnsupported
+        | ClipNote::FilesSkipped { .. }
+        | ClipNote::RemoteHeld { .. }
+        | ClipNote::Received { .. } => None,
     }
 }
 
@@ -690,9 +743,54 @@ mod tests {
         };
         let text = clip_message(&some, s).unwrap();
         assert!(text.contains('2') && text.contains('5'), "{text}");
-        assert!(clip_message(&ClipNote::PasteWaiting, s)
-            .unwrap()
-            .contains("粘贴"));
+        // 粘贴时才传：进度单独显示，不是提示
+        use peerdesk_net::clipsync::SendFail;
+        let sending = ClipNote::Sending {
+            kind: ClipKind::Files,
+            files: 3,
+            sent: 3 * 1_048_576,
+            total: 12 * 1_048_576,
+        };
+        assert_eq!(clip_message(&sending, s), None);
+        assert_eq!(
+            clip_progress(&sending, s),
+            Some(Some(
+                "正在把 3 个文件（12.0 MB）传给对方，已传 25%，传完自动粘贴".to_owned()
+            ))
+        );
+        let image = ClipNote::Sending {
+            kind: ClipKind::Png,
+            files: 0,
+            sent: 0,
+            total: 0,
+        };
+        let text = clip_progress(&image, &EN).unwrap().unwrap();
+        assert!(text.contains("an image") && text.contains("0%"), "{text}");
+        // 传完、取消、失败：收起进度；失败要说原因和办法
+        assert_eq!(clip_progress(&ClipNote::SendDone, s), Some(None));
+        assert_eq!(clip_message(&ClipNote::SendDone, s), None);
+        for (why, word) in [
+            (SendFail::Cancelled, "取消"),
+            (SendFail::Unreadable, "权限"),
+            (SendFail::RemoteWrite, "再按一次"),
+        ] {
+            let note = ClipNote::SendFailed(why);
+            assert_eq!(clip_progress(&note, s), Some(None));
+            assert!(clip_message(&note, s).unwrap().contains(word));
+        }
+        // 对方复制了文件、图片、长文字：说明没同步过来
+        for (kind, word) in [
+            (ClipKind::Files, "文件"),
+            (ClipKind::Png, "图片"),
+            (ClipKind::Text, "长文字"),
+        ] {
+            let note = ClipNote::RemoteHeld { kind };
+            assert!(clip_message(&note, s).unwrap().contains(word));
+            assert_eq!(clip_progress(&note, s), None);
+        }
+        for note in [&big, &remote, &none, &ClipNote::FilesUnsupported] {
+            assert_eq!(clip_progress(note, s), None);
+        }
         let ok = ClipNote::Received {
             kind: ClipKind::Text,
             size: 1,

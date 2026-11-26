@@ -151,6 +151,12 @@ pub fn pack_files(files: &[PackedFile]) -> Result<Vec<u8>, Error> {
     Ok(w.into_vec())
 }
 
+/// 打包的内容里有几个文件（只读开头的计数，界面显示进度用）；不是打包的格式时为 0。
+#[must_use]
+pub fn packed_count(data: &[u8]) -> u32 {
+    Reader::new(data).u16().map_or(0, u32::from)
+}
+
 /// 解包。路径不安全（绝对路径、`..` 等）时报错：不能让对方把文件写到临时目录以外。
 pub fn unpack_files(data: &[u8]) -> Result<Vec<PackedFile>, Error> {
     let mut r = Reader::new(data);
@@ -213,12 +219,23 @@ pub enum ClipMsg {
         /// 大小。
         size: u64,
     },
-    /// 接收方处理完了一份内容（写进了自己的剪贴板，或者写不进去、放弃了）。只发给声明了
-    /// [`Caps::CLIPBOARD_ACK`](crate::proto::Caps::CLIPBOARD_ACK) 的对端。控制端据此知道
-    /// 什么时候可以把粘贴键发过去（输入走数据报，会比剪贴板内容先到）。
+    /// 接收方处理完了一份内容。只发给声明了
+    /// [`Caps::CLIPBOARD_LAZY`](crate::proto::Caps::CLIPBOARD_LAZY) 的对端。控制端据此知道
+    /// 什么时候可以让对方执行粘贴（输入走数据报，会比剪贴板内容先到）。
     Applied {
         /// 处理完的那一份的序号。
         seq: u32,
+        /// 内容已经在接收方的剪贴板里（写进去了，或者本来就是这份）。`false`：写不进去。
+        ok: bool,
+    },
+    /// 发送方的剪贴板里有这种内容，但没有发过来（文件、图片、长文字只在粘贴时才传）。
+    /// 也用来作废一份发到一半的内容（用户取消）。只发给声明了
+    /// [`Caps::CLIPBOARD_LAZY`](crate::proto::Caps::CLIPBOARD_LAZY) 的对端。
+    Held {
+        /// 序号。
+        seq: u32,
+        /// 种类。
+        kind: ClipKind,
     },
 }
 
@@ -240,8 +257,11 @@ impl ClipMsg {
             Self::TooLarge { seq, kind, size } => {
                 body.u8(4).u32(*seq).u8(kind.id()).u64(*size);
             }
-            Self::Applied { seq } => {
-                body.u8(5).u32(*seq);
+            Self::Applied { seq, ok } => {
+                body.u8(5).u32(*seq).u8(u8::from(*ok));
+            }
+            Self::Held { seq, kind } => {
+                body.u8(6).u32(*seq).u8(kind.id());
             }
         }
         let body = body.into_vec();
@@ -277,7 +297,14 @@ impl ClipMsg {
                 kind: ClipKind::from_id(r.u8()?)?,
                 size: r.u64()?,
             },
-            5 => Self::Applied { seq: r.u32()? },
+            5 => Self::Applied {
+                seq: r.u32()?,
+                ok: r.u8()? != 0,
+            },
+            6 => Self::Held {
+                seq: r.u32()?,
+                kind: ClipKind::from_id(r.u8()?)?,
+            },
             other => return Err(Error::UnknownMessage(other)),
         })
     }
@@ -355,6 +382,8 @@ impl Sender {
             return Offered::Skip;
         }
         self.last = Some(hash);
+        // 本机剪贴板换了内容，不再是从对方收到的那份
+        self.echo = None;
         self.seq = self.seq.wrapping_add(1);
         self.queue.clear();
         let seq = self.seq;
@@ -393,9 +422,36 @@ impl Sender {
         });
     }
 
+    /// 本机剪贴板里有这种内容，但现在不发（粘贴时才传），或者发到一半不发了（用户取消，
+    /// 先调 [`Sender::forget`]）：没发完的作废，告诉对方。
+    pub fn announce_held(&mut self, kind: ClipKind) {
+        self.queue.clear();
+        // 本机剪贴板换了内容，不再是从对方收到的那份
+        self.echo = None;
+        self.seq = self.seq.wrapping_add(1);
+        self.queue.push_back(ClipMsg::Held {
+            seq: self.seq,
+            kind,
+        });
+    }
+
+    /// 上次发的内容没有到对方的剪贴板里（对方写不进去、用户取消）：没发完的作废，
+    /// 再发同一份时照常发（不当成“和上次一样”跳过）。
+    pub fn forget(&mut self) {
+        self.queue.clear();
+        self.last = None;
+    }
+
+    /// 对方的剪贴板换成了别的内容：上次发过去的那份已经不在对方的剪贴板里，再发同一份时照常发。
+    pub fn peer_changed(&mut self) {
+        self.last = None;
+    }
+
     /// 刚把对方的内容写进本机剪贴板：之后本机读到同样的内容不再发回去。
     pub fn applied_remote(&mut self, clip: &Clip) {
         self.echo = Some(clip.hash());
+        // 对方的剪贴板现在是这份内容，不是我们上次发过去的那份了
+        self.last = None;
     }
 
     /// 本机剪贴板里已经是这份内容（刚发出去的，或刚从对方收到的）：不用再写一遍。
@@ -441,6 +497,11 @@ pub enum Received {
         kind: ClipKind,
         /// 大小。
         size: u64,
+    },
+    /// 对方的剪贴板里有这种内容，没发过来（见 [`ClipMsg::Held`]）。
+    Held {
+        /// 种类。
+        kind: ClipKind,
     },
 }
 
@@ -540,6 +601,14 @@ impl Receiver {
                 }
                 self.current = None;
                 Ok(Some(Received::TooLarge { kind, size }))
+            }
+            ClipMsg::Held { seq, kind } => {
+                if !self.fresh(seq) {
+                    return Ok(None);
+                }
+                // 收到一半的那份不会再来了
+                self.current = None;
+                Ok(Some(Received::Held { kind }))
             }
             // 对方对我们发出去的内容的确认，和接收无关（由同步循环处理）
             ClipMsg::Applied { .. } => Ok(None),
@@ -827,9 +896,14 @@ mod tests {
         assert_eq!(s.seq(), 0);
         assert_eq!(s.offer(&Clip::text("a")), Offered::Sending);
         assert_eq!(s.seq(), 1);
-        let ack = ClipMsg::Applied { seq: s.seq() };
+        let ack = ClipMsg::Applied {
+            seq: s.seq(),
+            ok: true,
+        };
         let mut d = Deframer::default();
         assert_eq!(d.push(&ack.frame()).unwrap(), vec![ack.clone()]);
+        let failed = ClipMsg::Applied { seq: 7, ok: false };
+        assert_eq!(d.push(&failed.frame()).unwrap(), vec![failed]);
         let mut r = Receiver::new(Limits::DEFAULT);
         assert_eq!(r.on_msg(ack).unwrap(), None);
         // 确认不影响正在收的内容
@@ -856,5 +930,86 @@ mod tests {
         // 超长的消息
         let mut d = Deframer::default();
         assert!(d.push(&u32::MAX.to_be_bytes()).is_err());
+    }
+
+    #[test]
+    fn held_content_is_announced_and_can_be_sent_later() {
+        let mut s = Sender::new(Limits::DEFAULT);
+        let mut r = Receiver::new(Limits::DEFAULT);
+        let files = Clip {
+            kind: ClipKind::Files,
+            data: pack_files(&[PackedFile {
+                path: "a.txt".into(),
+                data: vec![1; CHUNK * 2],
+            }])
+            .unwrap(),
+        };
+        assert_eq!(packed_count(&files.data), 1);
+        assert_eq!(packed_count(&[]), 0);
+        // 复制时只告诉对方“有文件”
+        s.announce_held(ClipKind::Files);
+        let msgs = drain(&mut s);
+        assert_eq!(
+            msgs,
+            vec![ClipMsg::Held {
+                seq: 1,
+                kind: ClipKind::Files
+            }]
+        );
+        let mut d = Deframer::default();
+        assert_eq!(d.push(&msgs[0].frame()).unwrap(), msgs);
+        assert_eq!(
+            deliver(&msgs, &mut r, 3),
+            vec![Received::Held {
+                kind: ClipKind::Files
+            }]
+        );
+        // 粘贴时才发；发到一半取消：对方丢掉收到的那一半
+        assert_eq!(s.offer(&files), Offered::Sending);
+        let first: Vec<ClipMsg> = (0..2).filter_map(|_| s.next_msg()).collect();
+        assert!(deliver(&first, &mut r, 7).is_empty());
+        assert!(r.current.is_some());
+        s.forget();
+        s.announce_held(ClipKind::Files);
+        assert_eq!(s.pending(), 1);
+        assert_eq!(
+            deliver(&drain(&mut s), &mut r, 7),
+            vec![Received::Held {
+                kind: ClipKind::Files
+            }]
+        );
+        assert!(r.current.is_none());
+        // 过时的通知不理
+        let stale = ClipMsg::Held {
+            seq: 1,
+            kind: ClipKind::Png,
+        };
+        assert_eq!(r.on_msg(stale).unwrap(), None);
+        // 取消以后再粘贴：同一份内容照常发（不当成发过了）
+        assert_eq!(s.offer(&files), Offered::Sending);
+        assert_eq!(
+            deliver(&drain(&mut s), &mut r, 9),
+            vec![Received::Clip(files.clone())]
+        );
+        // 对方说写不进去：忘掉，下次照常发
+        assert_eq!(s.offer(&files), Offered::Skip);
+        s.forget();
+        assert_eq!(s.offer(&files), Offered::Sending);
+        // 只是又复制了一遍同样的文件（通知不改“发过了”的记录）：不重传
+        drain(&mut s);
+        s.announce_held(ClipKind::Files);
+        assert_eq!(s.offer(&files), Offered::Skip);
+        // 对方的剪贴板换了内容（对方自己复制了别的，或者收到了对方的内容）：要重新传
+        s.peer_changed();
+        assert_eq!(s.offer(&files), Offered::Sending);
+        drain(&mut s);
+        s.applied_remote(&Clip::text("对方复制的"));
+        assert!(s.is_local(&Clip::text("对方复制的")));
+        assert_eq!(s.offer(&files), Offered::Sending);
+        // 本机换了内容以后，以前从对方收到的那份不再算“本机已经有”
+        assert!(!s.is_local(&Clip::text("对方复制的")));
+        s.applied_remote(&Clip::text("又一份"));
+        s.announce_held(ClipKind::Png);
+        assert!(!s.is_local(&Clip::text("又一份")));
     }
 }

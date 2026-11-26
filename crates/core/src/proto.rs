@@ -286,9 +286,14 @@ impl Caps {
     /// 起步探测实测不如保守的起步码率，没用它（docs/research/L-framework.md T7）。
     pub const PROBE_TRAIN: Caps = Caps(1 << 24);
 
-    /// 剪贴板内容处理完后回一条确认（[`crate::clipboard::ClipMsg::Applied`]）。控制端据此把粘贴键
-    /// 推迟到内容到了对方剪贴板以后再发：输入走数据报，本来会比剪贴板内容先到，粘贴出来的是旧内容。
-    pub const CLIPBOARD_ACK: Caps = Caps(1 << 30);
+    /// 剪贴板“粘贴时才传”（做法和 RDP 的剪贴板重定向一样：复制时只说有什么，粘贴时才传数据）。
+    /// 声明它的一端：
+    /// - 复制文件、图片、长文字时不主动发内容，只发 [`crate::clipboard::ClipMsg::Held`]；短文字照常马上同步；
+    /// - 收到的内容处理完后回 [`crate::clipboard::ClipMsg::Applied`]；
+    /// - 作为被控端，认识 [`crate::input::InputEvent::Paste`]（内容到了以后补上被扣住的粘贴键）。
+    ///
+    /// 第 27、28、29 位另有用途，所以是第 30 位。
+    pub const CLIPBOARD_LAZY: Caps = Caps(1 << 30);
 
     // 第 24–26 位不是能力，是被控端在 Accept 里告诉控制端自己的系统（见 [`PeerOs`]），
     // 控制端的助手据此选一键快捷键（复制在 Mac 上是 Cmd+C）。键盘上按的键一一对应，不按系统换。
@@ -319,7 +324,7 @@ impl Caps {
             | Self::CLIPBOARD.0
             | Self::AUDIO.0
             | Self::CLIPBOARD_FILES.0
-            | Self::CLIPBOARD_ACK.0
+            | Self::CLIPBOARD_LAZY.0
             | Self::FEC_RS.0
             | Self::HOST_STATS.0
             | Self::FILE_BROWSE.0

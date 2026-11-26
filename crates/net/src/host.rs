@@ -466,8 +466,16 @@ pub async fn serve(
                             let count = u64::try_from(events.len()).unwrap_or(u64::MAX);
                             if opts.permissions.input {
                                 for event in &events {
-                                    keys.apply(event);
-                                    sink.inject(event);
+                                    // 推迟的粘贴：展开成按键（处理当时按着的修饰键），系统输入只见到按键
+                                    if let InputEvent::Paste { modifiers, code } = event {
+                                        for key in keys.paste(*modifiers, *code) {
+                                            keys.apply(&key);
+                                            sink.inject(&key);
+                                        }
+                                    } else {
+                                        keys.apply(event);
+                                        sink.inject(event);
+                                    }
                                 }
                                 input_events = input_events.saturating_add(count);
                             } else {
@@ -501,10 +509,12 @@ pub async fn serve(
                     let root = opts.recv_root.clone();
                     let allowed = opts.permissions.files;
                     let clipboard = clipboard.clone();
+                    let rtt_link = Arc::clone(&link);
                     let clip_opts = crate::clipsync::SyncOptions {
                         files: caps.has(Caps::CLIPBOARD_FILES),
-                        ack: caps.has(Caps::CLIPBOARD_ACK),
+                        lazy: caps.has(Caps::CLIPBOARD_LAZY),
                         paste: None,
+                        rtt: Some(crate::clipsync::RttProbe(Arc::new(move || rtt_link.rtt()))),
                     };
                     let audio = audio.clone();
                     let view = Arc::clone(&view);
