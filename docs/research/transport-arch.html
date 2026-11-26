@@ -1,0 +1,345 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<!-- 传输架构说明页（2026-11-26）。数字来源见 docs/research/L-framework.md 6.2、6.3。 -->
+<title>PeerDesk 传输架构</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* 布局：单栏技术说明，宽表和图各自横向滚动；数字一律等宽对齐 */
+:root {
+  --bg: #f5f7fa;
+  --panel: #ffffff;
+  --fg: #16212c;
+  --muted: #5a6877;
+  --line: #d9e0e8;
+  --accent: #0b6a86;
+  --accent-soft: #e3f1f5;
+  --warn: #a8641a;
+  --warn-soft: #f8ecdc;
+  --good: #23784a;
+  --good-soft: #e2f3e9;
+  --bad: #b23a3a;
+  --font-body: "Noto Sans SC", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #10161d; --panel: #18212b; --fg: #e4eaf0; --muted: #9aa8b6; --line: #2b3744;
+    --accent: #4fb6d3; --accent-soft: #15303a; --warn: #e2a35a; --warn-soft: #3a2a18;
+    --good: #5cc08a; --good-soft: #17301f; --bad: #e57373; color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #10161d; --panel: #18212b; --fg: #e4eaf0; --muted: #9aa8b6; --line: #2b3744;
+  --accent: #4fb6d3; --accent-soft: #15303a; --warn: #e2a35a; --warn-soft: #3a2a18;
+  --good: #5cc08a; --good-soft: #17301f; --bad: #e57373; color-scheme: dark;
+}
+body { background: var(--bg); color: var(--fg); font-family: var(--font-body); font-size: 15px; line-height: 1.7; }
+.wrap { max-width: 1080px; margin: 0 auto; padding-block: 32px 64px; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); display: grid; gap: 40px; }
+h1 { font-size: 28px; line-height: 1.3; margin: 0; text-wrap: balance; }
+h2 { font-size: 20px; margin: 0 0 4px; text-wrap: balance; }
+h3 { font-size: 16px; margin: 0; }
+p { margin: 0; max-width: 68ch; }
+.lede { color: var(--muted); max-width: 72ch; }
+.meta { font-family: var(--font-mono); font-size: 12px; color: var(--muted); letter-spacing: .02em; }
+section { display: grid; gap: 14px; min-width: 0; }
+.num { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+.kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
+.kpi { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; display: grid; gap: 4px; }
+.kpi .label { font-size: 13px; color: var(--muted); }
+.kpi .vals { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.kpi .old { font-family: var(--font-mono); color: var(--muted); text-decoration: line-through; font-size: 16px; }
+.kpi .new { font-family: var(--font-mono); font-size: 26px; font-weight: 500; color: var(--fg); }
+.kpi .delta { font-family: var(--font-mono); font-size: 13px; color: var(--good); }
+.scroll { overflow-x: auto; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; }
+table { border-collapse: collapse; width: 100%; font-size: 14px; }
+th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font-weight: 500; color: var(--muted); font-size: 13px; white-space: nowrap; background: var(--panel); }
+tbody tr:last-child td { border-bottom: none; }
+td.n, th.n { text-align: right; font-family: var(--font-mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
+td.c, th.c { text-align: center; }
+.group td { background: var(--accent-soft); color: var(--accent); font-weight: 500; font-size: 13px; }
+.src { font-size: 12px; color: var(--muted); white-space: nowrap; }
+.tag { display: inline-block; font-size: 12px; padding: 1px 8px; border-radius: 999px; background: var(--accent-soft); color: var(--accent); white-space: nowrap; }
+.tag.warn { background: var(--warn-soft); color: var(--warn); }
+.tag.good { background: var(--good-soft); color: var(--good); }
+.dot { font-size: 16px; color: var(--accent); }
+.dot.half { color: var(--muted); }
+.note { font-size: 13px; color: var(--muted); }
+.cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 16px; display: grid; gap: 8px; min-width: 0; }
+.card ul { margin: 0; padding-left: 18px; display: grid; gap: 4px; }
+svg text { font-family: var(--font-body); }
+.d-box { fill: var(--panel); stroke: var(--line); stroke-width: 1.2; }
+.d-est { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 1.2; }
+.d-net { fill: var(--warn-soft); stroke: var(--warn); stroke-width: 1.2; }
+.d-title { fill: var(--fg); font-size: 14px; font-weight: 700; }
+.d-sub { fill: var(--muted); font-size: 11.5px; }
+.d-lane { fill: var(--muted); font-size: 12px; letter-spacing: .08em; }
+.d-arrow { stroke: var(--fg); stroke-width: 1.4; fill: none; }
+.d-fb { stroke: var(--accent); stroke-width: 1.4; fill: none; stroke-dasharray: 5 4; }
+.d-fbtext { fill: var(--accent); font-size: 12px; }
+.d-head { fill: var(--fg); }
+.d-headfb { fill: var(--accent); }
+</style>
+</head>
+<body>
+
+<div class="wrap">
+  <header style="display:grid;gap:10px">
+    <div class="meta">PeerDesk · 传输与画质控制 · 2026-11-26</div>
+    <h1>PeerDesk 传输架构</h1>
+    <p class="lede">一帧画面从被控端采集到控制端显示走过哪些环节，每个环节由什么条件触发、做什么；12 条真实网络轨迹分别考哪些环节；以及改造后的版本和改造前的老版本在同一个测量平台上的对比。</p>
+  </header>
+
+  <section id="result">
+    <h2>先看结果：老版本和现在，同一把尺子</h2>
+    <p class="note">两个版本都编成真实程序，放在同一个测量平台上：用户态网络中继回放 12 条微软真实网络轨迹，Xvfb 里的办公桌面按同样的节奏打字、滚动、拖动、切换窗口、播视频，每条轨迹各跑 2 次。“冻结”指画面变了之后超过 200 ms 才看到新画面。</p>
+    <div class="kpis">
+      <div class="kpi"><div class="label">冻结次数（24 次合计）</div><div class="vals"><span class="old">135</span><span class="new">50</span><span class="delta">少 63%</span></div></div>
+      <div class="kpi"><div class="label">每次最长等待，平均</div><div class="vals"><span class="old">1341 ms</span><span class="new">303 ms</span><span class="delta">少 77%</span></div></div>
+      <div class="kpi"><div class="label">最长等待，最差一次</div><div class="vals"><span class="old">5841 ms</span><span class="new">1088 ms</span><span class="delta">少 81%</span></div></div>
+      <div class="kpi"><div class="label">第一幅画面，平均</div><div class="vals"><span class="old">562 ms</span><span class="new">191 ms</span><span class="delta">少 66%</span></div></div>
+    </div>
+    <p class="note">老版本是 b4b7dc2（2026-11-25，传输改造前最后一个版本，也就是和 UU、ToDesk 实机对比的那一版）；现在是 dev 上的最新版本。两个版本都不开发送节奏器。</p>
+    <p>改善最大的是两头：窄带上最长等待从几秒降到两三百毫秒（ms-02683 4844 → 181 ms，ms-09261 2587 → 275 ms），这主要靠大帧规则、补清晰上限和细节加权，让大帧不再一次塞满链路；宽带随机丢包时冻结从十几二十次降到一两次（ms-09235 24 → 3 次），这主要靠按序交出和整帧重传，让丢包不再变成关键帧。没有明显改善的是 ms-05729（1 Mbps、20% 随机丢包，29 → 28 次），见最后一节。老版本把更多数据塞进瓶颈：每次运行瓶颈排队丢包 43–217 个，现在 0–21 个。</p>
+  </section>
+
+  <section id="arch">
+    <h2>一帧走过的路</h2>
+    <p>上面一行是被控端：采集、调度、编码、发送。中间是网络。下面一行是控制端：重组、解码、显示。虚线是反馈：控制端大约每 20 ms 把测量和确认发回来，码率估计器据此定码率，码率再变成每一帧的字节预算交给编码器。</p>
+    <div class="scroll">
+      <svg viewBox="0 0 1000 560" width="1000" role="img" aria-label="传输架构图：被控端采集、调度、编码、发送，经网络到控制端重组、解码、显示，接收端测量反馈给码率估计器">
+        <defs>
+          <marker id="ah" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" class="d-head"/></marker>
+          <marker id="ahfb" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" class="d-headfb"/></marker>
+        </defs>
+        <text x="14" y="26" class="d-lane">被控端（发送）</text>
+        <rect x="290" y="40" width="420" height="74" rx="8" class="d-est"/>
+        <text x="500" y="66" text-anchor="middle" class="d-title">码率估计（经典算法 + 固有丢包）</text>
+        <text x="500" y="86" text-anchor="middle" class="d-sub">输出：目标码率 · 网络画像（稳定 / 无线）· 纠错比例</text>
+        <text x="500" y="104" text-anchor="middle" class="d-sub">拥塞判断：延迟趋势、排队、高出固有丢包的丢包</text>
+
+        <rect x="10" y="160" width="176" height="104" rx="8" class="d-box"/>
+        <text x="98" y="186" text-anchor="middle" class="d-title">采集 + 变化检测</text>
+        <text x="98" y="208" text-anchor="middle" class="d-sub">画面变没变、变了多少</text>
+        <text x="98" y="226" text-anchor="middle" class="d-sub">（按细节加权的面积）</text>
+        <text x="98" y="244" text-anchor="middle" class="d-sub">停下了没有</text>
+
+        <rect x="206" y="160" width="176" height="104" rx="8" class="d-box"/>
+        <text x="294" y="186" text-anchor="middle" class="d-title">调度</text>
+        <text x="294" y="208" text-anchor="middle" class="d-sub">帧率档位 60…5</text>
+        <text x="294" y="226" text-anchor="middle" class="d-sub">编码分辨率（最后手段）</text>
+        <text x="294" y="244" text-anchor="middle" class="d-sub">在途满 / 关键帧未确认就等</text>
+
+        <rect x="402" y="160" width="176" height="104" rx="8" class="d-box"/>
+        <text x="490" y="186" text-anchor="middle" class="d-title">编码（逐帧 QP）</text>
+        <text x="490" y="208" text-anchor="middle" class="d-sub">关键帧大帧规则</text>
+        <text x="490" y="226" text-anchor="middle" class="d-sub">一帧缓冲码控 · 补清晰</text>
+        <text x="490" y="244" text-anchor="middle" class="d-sub">超时限重编</text>
+
+        <rect x="598" y="160" width="190" height="104" rx="8" class="d-box"/>
+        <text x="693" y="186" text-anchor="middle" class="d-title">发送端</text>
+        <text x="693" y="208" text-anchor="middle" class="d-sub">每帧预算 · 排队回压</text>
+        <text x="693" y="226" text-anchor="middle" class="d-sub">RS 纠错 · 分片 · 重传缓存</text>
+        <text x="693" y="244" text-anchor="middle" class="d-sub">按请求重传（整帧也行）</text>
+
+        <rect x="808" y="160" width="182" height="104" rx="8" class="d-box"/>
+        <text x="899" y="186" text-anchor="middle" class="d-title">QUIC 数据报</text>
+        <text x="899" y="208" text-anchor="middle" class="d-sub">加密、穿透</text>
+        <text x="899" y="226" text-anchor="middle" class="d-sub">拥塞控制只当安全网</text>
+        <text x="899" y="244" text-anchor="middle" class="d-sub">节奏器默认关</text>
+
+        <path d="M186 212 H202" class="d-arrow" marker-end="url(#ah)"/>
+        <path d="M382 212 H398" class="d-arrow" marker-end="url(#ah)"/>
+        <path d="M578 212 H594" class="d-arrow" marker-end="url(#ah)"/>
+        <path d="M788 212 H804" class="d-arrow" marker-end="url(#ah)"/>
+        <path d="M420 114 L330 156" class="d-arrow" marker-end="url(#ah)"/>
+        <path d="M500 114 L500 156" class="d-arrow" marker-end="url(#ah)"/>
+        <path d="M580 114 L670 156" class="d-arrow" marker-end="url(#ah)"/>
+        <text x="352" y="140" class="d-sub">帧率</text>
+        <text x="508" y="140" class="d-sub">每帧预算</text>
+        <text x="634" y="140" class="d-sub">纠错比例</text>
+
+        <rect x="10" y="300" width="980" height="58" rx="8" class="d-net"/>
+        <text x="500" y="325" text-anchor="middle" class="d-title">网络</text>
+        <text x="500" y="345" text-anchor="middle" class="d-sub">带宽变化 · 随机丢包 · 瓶颈排队（满了丢）· 传播延迟和抖动</text>
+        <path d="M899 264 V296" class="d-arrow" marker-end="url(#ah)"/>
+        <path d="M170 358 V392" class="d-arrow" marker-end="url(#ah)"/>
+
+        <text x="14" y="388" class="d-lane">控制端（接收）</text>
+        <rect x="10" y="396" width="340" height="110" rx="8" class="d-box"/>
+        <text x="180" y="422" text-anchor="middle" class="d-title">重组与恢复</text>
+        <text x="180" y="444" text-anchor="middle" class="d-sub">RS 纠错恢复 · 缺片 10 ms 后请求重传</text>
+        <text x="180" y="462" text-anchor="middle" class="d-sub">整帧丢光时按帧号请求整帧</text>
+        <text x="180" y="480" text-anchor="middle" class="d-sub">按参考顺序交出（参考帧在补就先等）</text>
+        <text x="180" y="498" text-anchor="middle" class="d-sub">250 ms 没进展作废 → 要关键帧</text>
+
+        <rect x="390" y="396" width="150" height="110" rx="8" class="d-box"/>
+        <text x="465" y="446" text-anchor="middle" class="d-title">解码</text>
+        <text x="465" y="468" text-anchor="middle" class="d-sub">独立线程</text>
+
+        <rect x="580" y="396" width="150" height="110" rx="8" class="d-box"/>
+        <text x="655" y="446" text-anchor="middle" class="d-title">显示</text>
+        <text x="655" y="468" text-anchor="middle" class="d-sub">显卡转颜色</text>
+
+        <rect x="770" y="396" width="220" height="110" rx="8" class="d-est"/>
+        <text x="880" y="422" text-anchor="middle" class="d-title">接收端测量</text>
+        <text x="880" y="444" text-anchor="middle" class="d-sub">排队延迟 · 丢包率 · 送达速率</text>
+        <text x="880" y="462" text-anchor="middle" class="d-sub">延迟趋势 · 包串容量</text>
+        <text x="880" y="480" text-anchor="middle" class="d-sub">哪些帧送达了 · 缺哪些分片</text>
+
+        <path d="M350 451 H386" class="d-arrow" marker-end="url(#ah)"/>
+        <path d="M540 451 H576" class="d-arrow" marker-end="url(#ah)"/>
+        <path d="M350 500 Q560 540 766 480" class="d-fb" marker-end="url(#ahfb)"/>
+
+        <path d="M990 451 H996 V77 H714" class="d-fb" marker-end="url(#ahfb)"/>
+        <text x="984" y="292" text-anchor="end" class="d-fbtext">反馈约 20 ms 一次</text>
+        <path d="M770 430 H750 V270" class="d-fb" marker-end="url(#ahfb)"/>
+        <text x="742" y="286" text-anchor="end" class="d-fbtext">重传请求</text>
+      </svg>
+    </div>
+  </section>
+
+  <section id="mechanisms">
+    <h2>每个机制：在哪、什么时候动、做什么</h2>
+    <p class="note">“参照”是这个做法在业内的出处。每一项都在微软轨迹和端到端仿真上量过才留下；量过更差的没有采用（见最后一节）。</p>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>机制</th><th>什么时候动</th><th>做什么</th><th>参照</th></tr></thead>
+        <tbody>
+          <tr class="group"><td colspan="4">被控端 · 调度</td></tr>
+          <tr><td>帧率档位</td><td>编码跟不上，或画面内容连续 3 帧装不进预算</td><td>60 → 30 → 20 → 15 → 10 → 8 → 5 帧降一档；装得下 1.5 s 后升回</td><td class="src">WebRTC 屏幕共享“保分辨率、先降帧率”</td></tr>
+          <tr><td>编码分辨率</td><td>会话开始；带宽连粗编的原尺寸关键帧都送不完</td><td>半分辨率起步；降分辨率是最后手段；原尺寸关键帧 0.65 s 内送得完就升回（停下后放宽到 1.5 s / 5 s）</td><td class="src">CLAUDE.md：降级顺序画质 → 帧率 → 分辨率</td></tr>
+          <tr><td>等一等再编</td><td>在途数据超过“往返 + 50 ms”的量，或关键帧还没确认</td><td>这一帧不编，变化攒着，等确认之后编最新的画面</td><td class="src">WebRTC 拥塞窗口回压</td></tr>
+          <tr class="group"><td colspan="4">被控端 · 编码（软件编码逐帧定 QP）</td></tr>
+          <tr><td>关键帧大帧规则</td><td>每个关键帧</td><td>按“每百万像素多少字节”估计，取 100 ms 内送得完的最低 QP（不低于 22），粗的先到，之后补清晰</td><td class="src">Chromium 远程桌面 ShouldDropQualityForLargeFrame</td></tr>
+          <tr><td>一帧缓冲码控</td><td>画面连续在变（滚动、拖动、视频）</td><td>按上一帧实际大小和这一帧预算比：大了每帧 QP 最多 +10，小了最多 −2</td><td class="src">Sunshine / NVENC：缓冲 = 码率 ÷ 帧率</td></tr>
+          <tr><td>静止后第一帧变化</td><td>停了一会儿再变（切换窗口、打开菜单）</td><td>按<b>细节加权</b>的变化面积估计这一帧多大，装进大帧时限</td><td class="src">x264 前瞻按复杂度估计帧大小</td></tr>
+          <tr><td>超时限重编</td><td>画面变化编出来超过大帧时限 2 倍</td><td>按实际大小推一个装得进的 QP，重编成关键帧</td><td class="src">libvpx vp9_encodedframe_overshoot</td></tr>
+          <tr><td>补清晰</td><td>画面停下后</td><td>每帧降 QP，补充量不超过一帧预算；降一步的量超过链路约 200 ms 就停；补到 QP 12</td><td class="src">Chromium 远程桌面 top-off</td></tr>
+          <tr><td>码率过期</td><td>码率 2 s 没有被测量证实（通常是画面静止）</td><td>关键帧、静止后第一帧变化最多用一帧预算，先发粗的</td><td class="src">TCP 拥塞窗口验证（RFC 2861）</td></tr>
+          <tr class="group"><td colspan="4">被控端 · 发送</td></tr>
+          <tr><td>每帧预算</td><td>每一帧</td><td>码率 ÷ 帧率 × 画像安全系数（稳定 0.9、无线 0.8）；排队越接近 50 ms 预算越小</td><td class="src">WebRTC CongestionWindowPushback</td></tr>
+          <tr><td>前向纠错（RS）</td><td>每一帧</td><td>画像自带的比例（无线 15%）和“丢包率 × 3”（丢包 ≥ 1% 才加，最多 33%）取大</td><td class="src">WebRTC FEC 保护比例；Sunshine 固定 20%</td></tr>
+          <tr><td>重传</td><td>收到重传请求</td><td>同一分片一个往返（加排队）内只重传一次；一轮最多补 40 ms 的量；整帧请求展开成全部分片</td><td class="src">WebRTC RTPSender::ReSendPacket</td></tr>
+          <tr><td>发送节奏器</td><td>默认关</td><td>按码率的倍数匀速发；仿真和真实程序上都量过，打开不更好</td><td class="src">WebRTC PacingController</td></tr>
+          <tr class="group"><td colspan="4">控制端 · 接收</td></tr>
+          <tr><td>请求重传</td><td>某一帧缺分片超过 10 ms</td><td>每份反馈带上缺的分片（最多 48 个）</td><td class="src">WebRTC NackRequester</td></tr>
+          <tr><td>整帧重传</td><td>收到的帧参考了一个一个分片都没见过的帧</td><td>按帧号请求整帧，参考它的帧先等着</td><td class="src">WebRTC 按包序号请求，整帧丢了也能补</td></tr>
+          <tr><td>按参考顺序交出</td><td>新帧收齐了，但它参考的帧还在补</td><td>先放着，参考帧补齐后按顺序交出；补不回来才作废</td><td class="src">WebRTC FrameBuffer</td></tr>
+          <tr><td>作废和关键帧</td><td>一帧 250 ms 没有进展（关键帧放宽到 2 s）</td><td>作废，发送端从确认里看到后下一帧出关键帧</td><td class="src">WebRTC 关键帧请求</td></tr>
+          <tr class="group"><td colspan="4">码率估计（被控端，按反馈）</td></tr>
+          <tr><td>拥塞判断</td><td>每份反馈</td><td>延迟趋势过载（自适应门限）；或排队超过画像上限（稳定 12 ms、无线 30 ms）；或丢包比固有丢包高出 8% 且在排队</td><td class="src">WebRTC TrendlineEstimator、LossBasedBweV2</td></tr>
+          <tr><td>降码率</td><td>判为拥塞，距上次降已过一个往返（≥ 100 ms）</td><td>降到实测送达速率的 0.85</td><td class="src">WebRTC AimdRateControl</td></tr>
+          <tr><td>升码率</td><td>不拥塞、排队低、码率真的在用</td><td>测过包串容量时快速逼近容量的 0.8–0.9；否则按比例慢慢升</td><td class="src">WebRTC 探测 + AIMD 加性增</td></tr>
+          <tr><td>网络画像</td><td>连续两份反馈丢包 ≥ 1%</td><td>稳定 → 无线：常开纠错，随机丢包不降码率</td><td class="src">CLAUDE.md：随机丢包不降码率</td></tr>
+          <tr><td>静止探测</td><td>画面停下 2 s 后（之后间隔加倍）</td><td>发 8 个填充包测链路；明显变差就降码率（只降不升）</td><td class="src">WebRTC 应用受限时的探测</td></tr>
+          <tr><td>起步</td><td>会话开始</td><td>1 Mbps 起步，第一个关键帧本身就是包串，快链路几百毫秒内升上去</td><td class="src">量过：先探测再编第一帧更慢</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="traces">
+    <h2>12 条真实网络轨迹</h2>
+    <p>来自微软 MMSys 2024 带宽估计挑战赛的仿真通话（真实的带宽和丢包随时间变化），每条取变化最多的 40 秒，统一加单向 25 ms 延迟、瓶颈排队上限 200 ms。按它们考的东西分成四类。右边是真实程序上的结果（每条 2 次合计）。</p>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>轨迹</th><th>带宽</th><th>丢包（平均 / 最高）</th><th>主要考什么</th><th class="n">老版本 冻结</th><th class="n">现在 冻结</th><th class="n">老版本 最长等待</th><th class="n">现在 最长等待</th></tr></thead>
+        <tbody>
+          <tr class="group"><td colspan="8">窄带：带宽本身就紧，一帧大一点就要传好久</td></tr>
+          <tr><td class="num">ms-02683</td><td class="num">186–558 kbps</td><td class="num">0</td><td>最窄、还在变；大帧规则、补清晰上限、半分辨率</td><td class="n">15</td><td class="n">1</td><td class="n">4844</td><td class="n">181</td></tr>
+          <tr><td class="num">ms-02626</td><td class="num">318–615 kbps</td><td class="num">0</td><td>窄带起伏；降帧率、排队回压</td><td class="n">4</td><td class="n">2</td><td class="n">1570</td><td class="n">201</td></tr>
+          <tr><td class="num">ms-09261</td><td class="num">340 kbps 恒定</td><td class="num">0</td><td>恒定窄带；每一帧都在预算边上</td><td class="n">6</td><td class="n">5</td><td class="n">2587</td><td class="n">275</td></tr>
+          <tr><td class="num">ms-09217</td><td class="num">400 kbps 恒定</td><td class="num">0.2% / 1.2%</td><td>窄带加零星丢包；纠错别吃掉带宽</td><td class="n">6</td><td class="n">2</td><td class="n">1012</td><td class="n">235</td></tr>
+          <tr class="group"><td colspan="8">中等带宽，会变：码率要跟得上</td></tr>
+          <tr><td class="num">ms-09401</td><td class="num">486–1502 kbps</td><td class="num">0</td><td>带宽来回变；估计器升降、包串容量</td><td class="n">8</td><td class="n">1</td><td class="n">1127</td><td class="n">179</td></tr>
+          <tr><td class="num">ms-02605</td><td class="num">785–1396 kbps</td><td class="num">0</td><td>阶梯变化；静止时变差（码率过期、静止探测）</td><td class="n">7</td><td class="n">3</td><td class="n">1189</td><td class="n">411</td></tr>
+          <tr><td class="num">ms-02651</td><td class="num">914–1280 kbps</td><td class="num">0</td><td>较平稳；切换窗口的大帧（细节加权）</td><td class="n">4</td><td class="n">1</td><td class="n">705</td><td class="n">172</td></tr>
+          <tr><td class="num">ms-02703</td><td class="num">1 Mbps 恒定</td><td class="num">0</td><td>恒定 1 Mbps；大帧和补清晰的取舍</td><td class="n">5</td><td class="n">1</td><td class="n">779</td><td class="n">185</td></tr>
+          <tr class="group"><td colspan="8">宽带，随机丢包：丢包靠纠错和重传补，不该变成关键帧或降码率</td></tr>
+          <tr><td class="num">ms-09235</td><td class="num">8 Mbps</td><td class="num">12.4% / 40%</td><td>重丢包；按序交出、整帧重传、纠错</td><td class="n">24</td><td class="n">3</td><td class="n">376</td><td class="n">333</td></tr>
+          <tr><td class="num">ms-02560</td><td class="num">8 Mbps</td><td class="num">9.6% / 12.3%</td><td>持续丢包；固有丢包（别把随机丢包当拥塞）</td><td class="n">15</td><td class="n">2</td><td class="n">364</td><td class="n">248</td></tr>
+          <tr><td class="num">ms-05719</td><td class="num">8 Mbps</td><td class="num">8.4% / 13.4%</td><td>同上</td><td class="n">12</td><td class="n">1</td><td class="n">362</td><td class="n">176</td></tr>
+          <tr class="group"><td colspan="8">窄带加重丢包：最难的一条</td></tr>
+          <tr><td class="num">ms-05729</td><td class="num">1 Mbps</td><td class="num">16.2% / 20%</td><td>以上全部；纠错和带宽抢、一帧的突发排队被当成拥塞</td><td class="n">29</td><td class="n">28</td><td class="n">1174</td><td class="n">1034</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note">最长等待是每次运行里最长的那次等待，表里是 2 次的平均（ms）。工作负载每次都一样：停 1 秒、打字 3 秒、停、滚动 2 秒、停、拖动窗口 2 秒、停、切换窗口、停、视频 3 秒、停，做两遍。</p>
+  </section>
+
+  <section id="matrix">
+    <h2>场景和机制的触发关系</h2>
+    <p>同一个机制在不同场景下分量不同。<span class="dot">●</span> 是这类场景的主要瓶颈、靠它解决；<span class="dot half">○</span> 是会触发但不是关键。</p>
+    <div class="scroll">
+      <table>
+        <thead><tr><th></th><th class="c">大帧规则</th><th class="c">细节加权</th><th class="c">补清晰上限</th><th class="c">降帧率 / 分辨率</th><th class="c">码率升降</th><th class="c">码率过期 / 静止探测</th><th class="c">纠错</th><th class="c">重传 + 按序交出</th><th class="c">整帧重传</th><th class="c">固有丢包</th></tr></thead>
+        <tbody>
+          <tr class="group"><td colspan="11">网络</td></tr>
+          <tr><td>窄带</td><td class="c dot">●</td><td class="c dot">●</td><td class="c dot">●</td><td class="c dot">●</td><td class="c dot half">○</td><td class="c dot half">○</td><td class="c"></td><td class="c dot half">○</td><td class="c"></td><td class="c"></td></tr>
+          <tr><td>中等带宽、会变</td><td class="c dot">●</td><td class="c dot">●</td><td class="c dot half">○</td><td class="c dot half">○</td><td class="c dot">●</td><td class="c dot">●</td><td class="c"></td><td class="c dot half">○</td><td class="c"></td><td class="c"></td></tr>
+          <tr><td>宽带随机丢包</td><td class="c dot half">○</td><td class="c"></td><td class="c"></td><td class="c"></td><td class="c dot half">○</td><td class="c"></td><td class="c dot">●</td><td class="c dot">●</td><td class="c dot">●</td><td class="c dot">●</td></tr>
+          <tr><td>窄带加重丢包</td><td class="c dot">●</td><td class="c dot half">○</td><td class="c dot half">○</td><td class="c dot">●</td><td class="c dot">●</td><td class="c"></td><td class="c dot">●</td><td class="c dot">●</td><td class="c dot half">○</td><td class="c dot">●</td></tr>
+          <tr class="group"><td colspan="11">用户操作</td></tr>
+          <tr><td>会话开始</td><td class="c dot">●</td><td class="c"></td><td class="c dot half">○</td><td class="c dot">●</td><td class="c dot">●</td><td class="c"></td><td class="c"></td><td class="c"></td><td class="c"></td><td class="c"></td></tr>
+          <tr><td>打字</td><td class="c"></td><td class="c dot half">○</td><td class="c"></td><td class="c"></td><td class="c"></td><td class="c"></td><td class="c dot half">○</td><td class="c dot half">○</td><td class="c dot half">○</td><td class="c"></td></tr>
+          <tr><td>滚动、拖动</td><td class="c"></td><td class="c"></td><td class="c"></td><td class="c dot">●</td><td class="c dot">●</td><td class="c"></td><td class="c dot half">○</td><td class="c dot">●</td><td class="c dot half">○</td><td class="c"></td></tr>
+          <tr><td>切换窗口</td><td class="c dot">●</td><td class="c dot">●</td><td class="c"></td><td class="c"></td><td class="c"></td><td class="c dot">●</td><td class="c dot half">○</td><td class="c dot half">○</td><td class="c"></td><td class="c"></td></tr>
+          <tr><td>视频</td><td class="c"></td><td class="c"></td><td class="c"></td><td class="c dot">●</td><td class="c dot">●</td><td class="c"></td><td class="c dot half">○</td><td class="c dot">●</td><td class="c dot half">○</td><td class="c dot half">○</td></tr>
+          <tr><td>停下</td><td class="c"></td><td class="c"></td><td class="c dot">●</td><td class="c dot half">○</td><td class="c"></td><td class="c dot">●</td><td class="c"></td><td class="c"></td><td class="c"></td><td class="c"></td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note">举两个例子。8 Mbps、12% 随机丢包时，以前一帧丢了一片、下一帧先收齐，旧帧就被作废，新帧也解不了，40 秒出 46 个关键帧；现在“按序交出”让新帧等旧帧补齐，关键帧降到 2 个。1 Mbps 上切换窗口，以前按“变了几个点”估计帧大小，文字密集的弹窗估小了 5 倍以上，编出 89–125 KB、要传 700 ms 以上；现在按细节加权估计，帧小下来，等待减半。</p>
+  </section>
+
+  <section id="steps">
+    <h2>一步步的改进（仿真，36 次）</h2>
+    <p class="note">12 条轨迹 × 3 个随机种子，同一个评估集。每一步都在上一步的基础上加，数字是 36 次的合计 / 平均。</p>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>版本</th><th class="n">冻结</th><th class="n">最长等待平均</th><th class="n">最长等待最大</th><th class="n">停下后最差画质</th></tr></thead>
+        <tbody>
+          <tr><td>帧按参考顺序交出之后（基线）</td><td class="n">202</td><td class="n">681 ms</td><td class="n">2141 ms</td><td class="n">27.2 dB</td></tr>
+          <tr><td>+ 补清晰单步上限</td><td class="n">145</td><td class="n">642 ms</td><td class="n">1790 ms</td><td class="n">27.3 dB</td></tr>
+          <tr><td>+ 变化面积按细节加权</td><td class="n">95</td><td class="n">392 ms</td><td class="n">950 ms</td><td class="n">26.8 dB</td></tr>
+          <tr><td>+ 整帧重传</td><td class="n">87</td><td class="n">386 ms</td><td class="n">950 ms</td><td class="n">26.7 dB</td></tr>
+          <tr><td>+ 固有丢包（现在）</td><td class="n">83</td><td class="n">389 ms</td><td class="n">950 ms</td><td class="n">27.2 dB</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note">“按参考顺序交出”本身是在 8 条轨迹、1 个种子上量的：冻结 45 → 18 次，丢包轨迹的关键帧 46 → 2 个。真实程序和仿真的量级一致（真实程序平均每次冻结 2.1 次、最长等待 303 ms；仿真 2.3 次、389 ms），所以小改动先在仿真上量，大的决定再在真实程序上确认。</p>
+  </section>
+
+  <section id="rejected">
+    <h2>量过、没采用，和还没解决的</h2>
+    <div class="cols">
+      <div class="card">
+        <h3>量过、没采用 <span class="tag warn">更差</span></h3>
+        <ul>
+          <li>照 WebRTC 整套重写的网络控制器（gcc 路径）：冻结 59 对 18 次，静止后画质低十几 dB</li>
+          <li>送达速率按窗口算（4 种做法）：有的轨迹好、有的坏，合计不赢</li>
+          <li>排队按 100 ms 最小值判断（CoDel）：冻结 83 → 189</li>
+          <li>发送节奏器默认打开：仿真冻结多 23–46%，真实程序 50 → 57 次</li>
+          <li>纠错按平滑丢包率：1 Mbps、20% 丢包时纠错吃掉带宽，19 → 31 次</li>
+          <li>变化大小的学习修正系数、应用受限时退避：在噪声范围内或更差</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>还没解决 <span class="tag">已知</span></h3>
+        <ul>
+          <li>1 Mbps、20% 随机丢包（ms-05729）：一帧自己的突发排队被当成拥塞，码率压得偏低，每次十几次冻结。准备按 Parsec 的做法在工具条上告诉用户网络差在哪</li>
+          <li>真实的 4K144 硬件编码要实机测；传输层本身已经量过，100 Mbps 的流量两端处理 2 秒只用 240 ms</li>
+          <li>这些数字都是办公场景；游戏、电影模式是另外的策略表，以后单独量</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+</div>
+
+</body>
+</html>
