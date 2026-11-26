@@ -15,8 +15,6 @@
 //!
 //! 以后的 AI 模型也实现 [`RateEstimator`]，在同一套端到端测试里和经典算法比较。
 
-use std::collections::VecDeque;
-
 use crate::adaptive::{Feedback, Profile, RateController};
 use crate::cc::probe::ProbeCluster;
 use crate::cc::report::{PacketResult, SentPacket};
@@ -33,9 +31,6 @@ const SMOOTHING_PERMILLE: i64 = 900;
 const MIN_TRAIN_PACKETS: u32 = 3;
 /// 两份反馈相隔不超过这么久（微秒）才算不断档（控制端有新包时 20 ms 一份；静止时 1 秒一份，就断档了）。
 const CONTIGUOUS_US: u64 = 60_000;
-/// 发送端没用满码率时，排队要持续这么久（这段时间里的最小读数）才算常驻队列。取 RFC 8289（CoDel）判断常驻队列的
-/// 间隔 100 ms：一次 Wi-Fi 尖峰只影响几份反馈，最小值低；真有队列时这段时间每份都高。
-const STANDING_US: u64 = 100_000;
 /// 包串首尾到达间隔至少这么久（微秒）才算数。接收端是应用读数据报时打的时间戳，程序忙一下、几十个包
 /// 就一次读走，间隔几乎是 0（2026-11-26 用户日志：30 Mbps 的 Wi-Fi 测出 3 420 173 kbps，码率被直接拉到上限）。
 /// 1 ms 时一帧 37 个包（44 KB）还能测到约 350 Mbps，足够办公场景。
@@ -397,9 +392,58 @@ pub struct Observation {
     pub rtt_us: u64,
     /// 还没确认的字节数。
     pub in_flight: u64,
-    /// 发送端最近实际发出的帧折合的速率（比特每秒，不含重传和探测）；`None` 表示不知道（按送达速率判断）。
-    /// 判断“发送端用没用满码率”要看它：链路突然变窄时送达速率也低，按送达速率判断会把真拥塞当成没用满。
-    pub sent_bps: Option<u64>,
+}
+
+/// 码率控制所处的状态。量尺按它统计各状态的时间占比、核对“真实队列高时有没有被判成应用受限”；
+/// 状态切换写事件日志。还没有显式状态机的估计器一律报告 [`RateState::Tracking`]。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RateState {
+    /// 起步：会话开头的探测还没出结论。
+    Startup,
+    /// 跟踪：发送量被网络限制，按拥塞信号降、按送达速率升。
+    #[default]
+    Tracking,
+    /// 排空：刚降过码率，等队列排掉。
+    Drain,
+    /// 应用受限：发送端没那么多要发，送达速率不代表链路能力。
+    AppLimited,
+    /// 核实：应用受限时降过码率，等探测结论。
+    Verify,
+}
+
+impl RateState {
+    /// 全部状态，按固定顺序（统计表的列顺序）。
+    pub const ALL: [Self; 5] = [
+        Self::Startup,
+        Self::Tracking,
+        Self::Drain,
+        Self::AppLimited,
+        Self::Verify,
+    ];
+
+    /// 名字（日志和报告用）。
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Startup => "起步",
+            Self::Tracking => "跟踪",
+            Self::Drain => "排空",
+            Self::AppLimited => "应用受限",
+            Self::Verify => "核实",
+        }
+    }
+
+    /// 在 [`RateState::ALL`] 里的下标。
+    #[must_use]
+    pub const fn index(self) -> usize {
+        match self {
+            Self::Startup => 0,
+            Self::Tracking => 1,
+            Self::Drain => 2,
+            Self::AppLimited => 3,
+            Self::Verify => 4,
+        }
+    }
 }
 
 /// 码率估计器：经典算法、以后的 AI 模型都实现它。
@@ -458,6 +502,11 @@ pub trait RateEstimator: Send + std::fmt::Debug {
     /// 一行状态（诊断日志用）。
     fn state_line(&self) -> Option<String> {
         None
+    }
+
+    /// 码率控制现在处于哪个状态（见 [`RateState`]）。
+    fn state(&self) -> RateState {
+        RateState::Tracking
     }
 }
 
@@ -632,8 +681,6 @@ pub struct ClassicV1 {
     last_decrease: Option<Time>,
     /// 上一份反馈的时间（判断反馈断没断档，见 [`CONTIGUOUS_US`]）。
     last_feedback: Option<Time>,
-    /// 这一段不断档的反馈里，各份的时间和排队读数（只留最近 [`STANDING_US`] 加一份，见 [`ClassicV1::standing_queue`]）。
-    queue_run: VecDeque<(Time, u32)>,
     usage: Usage,
     /// 码率变化说明（取走后清空）和上次写说明时的码率（升码率累计超过一定比例才写一次）。
     notes: Vec<String>,
@@ -653,28 +700,6 @@ const K_DOWN_E7: i64 = 390_000;
 const CAPACITY_TTL_US: u64 = 5_000_000;
 
 impl ClassicV1 {
-    /// 记下这份反馈的排队读数，返回最近 [`STANDING_US`] 里的最小读数（常驻队列）。这一段不断档的反馈还不够这么长时
-    /// 返回 `None`：证据不够，不算常驻队列。断档时从头记。
-    fn standing_queue(&mut self, now: Time, queue_us: u32, contiguous: bool) -> Option<u32> {
-        if !contiguous {
-            self.queue_run.clear();
-        }
-        self.queue_run.push_back((now, queue_us));
-        // 最老的一份留在窗口左边界上或之前（代表窗口开始时的队列），更早的丢掉
-        while self
-            .queue_run
-            .get(1)
-            .is_some_and(|(t, _)| now.since(*t) >= STANDING_US)
-        {
-            self.queue_run.pop_front();
-        }
-        let (oldest, _) = self.queue_run.front()?;
-        if now.since(*oldest) < STANDING_US {
-            return None;
-        }
-        self.queue_run.iter().map(|(_, q)| *q).min()
-    }
-
     /// 创建。
     #[must_use]
     pub fn new(profile: Profile, start_bps: u64, min_bps: u64, max_bps: u64) -> Self {
@@ -690,7 +715,6 @@ impl ClassicV1 {
             capacity: None,
             last_decrease: None,
             last_feedback: None,
-            queue_run: VecDeque::new(),
             notes: Vec::new(),
             noted_bps: start_bps,
             usage: Usage::Normal,
@@ -801,14 +825,8 @@ impl RateEstimator for ClassicV1 {
         self.usage = self.detect(now, &obs.ext);
         // 拥塞：趋势过载，或者排队一直很高（趋势线可能还没攒够点）。
         // 丢包只有在排队也一直在时才算拥塞；单独的随机丢包交给纠错和重传，不降码率。
-        // 发送端是不是在用满码率（没用满时送达速率只是“要发的量”，不代表链路能力）。看发送端实际发了多少：
-        // 链路突然变窄时送达速率也低，按它判断会把真拥塞当成没用满、反应变慢。不知道发了多少时按送达速率。
-        let using =
-            obs.sent_bps.unwrap_or(recv_bps).saturating_mul(10) >= self.rate_bps.saturating_mul(6);
-        // 明显没用满（发出的不到码率的四分之一，轻操作时的样子）才按“没用满”放宽拥塞判断（见下面的 `queue_us`）。
-        // 用户日志里轻操作时发出的不到码率的 2%；窄带上被预算、在途上限拦着时一般是码率的 30–60%，按 60% 划线时
-        // 窄带轨迹 ms-05729 卡顿 3 次合计 19 → 22，再加“在途多算用满”反而 75 → 94（36 次合计）
-        let idle_ish = obs.sent_bps.unwrap_or(recv_bps).saturating_mul(4) < self.rate_bps;
+        // 发送端是不是在用满码率（没用满时送达速率只是“要发的量”，不代表链路能力；升码率时用）
+        let using = recv_bps.saturating_mul(10) >= self.rate_bps.saturating_mul(6);
         // 排队读数只在反馈不断档时才算数：和上一份反馈相隔不超过 [`CONTIGUOUS_US`]，说明这段时间包一直在到，
         // 排队读数是链路在忙时量的，这时的送达速率也就是链路能力，按它降不会过头。断档的那份（画面静止时零星的小包）
         // 不算：它的排队读数是 Wi-Fi 省电（空闲后网卡要醒）的延迟，那份反馈里只有一两个包、送达速率被空闲时间稀释。
@@ -819,24 +837,13 @@ impl RateEstimator for ClassicV1 {
             .last_feedback
             .is_some_and(|t| now.since(t) <= CONTIGUOUS_US);
         self.last_feedback = Some(now);
-        let standing = self.standing_queue(now, fb.queue_delay_us, contiguous);
-        // 发送端没用满码率时（轻操作，每秒只发几百 kbps），自己的流量堆不出队列，单次高读数多半是 Wi-Fi 的延迟尖峰，
-        // 要持续 [`STANDING_US`] 才算。2026-11-26 用户日志（Wi-Fi 30 Mbps、轻操作）：趋势是平的，一次 13–27 ms 的读数
-        // 就按送达速率降，17 Mbps 掉到底线 100 kbps，编码器出 0 KB 的帧，画面 6 秒不动；168 秒里降码率 59 次，
-        // 39 次在没用满码率时。用满码率时照旧一份就算：窄带上要求持续会让真拥塞反应慢（连着 3 份才算时卡顿 31 → 58）。
-        let queue_us = if idle_ish {
-            standing.unwrap_or(0)
-        } else {
-            fb.queue_delay_us
-        };
-        let queue_high = queue_us > p.high_delay_us && contiguous;
+        let queue_high = fb.queue_delay_us > p.high_delay_us && contiguous;
         // 固有丢包慢慢跟（每份反馈 1/128，反馈 20 ms 一次时约 2.5 秒）
         let loss = u64::from(fb.loss_permille).saturating_mul(1000);
         self.inherent_loss = self.inherent_loss - self.inherent_loss / 128 + loss / 128;
         let inherent = u16::try_from(self.inherent_loss / 1000).unwrap_or(u16::MAX);
-        // 丢包也按上面的读数：没用满码率时一份反馈里只有几个包，丢一个就是几百‰（用户日志：2 个包丢 1 个，500‰）
         let lossy_and_queued = fb.loss_permille > p.loss_permille.saturating_add(inherent)
-            && queue_us > p.low_delay_us
+            && fb.queue_delay_us > p.low_delay_us
             && contiguous;
         let congested = self.usage == Usage::Over || queue_high || lossy_and_queued;
         // 一个往返（至少 100 ms）之内只降一次：同一次拥塞的反馈会连着来好几条。
@@ -851,13 +858,6 @@ impl RateEstimator for ClassicV1 {
                     recv_bps.saturating_mul(u64::from(p.decrease_permille)) / 1000
                 } else {
                     self.rate_bps.saturating_mul(u64::from(p.decrease_permille)) / 1000
-                };
-                // 没用满码率时送达速率只是“要发的量”，不是链路能力：一次最多降一半（每个往返一次，真拥塞时
-                // 几个往返也就降下来了），不一下降到要发的量的 85%（轻操作时就是底线）
-                let target = if idle_ish {
-                    target.max(self.rate_bps / 2)
-                } else {
-                    target
                 };
                 let from_bps = self.rate_bps;
                 self.rate_bps = self.rate_bps.min(target).clamp(self.min_bps, self.max_bps);
@@ -969,8 +969,19 @@ mod tests {
             ext,
             rtt_us: 20_000,
             in_flight: 0,
-            sent_bps: None,
         }
+    }
+
+    #[test]
+    fn rate_states_have_names_and_a_fixed_order() {
+        for (i, state) in RateState::ALL.iter().enumerate() {
+            assert_eq!(state.index(), i);
+            assert!(!state.name().is_empty());
+        }
+        assert_eq!(RateState::default(), RateState::Tracking);
+        // 还没有显式状态机的估计器一律报告“跟踪”
+        let v = ClassicV1::new(Profile::STABLE, 1_000_000, 100_000, 10_000_000);
+        assert_eq!(v.state(), RateState::Tracking);
     }
 
     #[test]
@@ -1253,10 +1264,9 @@ mod tests {
         t += 200_000;
         v.on_observation(Time(t), &obs(fb(10_000, 200, 125_000), normal));
         assert_eq!(v.rate_bps(), before, "随机丢包不降码率");
-        // 丢包明显高出固有丢包、排队持续 100 ms 以上：拥塞，降（这时码率可能已经升得比送达速率高不少，
-        // 算没用满码率，要排队持续才算）
+        // 丢包明显高出固有丢包、排队连着几份都在：拥塞，降
         t += 200_000;
-        for i in 0..7u64 {
+        for i in 0..3u64 {
             v.on_observation(Time(t + i * 20_000), &obs(fb(10_000, 400, 125_000), normal));
         }
         assert!(v.rate_bps() < before);
@@ -1284,21 +1294,20 @@ mod tests {
             );
         }
         assert_eq!(v.rate_bps(), 30_000_000);
-        // 连续在发、用满了码率（码率 2.4 Mbps、送达 2 Mbps）：断档后的第一份不算，第二份起排队高就按送达速率降
-        let mut u = ClassicV1::new(Profile::STABLE, 2_400_000, 100_000, 50_000_000);
+        // 连续在发（20 ms 一份反馈）：断档后的第一份不算，第二份起排队高就按送达速率（2 Mbps）降
         let t = 7_000_000;
-        u.on_observation(Time(t), &obs(fb(20_000, 0, 250_000), flat));
-        assert!(u.rate_bps() >= 2_400_000, "断档后的第一份不降");
-        u.on_observation(Time(t + 20_000), &obs(fb(20_000, 0, 250_000), flat));
-        assert_eq!(u.rate_bps(), 1_700_000);
-        // 连续在发、用满了码率时丢包明显、又在排队：拥塞
-        let mut x = ClassicV1::new(Profile::STABLE, 2_400_000, 100_000, 50_000_000);
+        v.on_observation(Time(t), &obs(fb(20_000, 0, 250_000), flat));
+        assert_eq!(v.rate_bps(), 30_000_000);
+        v.on_observation(Time(t + 20_000), &obs(fb(20_000, 0, 250_000), flat));
+        assert_eq!(v.rate_bps(), 1_700_000);
+        // 连续在发时丢包明显、又在排队：拥塞
+        let mut x = ClassicV1::new(Profile::STABLE, 30_000_000, 100_000, 50_000_000);
         for i in 0..2u64 {
             x.on_observation(Time(i * 20_000), &obs(fb(5_000, 200, 250_000), flat));
         }
         assert_eq!(x.rate_bps(), 1_700_000);
         // 延迟趋势过载：断档也算（趋势本身是很多组攒出来的）
-        let mut y = ClassicV1::new(Profile::STABLE, 2_400_000, 100_000, 50_000_000);
+        let mut y = ClassicV1::new(Profile::STABLE, 30_000_000, 100_000, 50_000_000);
         let over = Extension {
             trend_tenth_ms: 3000,
             groups: 20,
@@ -1306,55 +1315,7 @@ mod tests {
         };
         y.on_observation(Time(20_000), &obs(fb(0, 0, 250_000), over));
         assert_eq!(y.rate_bps(), 1_700_000);
-        // 没用满码率（码率 30 Mbps、送达 2 Mbps）时趋势过载：一次最多降一半，不一下降到送达速率的 85%
-        let mut z = ClassicV1::new(Profile::STABLE, 30_000_000, 100_000, 50_000_000);
-        z.on_observation(Time(20_000), &obs(fb(0, 0, 250_000), over));
-        assert_eq!(z.rate_bps(), 15_000_000);
-    }
-
-    /// 2026-11-26 用户日志：轻操作（没用满码率）时一次 Wi-Fi 尖峰把码率从 17 Mbps 降到底线，画面 6 秒不动。
-    #[test]
-    fn spikes_while_app_limited_need_a_standing_queue_and_cut_at_most_half() {
-        let flat = Extension {
-            groups: 10,
-            ..Extension::default()
-        };
-        let mut v = ClassicV1::new(Profile::STABLE, 30_000_000, 100_000, 50_000_000);
-        // 打字：20 ms 一份反馈、送达 200 kbps（远没用满）；中间一阵尖峰，三份排队 25 ms、其中一份 2 个包丢 1 个
-        let mut t = 0u64;
-        let feed = |v: &mut ClassicV1, t: &mut u64, queue: u32, loss: u16| {
-            *t += 20_000;
-            v.on_observation(Time(*t), &obs(fb(queue, loss, 25_000), flat));
-        };
-        for _ in 0..10 {
-            feed(&mut v, &mut t, 1_000, 0);
-        }
-        feed(&mut v, &mut t, 25_000, 0);
-        feed(&mut v, &mut t, 25_000, 500);
-        feed(&mut v, &mut t, 25_000, 0);
-        for _ in 0..10 {
-            feed(&mut v, &mut t, 1_000, 0);
-        }
-        assert_eq!(v.rate_bps(), 30_000_000, "尖峰不是常驻队列");
-        // 断档以后重新开始攒：刚开始的几份不够 100 ms，排队再高也不算
-        t += 1_000_000;
-        for _ in 0..5 {
-            feed(&mut v, &mut t, 30_000, 0);
-        }
-        assert_eq!(v.rate_bps(), 30_000_000, "不断档的反馈还不到 100 ms");
-        // 排队持续 100 ms 以上：常驻队列，降，但一次最多降一半（每个往返一次）
-        feed(&mut v, &mut t, 30_000, 0);
-        assert_eq!(v.rate_bps(), 15_000_000);
-        for _ in 0..4 {
-            feed(&mut v, &mut t, 30_000, 0);
-        }
-        assert_eq!(
-            v.rate_bps(),
-            15_000_000,
-            "一个往返（至少 100 ms）之内只降一次"
-        );
-        feed(&mut v, &mut t, 30_000, 0);
-        assert_eq!(v.rate_bps(), 7_500_000);
+        // 已知的局限：连续在发时碰上一阵 Wi-Fi 尖峰（排队 20 ms），也会按当时的送达速率降一次
     }
 
     #[test]
@@ -1395,9 +1356,9 @@ mod tests {
         v.on_observation(Time(300_000), &obs(fb(0, 0, 850_000), falling));
         assert_eq!(v.usage(), Usage::Under);
         assert_eq!(v.rate_bps(), 6_800_000);
-        // 排队一直很高（趋势线还没攒够点）：持续 100 ms 以上也降（送达速率是 0，算没用满码率）
+        // 排队一直很高（趋势线还没攒够点）：连着几份反馈之后也降
         let mut fresh = ClassicV1::new(Profile::STABLE, 10_000_000, 100_000, 100_000_000);
-        for i in 0..7u64 {
+        for i in 0..3u64 {
             fresh.on_observation(
                 Time(1 + i * 20_000),
                 &obs(fb(50_000, 0, 0), Extension::default()),

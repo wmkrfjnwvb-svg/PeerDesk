@@ -15,6 +15,7 @@ pub mod report;
 use peerdesk_core::adaptive::Profile;
 use peerdesk_core::error::Error;
 pub use peerdesk_core::estimator::EstimatorKind;
+pub use peerdesk_core::estimator::RateState;
 use peerdesk_core::media::{MediaReceiver, MediaSender, SenderConfig};
 pub use peerdesk_core::policy::ContentPolicy;
 use peerdesk_core::proto::{decode_datagram, encode_datagram, Channel, Header};
@@ -38,6 +39,10 @@ const IDLE_FEEDBACK_US: u64 = 1_000_000;
 pub const SHARP_DB: f64 = 38.0;
 /// 两次画面更新间隔超过这么久算一次卡顿（微秒）。
 pub const FREEZE_US: u64 = 200_000;
+
+/// 真实排队（瓶颈里的数据要排多久）超过这么久算“真实队列高”（微秒）。取无线画像判拥塞的排队门限 30 ms：
+/// 真实队列到了这个程度，发送端就不该还认为自己“应用受限”（见 [`StateShare`]）。
+pub const TRUE_QUEUE_HIGH_US: u64 = 30_000;
 
 /// 一对编码器和解码器。
 type Codecs = (Box<dyn VideoEncoder>, Box<dyn VideoDecoder>);
@@ -234,10 +239,90 @@ pub struct Outcome {
     pub freezes: u32,
     /// 发送端重传的分片数（和 `net.lost` 比：重传远多于丢包说明接收端在要还在路上的分片）。
     pub retransmitted: u32,
+    /// 码率控制各状态的时间，以及真实队列高时被判成应用受限的时间。
+    pub states: StateShare,
     /// 带宽估计器的名字。
     pub estimator: &'static str,
     /// 每次反馈一行特征，带着仿真知道的真实情况（以后训练 AI 模型用）。
     pub features: Vec<FeatureRow>,
+}
+
+/// 码率控制各状态占了多少时间，以及量尺的核对项：仿真知道瓶颈里真实排了多久，真实队列高
+/// （超过 [`TRUE_QUEUE_HIGH_US`]）的时间里，发送端有多少时间认为自己是“应用受限”。
+///
+/// 这个比例应当接近 0：真有队列时还当成应用受限，拥塞反应就被放宽了。2026-11-26 的几次尝试按
+/// “发出量 ÷ 码率”判应用受限，1 Mbps 链路上排队超过 30 ms 的反馈里 35–44% 被判成没用满，窄带卡顿变多。
+///
+/// 时间按仿真的事件精确累计（不是按反馈抽样）：两个事件之间状态不变，真实排队按瓶颈速率线性排掉。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StateShare {
+    /// 每个状态的时间（微秒），下标见 [`RateState::index`]。
+    pub state_us: [u64; RateState::ALL.len()],
+    /// 真实队列高的时间（微秒）。
+    pub queued_us: u64,
+    /// 真实队列高、同时处于应用受限的时间（微秒）。
+    pub queued_app_limited_us: u64,
+}
+
+impl StateShare {
+    /// 记一段时间：这段时间开始时处于 `state`、瓶颈里真实排着 `backlog_us`，之后 `dt_us` 里没有新的包进瓶颈。
+    pub fn add(&mut self, state: RateState, backlog_us: u64, dt_us: u64) {
+        if let Some(slot) = self.state_us.get_mut(state.index()) {
+            *slot = slot.saturating_add(dt_us);
+        }
+        // 排队按瓶颈速率线性排掉：这段时间里排队高于门限的部分是开头的 backlog − 门限
+        let high = backlog_us.saturating_sub(TRUE_QUEUE_HIGH_US).min(dt_us);
+        self.queued_us = self.queued_us.saturating_add(high);
+        if state == RateState::AppLimited {
+            self.queued_app_limited_us = self.queued_app_limited_us.saturating_add(high);
+        }
+    }
+
+    /// 把另一次运行的时间加进来（多次运行合计）。
+    pub fn merge(&mut self, other: &Self) {
+        for (a, b) in self.state_us.iter_mut().zip(other.state_us) {
+            *a = a.saturating_add(b);
+        }
+        self.queued_us = self.queued_us.saturating_add(other.queued_us);
+        self.queued_app_limited_us = self
+            .queued_app_limited_us
+            .saturating_add(other.queued_app_limited_us);
+    }
+
+    /// 某个状态的时间占比（千分比）。
+    #[must_use]
+    pub fn share_permille(&self, state: RateState) -> u64 {
+        let total: u64 = self.state_us.iter().sum();
+        let us = self.state_us.get(state.index()).copied().unwrap_or(0);
+        us.saturating_mul(1000) / total.max(1)
+    }
+
+    /// 真实队列高的时间里被判成应用受限的比例（千分比）；真实队列从没高过时为 0。
+    #[must_use]
+    pub fn queued_app_limited_permille(&self) -> u64 {
+        self.queued_app_limited_us.saturating_mul(1000) / self.queued_us.max(1)
+    }
+
+    /// 一行报告。
+    #[must_use]
+    pub fn line(&self) -> String {
+        let shares: Vec<String> = RateState::ALL
+            .iter()
+            .map(|s| {
+                let p = self.share_permille(*s);
+                format!("{} {}.{}%", s.name(), p / 10, p % 10)
+            })
+            .collect();
+        let q = self.queued_app_limited_permille();
+        format!(
+            "状态时间占比：{}；真实队列 > {} ms 共 {} ms，其中被判为应用受限 {}.{}%",
+            shares.join("、"),
+            TRUE_QUEUE_HIGH_US / 1000,
+            self.queued_us / 1000,
+            q / 10,
+            q % 10
+        )
+    }
 }
 
 /// 一行特征：发送端这一刻看到的，以及仿真知道的真实链路。
@@ -263,18 +348,22 @@ pub struct FeatureRow {
     pub true_rate_bps: u64,
     /// 真实的在途包数（链路里排着的）。
     pub true_queue_packets: usize,
+    /// 瓶颈里真实排着多久的数据（微秒）。
+    pub true_queue_us: u64,
+    /// 码率控制处理完这份反馈之后的状态。
+    pub state: RateState,
 }
 
 impl FeatureRow {
     /// CSV 表头。
     pub const HEADER: &'static str =
-        "t_ms,rate_bps,queue_us,trend_0.1ms,train_Bps,loss_permille,recv_Bps,in_flight_B,true_rate_bps,true_queue_pkts";
+        "t_ms,rate_bps,queue_us,trend_0.1ms,train_Bps,loss_permille,recv_Bps,in_flight_B,true_rate_bps,true_queue_pkts,true_queue_us,state";
 
     /// 一行 CSV。
     #[must_use]
     pub fn csv(&self) -> String {
         format!(
-            "{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{}",
             self.t_ms,
             self.rate_bps,
             self.queue_us,
@@ -284,7 +373,9 @@ impl FeatureRow {
             self.recv,
             self.in_flight,
             self.true_rate_bps,
-            self.true_queue_packets
+            self.true_queue_packets,
+            self.true_queue_us,
+            self.state.name()
         )
     }
 }
@@ -439,6 +530,7 @@ pub fn run(s: &Scenario) -> Result<Outcome, Error> {
     // 画面变了但还没编（在途数据满了）。
     let mut pending = false;
     let mut overall_freezes = 0u32;
+    let mut states = StateShare::default();
 
     let mut now = Time::ZERO;
     let mut next_feedback = Time(FEEDBACK_US);
@@ -539,6 +631,11 @@ pub fn run(s: &Scenario) -> Result<Outcome, Error> {
                 .min()
                 .filter(|t| *t < tick_end);
                 let Some(when) = next else { break };
+                states.add(
+                    tx.rate_state(),
+                    net.backlog_us(HOST, VIEWER),
+                    when.since(now),
+                );
                 net.advance_to(when);
                 now = when;
                 if next_tick <= now {
@@ -641,6 +738,8 @@ pub fn run(s: &Scenario) -> Result<Outcome, Error> {
                                 in_flight: obs.in_flight,
                                 true_rate_bps: link.rate_bps.unwrap_or(0),
                                 true_queue_packets: net.in_flight(),
+                                true_queue_us: net.backlog_us(HOST, VIEWER),
+                                state: tx.rate_state(),
                             });
                         }
                         continue;
@@ -683,6 +782,11 @@ pub fn run(s: &Scenario) -> Result<Outcome, Error> {
                     shown = Some(screen);
                 }
             }
+            states.add(
+                tx.rate_state(),
+                net.backlog_us(HOST, VIEWER),
+                tick_end.since(now),
+            );
             net.advance_to(tick_end);
             now = tick_end;
         }
@@ -732,6 +836,7 @@ pub fn run(s: &Scenario) -> Result<Outcome, Error> {
         first_picture_ms: first_picture.map(ms),
         freezes: overall_freezes,
         retransmitted: tx_stats.retransmitted,
+        states,
         estimator: tx.estimator(),
         features,
         trace,
@@ -740,7 +845,7 @@ pub fn run(s: &Scenario) -> Result<Outcome, Error> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
     use super::*;
 
     /// 一个很小的结果，给报告的测试用。
@@ -773,6 +878,48 @@ mod tests {
         assert!(luma_psnr(&Screen::new(0, 0, 0), &a).abs() < 1e-9);
         assert!(luma_psnr(&Screen::new(0, 0, 0), &Screen::new(0, 0, 0)).abs() < 1e-9);
         assert_eq!(CodecKind::Tile.name(), "tile");
+    }
+
+    #[test]
+    fn state_share_counts_time_exactly() {
+        let mut a = StateShare::default();
+        assert_eq!(a.queued_app_limited_permille(), 0, "真实队列从没高过");
+        assert_eq!(a.share_permille(RateState::Tracking), 0);
+        // 跟踪 100 ms，开头真实排队 50 ms：前 20 ms 高于 30 ms 门限
+        a.add(RateState::Tracking, 50_000, 100_000);
+        assert_eq!((a.queued_us, a.queued_app_limited_us), (20_000, 0));
+        // 应用受限 10 ms，真实排队 200 ms：整段都高，全记在应用受限上
+        a.add(RateState::AppLimited, 200_000, 10_000);
+        assert_eq!((a.queued_us, a.queued_app_limited_us), (30_000, 10_000));
+        // 排队不到门限：不算
+        a.add(RateState::AppLimited, 30_000, 90_000);
+        assert_eq!((a.queued_us, a.queued_app_limited_us), (30_000, 10_000));
+        assert_eq!(a.share_permille(RateState::Tracking), 500);
+        assert_eq!(a.share_permille(RateState::AppLimited), 500);
+        assert_eq!(a.queued_app_limited_permille(), 333);
+        let mut total = a;
+        total.merge(&a);
+        assert_eq!(total.state_us[RateState::Tracking.index()], 200_000);
+        assert_eq!(total.queued_us, 60_000);
+        assert_eq!(total.queued_app_limited_us, 20_000);
+        assert_eq!(
+            a.line(),
+            "状态时间占比：起步 0.0%、跟踪 50.0%、排空 0.0%、应用受限 50.0%、核实 0.0%；\
+             真实队列 > 30 ms 共 30 ms，其中被判为应用受限 33.3%"
+        );
+        // 一次真实运行：各状态时间加起来等于场景时长；特征行带真实排队和状态
+        let o = run(&Scenario::new(
+            "share",
+            vec![Phase {
+                action: Action::Typing,
+                frames: 30,
+            }],
+        ))
+        .unwrap();
+        assert_eq!(o.states.state_us.iter().sum::<u64>(), 30 * 33_333);
+        assert!(FeatureRow::HEADER.ends_with("true_queue_us,state"));
+        let row = o.features.first().unwrap();
+        assert!(row.csv().ends_with(&format!(",{},跟踪", row.true_queue_us)));
     }
 
     #[test]

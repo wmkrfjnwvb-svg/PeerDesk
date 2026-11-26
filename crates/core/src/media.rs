@@ -47,10 +47,6 @@ const IN_FLIGHT_RECENT_US: u64 = 100_000;
 pub const MAX_NACKS: usize = 48;
 /// 分片缺了多久才请求重传（微秒）：短于这个时间可能只是乱序。
 const NACK_AFTER_US: u64 = 10_000;
-/// 判断发送端用没用满码率时看多长时间里发出的帧（取 WebRTC 送达速率窗口的 150 ms；往返更长时按往返）。
-const SENT_WINDOW_US: u64 = 150_000;
-/// 发出记录最多留这么久（往返再长也不看更早的）。
-const SENT_LOG_US: u64 = 1_000_000;
 
 /// 反馈数据报：[`Feedback`]、扩展测量（[`Extension`]），后面跟着重传请求（个数 + 每个的帧号和分片序号）。
 #[must_use]
@@ -371,9 +367,6 @@ pub struct MediaSender {
     rate: Box<dyn RateEstimator>,
     /// 已发出、还没有定论的帧：(帧号, 发出时间, 线上字节数)。
     unacked: VecDeque<(u32, Time, u64)>,
-    /// 最近发出的帧：(发出时间, 线上字节数)，不含重传和探测，确认了也不删（只按时间丢），
-    /// 用来算发送端实际要发多少（见 [`Observation::sent_bps`]）。
-    sent_log: VecDeque<(Time, u64)>,
     last_frame: u32,
     last_key: u32,
     stats: SenderStats,
@@ -455,7 +448,6 @@ impl MediaSender {
             notes: (Vec::new(), None),
             refine: false,
             unacked: VecDeque::new(),
-            sent_log: VecDeque::new(),
             last_frame: 0,
             last_key: 0,
             stats: SenderStats::default(),
@@ -1112,16 +1104,8 @@ impl MediaSender {
             self.stats.keyframes = self.stats.keyframes.saturating_add(1);
         }
         let wire_total: usize = out.iter().map(|o| o.body.len()).sum();
-        let wire_total = u64::try_from(wire_total).unwrap_or(u64::MAX);
-        self.unacked.push_back((frame_id, now, wire_total));
-        self.sent_log.push_back((now, wire_total));
-        while self
-            .sent_log
-            .front()
-            .is_some_and(|(at, _)| now.since(*at) > SENT_LOG_US)
-        {
-            self.sent_log.pop_front();
-        }
+        self.unacked
+            .push_back((frame_id, now, u64::try_from(wire_total).unwrap_or(u64::MAX)));
         self.stats.frames = self.stats.frames.saturating_add(1);
         self.stats.video_bytes = self
             .stats
@@ -1265,6 +1249,12 @@ impl MediaSender {
         self.rate.name()
     }
 
+    /// 码率控制现在处于哪个状态（量尺统计各状态的时间占比用）。
+    #[must_use]
+    pub fn rate_state(&self) -> crate::estimator::RateState {
+        self.rate.state()
+    }
+
     /// 最近一次交给估计器的观测（特征记录用）。
     #[must_use]
     pub const fn last_observation(&self) -> Option<Observation> {
@@ -1309,25 +1299,12 @@ impl MediaSender {
         usize::try_from(budget.saturating_mul(left) / QUEUE_TARGET_US).unwrap_or(usize::MAX)
     }
 
-    /// 最近 max([`SENT_WINDOW_US`], 往返) 里发出的帧（不含重传、探测）折合的速率（比特每秒）：发送端实际要发多少。
-    fn sent_bps(&self, now: Time) -> u64 {
-        let window = SENT_WINDOW_US.max(self.rtt_us).min(SENT_LOG_US);
-        let bytes: u64 = self
-            .sent_log
-            .iter()
-            .filter(|(at, _)| now.since(*at) < window)
-            .map(|(_, b)| *b)
-            .sum();
-        bytes.saturating_mul(8_000_000) / window
-    }
-
     fn observe(&mut self, now: Time, feedback: &Feedback, ext: Extension) {
         let obs = Observation {
             feedback: *feedback,
             ext,
             rtt_us: self.rtt_us,
             in_flight: self.in_flight(),
-            sent_bps: Some(self.sent_bps(now)),
         };
         // 还没开始起步探测就看到明显丢包：不探（有丢包的链路上探测结果不准，码率一下提上去之后在丢包里来回降：
         // 微软轨迹 ms-02560，8 Mbps、12% 随机丢包，卡顿 0 → 3 次）

@@ -448,6 +448,16 @@ impl<T> Net<T> {
     pub fn in_flight(&self) -> usize {
         self.queue.len()
     }
+
+    /// `from → to` 方向瓶颈里现在真实排着多久的数据（微秒）：现在发一个包，要等这么久才轮到它。
+    /// 不限速或没有这条链路时为 0。这是仿真才知道的真实值，量尺用它核对发送端的判断
+    /// （例如“真实队列很高时有没有被判成应用受限”）。
+    #[must_use]
+    pub fn backlog_us(&self, from: usize, to: usize) -> u64 {
+        self.busy_until
+            .get(&(from, to))
+            .map_or(0, |busy| busy.since(self.now))
+    }
 }
 
 #[cfg(test)]
@@ -574,6 +584,32 @@ mod tests {
         );
         net.send(0, 1, 1000, 9);
         assert_eq!(net.pop().unwrap().at, net.now());
+    }
+
+    #[test]
+    fn backlog_is_the_true_wait_at_the_bottleneck() {
+        let mut net: Net<u32> = Net::new(3);
+        assert_eq!(net.backlog_us(0, 1), 0, "没有这条链路");
+        net.set_link(0, 1, Link::ideal());
+        net.send(0, 1, 1000, 0);
+        assert_eq!(net.backlog_us(0, 1), 0, "不限速不排队");
+        // 80 kbps：1000 字节的包要发 100 ms
+        net.set_link(
+            0,
+            1,
+            Link {
+                rate_bps: Some(80_000),
+                ..Link::ideal()
+            },
+        );
+        net.send(0, 1, 1000, 1);
+        net.send(0, 1, 1000, 2);
+        assert_eq!(net.backlog_us(0, 1), 200_000);
+        assert_eq!(net.backlog_us(1, 0), 0, "另一个方向没发");
+        net.advance_to(Time(150_000));
+        assert_eq!(net.backlog_us(0, 1), 50_000, "随时间排掉");
+        net.advance_to(Time(500_000));
+        assert_eq!(net.backlog_us(0, 1), 0);
     }
 
     #[test]
