@@ -16,8 +16,11 @@
 //!   回 [`ClipMsg::Applied`] 以后，再让对方执行粘贴（[`InputEvent::Paste`]）。
 //!   同一份内容只传一次：剪贴板没变就不再读；变了但内容一样（哈希相同）读了也不传。
 //!   等的时候鼠标、键盘照常发，只推迟这一次粘贴。界面显示进度（[`ClipNote::Sending`]），可以取消。
-//! - 被控端复制文件、图片：这个方向没有“粘贴”的时机可用（要用系统的延迟提供数据机制，
-//!   见 docs/research/clipboard-lazy.md），目前不同步，只告诉控制端（[`ClipNote::RemoteHeld`]）。
+//! - 收到对方的 `Held`：在本机系统剪贴板上放一个“承诺”（[`SystemClipboard::promise`]，只声明格式，
+//!   不放数据）。本机任何程序来取（快捷键、右键菜单“粘贴”、拖放）时系统回调，回调里向对方发
+//!   [`ClipMsg::Want`]，对方这时才读出来传；取到的留着，同一份不重传。两个方向一样，所以被控端复制、
+//!   控制端本机粘贴也是这条路。系统不支持放承诺时（目前是 Linux）退回只有上一条，反方向不同步并提示。
+//!   各系统的做法和限制见 docs/research/clipboard-lazy.md。
 //!
 //! 对方是老版本时保持原来的行为：复制后马上整份同步，粘贴键原样发。
 //!
@@ -29,7 +32,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use peerdesk_core::clipboard::{
-    packed_count, Clip, ClipKind, ClipMsg, Deframer, Limits, Offered, Received, Receiver, Sender,
+    packed_count, packed_top_level, Clip, ClipKind, ClipMsg, Deframer, Limits, Offered, Received,
+    Receiver, Sender,
 };
 use peerdesk_core::input::{InputEvent, MODIFIER_FIRST, MODIFIER_LAST};
 use quinn::{RecvStream, SendStream};
@@ -97,7 +101,9 @@ pub enum ClipNote {
     SendDone,
     /// 没传成，这次粘贴没有执行。
     SendFailed(SendFail),
-    /// 对方复制了内容，没有同步过来（粘贴时才传）。
+    /// 本机的程序来取对方的内容，没取到。
+    FetchFailed(FetchError),
+    /// 对方复制了内容，但本机系统不支持延迟提供数据，没有同步过来。
     RemoteHeld {
         /// 种类。
         kind: ClipKind,
@@ -130,8 +136,8 @@ pub enum Copied {
 pub enum Peeked {
     /// 文字（已经在内存里，读它不花什么）。
     Text(Clip),
-    /// 这种内容，没有读出来（文件要读盘、图片要编码）。
-    Later(ClipKind),
+    /// 这种内容，没有读出来（文件要读盘、图片要编码），和它有几项（文件：最上层的文件和文件夹数；其他为 1）。
+    Later(ClipKind, u16),
 }
 
 /// 本机剪贴板。真实实现在平台层；测试用 [`MemClipboard`]（测试不碰开发者电脑的剪贴板）。
@@ -145,8 +151,8 @@ pub trait SystemClipboard: Send + Sync {
     fn peek(&self) -> Option<Peeked> {
         Some(match self.read()? {
             Copied::Clip(clip) if clip.kind == ClipKind::Text => Peeked::Text(clip),
-            Copied::Clip(clip) => Peeked::Later(clip.kind),
-            Copied::TooLarge { kind, .. } => Peeked::Later(kind),
+            Copied::Clip(clip) => Peeked::Later(clip.kind, 1),
+            Copied::TooLarge { kind, .. } => Peeked::Later(kind, 1),
         })
     }
     /// 写入。
@@ -156,6 +162,73 @@ pub trait SystemClipboard: Send + Sync {
     /// 用户有没有点“取消”（取走：返回 `true` 以后复位）。传输期间每 100 ms 问一次。默认没有。
     fn take_cancel(&self) -> bool {
         false
+    }
+    /// 系统剪贴板里现在是不是 [`SystemClipboard::promise`] 放的承诺（没被本机的复制顶掉）。
+    /// 有的系统在程序来取数据时变化计数也会变，同步循环靠它区分“还是承诺”和“用户复制了新东西”。
+    fn promise_in_place(&self) -> bool {
+        false
+    }
+    /// 在系统剪贴板上放一个“承诺”：有这种内容，但数据不在这里；本机任何程序来取时（快捷键、
+    /// 右键菜单、拖放）系统回调，回调里用 [`Promise::get`] 向对方要。放上去以后变化计数会变。
+    /// 默认不支持（返回原因）：这时对方复制的内容不会出现在本机剪贴板里。
+    fn promise(&self, _promise: Promise) -> Result<(), String> {
+        Err("这个系统上还不支持延迟提供剪贴板数据".into())
+    }
+}
+
+/// 系统回调里等对方数据最多等这么久。回调期间来粘贴的那个程序在等（Windows 上它的界面没有响应），
+/// 所以不能长；超时以后传输还在继续，传完再粘贴一次就能拿到。
+pub const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 承诺的数据为什么没取到。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchError {
+    /// 等了 [`FETCH_TIMEOUT`] 还没传完（传输在继续）。
+    Timeout,
+    /// 对方给不了：剪贴板已经换了内容、读不出来或者太大。
+    Failed,
+    /// 会话已经结束。
+    Gone,
+}
+
+/// 向对方要数据：阻塞到数据到了、失败或者过了给定的时间。可以在任何线程上调用（不能在会话的异步线程上）。
+pub type Fetch = Arc<dyn Fn(Duration) -> Result<Clip, FetchError> + Send + Sync>;
+
+/// 放在系统剪贴板上的承诺（[`SystemClipboard::promise`]）。
+#[derive(Clone)]
+pub struct Promise {
+    /// 种类：决定在系统剪贴板上声明哪些格式。
+    pub kind: ClipKind,
+    /// 有几项（文件：最上层的文件和文件夹数；其他为 1）。
+    pub items: u16,
+    /// 取数据。
+    pub fetch: Fetch,
+}
+
+impl std::fmt::Debug for Promise {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Promise({:?}, {})", self.kind, self.items)
+    }
+}
+
+impl Promise {
+    /// 系统回调里用：取数据，取不到时通过 `note` 告诉用户原因（会话结束除外）并返回 `None`
+    /// （回调给系统空结果）。
+    pub fn get(&self, timeout: Duration, note: &dyn Fn(ClipNote)) -> Option<Clip> {
+        match (self.fetch)(timeout) {
+            Ok(clip) => Some(clip),
+            Err(why) => {
+                crate::note!(
+                    warn,
+                    "剪贴板：本机程序来取对方的 {:?}，没取到：{why:?}",
+                    self.kind
+                );
+                if why != FetchError::Gone {
+                    note(ClipNote::FetchFailed(why));
+                }
+                None
+            }
+        }
     }
 }
 
@@ -184,11 +257,42 @@ pub struct MemClipboard {
     cancel: AtomicBool,
     /// 内容读不出来（模拟文件没有权限读）：看得到种类，整份读时失败。
     unreadable: AtomicBool,
+    /// 支持放承诺（模拟有延迟提供数据机制的系统）；默认不支持。
+    promises: AtomicBool,
+    /// 现在放着的承诺。
+    promised: Mutex<Option<Promise>>,
 }
 
 impl MemClipboard {
+    /// 之后支持放承诺（模拟 Windows、macOS 这样有延迟提供数据机制的系统）。
+    pub fn enable_promises(&self) {
+        self.promises.store(true, Ordering::Relaxed);
+    }
+
+    fn promised(&self) -> std::sync::MutexGuard<'_, Option<Promise>> {
+        self.promised.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// 现在放着的承诺是什么种类、几项。
+    #[must_use]
+    pub fn promise_on_board(&self) -> Option<(ClipKind, u16)> {
+        self.promised().as_ref().map(|p| (p.kind, p.items))
+    }
+
+    /// 模拟本机的一个程序来粘贴：剪贴板上是承诺时向对方取（最多等 `timeout`，取不到为 `None`），
+    /// 否则就是剪贴板里的内容。会阻塞，不能在异步线程上直接调用。
+    #[must_use]
+    pub fn paste(&self, timeout: Duration) -> Option<Clip> {
+        let promise = self.promised().clone();
+        match promise {
+            Some(promise) => promise.get(timeout, &|note| self.note(note)),
+            None => self.get(),
+        }
+    }
+
     /// 模拟用户复制。
     pub fn copy(&self, clip: Clip) {
+        *self.promised() = None;
         let mut s = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         s.0 = s.0.wrapping_add(1);
         s.1 = Some(clip);
@@ -197,6 +301,7 @@ impl MemClipboard {
 
     /// 模拟用户复制了太大的内容（例如超过 20 MB 的文件）。
     pub fn copy_too_large(&self, kind: ClipKind, size: u64) {
+        *self.promised() = None;
         let mut s = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         s.0 = s.0.wrapping_add(1);
         s.1 = None;
@@ -205,6 +310,7 @@ impl MemClipboard {
 
     /// 模拟剪贴板被清空（或者换成了读不了的格式）。
     pub fn clear(&self) {
+        *self.promised() = None;
         let mut s = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         s.0 = s.0.wrapping_add(1);
         s.1 = None;
@@ -219,6 +325,12 @@ impl MemClipboard {
     /// 之后整份读都失败（`false` 恢复）：模拟复制的文件没有权限读。
     pub fn set_unreadable(&self, unreadable: bool) {
         self.unreadable.store(unreadable, Ordering::Relaxed);
+    }
+
+    /// 变化计数加一、内容不变：模拟系统在程序来取承诺的数据时动了计数（Windows 是这样）。
+    pub fn touch(&self) {
+        let mut s = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        s.0 = s.0.wrapping_add(1);
     }
 
     /// 模拟用户点“取消”。
@@ -268,15 +380,25 @@ impl SystemClipboard for MemClipboard {
     fn peek(&self) -> Option<Peeked> {
         let st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(Copied::TooLarge { kind, .. }) = &st.3 {
-            return Some(Peeked::Later(*kind));
+            return Some(Peeked::Later(*kind, 1));
         }
-        st.1.as_ref().map(|clip| {
-            if clip.kind == ClipKind::Text {
-                Peeked::Text(clip.clone())
-            } else {
-                Peeked::Later(clip.kind)
-            }
+        st.1.as_ref().map(|clip| match clip.kind {
+            ClipKind::Text => Peeked::Text(clip.clone()),
+            ClipKind::Files => Peeked::Later(clip.kind, packed_top_level(&clip.data)),
+            ClipKind::Png => Peeked::Later(clip.kind, 1),
         })
+    }
+    fn promise_in_place(&self) -> bool {
+        self.promised().is_some()
+    }
+    fn promise(&self, promise: Promise) -> Result<(), String> {
+        if !self.promises.load(Ordering::Relaxed) {
+            return Err("这个假剪贴板没有打开承诺".into());
+        }
+        // 承诺顶掉原来的内容（真实系统上也是：放承诺前先清空）
+        self.clear();
+        *self.promised() = Some(promise);
+        Ok(())
     }
     fn write(&self, clip: &Clip) -> Result<(), String> {
         let failing = &self.failing;
@@ -519,10 +641,13 @@ struct Transfer {
     msgs: usize,
 }
 
-/// 同步循环里和“粘贴时才传”有关的状态。
+/// 同步循环里“本机的内容给对方”这一半的状态。
 struct Lazy {
-    /// 本机剪贴板里有这种内容，还没给对方（粘贴时才传）。
+    /// 本机剪贴板里有这种内容，还没给对方（对方来要、或者在远程按粘贴时才传）。
     held: Option<ClipKind>,
+    /// 告诉对方“有这种内容”的那条 [`ClipMsg::Held`] 的序号和项数（对方用这个序号来要）。
+    held_seq: u32,
+    held_items: u16,
     /// 自己发出去、还在等对方确认的那一份的序号。
     awaiting: Option<u32>,
     /// 等这一份到了对方再执行的粘贴。
@@ -535,6 +660,115 @@ impl Lazy {
     fn answer(&mut self, verdict: Verdict) {
         for waiter in self.waiters.drain(..) {
             let _ = waiter.send(verdict);
+        }
+    }
+}
+
+/// 系统来取数据的一次请求（[`Promise`] 的取数函数发给同步循环）。
+struct FetchRequest {
+    /// 承诺对应的那条 `Held` 的序号。
+    seq: u32,
+    reply: std::sync::mpsc::SyncSender<Result<Clip, FetchError>>,
+}
+
+/// 已经从对方取到的内容：（承诺的序号，内容）。取数函数先看这里，有就不用等同步循环。
+type Fetched = Arc<Mutex<Option<(u32, Clip)>>>;
+
+/// 同步循环里“对方的内容给本机”这一半的状态：本机系统剪贴板上的承诺。
+struct Remote {
+    /// 本机系统剪贴板上放着对方这条 `Held`（序号）的承诺。`None`：没有（系统不支持，或者被本机的复制顶掉了）。
+    promised: Option<u32>,
+    fetched: Fetched,
+    /// 上一份取到的内容：对方说“和上次一样”（[`ClipMsg::Same`]）时接着用。
+    previous: Option<Clip>,
+    /// 正在等数据的程序。
+    fetchers: Vec<std::sync::mpsc::SyncSender<Result<Clip, FetchError>>>,
+    /// 已经向对方要过这一份了。
+    wanted: bool,
+    requests: mpsc::UnboundedSender<FetchRequest>,
+}
+
+impl Remote {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<(u32, Clip)>> {
+        self.fetched.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// 等数据的程序都得到这个结果。
+    fn answer(&mut self, result: &Result<Clip, FetchError>) {
+        self.wanted = false;
+        for fetcher in self.fetchers.drain(..) {
+            let _ = fetcher.try_send(result.clone());
+        }
+    }
+
+    /// 承诺的内容到了：记下来，交给等着的程序。
+    fn deliver(&mut self, seq: u32, clip: Clip) {
+        *self.lock() = Some((seq, clip.clone()));
+        self.answer(&Ok(clip));
+    }
+
+    /// 对方说这条 `Held` 的内容和上次发的一样：接着用上一份。返回内容是不是在本机可用。
+    fn same(&mut self, seq: u32) -> bool {
+        match (self.promised, self.previous.take()) {
+            (Some(promised), Some(clip)) if promised == seq => {
+                self.deliver(seq, clip);
+                true
+            }
+            // 上一份已经不在了（不应该发生：本机换过内容的话对方不会说“一样”）：让对方重新传
+            (Some(_), _) => {
+                self.answer(&Err(FetchError::Failed));
+                false
+            }
+            // 没有承诺（系统不支持）：上一份当时已经写进了本机剪贴板
+            (None, _) => true,
+        }
+    }
+
+    /// 对方的剪贴板换了内容：取到的那份留作“上一份”，等着的程序拿不到了。
+    fn superseded(&mut self) {
+        let taken = self.lock().take();
+        if let Some((_, clip)) = taken {
+            self.previous = Some(clip);
+        }
+        self.promised = None;
+        self.answer(&Err(FetchError::Failed));
+    }
+
+    /// 本机剪贴板被本机的复制顶掉了：承诺没了，取到的内容也不用留。
+    fn dropped(&mut self) {
+        *self.lock() = None;
+        self.previous = None;
+        self.promised = None;
+        self.answer(&Err(FetchError::Failed));
+    }
+
+    /// 给系统剪贴板用的承诺：取数函数先看有没有取到过，没有就向同步循环要，等到超时。
+    fn promise(&self, seq: u32, kind: ClipKind, items: u16) -> Promise {
+        let fetched = Arc::clone(&self.fetched);
+        let requests = self.requests.clone();
+        Promise {
+            kind,
+            items,
+            fetch: Arc::new(move |timeout| {
+                let ready = fetched
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .as_ref()
+                    .filter(|(s, _)| *s == seq)
+                    .map(|(_, clip)| clip.clone());
+                if let Some(clip) = ready {
+                    return Ok(clip);
+                }
+                let (reply, result) = std::sync::mpsc::sync_channel(1);
+                if requests.send(FetchRequest { seq, reply }).is_err() {
+                    return Err(FetchError::Gone);
+                }
+                match result.recv_timeout(timeout) {
+                    Ok(result) => result,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(FetchError::Timeout),
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(FetchError::Gone),
+                }
+            }),
         }
     }
 }
@@ -556,13 +790,24 @@ pub async fn run(
     } = opts;
     // 流已经关了时设不上，随后的读写会报出来
     let _ = send.set_priority(STREAM_PRIORITY);
-    // 要回给对方的确认（不放进 sender 的队列：新的复制会清掉那个队列）
+    // 要回给对方的确认和请求（不放进 sender 的队列：新的复制会清掉那个队列）
     let mut acks: VecDeque<ClipMsg> = VecDeque::new();
     let mut state = Lazy {
         held: None,
+        held_seq: 0,
+        held_items: 1,
         awaiting: None,
         waiters: Vec::new(),
         transfer: None,
+    };
+    let (requests, mut fetches) = mpsc::unbounded_channel();
+    let mut remote = Remote {
+        promised: None,
+        fetched: Arc::default(),
+        previous: None,
+        fetchers: Vec::new(),
+        wanted: false,
+        requests,
     };
     let mut sender = Sender::new(limits);
     let mut receiver = Receiver::new(limits);
@@ -597,29 +842,74 @@ pub async fn run(
                     return Ok(());
                 };
                 for msg in deframer.push(buf.get(..n).unwrap_or_default())? {
-                    if let ClipMsg::Applied { seq, ok } = msg {
-                        if state.awaiting == Some(seq) {
-                            state.awaiting = None;
-                            let transfer = state.transfer.take();
-                            if ok {
-                                if transfer.is_some() {
+                    match msg {
+                        ClipMsg::Applied { seq, ok } => {
+                            if state.awaiting == Some(seq) {
+                                state.awaiting = None;
+                                let transfer = state.transfer.take();
+                                if ok {
                                     state.held = None;
-                                    crate::note!(info, "剪贴板：内容已经在对方的剪贴板里，执行粘贴");
-                                    clipboard.note(ClipNote::SendDone);
+                                    crate::note!(info, "剪贴板：内容已经在对方那里");
+                                    if transfer.is_some() {
+                                        clipboard.note(ClipNote::SendDone);
+                                    }
+                                    state.answer(Verdict::Go);
+                                } else {
+                                    // 没进对方的剪贴板：忘掉这一份，用户再按粘贴时重新传
+                                    crate::note!(warn, "剪贴板：内容传到了，但对方的剪贴板写不进去，这次粘贴不执行");
+                                    sender.forget();
+                                    clipboard.note(ClipNote::SendFailed(SendFail::RemoteWrite));
+                                    state.answer(Verdict::Drop);
                                 }
-                                state.answer(Verdict::Go);
-                            } else {
-                                // 没进对方的剪贴板：忘掉这一份，用户再按粘贴时重新传
-                                crate::note!(warn, "剪贴板：内容传到了，但对方的剪贴板写不进去，这次粘贴不执行");
-                                sender.forget();
-                                clipboard.note(ClipNote::SendFailed(SendFail::RemoteWrite));
-                                state.answer(Verdict::Drop);
                             }
+                            continue;
                         }
-                        continue;
+                        // 对方的某个程序来取数据了（右键菜单“粘贴”、快捷键、拖放）：现在读出来传过去
+                        ClipMsg::Want { seq } => {
+                            let current = state.held.filter(|_| state.held_seq == seq);
+                            if let Some(kind) = current {
+                                if state.awaiting.is_none() {
+                                    crate::note!(info, "剪贴板：对方的程序来取 {kind:?}，现在传");
+                                    pull(&clipboard, &mut sender, &mut state, &mut acks, files).await?;
+                                }
+                            }
+                            // 给不了（已经换了内容、读不出来、太大）：告诉对方，别让那个程序干等
+                            if current.is_none() || state.awaiting.is_none() {
+                                acks.push_back(ClipMsg::Unavailable { seq });
+                            }
+                            continue;
+                        }
+                        ClipMsg::Unavailable { seq } => {
+                            if remote.promised == Some(seq) {
+                                crate::note!(warn, "剪贴板：对方给不了承诺的内容（已经换了、读不出来或太大）");
+                                remote.answer(&Err(FetchError::Failed));
+                            }
+                            continue;
+                        }
+                        // 对方又复制了一遍同样的内容：接着用上一份
+                        ClipMsg::Same { seq } => {
+                            let ok = remote.same(seq);
+                            acks.push_back(ClipMsg::Applied { seq, ok });
+                            continue;
+                        }
+                        ClipMsg::Offer { .. }
+                        | ClipMsg::Chunk { .. }
+                        | ClipMsg::Done { .. }
+                        | ClipMsg::TooLarge { .. }
+                        | ClipMsg::Held { .. } => {}
                     }
                     let done = if let ClipMsg::Done { seq, .. } = &msg { Some(*seq) } else { None };
                     match receiver.on_msg(msg)? {
+                        // 本机系统剪贴板上放着承诺：内容不写进剪贴板，交给来取的程序（没有人在取就先留着）
+                        Some(Received::Clip(clip)) if remote.promised.is_some() => {
+                            crate::note!(info, "剪贴板：承诺的 {:?} {} 字节到了", clip.kind, clip.data.len());
+                            if let Some(promised) = remote.promised {
+                                remote.deliver(promised, clip);
+                            }
+                            if let Some(seq) = done {
+                                acks.push_back(ClipMsg::Applied { seq, ok: true });
+                            }
+                        }
                         Some(Received::Clip(clip)) => {
                             let (kind, size) = (clip.kind, len64(&clip));
                             // 和本机剪贴板现在的内容比一下（对方的内容可能比本机这边的轮询先到）。
@@ -628,7 +918,7 @@ pub async fn run(
                             let current = if lazy {
                                 match blocking(&clipboard, |c| c.peek()).await? {
                                     Some(Peeked::Text(text)) => Some(text),
-                                    Some(Peeked::Later(_)) | None => None,
+                                    Some(Peeked::Later(..)) | None => None,
                                 }
                             } else {
                                 match blocking(&clipboard, |c| c.read()).await? {
@@ -670,12 +960,27 @@ pub async fn run(
                         Some(Received::TooLarge { kind, size }) => {
                             crate::note!(info, "剪贴板：对方复制的 {kind:?} {size} 字节超过上限，没有同步");
                             clipboard.note(ClipNote::RemoteTooLarge { kind, size });
+                            remote.answer(&Err(FetchError::Failed));
                         }
-                        Some(Received::Held { kind }) => {
-                            crate::note!(info, "剪贴板：对方的剪贴板里是 {kind:?}，没有发过来（粘贴时才传）");
+                        Some(Received::Held { seq, kind, items }) => {
                             // 对方的剪贴板换了内容：上次发过去的那份已经不在了，再粘贴要重新传
                             sender.peer_changed();
-                            clipboard.note(ClipNote::RemoteHeld { kind });
+                            remote.superseded();
+                            // 在本机系统剪贴板上放承诺：本机任何程序来取时才向对方要
+                            let promise = remote.promise(seq, kind, items);
+                            match blocking(&clipboard, move |c| c.promise(promise)).await? {
+                                Ok(()) => {
+                                    crate::note!(info, "剪贴板：对方复制了 {kind:?}（{items} 项），本机放了承诺，有程序来取时再传");
+                                    remote.promised = Some(seq);
+                                    seen = blocking(&clipboard, |c| c.change_count()).await?;
+                                    // 本机剪贴板现在是对方的承诺，没有自己的内容要给对方了
+                                    state.held = None;
+                                }
+                                Err(why) => {
+                                    crate::note!(info, "剪贴板：对方复制了 {kind:?}，本机放不了承诺（{why}），没有同步过来");
+                                    clipboard.note(ClipNote::RemoteHeld { kind });
+                                }
+                            }
                         }
                         None => {}
                     }
@@ -690,16 +995,36 @@ pub async fn run(
                 };
                 // 马上看一眼本机剪贴板（不等下一次轮询）；正在传的时候不看，传完再说
                 if state.transfer.is_none() {
-                    refresh(&clipboard, &mut seen, &mut sender, &mut state, files, lazy).await?;
+                    refresh(&clipboard, &mut seen, &mut sender, &mut state, &mut remote, files, lazy).await?;
                 }
                 if state.awaiting.is_some() {
-                    // 正在发的那一份（上一次粘贴触发的传输）到了再粘贴
+                    // 正在发的那一份（上一次粘贴或者对方来取触发的传输）到了再粘贴
                     state.waiters.push(reply);
-                } else if let Some(kind) = state.held {
+                } else if state.held.is_some() {
                     state.waiters.push(reply);
-                    pull(&clipboard, &mut sender, &mut state, kind, files).await?;
+                    pull(&clipboard, &mut sender, &mut state, &mut acks, files).await?;
                 } else {
                     let _ = reply.send(Verdict::Go);
+                }
+            }
+            // 本机的某个程序来取承诺的数据
+            Some(request) = fetches.recv() => {
+                let ready = remote
+                    .lock()
+                    .as_ref()
+                    .filter(|(seq, _)| *seq == request.seq)
+                    .map(|(_, clip)| clip.clone());
+                if let Some(clip) = ready {
+                    let _ = request.reply.try_send(Ok(clip));
+                } else if remote.promised == Some(request.seq) {
+                    remote.fetchers.push(request.reply);
+                    if !remote.wanted {
+                        remote.wanted = true;
+                        acks.push_back(ClipMsg::Want { seq: request.seq });
+                    }
+                } else {
+                    // 过时的承诺（对方已经换了内容）
+                    let _ = request.reply.try_send(Err(FetchError::Failed));
                 }
             }
             _ = tick.tick() => {
@@ -712,7 +1037,8 @@ pub async fn run(
                         let kind = t.kind;
                         // 没发完的作废，告诉对方丢掉收到的那一半；内容还在本机，下次粘贴重新传
                         sender.forget();
-                        sender.announce_held(kind);
+                        sender.announce_held(kind, state.held_items);
+                        state.held_seq = sender.seq();
                         state.transfer = None;
                         state.awaiting = None;
                         state.held = Some(kind);
@@ -728,7 +1054,7 @@ pub async fn run(
                     None => {
                         // 没在传的时候点的取消不留到下一次
                         let _ = clipboard.take_cancel();
-                        refresh(&clipboard, &mut seen, &mut sender, &mut state, files, lazy).await?;
+                        refresh(&clipboard, &mut seen, &mut sender, &mut state, &mut remote, files, lazy).await?;
                     }
                 }
             }
@@ -766,12 +1092,13 @@ async fn next_paste(paste: Option<&mut PasteRequests>) -> Option<oneshot::Sender
     }
 }
 
-/// 本机剪贴板变了没有；变了就按内容决定：马上发，还是记下来等粘贴。
+/// 本机剪贴板变了没有；变了就按内容决定：马上发（对方是老版本），还是记下来等对方来要。
 async fn refresh(
     clipboard: &Arc<dyn SystemClipboard>,
     seen: &mut u64,
     sender: &mut Sender,
     state: &mut Lazy,
+    remote: &mut Remote,
     files: bool,
     lazy: bool,
 ) -> Result<(), NetError> {
@@ -780,6 +1107,10 @@ async fn refresh(
         return Ok(());
     }
     *seen = count;
+    // 计数变了，但剪贴板里还是我们放的承诺（Windows 在程序来取数据时序号会变）：不是本机复制了东西
+    if remote.promised.is_some() && blocking(clipboard, |c| c.promise_in_place()).await? {
+        return Ok(());
+    }
     if !lazy {
         // 对方是老版本：和原来一样，整份读出来马上发
         let started = std::time::Instant::now();
@@ -793,32 +1124,40 @@ async fn refresh(
         }
         return Ok(());
     }
+    // 本机复制了新东西：之前放的承诺（对方的内容）被顶掉了
+    if remote.promised.is_some() {
+        crate::note!(info, "剪贴板：本机复制了新内容，对方内容的承诺作废");
+    }
+    remote.dropped();
+    // 任何内容都一样：复制时不传，只告诉对方有什么
     match blocking(clipboard, |c| c.peek()).await? {
-        // 文字也一样：复制时不传，粘贴时才传
-        Some(Peeked::Text(_)) => hold(sender, state, ClipKind::Text),
-        Some(Peeked::Later(kind)) => hold(sender, state, kind),
+        Some(Peeked::Text(_)) => hold(sender, state, ClipKind::Text, 1),
+        Some(Peeked::Later(kind, items)) => hold(sender, state, kind, items),
         None => state.held = None,
     }
     Ok(())
 }
 
-/// 记下本机有这种内容、等粘贴时才传，并告诉对方。
-fn hold(sender: &mut Sender, state: &mut Lazy, kind: ClipKind) {
+/// 记下本机有这种内容、等对方来要时才传，并告诉对方。
+fn hold(sender: &mut Sender, state: &mut Lazy, kind: ClipKind, items: u16) {
     crate::note!(
         info,
-        "剪贴板：本机复制了 {kind:?}，先不传，等在远程按粘贴时再传"
+        "剪贴板：本机复制了 {kind:?}（{items} 项），先不传，对方来取或者在远程按粘贴时再传"
     );
     state.held = Some(kind);
+    state.held_items = items;
     state.awaiting = None;
-    sender.announce_held(kind);
+    sender.announce_held(kind, items);
+    state.held_seq = sender.seq();
 }
 
-/// 用户按了粘贴、本机有还没给对方的内容：现在读出来开始传。传不了时答复等着的粘贴。
+/// 本机有还没给对方的内容，现在要用了（在远程按了粘贴，或者对方的程序来取）：读出来开始传。
+/// 开始传了（或者和上次发的一样、不用传）以后 `state.awaiting` 有值；传不了时答复等着的粘贴。
 async fn pull(
     clipboard: &Arc<dyn SystemClipboard>,
     sender: &mut Sender,
     state: &mut Lazy,
-    kind: ClipKind,
+    acks: &mut VecDeque<ClipMsg>,
     files: bool,
 ) -> Result<(), NetError> {
     let started = std::time::Instant::now();
@@ -826,7 +1165,7 @@ async fn pull(
         None => {
             crate::note!(
                 warn,
-                "剪贴板：按了粘贴，但本机剪贴板里的 {kind:?} 读不出来，这次粘贴不执行"
+                "剪贴板：要传本机剪贴板里的内容，但读不出来，这次粘贴不执行"
             );
             clipboard.note(ClipNote::SendFailed(SendFail::Unreadable));
             None
@@ -850,10 +1189,12 @@ async fn pull(
                     msgs: sender.pending(),
                 })
             } else if sender.seq() == before && sender.is_local(&clip) {
-                // 和对方已有的是同一份（哈希相同）：不用传，直接粘贴
-                crate::note!(info, "剪贴板：这份内容对方已经有了，不再传");
-                state.held = None;
-                state.answer(Verdict::Go);
+                // 和上次发过去的是同一份（哈希相同）：不重传，让对方接着用上一份，等它确认
+                crate::note!(info, "剪贴板：这份内容和上次发的一样，不再传");
+                acks.push_back(ClipMsg::Same {
+                    seq: state.held_seq,
+                });
+                state.awaiting = Some(state.held_seq);
                 return Ok(());
             } else {
                 None
@@ -997,12 +1338,12 @@ mod tests {
             kind: ClipKind::Png,
             data: vec![1],
         })));
-        assert_eq!(png.peek(), Some(Peeked::Later(ClipKind::Png)));
+        assert_eq!(png.peek(), Some(Peeked::Later(ClipKind::Png, 1)));
         let big = Plain(Some(Copied::TooLarge {
             kind: ClipKind::Files,
             size: 1,
         }));
-        assert_eq!(big.peek(), Some(Peeked::Later(ClipKind::Files)));
+        assert_eq!(big.peek(), Some(Peeked::Later(ClipKind::Files, 1)));
         let probe = RttProbe(Arc::new(|| Duration::from_millis(3)));
         assert_eq!(format!("{probe:?}"), "RttProbe");
         assert_eq!((probe.0)(), Duration::from_millis(3));
@@ -1018,9 +1359,9 @@ mod tests {
             kind: ClipKind::Files,
             data: vec![0, 0],
         });
-        assert_eq!(clip.peek(), Some(Peeked::Later(ClipKind::Files)));
+        assert_eq!(clip.peek(), Some(Peeked::Later(ClipKind::Files, 0)));
         clip.copy_too_large(ClipKind::Png, 9);
-        assert_eq!(clip.peek(), Some(Peeked::Later(ClipKind::Png)));
+        assert_eq!(clip.peek(), Some(Peeked::Later(ClipKind::Png, 1)));
         assert_eq!(clip.reads(), 0);
         assert!(matches!(clip.read(), Some(Copied::TooLarge { .. })));
         assert_eq!(clip.reads(), 1);
@@ -1033,6 +1374,134 @@ mod tests {
         clip.cancel();
         assert!(clip.take_cancel());
         assert!(!clip.take_cancel());
+    }
+
+    #[test]
+    fn the_memory_clipboard_holds_a_promise_until_the_next_copy() {
+        let clip = MemClipboard::default();
+        let promise = |result: Result<Clip, FetchError>| Promise {
+            kind: ClipKind::Png,
+            items: 1,
+            fetch: Arc::new(move |_| result.clone()),
+        };
+        // 默认不支持（没有延迟提供数据机制的系统）
+        assert!(clip.promise(promise(Err(FetchError::Gone))).is_err());
+        assert!(Plain(None).promise(promise(Err(FetchError::Gone))).is_err());
+        clip.enable_promises();
+        clip.copy(Clip::text("本机原来的"));
+        let before = clip.change_count();
+        let png = Clip {
+            kind: ClipKind::Png,
+            data: vec![1, 2],
+        };
+        clip.promise(promise(Ok(png.clone()))).unwrap();
+        assert_eq!(format!("{:?}", promise(Ok(png.clone()))), "Promise(Png, 1)");
+        // 放上承诺：原来的内容没了，计数变了；看和读都是空的（不会把承诺当成本机复制的）
+        assert_ne!(clip.change_count(), before);
+        assert_eq!(clip.promise_on_board(), Some((ClipKind::Png, 1)));
+        assert!(clip.promise_in_place() && !Plain(None).promise_in_place());
+        let count = clip.change_count();
+        clip.touch();
+        assert!(clip.promise_in_place() && clip.change_count() != count);
+        assert_eq!((clip.get(), clip.peek(), clip.read()), (None, None, None));
+        // 程序来粘贴：取到
+        assert_eq!(clip.paste(Duration::ZERO), Some(png));
+        // 取不到：告诉用户原因；会话已经结束就不说了
+        for (why, noted) in [
+            (FetchError::Timeout, true),
+            (FetchError::Failed, true),
+            (FetchError::Gone, false),
+        ] {
+            let had = clip.notes().len();
+            clip.promise(promise(Err(why))).unwrap();
+            assert_eq!(clip.paste(Duration::ZERO), None);
+            let notes = clip.notes();
+            assert_eq!(notes.len() > had, noted);
+            if noted {
+                assert_eq!(notes.last(), Some(&ClipNote::FetchFailed(why)));
+            }
+        }
+        // 本机复制、清空、复制太大的内容：承诺被顶掉
+        clip.copy(Clip::text("新的"));
+        assert_eq!(clip.promise_on_board(), None);
+        assert_eq!(clip.paste(Duration::ZERO), Some(Clip::text("新的")));
+        clip.promise(promise(Err(FetchError::Gone))).unwrap();
+        clip.copy_too_large(ClipKind::Files, 9);
+        assert_eq!(clip.promise_on_board(), None);
+        clip.promise(promise(Err(FetchError::Gone))).unwrap();
+        clip.clear();
+        assert_eq!(clip.promise_on_board(), None);
+    }
+
+    fn remote() -> (Remote, mpsc::UnboundedReceiver<FetchRequest>) {
+        let (requests, fetches) = mpsc::unbounded_channel();
+        let remote = Remote {
+            promised: None,
+            fetched: Arc::default(),
+            previous: None,
+            fetchers: Vec::new(),
+            wanted: false,
+            requests,
+        };
+        (remote, fetches)
+    }
+
+    #[test]
+    fn a_promise_fetches_once_and_reuses_what_it_got() {
+        let (mut r, mut fetches) = remote();
+        let text = Clip::text("对方的内容");
+        r.promised = Some(7);
+        let promise = r.promise(7, ClipKind::Text, 1);
+        // 没取到过：向同步循环要，等到超时
+        assert_eq!(
+            (promise.fetch)(Duration::from_millis(5)),
+            Err(FetchError::Timeout)
+        );
+        let request = fetches.try_recv().unwrap();
+        assert_eq!(request.seq, 7);
+        // 同步循环答复了：等着的程序拿到
+        let waiting = std::thread::spawn({
+            let promise = promise.clone();
+            move || (promise.fetch)(Duration::from_secs(5))
+        });
+        let request = fetches.blocking_recv().unwrap();
+        r.fetchers.push(request.reply);
+        r.wanted = true;
+        r.deliver(7, text.clone());
+        assert_eq!(waiting.join().unwrap(), Ok(text.clone()));
+        assert!(!r.wanted);
+        // 取到过：不再问同步循环
+        assert_eq!((promise.fetch)(Duration::ZERO), Ok(text.clone()));
+        assert!(fetches.try_recv().is_err());
+        // 对方换了内容：取到的留作上一份；说“和上次一样”时接着用
+        r.superseded();
+        assert_eq!(r.promised, None);
+        r.promised = Some(8);
+        assert!(r.same(8));
+        let again = r.promise(8, ClipKind::Text, 1);
+        assert_eq!((again.fetch)(Duration::ZERO), Ok(text));
+        // 上一份不在了、序号对不上：让对方重新传；没有承诺（系统不支持）：算在
+        assert!(!r.same(8));
+        r.superseded();
+        r.promised = Some(9);
+        assert!(!r.same(10));
+        r.promised = None;
+        assert!(r.same(11));
+        // 本机复制了新内容：什么都不留，等着的程序拿到失败
+        let (reply, result) = std::sync::mpsc::sync_channel(1);
+        r.fetchers.push(reply);
+        r.dropped();
+        assert_eq!(result.recv().unwrap(), Err(FetchError::Failed));
+        assert!(r.previous.is_none() && r.lock().is_none());
+        // 同步循环没了：会话已经结束
+        drop(fetches);
+        assert_eq!((promise.fetch)(Duration::ZERO), Err(FetchError::Gone));
+        let (r, fetches) = remote();
+        let promise = r.promise(1, ClipKind::Png, 1);
+        let waiting = std::thread::spawn(move || (promise.fetch)(Duration::from_secs(5)));
+        let mut fetches = fetches;
+        drop(fetches.blocking_recv());
+        assert_eq!(waiting.join().unwrap(), Err(FetchError::Gone));
     }
 
     const fn key(code: u16, down: bool) -> InputEvent {

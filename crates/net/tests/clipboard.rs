@@ -10,7 +10,9 @@ use peerdesk_core::crypto::Policy;
 use peerdesk_core::input::InputEvent;
 use peerdesk_core::proto::Caps;
 use peerdesk_core::session::SessionConfig;
-use peerdesk_net::clipsync::{ClipNote, ClipboardHandle, MemClipboard, SendFail};
+use peerdesk_net::clipsync::{
+    ClipNote, ClipboardHandle, FetchError, MemClipboard, SendFail, SystemClipboard,
+};
 use peerdesk_net::controller::{self, ControllerOptions};
 use peerdesk_net::demo::{CountSink, DemoDesktop};
 use peerdesk_net::host::{self, HostOptions, InputSink};
@@ -76,7 +78,20 @@ struct Recorder {
 }
 impl InputSink for Recorder {
     fn inject(&mut self, event: &InputEvent) {
-        let now = self.clip.get();
+        // 剪贴板上是承诺时（模拟有延迟提供数据机制的系统）：按下 V 的那一刻模拟程序来取，
+        // 只等 1 ms，所以只有内容已经先到了才取得到
+        let pasting = matches!(
+            event,
+            InputEvent::Key {
+                code: 0x19,
+                down: true
+            }
+        );
+        let now = if pasting && self.clip.promise_on_board().is_some() {
+            self.clip.paste(Duration::from_millis(1))
+        } else {
+            self.clip.get()
+        };
         self.typed.lock().unwrap().push((event.clone(), now));
     }
 }
@@ -563,7 +578,16 @@ async fn files_are_sent_when_pasted_not_when_copied() {
         tokio::time::sleep(Duration::from_millis(300)).await;
         send(&input, &CTRL_V).await;
         arrives_within(&host, &files, Duration::from_secs(10)).await;
-        assert_eq!(received(&host), 2);
+        // 提示在写入之后才发，等它一下
+        let start = Instant::now();
+        while received(&host) != 2 {
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "{}",
+                received(&host)
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     })
     .await;
 }
@@ -716,5 +740,185 @@ async fn an_old_peer_gets_the_old_behaviour() {
                 .any(|n| matches!(n, ClipNote::Sending { .. })));
         },
     )
+    .await;
+}
+
+/// 模拟本机的一个程序来粘贴（会阻塞，放到阻塞线程上）。
+async fn paste(clip: &Arc<MemClipboard>, timeout: Duration) -> Option<Clip> {
+    let clip = Arc::clone(clip);
+    tokio::task::spawn_blocking(move || clip.paste(timeout))
+        .await
+        .unwrap()
+}
+
+/// 等 `clip` 上出现这种承诺。
+async fn promised(clip: &MemClipboard, want: (ClipKind, u16)) {
+    promised_since(clip, u64::MAX, want).await;
+}
+
+/// 等 `clip` 上换成这种承诺（变化计数不再是 `before`）：前后两个承诺种类相同时用。
+async fn promised_since(clip: &MemClipboard, before: u64, want: (ClipKind, u16)) {
+    let start = Instant::now();
+    while clip.promise_on_board() != Some(want) || clip.change_count() == before {
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "没有等到承诺 {want:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+fn sends_started(clip: &MemClipboard) -> usize {
+    clip.notes()
+        .iter()
+        .filter(|n| matches!(n, ClipNote::Sending { sent: 0, .. }))
+        .count()
+}
+
+const LONG: Duration = Duration::from_secs(10);
+
+/// 被控端系统支持延迟提供数据：控制端复制后，被控端的系统剪贴板上只有“承诺”；
+/// 被控端上任何程序来取（右键菜单“粘贴”，不经过我们的快捷键）时才向控制端要，取到的留着重用。
+/// 快捷键粘贴照旧先传完再执行。
+#[tokio::test(flavor = "multi_thread")]
+async fn a_program_on_the_host_fetches_what_the_controller_copied() {
+    lazy_session(|host, ctrl, input, typed| async move {
+        host.enable_promises();
+        // 复制文字：被控端只放承诺，控制端没有读、没有传
+        let text = Clip::text("控制端复制的文字");
+        ctrl.copy(text.clone());
+        promised(&host, (ClipKind::Text, 1)).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!((ctrl.reads(), sends_started(&ctrl)), (0, 0));
+        // 被控端的程序来取（右键“粘贴”）：这时才传；再取一次用留着的，不重传
+        assert_eq!(paste(&host, LONG).await, Some(text.clone()));
+        // 系统在程序取数据时动了变化计数（Windows 是这样）：承诺还在，不能当成被控端自己复制了东西
+        host.touch();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(host.promise_on_board(), Some((ClipKind::Text, 1)));
+        assert!(ctrl
+            .notes()
+            .iter()
+            .all(|n| !matches!(n, ClipNote::RemoteHeld { .. })));
+        assert_eq!(paste(&host, Duration::ZERO).await, Some(text));
+        assert_eq!((ctrl.reads(), sends_started(&ctrl)), (1, 1));
+        // 内容不写进被控端的剪贴板（那里是承诺），所以没有“收到”的提示
+        assert_eq!(received(&host), 0);
+
+        // 文件：承诺里带着最上层有几项（一个文件夹、一个文件）
+        let files = packed(&[
+            ("报告/a.txt", 10),
+            ("报告/b.bin", 99),
+            ("视频.mp4", 1 << 20),
+        ]);
+        ctrl.copy(files.clone());
+        promised(&host, (ClipKind::Files, 2)).await;
+        // 快捷键粘贴：先传完，被控端按下 V 时程序马上取得到（只等 1 ms）
+        send(&input, &CTRL_V).await;
+        let got = typed_n(&typed, 6).await;
+        assert_eq!(got[3].0, key(0x19, true));
+        assert_eq!(got[3].1, Some(files.clone()));
+        assert_eq!(sends_started(&ctrl), 2);
+
+        // 又复制了一遍同样的文件：被控端换了新的承诺；程序来取时控制端读出来发现和上次一样，
+        // 不重传，被控端接着用上一份
+        let reads = ctrl.reads();
+        ctrl.copy(files.clone());
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(paste(&host, LONG).await, Some(files));
+        assert_eq!((ctrl.reads(), sends_started(&ctrl)), (reads + 1, 2));
+    })
+    .await;
+}
+
+/// 反方向：被控端复制，控制端本机的系统剪贴板上放承诺，本机程序粘贴时才向被控端要。
+#[tokio::test(flavor = "multi_thread")]
+async fn a_program_on_the_controller_fetches_what_the_host_copied() {
+    lazy_session(|host, ctrl, input, typed| async move {
+        ctrl.enable_promises();
+        let png = Clip {
+            kind: ClipKind::Png,
+            data: vec![5; 400_000],
+        };
+        host.copy(png.clone());
+        promised(&ctrl, (ClipKind::Png, 1)).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(host.reads(), 0, "复制时不能读、不能传");
+        // 能放承诺就不用提示“没有同步过来”
+        assert!(!ctrl
+            .notes()
+            .iter()
+            .any(|n| matches!(n, ClipNote::RemoteHeld { .. })));
+        // 这时在远程窗口按粘贴：本机剪贴板是对方的承诺，没有要传的，按键原样马上到
+        send(&input, &CTRL_V[..2]).await;
+        typed_n(&typed, 2).await;
+        send(&input, &CTRL_V[2..]).await;
+        let got = typed_n(&typed, 4).await;
+        let keys: Vec<InputEvent> = got.iter().map(|(e, _)| e.clone()).collect();
+        assert_eq!(keys, CTRL_V);
+        assert_eq!(host.reads(), 0);
+        // 本机程序粘贴：取到
+        assert_eq!(paste(&ctrl, LONG).await, Some(png));
+        assert_eq!(host.reads(), 1);
+
+        // 取不到的几种情况，都要告诉用户，程序得到空结果
+        let failed = |why: FetchError| move |n: &ClipNote| *n == ClipNote::FetchFailed(why);
+        // 1. 对方读不出来
+        host.copy(packed(&[("a.bin", 100)]));
+        promised(&ctrl, (ClipKind::Files, 1)).await;
+        host.set_unreadable(true);
+        assert_eq!(paste(&ctrl, LONG).await, None);
+        noted(&ctrl, "取不到", failed(FetchError::Failed)).await;
+        host.set_unreadable(false);
+        // 2. 对方的内容太大
+        let before = ctrl.change_count();
+        host.copy_too_large(ClipKind::Files, 25 << 20);
+        promised_since(&ctrl, before, (ClipKind::Files, 1)).await;
+        assert_eq!(paste(&ctrl, LONG).await, None);
+        noted(&ctrl, "太大", |n| {
+            matches!(n, ClipNote::RemoteTooLarge { .. })
+        })
+        .await;
+        // 3. 超时：程序先得到空结果，传输继续，传完再粘贴一次就有了
+        let big = packed(&[("大文件.bin", 3 << 20)]);
+        let before = ctrl.change_count();
+        host.copy(big.clone());
+        promised_since(&ctrl, before, (ClipKind::Files, 1)).await;
+        assert_eq!(paste(&ctrl, Duration::from_millis(50)).await, None);
+        noted(&ctrl, "超时", failed(FetchError::Timeout)).await;
+        let start = Instant::now();
+        while paste(&ctrl, Duration::ZERO).await.is_none() {
+            assert!(start.elapsed() < LONG, "超时以后传输没有继续");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(paste(&ctrl, Duration::ZERO).await, Some(big));
+        // 4. 等的时候对方又复制了别的：已经在传的这份照样传完（程序拿到它开始粘贴时的内容），
+        //    然后新的承诺换上来
+        let other = packed(&[("另一个.bin", 4 << 20)]);
+        let before = ctrl.change_count();
+        host.copy(other.clone());
+        promised_since(&ctrl, before, (ClipKind::Files, 1)).await;
+        let waiting = tokio::spawn({
+            let ctrl = Arc::clone(&ctrl);
+            async move { paste(&ctrl, LONG).await }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let text = Clip::text("对方后来复制的");
+        host.copy(text.clone());
+        assert_eq!(waiting.await.unwrap(), Some(other));
+        promised(&ctrl, (ClipKind::Text, 1)).await;
+        assert_eq!(paste(&ctrl, LONG).await, Some(text));
+
+        // 本机自己复制了东西：承诺被顶掉，轮到对方放承诺（对方不支持时只是通知）
+        let mine = Clip::text("控制端自己复制的");
+        ctrl.copy(mine.clone());
+        noted(&host, "对方复制了文字", |n| {
+            *n == ClipNote::RemoteHeld {
+                kind: ClipKind::Text,
+            }
+        })
+        .await;
+        assert_eq!(paste(&ctrl, Duration::ZERO).await, Some(mine));
+    })
     .await;
 }

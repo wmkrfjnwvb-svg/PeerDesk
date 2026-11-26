@@ -1,6 +1,11 @@
 //! 真实的系统剪贴板（系统胶水）。读写用 arboard；变化检测用各系统的计数：
 //! Windows 剪贴板序号、macOS `changeCount`，Linux（X11）没有便宜的计数，比较内容的哈希。
 //!
+//! 对方复制的内容不直接写进来，而是放一个“承诺”（[`SystemClipboard::promise`]）：只声明格式，
+//! 本机程序来取时才向对方要（Windows 的延迟渲染在 `clipboard_win.rs`，macOS 的数据提供者在
+//! `clipboard_mac.rs`，取数和格式转换在 [`crate::promised`]）。Linux 还没有做，放承诺会返回不支持，
+//! 这时对方复制的内容只有在远程窗口按粘贴键时才传（控制端 → 被控端），反方向不同步。
+//!
 //! 测试构建不会创建它（不碰开发者电脑的剪贴板），在各平台实机上验证。
 #![cfg_attr(windows, allow(unsafe_code))]
 
@@ -9,7 +14,13 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use peerdesk_core::clipboard::FILES_LIMIT;
 use peerdesk_core::clipboard::{Clip, ClipKind};
-use peerdesk_net::clipsync::{ClipNote, ClipboardHandle, Copied, Peeked, SystemClipboard};
+#[cfg(any(windows, target_os = "macos"))]
+use peerdesk_net::clipsync::Promise;
+use peerdesk_net::clipsync::{
+    ClipNote, ClipboardHandle, Copied, Peeked, SystemClipboard, FETCH_TIMEOUT,
+};
+
+use crate::promised::Promised;
 
 use crate::clipboard::{pack_paths, png_to_rgba, rgba_to_png, unpack_to};
 
@@ -19,7 +30,17 @@ pub type OnNote = Box<dyn Fn(ClipNote) + Send + Sync>;
 /// 系统剪贴板。
 pub struct SystemClip {
     inner: Mutex<arboard::Clipboard>,
-    on_note: OnNote,
+    on_note: crate::promised::Note,
+    /// 现在放在系统剪贴板上的承诺（对方的内容）。Linux 上还放不了承诺，用不到。
+    #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+    promised: Arc<Promised>,
+    /// macOS：放上承诺以后的变化计数（计数没变说明剪贴板里还是我们的承诺，不是用户复制的东西）。
+    /// Windows 上看剪贴板的所有者是不是我们的窗口，不用它。
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    promised_count: Arc<Mutex<Option<u64>>>,
+    /// Windows：延迟渲染用的窗口；建不起来时为 `None`（放承诺返回不支持）。
+    #[cfg(windows)]
+    delayed: Option<crate::clipboard_win::DelayedClipboard>,
     /// 用户在界面上点了“取消”（界面置位，同步循环取走）。
     cancel: Arc<AtomicBool>,
     /// Linux 上用内容哈希当计数：（上次的哈希，计数）。
@@ -37,9 +58,19 @@ impl SystemClip {
     /// 打开系统剪贴板。`cancel`：界面在用户点“取消传输”时置位。
     pub fn open(on_note: OnNote, cancel: Arc<AtomicBool>) -> Result<Self, String> {
         let inner = arboard::Clipboard::new().map_err(|e| format!("打不开剪贴板：{e}"))?;
+        let on_note: crate::promised::Note = Arc::from(on_note);
+        let promised = Arc::new(Promised::new(
+            Arc::clone(&on_note),
+            FETCH_TIMEOUT,
+            std::env::temp_dir().join("PeerDesk-clipboard"),
+        ));
         Ok(Self {
             inner: Mutex::new(inner),
             on_note,
+            #[cfg(windows)]
+            delayed: start_delayed(&promised),
+            promised,
+            promised_count: Arc::default(),
             cancel,
             hashed: Mutex::new((0, 0)),
         })
@@ -47,6 +78,32 @@ impl SystemClip {
 
     fn clipboard(&self) -> std::sync::MutexGuard<'_, arboard::Clipboard> {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// 系统剪贴板里现在是不是我们放的承诺（对方的内容）。是的话不能当成本机复制的内容去看、去读：
+    /// 读它会触发我们自己的回调，向对方要数据。被别的内容顶掉了就把承诺忘掉。
+    fn ours(&self) -> bool {
+        #[cfg(windows)]
+        {
+            // 被顶掉时窗口收到 WM_DESTROYCLIPBOARD，那边会把承诺忘掉
+            self.promised.on_board().is_some() && self.delayed.as_ref().is_some_and(|d| d.owns())
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let mut at = self
+                .promised_count
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let ours = at.is_some_and(|count| count == self.change_count());
+            if !ours && at.take().is_some() {
+                self.promised.clear();
+            }
+            ours
+        }
+        #[cfg(not(any(windows, target_os = "macos")))]
+        {
+            false
+        }
     }
 
     /// 剪贴板里有没有图片。只看有没有这种格式，不把像素取出来（一张 4K 截图有 30 多 MB）。
@@ -151,6 +208,9 @@ impl SystemClipboard for SystemClip {
     }
 
     fn read(&self) -> Option<Copied> {
+        if self.ours() {
+            return None;
+        }
         if concealed() {
             peerdesk_net::note!(info, "剪贴板：内容被标为敏感（密码管理器），不同步");
             return None;
@@ -217,13 +277,16 @@ impl SystemClipboard for SystemClip {
     }
 
     fn peek(&self) -> Option<Peeked> {
-        if concealed() {
+        if concealed() || self.ours() {
             return None;
         }
         // 顺序和 read 一样：文件、文字、图片。文件只看有没有，不读盘；图片只看格式，不取像素
         let mut board = self.clipboard();
-        if board.get().file_list().is_ok_and(|paths| !paths.is_empty()) {
-            return Some(Peeked::Later(ClipKind::Files));
+        if let Ok(paths) = board.get().file_list() {
+            if !paths.is_empty() {
+                let items = u16::try_from(paths.len()).unwrap_or(u16::MAX);
+                return Some(Peeked::Later(ClipKind::Files, items));
+            }
         }
         if let Ok(text) = board.get_text() {
             if !text.is_empty() {
@@ -231,11 +294,64 @@ impl SystemClipboard for SystemClip {
             }
         }
         drop(board);
-        self.has_image().then_some(Peeked::Later(ClipKind::Png))
+        self.has_image().then_some(Peeked::Later(ClipKind::Png, 1))
     }
 
     fn take_cancel(&self) -> bool {
         self.cancel.swap(false, Ordering::Relaxed)
+    }
+
+    fn promise_in_place(&self) -> bool {
+        self.ours()
+    }
+
+    #[cfg(windows)]
+    fn promise(&self, promise: Promise) -> Result<(), String> {
+        use crate::clipboard_win::{png_format, CF_DIBV5, CF_HDROP, CF_UNICODETEXT};
+        let delayed = self.delayed.as_ref().ok_or("延迟渲染用的窗口没有建起来")?;
+        let formats = match promise.kind {
+            ClipKind::Text => vec![CF_UNICODETEXT],
+            // PNG 在前：认它的程序能拿到带透明度的原图
+            ClipKind::Png => vec![png_format(), CF_DIBV5],
+            ClipKind::Files => vec![CF_HDROP],
+        };
+        // 先声明、再记下承诺：声明时系统会先通知“上一份被清掉了”（把旧承诺忘掉）
+        delayed.offer(&formats)?;
+        self.promised.set(promise);
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn promise(&self, promise: Promise) -> Result<(), String> {
+        use crate::clipboard_mac::{offer, Provide, Provided, Settled, FILE_URL, PNG, TEXT};
+        let (kind, items) = match promise.kind {
+            ClipKind::Text => (TEXT, 1),
+            ClipKind::Png => (PNG, 1),
+            ClipKind::Files => (FILE_URL, usize::from(promise.items)),
+        };
+        let promised = Arc::clone(&self.promised);
+        let provide: Provide = Arc::new(move |index, kind| match kind {
+            TEXT => promised.text().map(Provided::Text),
+            PNG => promised.png().map(Provided::Data),
+            FILE_URL => promised
+                .files()
+                .and_then(|paths| paths.get(index).map(|p| crate::promised::file_url(p)))
+                .map(Provided::Text),
+            _ => None,
+        });
+        // 数据交给系统以后变化计数可能会变（文档没有说）：重新记，免得把自己的承诺当成用户复制的东西
+        let count = Arc::clone(&self.promised_count);
+        let settled: Settled = Arc::new(move || {
+            let now = objc2_app_kit::NSPasteboard::generalPasteboard().changeCount();
+            let mut at = count.lock().unwrap_or_else(PoisonError::into_inner);
+            if at.is_some() {
+                *at = u64::try_from(now).ok();
+            }
+        });
+        self.promised.set(promise);
+        offer(items, kind, &provide, &settled).inspect_err(|_| self.promised.clear())?;
+        self.promised_placed();
+        Ok(())
     }
 
     fn write(&self, clip: &Clip) -> Result<(), String> {
@@ -255,6 +371,7 @@ impl SystemClipboard for SystemClip {
                 board.set_image(image).map_err(|e| e.to_string())
             }
             ClipKind::Files => {
+                // 对方是老版本时才走这里（整份推过来）；新版本放承诺，被取时解到同一个临时目录。
                 // 解到临时目录里新建的子目录（每次一个，不覆盖之前粘贴的），剪贴板里放这些文件
                 let dir = std::env::temp_dir()
                     .join("PeerDesk-clipboard")
@@ -282,6 +399,45 @@ impl SystemClipboard for SystemClip {
 
     fn note(&self, note: ClipNote) {
         (self.on_note)(note);
+    }
+}
+
+impl SystemClip {
+    /// 承诺刚放上去：记下现在的变化计数。
+    #[cfg(target_os = "macos")]
+    fn promised_placed(&self) {
+        let count = self.change_count();
+        *self
+            .promised_count
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(count);
+    }
+}
+
+/// Windows：起延迟渲染的窗口。来取某个格式时从承诺里取数、转成这个格式的字节。
+#[cfg(windows)]
+fn start_delayed(promised: &Arc<Promised>) -> Option<crate::clipboard_win::DelayedClipboard> {
+    use crate::clipboard_win::{png_format, DelayedClipboard, CF_DIBV5, CF_HDROP, CF_UNICODETEXT};
+    use crate::promised::{dibv5, dropfiles, utf16_nul};
+    let png = png_format();
+    let render = Arc::clone(promised);
+    let lost = Arc::clone(promised);
+    let started = DelayedClipboard::start(
+        Arc::new(move |format| match format {
+            CF_UNICODETEXT => render.text().map(|text| utf16_nul(&text)),
+            CF_DIBV5 => render.rgba().map(|(w, h, rgba)| dibv5(w, h, &rgba)),
+            CF_HDROP => render.files().map(|paths| dropfiles(&paths)),
+            other if other == png && png != 0 => render.png(),
+            _ => None,
+        }),
+        Arc::new(move || lost.clear()),
+    );
+    match started {
+        Ok(delayed) => Some(delayed),
+        Err(e) => {
+            peerdesk_net::note!(warn, "剪贴板：{e}，对方复制的内容不能按需取");
+            None
+        }
     }
 }
 

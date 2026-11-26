@@ -20,13 +20,18 @@ mod audio_sys;
 pub mod capture;
 pub use audio_sys::{system_capture, system_playback};
 pub mod clipboard;
+#[cfg(target_os = "macos")]
+mod clipboard_mac;
 mod clipboard_sys;
+#[cfg(windows)]
+mod clipboard_win;
 pub use clipboard_sys::{open_clipboard, OnNote, SystemClip};
 mod error;
 pub mod guide;
 pub mod keymap;
 pub mod pixel;
 pub mod pointer;
+pub mod promised;
 pub mod session;
 
 #[cfg(target_os = "macos")]

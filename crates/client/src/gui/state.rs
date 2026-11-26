@@ -212,7 +212,7 @@ pub enum ViewPhase {
 /// 剪贴板事件要给用户看的话；不需要提示的返回 `None`。
 #[must_use]
 pub fn clip_message(note: &peerdesk_net::clipsync::ClipNote, s: &Strings) -> Option<String> {
-    use peerdesk_net::clipsync::{ClipNote, SendFail};
+    use peerdesk_net::clipsync::{ClipNote, FetchError, SendFail};
     let mb = |size: u64| format!("{:.1}", size as f64 / 1_048_576.0);
     match note {
         ClipNote::LocalTooLarge { size, .. } => {
@@ -233,6 +233,10 @@ pub fn clip_message(note: &peerdesk_net::clipsync::ClipNote, s: &Strings) -> Opt
         ClipNote::SendFailed(SendFail::Cancelled) => Some(s.clip_send_cancelled.to_owned()),
         ClipNote::SendFailed(SendFail::Unreadable) => Some(s.clip_send_unreadable.to_owned()),
         ClipNote::SendFailed(SendFail::RemoteWrite) => Some(s.clip_send_remote_write.to_owned()),
+        ClipNote::FetchFailed(FetchError::Timeout) => Some(s.clip_fetch_timeout.to_owned()),
+        ClipNote::FetchFailed(FetchError::Failed) => Some(s.clip_fetch_failed.to_owned()),
+        // 会话已经结束：界面上有结束的提示，不用再说
+        ClipNote::FetchFailed(FetchError::Gone) => None,
         ClipNote::RemoteHeld { kind } => {
             Some(s.clip_remote_held.replace("{what}", clip_what(*kind, s)))
         }
@@ -284,6 +288,7 @@ pub fn clip_progress(
         | ClipNote::FilesUnsupported
         | ClipNote::FilesSkipped { .. }
         | ClipNote::RemoteHeld { .. }
+        | ClipNote::FetchFailed(_)
         | ClipNote::Received { .. } => None,
     }
 }
@@ -786,6 +791,19 @@ mod tests {
         ] {
             let note = ClipNote::RemoteHeld { kind };
             assert!(clip_message(&note, s).unwrap().contains(word));
+            assert_eq!(clip_progress(&note, s), None);
+        }
+        // 本机程序粘贴对方的内容没取到：说原因和办法；会话结束了就不说
+        use peerdesk_net::clipsync::FetchError;
+        for (why, word) in [
+            (FetchError::Timeout, Some("10 秒")),
+            (FetchError::Failed, Some("重新复制")),
+            (FetchError::Gone, None),
+        ] {
+            let note = ClipNote::FetchFailed(why);
+            let text = clip_message(&note, s);
+            assert_eq!(text.is_some(), word.is_some());
+            assert!(text.is_none_or(|t| word.is_some_and(|w| t.contains(w))));
             assert_eq!(clip_progress(&note, s), None);
         }
         for note in [&big, &remote, &none, &ClipNote::FilesUnsupported] {

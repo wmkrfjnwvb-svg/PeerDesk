@@ -38,15 +38,60 @@
   所有流的数据（quinn-proto 0.11.19 `connection/mod.rs` 组包时先写 DATAGRAM 再写 STREAM）。
   但拥塞窗口是共用的，所以优先级不能代替限速。
 
-## 3. 没实现：被控端复制 → 控制端粘贴
+## 3. 系统的延迟提供数据：任何程序来取时才传（2026-11-26 实现，Windows 和 macOS）
 
-这个方向上，“粘贴”发生在控制端本机的某个程序里，我们收不到按键，没有触发传输的时机。
-目前被控端复制文件、图片、长文字时不推送，只告诉控制端（工具条提示“对方复制了文件，没有同步到本机……
-请用文件传输取回”），文字也一样不推送。**这比老版本少了功能**（老版本会把被控端复制的内容整份推过来），
-由下面的延迟提供数据机制补上。
+只靠“在远程窗口按粘贴键”有两个缺口：被控端上右键菜单的“粘贴”拿不到控制端刚复制的内容；
+被控端复制的内容到不了控制端（粘贴发生在控制端本机的程序里，我们收不到按键）。
+补法和 RDP 一样：收到对方的 `Held` 以后，在本机系统剪贴板上放一个**承诺**（只声明格式，不放数据），
+本机任何程序来取时系统回调我们，我们再向对方要。两个方向用同一套逻辑。
 
-要做到粘贴时再取，得用各系统“延迟提供数据”的机制：控制端先在本机剪贴板上放一个承诺，
-本机程序来取数据时系统回调我们，我们再去被控端要。
+### 3.0 已经实现的
+
+| 环节 | 做法 | 代码 |
+| --- | --- | --- |
+| 协议 | `Held` 带项数；`Want`（来要数据，相当于 RDP 的 Format Data Request）；`Unavailable`（给不了）；`Same`（和上次发的一样，接着用上一份，不重传） | `core/src/clipboard.rs` |
+| 逻辑 | 收到 `Held` 放承诺；程序来取时发 `Want`，等数据（最多 10 秒），取到的留着重用；本机复制了新东西承诺作废 | `net/src/clipsync.rs`（`Remote`、`Promise`） |
+| 取数和格式转换 | 文字转 UTF-16、图片转 `CF_DIBV5`、文件解到临时目录再给 `DROPFILES` 或 `file://` 网址 | `platform/src/promised.rs`（有单元测试） |
+| Windows | 延迟渲染：只收消息的窗口加消息循环，处理 `WM_RENDERFORMAT`、`WM_RENDERALLFORMATS`、`WM_DESTROYCLIPBOARD` | `platform/src/clipboard_win.rs` |
+| macOS | 每项一个 `NSPasteboardItem`，数据提供者实现 `pasteboard:item:provideDataForType:` | `platform/src/clipboard_mac.rs` |
+| Linux（X11） | **没有做**。放承诺返回“不支持”，退回上一步的行为：控制端 → 被控端只有在远程窗口按粘贴键时才传；被控端 → 控制端不同步，工具条提示 | 见 3.3 |
+
+和“按粘贴键”的配合：在远程窗口按粘贴键时仍然先把内容传过去、对方确认以后再执行粘贴
+（有进度、能取消、不让对方的程序干等）；对方有承诺时内容不写进它的剪贴板，而是留给来取的程序，
+按键到了程序一取就有。右键菜单“粘贴”走系统回调。
+
+系统回调里的限制（各系统都一样）：**回调期间来粘贴的那个程序在等**，所以等数据有 10 秒上限
+（`FETCH_TIMEOUT`）。超时以后给系统空结果，工具条提示“等了 10 秒还没传完……传输还在继续，
+过一会儿再粘贴一次”；传输不会停，传完以后再粘贴直接拿到。限速从 1 Mbps 起步（见第 2 节），
+回环上 3 MB 约 1.5 秒；慢链路上几 MB 的内容第一次经右键粘贴可能超时，快捷键粘贴没有这个问题。
+
+没有做的：
+- **Windows 文件没有用 `CFSTR_FILEDESCRIPTORW` / `CFSTR_FILECONTENTS`**，用的是延迟渲染 `CF_HDROP`：
+  资源管理器来取时把文件全部收到临时目录，再给路径。差别：资源管理器在回调里干等（最多 10 秒），
+  没有系统的复制进度；10 秒传不完的文件第一次粘贴会失败。`FILECONTENTS` 要实现 OLE 的
+  `IDataObject` 和 `IStream`（见 3.1），估计 1.5–2 周，而且没有 Windows 真机没法调，这次没有做。
+- 接收的一侧没有进度条（发送的一侧有）。
+- Linux。
+
+### 3.0.1 要用 CI `[win][mac]` 和真机验证的清单
+
+Linux 上验证过的：协议、同步逻辑、取数和格式转换（单元测试和真实 QUIC 会话测试，系统剪贴板用假的）；
+`clipboard_win.rs` 和整个平台层对 `x86_64-pc-windows-gnu` 通过了 `cargo clippy -D warnings`
+（只检查，没有链接、没有运行）；`clipboard_mac.rs` 单独对 `aarch64-apple-darwin` 通过了同样的检查。
+
+没有验证过的：
+1. `clipboard_sys.rs` 里 macOS 的分支（`promise`、`ours`、`has_image`）没有编译过。
+2. Windows：放承诺以后记事本、资源管理器、Office 里 Ctrl+V 和右键“粘贴”能不能取到文字、图片、文件；
+   `CF_DIBV5` 的字节布局各程序认不认（照 arboard 3.7 写的）；`PNG` 格式。
+3. Windows：`ExcludeClipboardContentFromMonitorProcessing` 是否真的让剪贴板历史（Win+V）不在复制时来取。
+   如果它还是来取，就等于复制时就传了。
+4. Windows：被控端以服务身份运行、或者在登录界面时，只收消息的窗口能不能当剪贴板所有者。
+5. macOS：回调在哪个线程上来；被控端没有界面主循环时回调会不会来。
+6. macOS：Finder 对延迟提供的 `public.file-url` 是否照常粘贴（见 3.2）；多个文件时是否每项各来取一次。
+7. macOS：数据交给系统以后 `changeCount` 变不变（代码两种情况都处理了，但没有实测）。
+8. 两个系统：剪贴板管理工具、其他远程软件在复制时就来取的情况有多普遍。
+9. 本机的观看窗口自己读剪贴板（egui 在按 Ctrl/Command+V 时读文字）会触发一次取数：
+   对方复制的是文字时，在远程窗口按粘贴会顺带把对方的文字取到本机（很小，但界面线程在等）。
 
 ### 3.1 Windows
 
@@ -63,6 +108,19 @@
 
 > If the clipboard owner is about to be destroyed and has delayed rendering some or all clipboard
 > formats, it receives the WM_RENDERALLFORMATS message.
+
+剪贴板序号在渲染时才变（`GetClipboardSequenceNumber` 的说明，
+<https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getclipboardsequencenumber>）：
+
+> If clipboard rendering is delayed, the sequence number is not incremented until the changes are rendered.
+
+所以判断“剪贴板里还是不是我们的承诺”看的是所有者窗口，不是序号。
+
+不让剪贴板历史在复制时就来取（*Clipboard Formats*，
+<https://learn.microsoft.com/en-us/windows/win32/dataxchg/clipboard-formats>）：
+
+> ExcludeClipboardContentFromMonitorProcessing: Place any data on the clipboard in this format to prevent
+> all clipboard formats being included in the clipboard history or synchronized to the user's other devices.
 
 同一页的代价说明，对我们很关键：
 
@@ -92,10 +150,9 @@
   用 `OleSetClipboard` 放上去；资源管理器粘贴时逐个文件 `GetData(CFSTR_FILECONTENTS, lindex=i)`，
   从我们的 `IStream::Read` 里读，读多少我们向被控端要多少。资源管理器自己显示复制进度、可以取消。
   这就是 RDP 客户端的做法（第 5 节）。
-- 现状：arboard 3.7.0 没有延迟渲染的接口（读了 `src/platform/windows.rs`：`Set::text/image/file_list`
-  都是直接 `SetClipboardData` 放数据）。要自己写，`unsafe` 加 COM，放在平台层新文件里。
-- 工作量估计：文字和图片的延迟渲染约 3–4 天（窗口、消息线程、和同步循环之间的请求/应答协议、超时）；
-  文件（`IDataObject` + `IStream` + 协议里加“按文件、按范围要数据”）约 1.5–2 周，另加真机调试。
+- arboard 3.7.0 没有延迟渲染的接口（读了 `src/platform/windows.rs`：`Set::text/image/file_list`
+  都是直接 `SetClipboardData` 放数据），所以自己写了 `clipboard_win.rs`（文字、图片、`CF_HDROP`）。
+- 剩下的工作量：文件（`IDataObject` + `IStream` + 协议里加“按文件、按范围要数据”）约 1.5–2 周，另加真机调试。
   风险：`IStream` 的读取在资源管理器的线程上同步进行，网络断了要能让它尽快失败。
 
 ### 3.2 macOS
@@ -116,15 +173,13 @@
 > use promises to indicate intent for future action. … The NSFilePromiseProvider will write the
 > promised file to the destination directory.
 
-- 文字、图片：`NSPasteboardItem.setDataProvider(_:forTypes:)`，在 `provideDataForType` 回调里向被控端要
-  数据再 `setData`。和 Windows 一样，回调期间来粘贴的程序在等。可行，约 3–4 天（objc2 里声明一个实现
-  这个协议的类，`macos.rs` 里已有 `define_class!` 的用法可以照着写）。
-- 文件：`NSFilePromiseProvider` 的原文说的是拖放（*When you're working with drag and drop*）。
-  **Finder 对剪贴板里的文件承诺执行 Command+V 是否有效，原文没有说，我没有验证**；
-  印象里 Finder 的粘贴只认 `public.file-url`（已存在的文件），需要真机试。
-  如果不行，退路是把 `public.file-url` 做成延迟提供：回调里把文件全部下载到临时目录，再给路径
-  （Finder 卡住等下载，没有系统进度）。
-- 工作量估计：文字和图片 3–4 天；文件要先做半天到一天的真机验证才能估。
+- 文字、图片：已实现（`clipboard_mac.rs`）。`NSPasteboardItem.setDataProvider(_:forTypes:)`，
+  在 `provideDataForType` 回调里向对方要数据再 `setData`。和 Windows 一样，回调期间来粘贴的程序在等。
+- 文件：已实现的是“延迟提供的 `public.file-url`”：每个文件一个剪贴板项，被取时把文件全部收到临时目录，
+  再给 `file://` 网址（Finder 等着，没有系统进度）。没有用 `NSFilePromiseProvider`：它的原文说的是拖放
+  （*When you're working with drag and drop*），**Finder 的 Command+V 接受哪一种，原文没有说，
+  我也没有在真机上验证**；选 `public.file-url` 是因为 Finder 自己复制文件时放的就是它。
+  真机上如果 Finder 不认延迟提供的 `public.file-url`，再试文件承诺。
 
 ### 3.3 Linux（X11）
 
@@ -147,30 +202,25 @@ X11 的选区天生是延迟的：复制只是声明所有权，数据在别人�
   我们目前在 Wayland 上的剪贴板支持情况没有查。
 - 工作量估计：X11 文字和图片约 1 周（选区协议、INCR、和 arboard 并存或者替换它）。
 
-### 3.4 协议要加什么
+### 3.4 协议还要加什么（做文件流式传输时）
 
-- 现在的 `ClipMsg::Held { kind }` 只说了种类。要做延迟提供，得带上格式列表和元数据
-  （文件名、大小、修改时间），相当于 RDP 的 Format List。
-- 加“请求数据”和“请求某个文件的某一段”两条消息，以及取消。
-- 被控端在被请求时读盘，沿用现在的限速（`throttle.rs`）。被控端有媒体层的带宽估计，
-  可以直接用“估计的一半”，不用自己探。
+- 现在的 `Held` 只有种类和项数。按文件、按范围取数据（`CFSTR_FILECONTENTS`）需要文件名、大小、
+  修改时间的列表，以及“要某个文件的某一段”的消息。
+- 被控端有媒体层的带宽估计，被控端 → 控制端方向的限速可以直接用“估计的一半”，现在两个方向都是自己探。
 
-### 3.5 建议的顺序
+### 3.5 接下来的顺序
 
-1. Windows 控制端的文字和图片延迟渲染（用户最多；图片是截图场景，最常用）。
-2. macOS 控制端的文字和图片。
-3. Windows 文件（`IDataObject`）。这一步之前，文件走现有的文件传输窗口。
-4. macOS 文件：先验证 Finder 行为再决定。
-5. Linux 排最后。
-
-在这之前，被控端复制图片不能同步到控制端，是相对老版本的退步。如果不能接受，
-可以先给被控端加一个小的例外（例如不超过 1 MB 的图片照旧推送），代价是又有了“复制就传”的流量。
+1. 用 `[win][mac]` 和真机把 3.0.1 的清单过一遍。
+2. Windows 文件改成 `IDataObject` + `CFSTR_FILECONTENTS`（资源管理器自己显示进度、不干等）。
+3. Linux（X11）的选区所有者。
+4. 接收一侧的进度显示。
 
 ## 4. 只在 Linux 上验证过、要真机确认的
 
+- 延迟提供数据的系统代码：见 3.0.1 的清单。
 - `crates/platform/src/clipboard_sys.rs` 的 `peek`（只看有没有文件、文字、图片，不读内容）：
-  Windows 用 `IsClipboardFormatAvailable`，macOS 看 `NSPasteboard.types`。这两段在 Linux 上不编译，
-  没有跑过。
+  Windows 用 `IsClipboardFormatAvailable`（对 Windows 目标编译检查过，没有运行过），
+  macOS 看 `NSPasteboard.types`（没有编译过）。
 - 被控端展开 `InputEvent::Paste`：同一时刻连续注入“修饰键按下、V 按下、V 抬起、修饰键抬起”，
   Windows（`SendInput`）、macOS（`CGEvent`）、X11（XTest）上目标程序是否都认。
 - 限速的常数在真实慢链路（1–4 Mbps 上行、Wi-Fi 丢包）上的表现；往返时间上涨的判定会不会被画面方向的
