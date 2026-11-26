@@ -553,7 +553,12 @@ async fn files_are_sent_when_pasted_not_when_copied() {
 
         // 对方自己复制了别的东西以后，再粘贴本机这份：对方剪贴板里已经不是它，重新传
         host.copy(Clip::text("被控端自己复制的"));
-        arrives(&ctrl, &Clip::text("被控端自己复制的")).await;
+        noted(&ctrl, "对方复制了文字", |n| {
+            *n == ClipNote::RemoteHeld {
+                kind: ClipKind::Text,
+            }
+        })
+        .await;
         ctrl.copy(files.clone());
         tokio::time::sleep(Duration::from_millis(300)).await;
         send(&input, &CTRL_V).await;
@@ -629,38 +634,26 @@ async fn a_transfer_that_fails_drops_the_paste_and_says_why() {
     .await;
 }
 
-/// 短文字照旧一复制就同步（远程右键菜单里点“粘贴”拿得到）；复制后马上按粘贴，等它到了再执行。
-/// 长文字（超过 64 KB）和图片与文件一样，粘贴时才传。
+/// 文字、图片也和文件一样：复制时不传，粘贴时才传（Shift+Insert 也是粘贴）。
 #[tokio::test(flavor = "multi_thread")]
-async fn short_text_syncs_at_once_and_long_text_and_images_when_pasted() {
+async fn text_and_images_are_also_sent_only_when_pasted() {
     lazy_session(|host, ctrl, input, typed| async move {
-        // 不按粘贴也会到
-        let text = Clip::text("短文字");
-        ctrl.copy(text.clone());
-        let took = arrives(&host, &text).await;
-        assert!(took < Duration::from_millis(300), "文本同步用了 {took:?}");
-        // 复制后马上粘贴（连轮询都还没轮到）：按下 V 时新内容已经在对方剪贴板里
-        let second = Clip::text("刚复制的文字");
-        ctrl.copy(second.clone());
-        send(&input, &CTRL_V[..2]).await;
-        let got = typed_n(&typed, 2).await;
-        assert_eq!(got[1].1, Some(second.clone()));
-        send(&input, &CTRL_V[2..]).await;
-        typed_n(&typed, 4).await;
-        // 长文字、图片：复制时不传
-        let long = Clip::text(&"字".repeat(40_000));
         let png = Clip {
             kind: ClipKind::Png,
             data: vec![9; 300_000],
         };
-        for clip in [long, png] {
-            let had = received(&host);
+        for clip in [
+            Clip::text("一小段文字"),
+            Clip::text(&"字".repeat(40_000)),
+            png,
+        ] {
+            let had = (received(&host), ctrl.reads());
             ctrl.copy(clip.clone());
             tokio::time::sleep(Duration::from_millis(400)).await;
-            assert_eq!(received(&host), had, "复制时不能传");
+            assert_eq!((received(&host), ctrl.reads()), had, "复制时不能读、不能传");
             let before = keys_of(&typed).len();
             send(&input, &[key(0xE1, true), key(0x49, true)]).await;
-            // Shift+Insert 也是粘贴；传完由被控端按原来的组合键
+            // 传完由被控端按原来的组合键
             let got = typed_n(&typed, before + 2).await;
             assert_eq!(got[before + 1].0, key(0x49, true));
             assert_eq!(got[before + 1].1, Some(clip));
@@ -671,27 +664,25 @@ async fn short_text_syncs_at_once_and_long_text_and_images_when_pasted() {
     .await;
 }
 
-/// 被控端复制文件、图片：这个方向目前不传（没有粘贴的时机，方案见 docs/research/clipboard-lazy.md），
-/// 不读、不推送，告诉控制端；文字照常同步。
+/// 被控端复制任何内容都不主动推送（没有粘贴的时机，方案见 docs/research/clipboard-lazy.md），
+/// 不读，只告诉控制端。
 #[tokio::test(flavor = "multi_thread")]
-async fn the_host_only_pushes_text() {
+async fn the_host_pushes_nothing() {
     lazy_session(|host, ctrl, _input, _typed| async move {
         let png = Clip {
             kind: ClipKind::Png,
             data: vec![3; 2_000_000],
         };
-        host.copy(png);
-        noted(&ctrl, "对方复制了图片", |n| {
-            *n == ClipNote::RemoteHeld {
-                kind: ClipKind::Png,
-            }
-        })
-        .await;
+        for clip in [png, Clip::text("被控端复制的文字")] {
+            let kind = clip.kind;
+            host.copy(clip);
+            noted(&ctrl, "对方复制了内容", |n| {
+                *n == ClipNote::RemoteHeld { kind }
+            })
+            .await;
+        }
         tokio::time::sleep(Duration::from_millis(400)).await;
         assert_eq!((host.reads(), ctrl.get()), (0, None));
-        let text = Clip::text("被控端复制的文字");
-        host.copy(text.clone());
-        arrives(&ctrl, &text).await;
     })
     .await;
 }

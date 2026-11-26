@@ -782,7 +782,7 @@ mod tests {
         for (kind, word) in [
             (ClipKind::Files, "文件"),
             (ClipKind::Png, "图片"),
-            (ClipKind::Text, "长文字"),
+            (ClipKind::Text, "文字"),
         ] {
             let note = ClipNote::RemoteHeld { kind };
             assert!(clip_message(&note, s).unwrap().contains(word));

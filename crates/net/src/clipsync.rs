@@ -9,15 +9,15 @@
 //! 一样（复制时只说有什么，粘贴时才传数据），对方声明了
 //! [`Caps::CLIPBOARD_LAZY`](peerdesk_core::proto::Caps::CLIPBOARD_LAZY) 时启用：
 //!
-//! - 复制时：短文字（不超过 [`EAGER_TEXT`]）照旧马上同步，远程右键菜单里点“粘贴”拿得到。
-//!   文件、图片、长文字不读盘、不打包、不发数据，只记下“有这种内容”并告诉对方（[`ClipMsg::Held`]）。
+//! - 复制时：任何内容（文字、图片、文件）都不读盘、不打包、不发数据，只记下“有这种内容”
+//!   并告诉对方（[`ClipMsg::Held`]）。
 //! - 控制端在远程窗口按粘贴键时（[`gate_pastes`]）：这一下按键先扣住，同步循环看本机剪贴板，
 //!   有还没给对方的内容就现在读出来、限速传过去（[`crate::throttle`]），对方写进剪贴板、
 //!   回 [`ClipMsg::Applied`] 以后，再让对方执行粘贴（[`InputEvent::Paste`]）。
 //!   同一份内容只传一次：剪贴板没变就不再读；变了但内容一样（哈希相同）读了也不传。
 //!   等的时候鼠标、键盘照常发，只推迟这一次粘贴。界面显示进度（[`ClipNote::Sending`]），可以取消。
 //! - 被控端复制文件、图片：这个方向没有“粘贴”的时机可用（要用系统的延迟提供数据机制，
-//!   见 docs/research/clipboard-lazy.md），目前只同步文字，并告诉控制端（[`ClipNote::RemoteHeld`]）。
+//!   见 docs/research/clipboard-lazy.md），目前不同步，只告诉控制端（[`ClipNote::RemoteHeld`]）。
 //!
 //! 对方是老版本时保持原来的行为：复制后马上整份同步，粘贴键原样发。
 //!
@@ -40,10 +40,6 @@ use crate::NetError;
 
 /// 多久看一次本机剪贴板有没有变（只读一个计数，开销可以忽略）。
 pub const POLL: Duration = Duration::from_millis(100);
-
-/// 不超过这么长的文字复制后马上同步（几 KB 的文字对带宽没有影响）；更长的和文件、图片一样，
-/// 粘贴时才传。
-pub const EAGER_TEXT: usize = 64 * 1024;
 
 /// 剪贴板流的优先级：比控制流、文件流（默认 0）低。数据报（画面、输入）在 quinn 里本来就排在
 /// 所有流的数据前面（quinn-proto 0.11 `Connection::populate_packet` 先写 DATAGRAM 再写 STREAM）。
@@ -101,7 +97,7 @@ pub enum ClipNote {
     SendDone,
     /// 没传成，这次粘贴没有执行。
     SendFailed(SendFail),
-    /// 对方复制了文件、图片或长文字，没有同步过来（这个方向目前只同步短文字）。
+    /// 对方复制了内容，没有同步过来（粘贴时才传）。
     RemoteHeld {
         /// 种类。
         kind: ClipKind,
@@ -697,7 +693,7 @@ pub async fn run(
                     refresh(&clipboard, &mut seen, &mut sender, &mut state, files, lazy).await?;
                 }
                 if state.awaiting.is_some() {
-                    // 正在发的那一份（刚复制的短文字，或者上一次粘贴触发的传输）到了再粘贴
+                    // 正在发的那一份（上一次粘贴触发的传输）到了再粘贴
                     state.waiters.push(reply);
                 } else if let Some(kind) = state.held {
                     state.waiters.push(reply);
@@ -798,12 +794,7 @@ async fn refresh(
         return Ok(());
     }
     match blocking(clipboard, |c| c.peek()).await? {
-        Some(Peeked::Text(clip)) if clip.data.len() <= EAGER_TEXT => {
-            state.held = None;
-            if offer(clipboard, sender, &clip, files, 0) {
-                state.awaiting = Some(sender.seq());
-            }
-        }
+        // 文字也一样：复制时不传，粘贴时才传
         Some(Peeked::Text(_)) => hold(sender, state, ClipKind::Text),
         Some(Peeked::Later(kind)) => hold(sender, state, kind),
         None => state.held = None,
@@ -818,7 +809,6 @@ fn hold(sender: &mut Sender, state: &mut Lazy, kind: ClipKind) {
         "剪贴板：本机复制了 {kind:?}，先不传，等在远程按粘贴时再传"
     );
     state.held = Some(kind);
-    // 之前在发的短文字作废了（剪贴板里已经不是它）
     state.awaiting = None;
     sender.announce_held(kind);
 }

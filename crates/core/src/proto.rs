@@ -288,7 +288,7 @@ impl Caps {
 
     /// 剪贴板“粘贴时才传”（做法和 RDP 的剪贴板重定向一样：复制时只说有什么，粘贴时才传数据）。
     /// 声明它的一端：
-    /// - 复制文件、图片、长文字时不主动发内容，只发 [`crate::clipboard::ClipMsg::Held`]；短文字照常马上同步；
+    /// - 复制任何内容（文字、图片、文件）时都不主动发，只发 [`crate::clipboard::ClipMsg::Held`]；
     /// - 收到的内容处理完后回 [`crate::clipboard::ClipMsg::Applied`]；
     /// - 作为被控端，认识 [`crate::input::InputEvent::Paste`]（内容到了以后补上被扣住的粘贴键）。
     ///

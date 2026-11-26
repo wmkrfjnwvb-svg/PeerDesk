@@ -275,7 +275,7 @@ pub struct Strings {
     pub clip_what_files: &'static str,
     /// `{what}`：图片。
     pub clip_what_image: &'static str,
-    /// `{what}`：长文字。
+    /// `{what}`：文字。
     pub clip_what_text: &'static str,
     /// 远程控制
     pub nav_home: &'static str,
@@ -566,10 +566,10 @@ pub const ZH: Strings = Strings {
     clip_send_cancelled: "已取消传输，没有粘贴。再按一次粘贴会重新传",
     clip_send_unreadable: "剪贴板里的内容读不出来，没有粘贴。请重新复制再粘贴；如果是文件，请检查 PeerDesk 有没有访问那个文件夹的权限（macOS：系统设置 → 隐私与安全性 → 文件和文件夹），或用文件传输",
     clip_send_remote_write: "内容已经传到，但对方的剪贴板写不进去（可能被别的程序占用），没有粘贴。请再按一次粘贴",
-    clip_remote_held: "对方复制了{what}，没有同步到本机：从对方到本机目前只同步短文字。文件请用文件传输取回",
+    clip_remote_held: "对方复制了{what}，没有同步到本机：从对方复制、到本机粘贴目前还不支持。文件请用文件传输取回",
     clip_what_files: "文件",
     clip_what_image: "图片",
-    clip_what_text: "一段长文字",
+    clip_what_text: "文字",
     nav_home: "远程控制",
     nav_devices: "设备",
     nav_settings: "设置",
@@ -782,10 +782,10 @@ pub const EN: Strings = Strings {
     clip_send_cancelled: "Transfer cancelled; nothing was pasted. Paste again to resend",
     clip_send_unreadable: "The clipboard content could not be read, so nothing was pasted. Copy it again and paste; for files, check that PeerDesk may access that folder (macOS: System Settings → Privacy & Security → Files and Folders), or use file transfer",
     clip_send_remote_write: "The content arrived, but the remote clipboard could not be written (another program may be using it), so nothing was pasted. Press paste again",
-    clip_remote_held: "The remote copied {what}; it was not synced to this computer (only short text is synced in this direction). Use file transfer to fetch files",
+    clip_remote_held: "The remote copied {what}; it was not synced to this computer (copying on the remote and pasting here is not supported yet). Use file transfer to fetch files",
     clip_what_files: "files",
     clip_what_image: "an image",
-    clip_what_text: "a long text",
+    clip_what_text: "text",
     nav_home: "Remote control",
     nav_devices: "Devices",
     nav_settings: "Settings",
