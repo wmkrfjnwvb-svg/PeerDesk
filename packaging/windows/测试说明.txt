@@ -8,7 +8,6 @@ PeerDesk 测试版（Windows）
 
 文件
   peerdesk.exe          客户端。双击打开图形界面；带参数运行是命令行（peerdesk help）。
-  peerdesk-server.exe   服务端（信令和中继），只在两台机器不在同一局域网时需要。
 
 使用（同一局域网）
   1. 两台机器都运行 peerdesk.exe。第一次运行时 Windows 防火墙会询问，请允许“专用网络”。
@@ -21,7 +20,7 @@ PeerDesk 测试版（Windows）
   只有一台机器时：勾选“允许远程控制”后点“连接本机（自测）”。
 
 通过服务器连接（不在同一网络）
-  在有公网地址的机器上运行 peerdesk-server.exe <配置文件>（配置见项目 config 目录），
+  服务端（peerdesk-server）单独下载。在有公网地址的机器上运行 peerdesk-server.exe <配置文件>（配置见项目 config 目录），
   被控机在“通过服务器让别人找到本机”里填服务器地址后再打开“允许远程控制”；
   控制机在“通过服务器连接”里填服务器地址和被控机的设备指纹。
 
@@ -44,7 +43,6 @@ input injection land, the same UI shows the real desktop.
 
 Files
   peerdesk.exe          The client. Double-click for the GUI; with arguments it is the CLI (peerdesk help).
-  peerdesk-server.exe   Signaling and relay server; only needed when the machines are not on one LAN.
 
 Usage (same LAN)
   1. Run peerdesk.exe on both machines. Allow it on "Private networks" when the firewall asks.
@@ -57,7 +55,7 @@ Usage (same LAN)
   With one machine: tick "Allow remote control", then click "Connect to this device (self-test)".
 
 Through a server (different networks)
-  Run peerdesk-server.exe <config> on a machine with a public address (see the config folder
+  The server (peerdesk-server) is a separate download. Run peerdesk-server.exe <config> on a machine with a public address (see the config folder
   of the project). On the host fill in "Register on a signaling server" before turning on
   "Allow remote control"; on the controller use "Connect via signaling server" with the
   server address and the host's fingerprint.

@@ -29,8 +29,7 @@ PeerDesk 测试版（macOS，Apple 芯片和 Intel 通用）
   只有一台机器时：勾选“允许远程控制”后点“连接本机（自测）”。
 
 服务端
-  peerdesk-server 是信令和中继服务端，只在两台机器不在同一网络时需要：
-  ./peerdesk-server <配置文件>（第一次运行前同样执行 xattr -d com.apple.quarantine peerdesk-server）。
+  信令和中继服务端（peerdesk-server）单独下载，只在两台机器不在同一网络、又不用默认服务器时需要。
 命令行
   /Applications/PeerDesk.app/Contents/MacOS/peerdesk help
 
@@ -72,8 +71,8 @@ Usage (same LAN)
   With one machine: tick "Allow remote control", then click "Connect to this device (self-test)".
 
 Server
-  peerdesk-server is the signaling and relay server, only needed across networks:
-  ./peerdesk-server <config> (run xattr -d com.apple.quarantine peerdesk-server first).
+  The signaling and relay server (peerdesk-server) is a separate download, only needed across networks
+  when you do not use the default server.
 Command line
   /Applications/PeerDesk.app/Contents/MacOS/peerdesk help
 

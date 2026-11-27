@@ -307,7 +307,8 @@ jobs:
         run: |
           short=$(git rev-parse --short=7 HEAD)
           echo "ARTIFACT=peerdesk-$short-${{ matrix.name }}" >> "$GITHUB_ENV"
-          ${{ matrix.script }} dist "peerdesk-$short-${{ matrix.name }}"
+          echo "SERVER_ARTIFACT=peerdesk-server-$short-${{ matrix.name }}" >> "$GITHUB_ENV"
+          ${{ matrix.script }} dist "peerdesk-$short-${{ matrix.name }}" dist-server
       - name: Binary sizes
         shell: bash
         run: ls -l target/release/peerdesk* target/universal/* 2>/dev/null || true
@@ -315,6 +316,13 @@ jobs:
         with:
           name: ${{ env.ARTIFACT }}
           path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+      # 服务端单独一个产物：客户端安装包里不再带服务端
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.SERVER_ARTIFACT }}
+          path: dist-server/*
           if-no-files-found: error
           retention-days: 7
 
