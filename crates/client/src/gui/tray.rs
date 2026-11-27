@@ -246,10 +246,12 @@ mod native {
 
     /// 在界面线程里立即退出：摘掉托盘图标，以退出码 0 结束（守护不会拉起）。
     /// Windows 的“退出”走这里：窗口隐藏时 `update` 不运行，不能等它。代价：不经过 eframe 的正常收尾，
-    /// 正在进行的远程会话由对端按超时发现断开；单实例锁和网络连接由系统回收。
+    /// 对端已在上面收到带原因的关闭；单实例锁和网络连接由系统回收。
     #[cfg(windows)]
     pub fn quit_now() {
-        log::info!("退出（托盘菜单或窗口请求）");
+        // 先告诉所有会话的对端“我退出了”（最多等 300 毫秒让关闭帧发出去），再立即退出
+        let told = crate::gui::session::say_goodbye();
+        log::info!("退出（托盘菜单或窗口请求），已通知 {told} 个会话的对端");
         ICON.with(|icon| drop(icon.borrow_mut().take()));
         std::process::exit(i32::from(crate::EXIT_OK));
     }

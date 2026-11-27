@@ -141,7 +141,12 @@ impl Background {
                 }
                 WindowAction::Kick => kick(),
                 // 关闭请求下一帧到来时 `life` 已经是退出状态，会放行
-                WindowAction::Exit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                WindowAction::Exit => {
+                    // 退出前先告诉对端“我退出了”，对端不用等超时
+                    let told = super::session::say_goodbye();
+                    log::info!("退出，已通知 {told} 个会话的对端");
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
                 WindowAction::Nothing => {}
             }
         }
@@ -166,7 +171,11 @@ impl Background {
                     ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                     status = Some(Status::info(s.tray_hint));
                 }
-                CloseAction::Quit => {}
+                CloseAction::Quit => {
+                    // 没有托盘时关窗口就是退出：同样先通知对端
+                    let told = super::session::say_goodbye();
+                    log::info!("关闭窗口即退出，已通知 {told} 个会话的对端");
+                }
             }
         }
         if let Some(tray) = &mut self.tray {
