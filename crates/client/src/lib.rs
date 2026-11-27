@@ -5,6 +5,7 @@
 
 use std::io::Write;
 
+pub mod account;
 pub mod autostart;
 pub mod crashreport;
 pub mod diag_record;
@@ -59,6 +60,9 @@ const USAGE: &str = "\
   host [选项]             作为被控端等待连接
   connect <地址> [选项]   作为控制端直接连接被控端
   connect --server <地址> --device <设备码> [选项]
+  account join --server <地址> [--server-pin <指纹>] --token <入表令牌> [--name <名字>] [--controller]
+                          把这台设备加入账户（之后在账户的设备列表里看得到它）；account status、account leave
+  devices [--json]        列出账户里的设备；devices rename <编号> <新名字>、devices remove <编号>
   netcheck [--server <地址> [--server-pin <指纹>]]
                           网络体检：NAT 类型、本机到路由器和服务器的延迟、IPv6
                           通过服务器找到被控端：先试直连（打洞），不通再走中继
@@ -314,6 +318,8 @@ pub fn run(args: &[String], out: &mut dyn Write) -> u8 {
         "connect" => return remote::connect(rest, out),
         "bench-transport" => return remote::bench(rest, out),
         "netcheck" => return remote::netcheck(rest, out),
+        "account" => return account::cmd_account(rest, out),
+        "devices" => return account::cmd_devices(rest, out),
         "screen-check" => return screen_check::screen_check(rest, out),
         "check-config" => cmd_check_config(rest, out),
         "hw-check" => return hwcheck::hw_check(out, &data_dir().join("logs")),
