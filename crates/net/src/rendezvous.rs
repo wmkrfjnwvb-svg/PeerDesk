@@ -9,8 +9,9 @@ use std::time::{Duration, Instant};
 
 use peerdesk_core::paths::{Candidate, Limits, PathKind, NAT_PENALTY_US};
 use peerdesk_core::relay::{parse_notice, unwrap, wrap, SessionId, RELAY_HEADER};
+use peerdesk_core::devices::{Enrolled, Refusal, Role};
 use peerdesk_core::signal::{
-    format_code, observe_packet, Features, PunchInfo, PunchPlan, RelayGrant, SignalMsg,
+    format_code, observe_packet, DeviceRow, Features, PunchInfo, PunchPlan, RelayGrant, SignalMsg,
 };
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
@@ -320,19 +321,146 @@ pub async fn register_with(
 
 /// 问服务器会哪些后来加的功能（不登记的一方用，例如控制端）。老服务器回答的是 [`Features::NONE`]。
 ///
-/// 用的是体检消息（[`SignalMsg::Check`]），所有版本的服务器都认识。注意体检有一个副作用：服务器会忘掉这台设备
-/// 上一次 NAT 探测的结果，所以别在“探测”和“发起连接”之间调用它；会话开始前单独问一次，结果可以一直用。
+/// 用“只问功能的体检”（[`SignalMsg::CheckQuiet`]）：所有版本的服务器都认识体检消息，新服务器看到末尾的标志
+/// 就不动 NAT 探测的结果，所以什么时候问都行。老服务器会按普通体检处理（忘掉上一次探测的结果），但它什么新功能
+/// 都不会，客户端问完也就不再发新消息了。
 pub async fn server_features(node: &Node, server: &Server) -> Result<Features, NetError> {
-    let link = node.connect(server.addr, server.pin.as_ref()).await?;
-    let (mut send, mut recv) = link.open_stream().await?;
-    write_kind(&mut send, StreamKind::Signal).await?;
-    write_signal(&mut send, &SignalMsg::Check).await?;
-    let reply = read_signal(&mut recv).await;
-    link.close("done");
-    if let SignalMsg::Checked { features, .. } = reply? {
-        return Ok(features);
+    let session = AccountSession::open(node, server).await?;
+    let features = session.features;
+    session.close();
+    Ok(features)
+}
+
+/// 和服务器之间的一条信令流，用来做账户设备表的操作（入表、列出、改名、移除）。
+///
+/// 打开时先问服务器会不会（[`Features::DEVICES`]）。不会就不发任何设备表的消息——老服务器遇到不认识的消息会
+/// 关掉信令流——每个操作直接返回 [`Refusal::Unsupported`]。
+#[derive(Debug)]
+pub struct AccountSession {
+    link: Link,
+    send: quinn::SendStream,
+    recv: quinn::RecvStream,
+    /// 服务器开着的功能。
+    pub features: Features,
+}
+
+/// 一次设备列表查询的结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceChanges {
+    /// 账户现在的修订号（下次查询带上它，只取之后的改动）。
+    pub rev: u64,
+    /// `true`：`rows` 是全部设备，把手上的表换掉；`false`：`rows` 是改动过的（含移除的），按编号合并。
+    pub full: bool,
+    /// 设备。
+    pub rows: Vec<DeviceRow>,
+}
+
+/// 一次查询最多收这么多条分页消息（每条 [`peerdesk_core::signal::MAX_ROWS`] 台，够
+/// [`peerdesk_core::devices::MAX_DEVICES`] 台再加墓碑；服务器乱发时不无限读下去）。
+const MAX_PAGES: usize = 1024;
+
+impl AccountSession {
+    /// 连上服务器，问清它会什么。
+    pub async fn open(node: &Node, server: &Server) -> Result<Self, NetError> {
+        let link = node.connect(server.addr, server.pin.as_ref()).await?;
+        let (mut send, mut recv) = link.open_stream().await?;
+        write_kind(&mut send, StreamKind::Signal).await?;
+        write_signal(&mut send, &SignalMsg::CheckQuiet).await?;
+        let SignalMsg::Checked { features, .. } = read_signal(&mut recv).await? else {
+            return Err(NetError::Protocol("服务器的体检应答不对"));
+        };
+        Ok(Self {
+            link,
+            send,
+            recv,
+            features,
+        })
     }
-    Err(NetError::Protocol("服务器的体检应答不对"))
+
+    /// 发一条设备表的请求，读一条回复。服务器不会设备表时不发。
+    async fn ask(&mut self, msg: &SignalMsg) -> Result<SignalMsg, NetError> {
+        if !self.features.has(Features::DEVICES) {
+            return Err(NetError::Refused(Refusal::Unsupported));
+        }
+        write_signal(&mut self.send, msg).await?;
+        match read_signal(&mut self.recv).await? {
+            SignalMsg::Refused { code } => Err(NetError::Refused(Refusal::from_code(code))),
+            reply => Ok(reply),
+        }
+    }
+
+    /// 用入表令牌把这台设备加进账户。`os` 是 [`peerdesk_core::proto::PeerOs`] 的数值。
+    pub async fn enroll(
+        &mut self,
+        token: &str,
+        name: &str,
+        os: u8,
+        role: Role,
+    ) -> Result<Enrolled, NetError> {
+        let msg = SignalMsg::Enroll {
+            token: token.to_owned(),
+            name: name.to_owned(),
+            os,
+            role: role.id(),
+        };
+        if let SignalMsg::Enrolled { account, row, rev } = self.ask(&msg).await? {
+            return Ok(Enrolled { account, row, rev });
+        }
+        Err(NetError::Protocol("服务器对入表的应答不对"))
+    }
+
+    /// 账户里 `since` 之后的改动（0 取全量）。
+    pub async fn devices(&mut self, since: u64) -> Result<DeviceChanges, NetError> {
+        let mut reply = self.ask(&SignalMsg::Devices { since }).await?;
+        let mut all = Vec::new();
+        for _ in 0..MAX_PAGES {
+            let SignalMsg::DeviceRows {
+                rev,
+                full,
+                more,
+                rows,
+            } = reply
+            else {
+                return Err(NetError::Protocol("服务器对设备列表的应答不对"));
+            };
+            all.extend(rows);
+            if !more {
+                return Ok(DeviceChanges {
+                    rev,
+                    full,
+                    rows: all,
+                });
+            }
+            reply = read_signal(&mut self.recv).await?;
+        }
+        Err(NetError::Protocol("服务器发来的设备列表没完没了"))
+    }
+
+    /// 给设备改名，返回改动后的修订号。
+    pub async fn rename(&mut self, row: u32, name: &str) -> Result<u64, NetError> {
+        let msg = SignalMsg::Rename {
+            row,
+            name: name.to_owned(),
+        };
+        self.changed(&msg).await
+    }
+
+    /// 把设备移出账户（`row` 为 0 是自己退出），返回改动后的修订号。
+    pub async fn remove(&mut self, row: u32) -> Result<u64, NetError> {
+        self.changed(&SignalMsg::Remove { row }).await
+    }
+
+    async fn changed(&mut self, msg: &SignalMsg) -> Result<u64, NetError> {
+        if let SignalMsg::Changed { rev } = self.ask(msg).await? {
+            return Ok(rev);
+        }
+        Err(NetError::Protocol("服务器对改动的应答不对"))
+    }
+
+    /// 用完了。
+    pub fn close(self) {
+        self.link.close("done");
+    }
 }
 
 /// 从连接用的端口向服务器的探测地址发几个 NAT 探测包（丢一两个没关系）。
@@ -602,6 +730,15 @@ async fn dial_on(
         | SignalMsg::Registered { .. }
         | SignalMsg::Connect { .. }
         | SignalMsg::ConnectCode { .. }
+        | SignalMsg::CheckQuiet
+        | SignalMsg::Enroll { .. }
+        | SignalMsg::Enrolled { .. }
+        | SignalMsg::Refused { .. }
+        | SignalMsg::Devices { .. }
+        | SignalMsg::DeviceRows { .. }
+        | SignalMsg::Rename { .. }
+        | SignalMsg::Remove { .. }
+        | SignalMsg::Changed { .. }
         | SignalMsg::Incoming { .. } => return Err(NetError::Protocol("服务器的应答不是地址")),
     };
     timing.lookup = asked.elapsed();

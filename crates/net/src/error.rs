@@ -26,6 +26,8 @@ pub enum NetError {
     Protocol(&'static str),
     /// 等待超时。
     Timeout(&'static str),
+    /// 服务器拒绝了账户设备表的操作（原因和解决办法见 [`peerdesk_core::devices::Refusal::text`]）。
+    Refused(peerdesk_core::devices::Refusal),
 }
 
 impl fmt::Display for NetError {
@@ -42,6 +44,7 @@ impl fmt::Display for NetError {
             ),
             NetError::Protocol(what) => write!(f, "对端违反协议：{what}"),
             NetError::Timeout(what) => write!(f, "超时：{what}"),
+            NetError::Refused(why) => write!(f, "{}", why.text()),
         }
     }
 }
@@ -72,6 +75,7 @@ mod tests {
             },
             NetError::Protocol("x"),
             NetError::Timeout("x"),
+            NetError::Refused(peerdesk_core::devices::Refusal::ExpiredToken),
         ];
         for e in all {
             assert!(!e.to_string().is_empty());

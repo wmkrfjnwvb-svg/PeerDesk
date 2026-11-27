@@ -921,6 +921,8 @@ pub struct Registry {
     devices: BTreeMap<DeviceId, Online>,
     codes: BTreeMap<DeviceId, u32>,
     owners: BTreeMap<u32, DeviceId>,
+    /// 这台服务器实际开着的功能（登记的回复里告诉设备）。
+    features: Features,
 }
 
 /// 一台在线设备。
@@ -970,7 +972,13 @@ impl Registry {
             devices: BTreeMap::new(),
             codes: BTreeMap::new(),
             owners: BTreeMap::new(),
+            features: Features::NONE,
         }
+    }
+
+    /// 这台服务器实际开着哪些功能（代码会、配置也开了的）。不设就是什么都不报。
+    pub const fn set_features(&mut self, features: Features) {
+        self.features = features;
     }
 
     /// 从存盘的码簿恢复（每行 `设备码 指纹十六进制`）。返回读不懂的行数，这些行被跳过。
@@ -1053,7 +1061,7 @@ impl Registry {
                 observed,
                 code,
                 probe,
-                features: Features::SERVER,
+                features: self.features,
             },
             code,
             new_code,
@@ -1449,7 +1457,7 @@ mod tests {
                     observed: addr("198.51.100.1:5000"),
                     code: CODE_MIN + 5,
                     probe: None,
-                    features: Features::SERVER,
+                    features: Features::NONE,
                 },
                 code: CODE_MIN + 5,
                 new_code: true,
@@ -1722,8 +1730,9 @@ mod tests {
         let with = registered(all).encode();
         let without = registered(Features::NONE).encode();
         assert_eq!(with[..with.len() - 4], without[..without.len() - 4]);
-        // 登记的回复带着这个版本服务器的功能
+        // 登记的回复带着这台服务器开着的功能（没设就是什么都不报）
         let mut reg = Registry::new();
+        reg.set_features(Features::SERVER);
         let done = reg
             .register(
                 1,
