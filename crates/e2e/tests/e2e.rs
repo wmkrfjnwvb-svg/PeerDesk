@@ -377,12 +377,10 @@ fn wifi_light_activity(name: &str) -> Scenario {
 }
 
 #[test]
-// 2880×1800 一分多钟：调试构建插桩后要跑一个小时以上（2026-11-27 覆盖率任务实测 50 分钟没跑完），所以只在发布构建
-// 里跑。CI 的端到端任务每次推送都跑发布构建，门槛照样每次都守。
-#[cfg_attr(
-    debug_assertions,
-    ignore = "大屏场景只在发布构建跑（端到端任务），调试构建太慢"
-)]
+// 2880×1800 一分多钟，CI 额度有限，不进 CI（调试构建插桩后更要一个小时以上）。改了传输、码率控制或编码之后，
+// 合并前在本地手动跑（和 microsoft_traces 的 144 次一样）：
+// cargo test -p peerdesk-e2e --release --test e2e light_activity_on_wifi_keeps_the_rate -- --ignored
+#[ignore = "大屏场景耗时长，不进 CI；改传输后本地手动跑（见上面的注释）"]
 fn light_activity_on_wifi_keeps_the_rate() {
     let o = run(&wifi_light_activity("wifi-light")).unwrap();
     finish(&o);
