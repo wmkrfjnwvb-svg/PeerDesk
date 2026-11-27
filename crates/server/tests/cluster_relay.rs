@@ -291,6 +291,57 @@ async fn paid_and_free_relays_billing_and_failover() {
             5
         )
     );
+    // 账户设备表：给这个账户签一枚入表令牌（要管理令牌；账户号、天数不对是 400）
+    let enroll_body = format!("{{\"account\":\"{account}\",\"days\":7}}");
+    let (status, _) = http(f2.http, "POST", "/api/enroll-tokens", None, &enroll_body);
+    assert_eq!(status, 401);
+    for bad in [
+        "{\"account\":\"xyz\"}".to_owned(),
+        format!("{{\"account\":\"{account}\",\"days\":0}}"),
+        format!("{{\"account\":\"{account}\",\"days\":91}}"),
+    ] {
+        let (status, body) = http(f2.http, "POST", "/api/enroll-tokens", Some(ADMIN), &bad);
+        assert_eq!(status, 400, "{bad} → {body}");
+    }
+    let (status, body) = http(
+        f2.http,
+        "POST",
+        "/api/enroll-tokens",
+        Some(ADMIN),
+        &enroll_body,
+    );
+    assert_eq!(status, 200, "{body}");
+    let enroll_token = body
+        .split("\"enroll_token\":\"")
+        .nth(1)
+        .unwrap()
+        .split('"')
+        .next()
+        .unwrap()
+        .to_owned();
+    assert!(
+        enroll_token.starts_with(&format!("pde1-{account}-")),
+        "{body}"
+    );
+    // 真实的服务器进程：一台设备用它入表、列出自己；表落在这个节点的数据目录里
+    {
+        use peerdesk_core::devices::Role;
+        use peerdesk_core::signal::Features;
+        use peerdesk_net::rendezvous::AccountSession;
+        let mut session = AccountSession::open(&ctrl, &s2).await.unwrap();
+        assert!(session.features.has(Features::DEVICES));
+        let enrolled = session
+            .enroll(&enroll_token, "测试机", 3, Role::Controller)
+            .await
+            .unwrap();
+        assert_eq!((enrolled.row, enrolled.rev), (1, 1));
+        let all = session.devices(0).await.unwrap();
+        assert_eq!(all.rows.len(), 1);
+        assert_eq!(all.rows[0].name, "测试机");
+        session.close();
+        let log = std::fs::read_to_string(f2.dir.join("devices").join("devices.log")).unwrap();
+        assert!(log.contains(&account) && log.contains("测试机"), "{log}");
+    }
     let (status, _) = http(
         f2.http,
         "POST",

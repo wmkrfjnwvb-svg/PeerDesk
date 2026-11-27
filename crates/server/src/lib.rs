@@ -4,6 +4,7 @@
 //! 内嵌的 React 管理页面与状态接口。信令和中继在 M3 加入，复用这里的集群与路由。
 
 pub mod accounting;
+pub mod devices;
 pub mod http;
 pub mod json;
 pub mod logging;
