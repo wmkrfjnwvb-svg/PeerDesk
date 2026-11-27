@@ -765,6 +765,9 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(matches!(reply, peerdesk_core::browse::Reply::List { .. }));
+        // 测完删掉临时目录：不删的话每跑一次在临时目录里留 33 MB（2026-11-27 积了 92 份、约 3 GB）
+        drop(runner);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
