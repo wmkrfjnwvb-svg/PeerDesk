@@ -598,6 +598,10 @@ pub struct MediaSender {
     probing_at: Time,
     probing_late: bool,
     pacer_busy: bool,
+    /// 最近一次“有东西要发、被网络挡住”（该编帧时被拦、关键帧没确认、重传被截断）是什么时候。
+    blocked_at: Option<Time>,
+    /// 上一份反馈是什么时候处理的。
+    observed_at: Option<Time>,
     /// 接收端报告的每一帧到了几个分片（见 [`crate::transport::PROGRESS`]）。
     progress: BTreeMap<u32, u16>,
 }
@@ -670,6 +674,8 @@ impl MediaSender {
             probing_at: Time(0),
             probing_late: false,
             pacer_busy: false,
+            blocked_at: None,
+            observed_at: None,
             progress: BTreeMap::new(),
             scale: if codec == Codec::H264 {
                 ScalePolicy::new()
@@ -1247,6 +1253,13 @@ impl MediaSender {
     /// 记一次网络受限的原因，马上告诉估计器（应用受限进慢出快，不等下一份反馈）。
     fn net_event(&mut self, now: Time, cause: NetCause) {
         self.net_limited = Some((now, cause));
+        // 有东西要发、被网络挡住的那几种原因单独记时间（见 `observe` 里的 `backlog`）
+        if matches!(
+            cause,
+            NetCause::FrameBlocked | NetCause::KeyPending | NetCause::ResendCapped
+        ) {
+            self.blocked_at = Some(now);
+        }
         self.rate.on_net_limited(cause);
         // 探测期间出现网络受限的原因：中止，结果不用
         self.end_run_probe(now, ProbeEnd::Aborted(cause.name()));
@@ -1796,12 +1809,21 @@ impl MediaSender {
     }
 
     fn observe(&mut self, now: Time, feedback: &Feedback, ext: Extension) {
+        let limit = self.send_limit(now);
+        // 这一刻发送端有没有东西等着发、被网络挡着（估计器据此判断送达速率是不是链路的能力）
+        let blocked_lately = self
+            .blocked_at
+            .is_some_and(|at| self.observed_at.is_none_or(|last| at >= last));
+        let backlog =
+            blocked_lately || self.key_pending() || self.pacer_busy || self.in_flight_full(now);
+        self.observed_at = Some(now);
         let obs = Observation {
             feedback: *feedback,
             ext,
             rtt_us: self.rtt_us,
             in_flight: self.in_flight(),
-            limit: self.send_limit(now),
+            limit,
+            backlog,
         };
         // 还没开始起步探测就看到明显丢包：不探（有丢包的链路上探测结果不准，码率一下提上去之后在丢包里来回降：
         // 微软轨迹 ms-02560，8 Mbps、12% 随机丢包，卡顿 0 → 3 次）

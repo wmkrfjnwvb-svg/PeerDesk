@@ -452,6 +452,10 @@ pub struct Observation {
     pub in_flight: u64,
     /// 发送量现在是被谁限制的（发送端按原因判，见 [`SendLimit`]）。
     pub limit: SendLimit,
+    /// 发送端这一刻有东西等着发、被网络挡着（上一份反馈以来该编帧时被在途上限或节奏器拦过、重传被额度截断过，
+    /// 或者现在关键帧没确认、节奏器里还有包、在途满着）。[`SendLimit`] 的原因会保留 500 ms，这个只说现在。
+    /// 估计器用它判断这份反馈里的送达速率是不是链路的能力（见 [`ClassicV1`] 的 `busy`）。
+    pub backlog: bool,
 }
 
 /// 发送量被网络限制的原因（发送端记下最近一次，见 [`crate::media::MediaSender`]）。
@@ -935,6 +939,68 @@ pub struct ClassicV1 {
     queue_run: VecDeque<(Time, u32)>,
     /// 运行中探测的触发和结论（见 [`Probing`]）。
     probing: Probing,
+    /// 从什么时候起发送端一直在把链路往满里用（每份反馈都是用满了码率或有积压）。持续满一个窗口，
+    /// 送达速率才代表链路的能力（见 [`ClassicV1::link_limited`]）。
+    busy: Busy,
+    /// 没在用链路时的排队读数（链路自己的抖动，见 [`Jitter`]）。
+    jitter: Jitter,
+}
+
+/// 发送端是不是一直在把链路往满里用。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Busy {
+    /// 从会话开始就是（还没见过不是的反馈）。
+    FromStart,
+    /// 从这个时刻起一直是。
+    Since(Time),
+    /// 最近一份反馈不是。
+    No,
+}
+
+/// 链路自己的抖动：发送端没在用链路（没用满码率、也没有积压）时的排队读数。这时我们的流量堆不出队列，
+/// 读数高只能是链路自己的毛病（Wi-Fi 的信道争用、省电唤醒、接收端批量读包）。
+///
+/// 用它选延迟门限，而不是按“是不是 Wi-Fi”写死（以前会话里写死成“不是”，Wi-Fi 的门限从来没用上）：
+/// 最近 [`JITTER_WINDOW`] 份这样的读数里有 [`JITTER_ON`] 份以上超过稳定链路的 high（12 ms），就按抖动链路的门限
+/// （[`Profile::WIRELESS`] 的 low 8 ms、high 30 ms）；整整一个窗口一份都没有才换回来（滞回）。
+/// 2026-11-27 用户日志：Mac 公网 Wi-Fi 和 Windows 局域网 Wi-Fi 上，降码率时的排队中位都是 17 ms（10%–90% 分位 12–50 ms），
+/// 趋势正常、丢包 0——刚过 12 ms 的线。只换延迟门限，不换整套画像：纠错比例是给丢包准备的，这里没有丢包。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Jitter {
+    /// 最近的读数是否超过了稳定链路的 high。
+    recent: VecDeque<bool>,
+    /// 现在按抖动链路的门限。
+    on: bool,
+}
+
+/// 看最近多少份“没在用链路”的排队读数。
+const JITTER_WINDOW: usize = 64;
+/// 其中有这么多份超过稳定链路的 high 就算抖动链路（约 5%：有线链路上这样的读数基本是 0）。
+const JITTER_ON: usize = 3;
+
+impl Jitter {
+    const fn new() -> Self {
+        Self {
+            recent: VecDeque::new(),
+            on: false,
+        }
+    }
+
+    /// 记一份读数；返回门限是否换了（换了要写日志）。
+    fn add(&mut self, over: bool) -> bool {
+        self.recent.push_back(over);
+        if self.recent.len() > JITTER_WINDOW {
+            self.recent.pop_front();
+        }
+        let count = self.recent.iter().filter(|o| **o).count();
+        let was = self.on;
+        if count >= JITTER_ON {
+            self.on = true;
+        } else if count == 0 && self.recent.len() >= JITTER_WINDOW {
+            self.on = false;
+        }
+        self.on != was
+    }
 }
 
 /// 运行中探测在估计器这边的状态：什么时候要探、探多快、结论怎么用。发、等、超时、中止在发送端
@@ -1115,6 +1181,8 @@ impl ClassicV1 {
             inherent_loss: 0,
             phase: Phase::Tracking,
             queue_run: VecDeque::new(),
+            busy: Busy::FromStart,
+            jitter: Jitter::new(),
             probing: Probing {
                 drop: None,
                 calm_since: None,
@@ -1176,6 +1244,53 @@ impl ClassicV1 {
         }
     }
 
+    /// 延迟门限 `(low, high)`：链路自己抖动大时用抖动链路的（见 [`Jitter`]），不低于画像本身的。
+    fn delay_limits(&self) -> (u32, u32) {
+        let p = &self.profile;
+        if self.jitter.on {
+            (
+                p.low_delay_us.max(Profile::WIRELESS.low_delay_us),
+                p.high_delay_us.max(Profile::WIRELESS.high_delay_us),
+            )
+        } else {
+            (p.low_delay_us, p.high_delay_us)
+        }
+    }
+
+    /// 这份反馈里的送达速率是不是链路的能力（“链路受限的样本”）。是的话按它降不会过头；不是的话它只是
+    /// “这段时间要发的量”，不能用来降码率——BBR 的规则（draft-ietf-ccwg-bbr：应用受限的送达速率样本只能把估计
+    /// 往上推；而且应用受限的标记要等受限期间发的包都确认完才清掉）。
+    ///
+    /// 两种情况算链路受限：
+    /// - 送达速率已经在码率的六成以上（用满了）：按它降最多降一半，本身就是证据；
+    /// - 发送端连着一个窗口（100 ms，往返更长时按往返）都有积压或用满码率：这份反馈确认的包是在链路一直忙着的
+    ///   时候发的。刚开始有积压的那一个窗口不算——确认的还是之前零零星星发的包（“气泡”还没走完）。
+    ///
+    /// 和以前的区别：以前只要状态是“跟踪”，一份排队读数高就按送达速率降。但从应用受限切回跟踪只需要一个大帧，
+    /// 那之后的送达速率还是静止时的：2026-11-27 Mac 日志 46 分钟里这样降了 496 次，317 次降到 1 Mbps 以下
+    /// （`docs/research/P-fps-bitrate.md` M1）。
+    fn link_limited(&mut self, now: Time, using: bool, obs: &Observation) -> bool {
+        let backlog = obs.backlog
+            || matches!(
+                obs.limit,
+                SendLimit::Network(NetCause::Unknown | NetCause::Start | NetCause::UsingRate)
+            );
+        if using || backlog {
+            if self.busy == Busy::No {
+                self.busy = Busy::Since(now);
+            }
+        } else {
+            self.busy = Busy::No;
+        }
+        let window = STANDING_US.max(obs.rtt_us);
+        using
+            || match self.busy {
+                Busy::FromStart => true,
+                Busy::Since(t) => now.since(t) >= window,
+                Busy::No => false,
+            }
+    }
+
     /// 记下这份反馈的排队读数，返回最近 `window_us` 里的最小读数（常驻队列）。这一段不断档的反馈还不够这么长时
     /// 返回 `None`：证据不够，不算常驻队列。断档时从头记。
     fn standing_queue(
@@ -1207,7 +1322,7 @@ impl ClassicV1 {
     /// 按发送端报告的受限原因和时间走状态机的出口（降码率引起的切换在 [`RateEstimator::on_observation`] 里）。
     /// 一份反馈最多走一步。
     fn step(&mut self, now: Time, obs: &Observation) {
-        let low = self.profile.low_delay_us;
+        let (low, _) = self.delay_limits();
         let queue = obs.feedback.queue_delay_us;
         match (self.phase, obs.limit) {
             // 起步由发送端的起步探测结束（见 `set_startup`）
@@ -1692,24 +1807,43 @@ impl RateEstimator for ClassicV1 {
             STANDING_US.max(obs.rtt_us),
         );
         self.probing.rtt_us = obs.rtt_us;
+        // 这份反馈里的送达速率是不是链路的能力；不是的话，它的排队读数记进“链路自己的抖动”
+        let link_limited = self.link_limited(now, using, obs);
+        if !link_limited && self.jitter.add(fb.queue_delay_us > Profile::STABLE.high_delay_us) {
+            let (low, high) = self.delay_limits();
+            self.note(format!(
+                "延迟门限换成 low {} ms、high {} ms：{}",
+                low / 1000,
+                high / 1000,
+                if self.jitter.on {
+                    "没在用链路的时候排队读数也常常超过 12 ms，是链路自己的抖动（Wi-Fi 一类）"
+                } else {
+                    "最近没在用链路时的排队读数都很低，链路是稳的"
+                }
+            ));
+        }
+        let (low_us, high_us) = self.delay_limits();
         // 平静：排队低于 low。断档的那份反馈不算数（和判拥塞时一样：零星小包的读数是 Wi-Fi 省电的延迟，
         // 几乎每份都是十几毫秒；算上的话轻操作时永远“不平静”，核实要干等——大屏 Wi-Fi 场景实测等了 2 秒）
-        if fb.queue_delay_us < p.low_delay_us || !contiguous {
+        if fb.queue_delay_us < low_us || !contiguous {
             self.probing.calm_since.get_or_insert(now);
         } else {
             self.probing.calm_since = None;
         }
         // 以上是各状态共用的测量（和状态无关，每份反馈都一样算）。下面先走状态机的出口，再按状态判断。
         self.step(now, obs);
-        let relaxed = self.phase.relaxed();
+        let relaxed_phase = self.phase.relaxed();
+        // 放宽（只认常驻队列、一次最多降一半）：状态是应用受限一类，或者这份样本不是链路受限的（跟踪状态下也一样：
+        // 送达速率不代表链路能力时，不能按它降）。
         // 应用受限时自己的流量堆不出队列，单次高读数多半是 Wi-Fi 的延迟尖峰，要常驻（持续一个窗口）才算；
-        // 网络受限时照旧一份就算：窄带上要求持续会让真拥塞反应慢（连着 3 份才算时卡顿 31 → 58）。
+        // 链路受限时照旧一份就算：窄带上要求持续会让真拥塞反应慢（连着 3 份才算时卡顿 31 → 58）。
+        let relaxed = relaxed_phase || !link_limited;
         let queue_us = if relaxed {
             standing.unwrap_or(0)
         } else {
             fb.queue_delay_us
         };
-        let queue_high = queue_us > p.high_delay_us && contiguous;
+        let queue_high = queue_us > high_us && contiguous;
         // 固有丢包慢慢跟（每份反馈 1/128，反馈 20 ms 一次时约 2.5 秒）
         let loss = u64::from(fb.loss_permille).saturating_mul(1000);
         self.inherent_loss = self.inherent_loss - self.inherent_loss / 128 + loss / 128;
@@ -1717,7 +1851,7 @@ impl RateEstimator for ClassicV1 {
         // 丢包也按上面的读数：应用受限时一份反馈里只有几个包，丢一个就是几百‰（用户日志：2 个包丢 1 个，500‰），
         // 没有常驻队列就不算
         let lossy_and_queued = fb.loss_permille > p.loss_permille.saturating_add(inherent)
-            && queue_us > p.low_delay_us
+            && queue_us > low_us
             && contiguous;
         let congested = self.usage == Usage::Over || queue_high || lossy_and_queued;
         // 一个往返（至少 100 ms）之内只降一次：同一次拥塞的反馈会连着来好几条。
@@ -1790,10 +1924,10 @@ impl RateEstimator for ClassicV1 {
                 if self.phase != Phase::Startup {
                     self.go(
                         Phase::Drain {
-                            from_app: relaxed,
+                            from_app: relaxed_phase,
                             since: now,
                         },
-                        if relaxed {
+                        if relaxed_phase {
                             "应用受限时降了码率（常驻队列或趋势过载）"
                         } else {
                             "降了码率，等队列排掉"
@@ -1805,7 +1939,7 @@ impl RateEstimator for ClassicV1 {
         }
         // 排队在消退，或者（不断档的反馈里）还有排队：先不升。断档的那份不算：Wi-Fi 省电下零星的帧几乎每份都是
         // 12–25 ms（空闲后网卡要醒），算上的话码率永远升不上去（仿真：大屏 Wi-Fi 一直停在 1.36 Mbps）。
-        if self.usage == Usage::Under || (fb.queue_delay_us >= p.low_delay_us && contiguous) {
+        if self.usage == Usage::Under || (fb.queue_delay_us >= low_us && contiguous) {
             return;
         }
         // 应用受限（和它的核实、排空）不自己升：送达速率只是要发的量，证明不了链路能承载更多（升靠探测结论）
@@ -1886,6 +2020,7 @@ mod tests {
             rtt_us: 20_000,
             in_flight: 0,
             limit: SendLimit::default(),
+            backlog: false,
         }
     }
 
@@ -2946,7 +3081,6 @@ mod tests {
             NetCause::Unknown,
             NetCause::FrameBlocked,
             NetCause::KeyPending,
-            NetCause::FrameNearBudget,
             NetCause::UsingRate,
         ];
         for (seed, profile) in [Profile::STABLE, Profile::WIRELESS, Profile::CELLULAR]
@@ -3007,7 +3141,9 @@ mod tests {
                     },
                     rtt_us: 20_000 + rng.below(300_000),
                     in_flight: 0,
-                    limit: SendLimit::Network(causes[usize::try_from(rng.below(5)).unwrap()]),
+                    limit: SendLimit::Network(causes[usize::try_from(rng.below(4)).unwrap()]),
+                    // 发送端一直有积压：每份反馈的送达速率都是链路的能力
+                    backlog: true,
                 };
                 // 起步探测开始、结束、出结论也随机穿插（参照版本里结论就是直接定码率）
                 if i % 5_000 == 10 {
