@@ -371,4 +371,34 @@ mod tests {
         d.update_threshold(before + 10.0, 1e9 + 100.0);
         assert!(d.threshold > before, "持续高于门限：门限往上走");
     }
+
+    /// 一份报告里按到达时间排序后，比当前这一组第一个包还早发的包（乱序）整个丢掉：
+    /// 它不是新的一组，也不能把当前组的起点往前拉。
+    #[test]
+    fn a_packet_sent_before_the_current_group_is_ignored() {
+        let packet = |seq: u32, send: u64, recv: u64| PacketResult {
+            sent: SentPacket {
+                seq,
+                send_time: Time(send),
+                size: 1200,
+                kind: PacketKind::Media,
+            },
+            recv_time: Some(Time(recv)),
+        };
+        let mut d = DelayDetector::new();
+        // 先到的包是 10 ms 发的；后到的包是 0 ms 发的（比当前组的第一个包还早发）
+        d.on_packets(&[packet(1, 10_000, 40_000), packet(0, 0, 45_000)]);
+        let group = d.current.as_ref().unwrap();
+        assert_eq!(
+            (group.first_send, group.last_send),
+            (Time(10_000), Time(10_000))
+        );
+        assert_eq!(
+            group.complete,
+            Time(40_000),
+            "乱序的包没有算进这一组的到达时间"
+        );
+        assert_eq!(d.num_deltas, 0);
+        assert_eq!(d.usage(), Usage::Normal);
+    }
 }

@@ -42,8 +42,17 @@ fn gui_without_a_display_fails_cleanly() {
         .env("PEERDESK_DATA_DIR", temp_dir("gui"))
         .output()
         .unwrap();
-    assert_eq!(out.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("GUI"));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // 两种环境，两种退出码，语义都对：
+    // - 机器上没装图形系统库（CI 的覆盖率机器）：程序在 libcheck 那一步就退出，重试没用，
+    //   退出码是 EXIT_NO_RETRY（守护不重试），stderr 里说明缺哪些库；
+    // - 装了库（开发机）：走到“没有显示器”，退出码 1（守护会重试），stderr 里提到 GUI。
+    if stderr.contains("Missing system libraries") {
+        assert_eq!(out.status.code(), Some(i32::from(peerdesk::EXIT_NO_RETRY)));
+    } else {
+        assert_eq!(out.status.code(), Some(1));
+        assert!(stderr.contains("GUI"), "{stderr}");
+    }
 }
 
 fn temp_dir(tag: &str) -> PathBuf {

@@ -4115,4 +4115,262 @@ mod tests {
         );
         assert!(tx.frame_budget() < half);
     }
+
+    /// 带到达报告的反馈格式（发送端用网络控制器时）：反馈、重传请求、到达报告原样来回，坏数据报被拒绝。
+    #[test]
+    fn feedback_with_an_arrival_report_round_trips_and_rejects_garbage() {
+        let fb = Feedback {
+            floor: 9,
+            delivered: 5,
+            queue_delay_us: 3_000,
+            loss_permille: 12,
+            recv_bytes_per_s: 700_000,
+        };
+        let report = ArrivalReport {
+            base_seq: 100,
+            arrivals: vec![
+                Some(Time(5_000)),
+                None,
+                Some(Time(5_250)),
+                Some(Time(9_000)),
+            ],
+        };
+        let nacks = [(7u32, 1u16), (7, 2)];
+        let buf = encode_feedback_v2(&fb, &nacks, Some(&report));
+        let (f, n, r) = decode_feedback_v2(&buf).unwrap();
+        assert_eq!((f, n, r), (fb, nacks.to_vec(), Some(report)));
+        // 没有报告（接收端还没收到过包）：最后一个字节是 0，解出来是 None
+        let buf = encode_feedback_v2(&fb, &[], None);
+        assert_eq!(buf.last(), Some(&0));
+        assert_eq!(decode_feedback_v2(&buf).unwrap(), (fb, vec![], None));
+        // 重传请求最多编 MAX_NACKS 个，多的丢掉
+        let many: Vec<(u32, u16)> = (0..u32::try_from(MAX_NACKS).unwrap() + 5)
+            .map(|i| (i, 0))
+            .collect();
+        let (_, n, _) = decode_feedback_v2(&encode_feedback_v2(&fb, &many, None)).unwrap();
+        assert_eq!(n.len(), MAX_NACKS);
+        // 伪造：声称有比上限还多的重传请求
+        let mut forged = encode_feedback_v2(&fb, &[], None);
+        forged[Feedback::LEN] = u8::try_from(MAX_NACKS + 1).unwrap();
+        assert!(matches!(
+            decode_feedback_v2(&forged),
+            Err(Error::TooManyItems { .. })
+        ));
+        // 截断、多余的尾巴
+        assert!(decode_feedback_v2(&buf[..3]).is_err());
+        assert!(decode_feedback_v2(&buf[..buf.len() - 1]).is_err());
+        let mut long = buf;
+        long.push(0);
+        assert!(
+            decode_feedback_v2(&long).is_err(),
+            "多出来的字节不能悄悄吞掉"
+        );
+    }
+
+    /// 到达报告走通整条链：发送端记发送历史 → 接收端记到达 → 反馈带报告 → 发送端对账交给网络控制器。
+    #[test]
+    fn arrival_reports_flow_from_the_receiver_to_the_gcc_sender() {
+        // 估计器不用报告时，打开也没用（握手协商了也一样）
+        let mut classic = MediaSender::new(cfg(), Box::new(FakeEncoder::default()));
+        classic.set_reports(true);
+        assert!(!classic.reports());
+        let mut tx = MediaSender::new(
+            SenderConfig {
+                estimator: EstimatorKind::GccV1,
+                ..cfg()
+            },
+            Box::new(FakeEncoder::default()),
+        );
+        let mut rx = MediaReceiver::new(Time::ZERO, 250_000, Box::new(FakeDecoder::default()));
+        assert!(!tx.reports());
+        tx.set_reports(true);
+        rx.set_reports(true);
+        assert!(tx.reports());
+        assert_eq!(tx.estimator(), "gcc-v1");
+        let mut seq = 0u32;
+        let mut last_fb = Vec::new();
+        for i in 0..40u32 {
+            let t = Time(u64::from(i) * 33_000);
+            let out = tx
+                .on_frame(t, &Screen::new(32, 32, i + 1), true, 10_000)
+                .unwrap();
+            for o in &out {
+                tx.on_packet_sent(t, seq, o);
+                rx.on_datagram(t.plus(20_000), t, seq, o.flags, &o.body)
+                    .unwrap();
+                seq += 1;
+            }
+            tx.on_tick(t);
+            last_fb = rx.feedback_datagram(t.plus(25_000));
+            let resend = tx.on_feedback_datagram(t.plus(45_000), &last_fb).unwrap();
+            assert!(resend.is_empty(), "什么都没丢，不用重传");
+        }
+        assert_eq!(rx.stats().decoded, 40);
+        assert_eq!(tx.stats().frames, 40);
+        // 反馈里确实带着报告，报的是最近收到的包
+        let (_, _, report) = decode_feedback_v2(&last_fb).unwrap();
+        let report = report.expect("接收端收到过包，反馈里应当有报告");
+        assert!(!report.arrivals.is_empty());
+        assert!(report.arrivals.iter().all(Option::is_some), "没丢包");
+        // 发送端的网络控制器收到了对账后的报告：状态行里有“网络控制”，码率没有掉到底线
+        let line = tx.controller_line().unwrap();
+        assert!(line.contains("网络控制 目标"), "{line}");
+        assert!(tx.rate_bps() >= cfg().start_bps, "{}", tx.rate_bps());
+        // 会话开头没有应用受限那么久：没有要发的探测
+        assert!(tx.take_probes().is_empty());
+        // 坏反馈被拒绝，不影响后面的
+        assert!(tx
+            .on_feedback_datagram(Time(2_000_000), &[1, 2, 3])
+            .is_err());
+    }
+
+    /// 一个数据报让好几帧一起能解（参考帧补齐了，等它的帧跟着交出）时，前一帧解失败，后面接在它后面的帧
+    /// 不交给解码器（解码器会因为参考帧不对而出错），算跳过，发送端据此补关键帧。
+    #[test]
+    fn a_failed_decode_skips_the_frames_that_were_already_waiting_behind_it() {
+        let mut tx = MediaSender::new(
+            SenderConfig {
+                max_payload: 40,
+                ..cfg()
+            },
+            Box::new(FakeEncoder::default()),
+        );
+        tx.set_profile(Profile {
+            fec_permille: 0,
+            ..Profile::STABLE
+        });
+        let mut rx = MediaReceiver::new(Time::ZERO, 1_000_000, Box::new(FakeDecoder::default()));
+        rx.set_keyframe_grace(true);
+        let mut seq = 0u32;
+        let mut give = |rx: &mut MediaReceiver, t: Time, o: &Outgoing| {
+            seq += 1;
+            rx.on_datagram(t, t, seq, o.flags, &o.body)
+                .unwrap()
+                .map(|s| s.frame_id)
+        };
+        let t = Time(1_000);
+        let key = tx.on_frame(t, &Screen::new(8, 8, 1), true, 0).unwrap();
+        assert_eq!(
+            key.iter().filter_map(|o| give(&mut rx, t, o)).last(),
+            Some(1)
+        );
+        // 第 2 帧（解码器会报错）有好几个分片，先丢掉第一个；第 3 帧整帧到齐，但要等第 2 帧
+        let bad = tx
+            .on_frame(t, &Screen::new(8, 8, 0x00de_ad00), true, 0)
+            .unwrap();
+        assert!(bad.len() >= 2, "第 2 帧要有好几个分片：{}", bad.len());
+        let next = tx.on_frame(t, &Screen::new(8, 8, 3), true, 0).unwrap();
+        for o in bad.iter().skip(1) {
+            assert_eq!(give(&mut rx, t, o), None);
+        }
+        for o in &next {
+            assert_eq!(give(&mut rx, t, o), None, "第 2 帧没齐，第 3 帧不能先解");
+        }
+        assert_eq!(rx.stats().bad, 0);
+        // 第 2 帧最后一个分片到了：它解失败，第 3 帧跟着跳过，什么都不显示
+        assert_eq!(give(&mut rx, t, &bad[0]), None);
+        assert_eq!(rx.stats().bad, 1, "第 2 帧解码失败");
+        assert_eq!(rx.stats().skipped, 1, "第 3 帧跟着跳过");
+        assert_eq!(rx.stats().decoded, 1, "只有第 1 帧显示过");
+        // 反馈里只有第 1 帧送达（位 0 是 floor 那一帧，往后依次是更早的帧），发送端据此补关键帧
+        let fb = rx.feedback(t.plus(1));
+        assert_eq!(fb.floor, 3);
+        assert_eq!(fb.delivered & 0b111, 0b100);
+    }
+
+    /// 编码器：第 1、3 帧是关键帧，别的是增量帧；记下通知它丢了哪些帧。
+    #[derive(Debug, Default)]
+    struct KeyOnOddFrames {
+        encoded: u32,
+        lost: Arc<Mutex<Vec<u32>>>,
+    }
+
+    impl VideoEncoder for KeyOnOddFrames {
+        fn codec(&self) -> Codec {
+            Codec::H264
+        }
+        fn encode(
+            &mut self,
+            _id: u32,
+            s: &Screen,
+            _changed: bool,
+            _budget: usize,
+        ) -> Result<Option<EncodedFrame>, Error> {
+            self.encoded += 1;
+            let key = self.encoded % 2 == 1;
+            let header = FrameHeader {
+                codec: Codec::H264,
+                key,
+                width: s.width(),
+                height: s.height(),
+            };
+            Ok(Some(EncodedFrame {
+                payload: header.frame(&[7u8; 10]),
+                key,
+            }))
+        }
+        fn on_feedback(&mut self, _floor: u32, _mask: u32) {}
+        fn on_lost(&mut self, frame_id: u32) {
+            self.lost.lock().unwrap().push(frame_id);
+        }
+        fn wants_refine(&self) -> bool {
+            false
+        }
+    }
+
+    /// 最近一个关键帧之前的帧丢了没关系（接收端从那个关键帧开始就能解）：不算丢，不通知编码器、不补关键帧。
+    #[test]
+    fn frames_before_the_latest_keyframe_are_not_counted_as_lost() {
+        let lost = Arc::new(Mutex::new(Vec::new()));
+        let encoder = KeyOnOddFrames {
+            lost: lost.clone(),
+            ..KeyOnOddFrames::default()
+        };
+        let mut tx = MediaSender::new(cfg(), Box::new(encoder));
+        for i in 0..3u32 {
+            let t = Time(u64::from(i) * 10_000);
+            let out = tx
+                .on_frame(t, &Screen::new(16, 16, i), true, 10_000)
+                .unwrap();
+            assert!(!out.is_empty());
+        }
+        assert_eq!(tx.stats().keyframes, 2, "第 1、3 帧是关键帧");
+        // 三帧都一直没有反馈：都超时。第 1、2 帧在第 3 帧（关键帧）之前，只有第 3 帧算丢
+        tx.expire_unacked(Time(60_000_000));
+        assert_eq!(tx.stats().lost, 1);
+        assert_eq!(*lost.lock().unwrap(), vec![3]);
+    }
+
+    /// 节奏器里的包还要不要发：帧还没有定论就要；送到了（或接收端已经放弃）就不发；探测的填充包不属于哪一帧，照发。
+    #[test]
+    fn a_queued_packet_is_dropped_once_its_frame_has_a_verdict() {
+        let mut tx = MediaSender::new(cfg(), Box::new(FakeEncoder::default()));
+        let mut rx = MediaReceiver::new(Time::ZERO, 100_000, Box::new(FakeDecoder::default()));
+        let t = Time(1_000);
+        let out = tx
+            .on_frame(t, &Screen::new(16, 16, 1), true, 10_000)
+            .unwrap();
+        let first = out.first().unwrap().clone();
+        assert_eq!(first.fragment.map(|(frame, _)| frame), Some(1));
+        assert!(tx.wanted(&first), "第 1 帧还没确认");
+        deliver(&mut rx, t, &out, |_| false);
+        let fb = rx.feedback(t.plus(1));
+        tx.on_feedback(t.plus(1), &fb);
+        assert!(!tx.wanted(&first), "第 1 帧送到了，排队的包不用发了");
+        let padding = Outgoing {
+            fragment: None,
+            ..first
+        };
+        assert!(tx.wanted(&padding), "探测的填充包不属于哪一帧");
+    }
+
+    /// 发送端把码率估计交给估计器、画像交给估计器：换画像、报名字都要转给它。
+    #[test]
+    fn the_sender_reports_the_estimator_name_and_hands_it_the_profile() {
+        let (mut tx, _, _) = asking(ProbeKind::Verify);
+        assert_eq!(tx.estimator(), "asker");
+        assert_eq!(tx.profile_name(), Profile::STABLE.name);
+        tx.set_profile(Profile::WIRELESS);
+        assert_eq!(tx.profile_name(), Profile::WIRELESS.name);
+    }
 }
