@@ -8,6 +8,7 @@
 | `industry-network-sim.md` | 业内网络仿真、网络类型、公开轨迹数据集、验证方法、规模和统计 |
 | `industry-codec-layer.md` | 业内编解码层架构、厂商 SDK 许可、低延迟参数、解码显示 |
 | `datasets-more.md` | 更多公开数据集：能用（20 个）、不能用、许可不明，推荐优先接入的 5 个 |
+| `datasets-hf.md` | Hugging Face 上的网络数据集：几乎没有真实测量数据，能用的 5 个 |
 | `data-m0-ms24.md` | M0：微软仓库自带 24 通的步长核对和统计 |
 | `industry-hires-quality.md` | 2K/4K/8K、4:4:4、游戏和电影模式、编码格式分层（H.264/HEVC/AV1） |
 | `../P-industry.md` | 帧率稳定、QSV、GPU 读回、软编帧率、局域网带宽探测 |
