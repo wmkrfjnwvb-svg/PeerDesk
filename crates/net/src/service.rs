@@ -12,7 +12,9 @@ use peerdesk_core::paths::Candidate;
 use peerdesk_core::relay::{
     unwrap, FreePolicy, Record, Relay, SessionId, Ticket, Usage, TICKET_LEN, TICKET_MAGIC,
 };
-use peerdesk_core::signal::{format_code, parse_observe, Caller, DeviceId, Registry, SignalMsg};
+use peerdesk_core::signal::{
+    format_code, parse_observe, Caller, DeviceId, Features, Registry, SignalMsg,
+};
 use peerdesk_core::Time;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
@@ -618,6 +620,7 @@ async fn serve_device(state: Arc<SignalState>, link: Link) -> Result<(), NetErro
                         observed: link.remote_addr(),
                         probe: state.relay.as_ref().map(|r| r.addr()),
                         seen: state.relay.as_ref().and_then(|r| r.observed(&me)),
+                        features: Features::SERVER,
                     };
                     // 下一次体检看的是这次之后的探测包。
                     if let Some(relay) = state.relay.as_ref() {

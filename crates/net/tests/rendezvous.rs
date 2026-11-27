@@ -8,8 +8,10 @@ use std::time::Duration;
 use peerdesk_core::crypto::Policy;
 use peerdesk_core::paths::{Candidate, PathKind};
 use peerdesk_core::proto::Channel;
-use peerdesk_core::signal::{Nat, PunchInfo, SignalMsg};
-use peerdesk_net::rendezvous::{answer, dial, register, Dialed, Lookup, Path, PathPolicy, Server};
+use peerdesk_core::signal::{Features, Nat, PunchInfo, SignalMsg};
+use peerdesk_net::rendezvous::{
+    answer, dial, register, server_features, Dialed, Lookup, Path, PathPolicy, Server,
+};
 use peerdesk_net::service::{RelayService, SignalService};
 use peerdesk_net::stream::{read_kind, read_signal, write_kind, write_signal, StreamKind};
 use peerdesk_net::{Identity, Link, NetError, Node};
@@ -674,4 +676,50 @@ async fn host_reports_the_port_its_router_mapped() {
     assert_eq!(report.mapped, Some((mapped, "NAT-PMP")), "{report:?}");
     assert_eq!(extra.len(), 1);
     assert_eq!((extra[0].addr, extra[0].kind), (mapped, PathKind::Mapped));
+}
+
+/// 服务器在登记和体检的回复里告诉客户端它会哪些后来加的功能；登记的一方和不登记的一方问到的一样。
+#[tokio::test]
+async fn the_server_tells_clients_which_features_it_has() {
+    let w = world(false).await;
+    let registration = register(&w.host, &w.server).await.unwrap();
+    assert_eq!(registration.features, Features::SERVER);
+    assert_eq!(
+        server_features(&w.ctrl, &w.server).await.unwrap(),
+        Features::SERVER
+    );
+    // 问完之后被控端的登记还在
+    assert_eq!(w.signal.online(), 1);
+}
+
+/// 回归：服务器遇到不认识的信令消息会关掉这条信令流，被控端的登记跟着断。所以新加的消息只能在服务器的
+/// 功能字段（[`Features`]）说它会的时候才发。以后谁加了新消息又忘了先看功能字段，这个测试说明后果。
+#[tokio::test]
+async fn an_unknown_signal_message_costs_the_registration() {
+    let w = world(false).await;
+    let link = w
+        .host
+        .connect(w.server.addr, w.server.pin.as_ref())
+        .await
+        .unwrap();
+    let (mut send, mut recv) = link.open_stream().await.unwrap();
+    write_kind(&mut send, StreamKind::Signal).await.unwrap();
+    write_signal(&mut send, &SignalMsg::Register { locals: vec![] })
+        .await
+        .unwrap();
+    assert!(matches!(
+        read_signal(&mut recv).await.unwrap(),
+        SignalMsg::Registered { .. }
+    ));
+    assert_eq!(w.signal.online(), 1);
+    // 一条长度 1、种类 200 的消息：这个版本（和所有老版本）的服务器都不认识
+    send.write_all(&[0, 1, 200]).await.unwrap();
+    assert!(read_signal(&mut recv).await.is_err(), "服务器关掉了这条流");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while w.signal.online() != 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("登记应当已经没了");
 }
