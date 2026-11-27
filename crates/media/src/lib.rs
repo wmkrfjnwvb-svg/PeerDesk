@@ -29,7 +29,7 @@ pub mod stall;
 mod vaapi;
 use backend::{EncoderBackend, Finished, FrameAsk, FrameInput, Rates, Submitted};
 use peerdesk_core::error::Error;
-use peerdesk_core::frame::{Frame, GpuFrame, GpuHandle, Nv12, Picture};
+use peerdesk_core::frame::{ContentDesc, Frame, GpuFrame, GpuHandle, LumaDesc, Nv12, Picture};
 use peerdesk_core::policy::ContentPolicy;
 use peerdesk_core::scale::encode_size;
 use peerdesk_core::screen::Screen;
@@ -635,6 +635,8 @@ enum Input<'a> {
     Rgb(&'a Screen),
     /// 显卡画面：已经是编码尺寸的 NV12。
     Gpu(&'a dyn GpuFrame),
+    /// 内容描述（没有像素，全模型仿真用）：变化面积和细节的抽样都在里面，不转换、不读回。
+    Described(&'a ContentDesc),
 }
 
 /// 硬件编码器连续这么多帧给出没要求的关键帧，就认为它不能用。
@@ -1003,6 +1005,8 @@ impl H264Encoder {
             ),
             // 显卡画面：采集端已经按编码尺寸准备好了
             Input::Gpu(frame) => frame.size(),
+            // 内容描述：和 CPU 画面一样按比例和窗口算
+            Input::Described(content) => encode_size(content.size, self.scale_permille, self.view),
         };
         // 按“上一次编出来的尺寸”判断，和用的是硬件还是软件编码器无关
         let fresh = self.encoded_size != Some(size);
@@ -1052,6 +1056,8 @@ impl H264Encoder {
                 self.timing.encode_us = micros_since(encoding).saturating_sub(self.convert_us);
                 (usize::from(size.0), usize::from(size.1), hw)
             }
+            // 内容描述没有像素：不转换，也不走硬件（模型后端接在软件后端的位置上）
+            Input::Described(_) => (usize::from(size.0), usize::from(size.1), Hw::Off),
         };
         self.timing.hardware = !matches!(hw, Hw::Off);
         match hw {
@@ -1113,6 +1119,27 @@ impl H264Encoder {
                 let _ = self.area.observe(screen);
                 None
             }
+            // 内容描述：抽样已经在描述里，比较和记账走同一段代码
+            Input::Described(c) if changed && !fresh && !self.force_key => Some(
+                self.area
+                    .observe_sample(c.size, &c.area_pixels, &c.area_detail),
+            ),
+            Input::Described(c) if fresh || self.force_key => {
+                let _ = self
+                    .area
+                    .observe_sample(c.size, &c.area_pixels, &c.area_detail);
+                None
+            }
+            Input::Rgb(_) | Input::Gpu(_) | Input::Described(_) => None,
+        };
+        // 交给软件后端的是转好的平面，还是内容描述里这个编码尺寸的那一份
+        let source = match input {
+            Input::Described(c) => Some((
+                c.version,
+                c.luma_at(coded).ok_or(Error::InvalidArgument(
+                    "内容描述里没有这个编码尺寸的亮度抽样",
+                ))?,
+            )),
             Input::Rgb(_) | Input::Gpu(_) => None,
         };
         // 这一帧的 QP（见 qp 模块）：关键帧按大帧规则装进时限，在变的帧跟着目标，停下的帧往下补
@@ -1152,7 +1179,7 @@ impl H264Encoder {
             Some(default) if fresh && qp < default.saturating_add(PRIME_ABOVE) => default,
             Some(_) | None => qp,
         };
-        let first = self.submit_soft(budget, qp, self.force_key || fresh)?;
+        let first = self.submit_soft(source, budget, qp, self.force_key || fresh)?;
         // 多编的那一次是初始化的开销（和打开编码器一样），不算进编码耗时：帧率调节按编码耗时判断 CPU
         // 跟不跟得上，算进去的话每次新开编码器都像 CPU 过载（实测 100 帧时被降到 50 帧）。
         let primed = first.timing.setup_us > 0;
@@ -1169,7 +1196,7 @@ impl H264Encoder {
             .then(|| self.qp.overshoot_qp(bytes, qp, key_allowed))
             .flatten()
         {
-            let again = self.submit_soft(budget, q, true)?;
+            let again = self.submit_soft(source, budget, q, true)?;
             computed = computed.saturating_add(again.timing.compute_us);
             (key, data) = (again.key, again.data);
             qp = q;
@@ -1258,12 +1285,14 @@ impl H264Encoder {
         self.fps / 5
     }
 
-    /// 把 `planes` 里转好的这一帧交给软件后端，按 `qp` 编；`keyframe` 要关键帧。
+    /// 把这一帧交给软件后端，按 `qp` 编；`keyframe` 要关键帧。`described` 为 `None` 时交 `planes` 里转好的平面，
+    /// 否则交内容描述（版本号和这个编码尺寸的亮度抽样）。
     ///
     /// # Errors
     /// 后端出错（它已经复位，下一帧会重新配置、从关键帧开始）。
     fn submit_soft(
         &mut self,
+        described: Option<(u64, &LumaDesc)>,
         budget: usize,
         qp: u8,
         keyframe: bool,
@@ -1275,10 +1304,17 @@ impl H264Encoder {
             qp: Some(qp),
             keyframe,
         };
-        let input = FrameInput::I420 {
-            y: &self.planes.0,
-            u: &self.planes.1,
-            v: &self.planes.2,
+        let input = match described {
+            Some((version, luma)) => FrameInput::Described {
+                version,
+                sample: &luma.sample,
+                detail_permille: luma.detail_permille,
+            },
+            None => FrameInput::I420 {
+                y: &self.planes.0,
+                u: &self.planes.1,
+                v: &self.planes.2,
+            },
         };
         match self.soft.submit(input, ask) {
             Ok(Submitted::Ready(Finished::Frame(frame))) if frame.token == ask.token => Ok(frame),
@@ -1343,6 +1379,16 @@ impl VideoEncoder for H264Encoder {
             Frame::Rgb(screen) => self.encode_input(Input::Rgb(screen), changed, budget),
             Frame::Gpu(gpu) => self.encode_input(Input::Gpu(gpu.as_ref()), changed, budget),
         }
+    }
+
+    fn encode_described(
+        &mut self,
+        _frame_id: u32,
+        content: &ContentDesc,
+        changed: bool,
+        budget: usize,
+    ) -> Result<Option<EncodedFrame>, Error> {
+        self.encode_input(Input::Described(content), changed, budget)
     }
 
     fn on_feedback(&mut self, _floor: u32, _mask: u32) {}

@@ -86,6 +86,46 @@ pub trait GpuFrame: Send + Sync + std::fmt::Debug {
     fn read_nv12(&self) -> Result<Nv12, Error>;
 }
 
+/// 一幅画面的**内容描述**：没有像素，只有编码这条路上真正用到的那几样抽样。全模型仿真（L0，见
+/// `docs/research/Q-redesign/a1-plan.md`）用它代替像素——编码器的码率控制、大帧规则、补清晰照常跑真代码，
+/// 只是“变了多少、有多少细节”不再从像素算，而是从这里取。
+///
+/// 抽样和产品里的算法是同一份定义（`peerdesk_media::content`），所以拿同一幅画面的像素和它的描述去编，
+/// 码率控制看到的数完全一样。带的是抽样本身而不是“变了千分之几”这样的结果：变了多少要和**上一次编的那一幅**比，
+/// 而上一次编的是哪一幅由发送端当时的状态决定（在途满了会跳帧），事先算不出来。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContentDesc {
+    /// 源画面的第几版（每变一次加一）。假码流里带着它，显示端据此知道显示的是哪一版。
+    pub version: u64,
+    /// 原始尺寸。
+    pub size: (u16, u16),
+    /// 编码器估计变化面积用的抽样点（像素值），在原始尺寸上取。
+    pub area_pixels: Arc<[u32]>,
+    /// 每个抽样点的细节量。
+    pub area_detail: Arc<[u32]>,
+    /// 每种可能的编码尺寸各一份亮度抽样（原尺寸、降分辨率时的尺寸）。
+    pub luma: Vec<LumaDesc>,
+}
+
+/// 某个编码尺寸下亮度平面的抽样和细节。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LumaDesc {
+    /// 编码尺寸（宽高都是偶数）。
+    pub size: (u16, u16),
+    /// 亮度平面的抽样。
+    pub sample: Arc<[u8]>,
+    /// 细节（千分之几）。
+    pub detail_permille: u32,
+}
+
+impl ContentDesc {
+    /// 编码尺寸为 `size` 时的亮度描述；没有准备这个尺寸时为 `None`。
+    #[must_use]
+    pub fn luma_at(&self, size: (u16, u16)) -> Option<&LumaDesc> {
+        self.luma.iter().find(|l| l.size == size)
+    }
+}
+
 /// 显卡画面的系统句柄。指针只在拿到它的那个 [`GpuFrame`] 活着时有效。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GpuHandle {

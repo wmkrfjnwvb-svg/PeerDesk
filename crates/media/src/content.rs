@@ -7,6 +7,9 @@
 //!   按点数和按细节加权的变化比例。
 //! - [`detail_permille`]、[`sample_luma`]、[`luma_changed_permille`]：假后端用。从亮度平面抽样，算细节和变化比例。
 
+use peerdesk_core::error::Error;
+use peerdesk_core::frame::{ContentDesc, LumaDesc};
+use peerdesk_core::scale::encode_size;
 use peerdesk_core::screen::Screen;
 
 /// 估计画面变了多少时每隔多少像素抽一个（横竖都是）：720p 约 3600 个，几乎不花时间。
@@ -64,34 +67,24 @@ impl AreaSampler {
     /// 只数变了几个点会把“文字密集的弹窗盖在白底上”估得很小（弹窗占 36%，变了的点只有 19%，按点数估计
     /// 比实际小 5 倍以上，2026-11 微软轨迹里切换窗口的帧在 1 Mbps 上编出 89–125 KB）。
     pub fn observe(&mut self, screen: &Screen) -> Area {
-        let width = usize::from(screen.width());
-        let size = (screen.width(), screen.height());
-        let pixels = screen.pixels();
-        let rows: Vec<&[u32]> = pixels.chunks(width.max(1)).collect();
-        // 每个抽样点：像素值，和它在新画面里的细节量（和右边、下边像素的亮度差，加一个底数）
-        let mut now = Vec::with_capacity(self.samples.len());
-        let mut detail = Vec::with_capacity(self.samples.len());
-        for (y, row) in rows.iter().enumerate().step_by(SAMPLE_STEP) {
-            let below = rows.get(y.saturating_add(1));
-            for (x, p) in row.iter().enumerate().step_by(SAMPLE_STEP) {
-                let l = luma(*p);
-                let right = row.get(x.saturating_add(1)).map_or(l, |q| luma(*q));
-                let down = below.and_then(|r| r.get(x)).map_or(l, |q| luma(*q));
-                now.push(*p);
-                detail.push(l.abs_diff(right) + l.abs_diff(down) + DETAIL_FLOOR);
-            }
-        }
-        let changed = if size == self.sampled && now.len() == self.samples.len() {
+        let sample = AreaSample::of(screen);
+        self.observe_sample(sample.size, &sample.pixels, &sample.detail)
+    }
+
+    /// 和 [`Self::observe`] 一样，交来的是已经抽好的点（[`AreaSample::of`] 的结果）。全模型仿真没有像素，
+    /// 从内容描述里拿抽样走这里；和拿同一幅画面的像素走 `observe` 结果相同。
+    pub fn observe_sample(&mut self, size: (u16, u16), pixels: &[u32], detail: &[u32]) -> Area {
+        let changed = if size == self.sampled && pixels.len() == self.samples.len() {
             let total: u64 = detail.iter().map(|d| u64::from(*d)).sum();
-            let (count, weight) = now
+            let (count, weight) = pixels
                 .iter()
                 .zip(&self.samples)
-                .zip(&detail)
+                .zip(detail)
                 .filter(|((a, b), _)| a != b)
                 .fold((0u64, 0u64), |(c, w), (_, d)| {
                     (c.saturating_add(1), w.saturating_add(u64::from(*d)))
                 });
-            let points = u64::try_from(now.len()).unwrap_or(u64::MAX).max(1);
+            let points = u64::try_from(pixels.len()).unwrap_or(u64::MAX).max(1);
             Area {
                 by_points: count.saturating_mul(1000) / points,
                 by_detail: weight.saturating_mul(1000) / total.max(1),
@@ -99,10 +92,93 @@ impl AreaSampler {
         } else {
             Area::FULL
         };
-        self.samples = now;
+        self.samples.clear();
+        self.samples.extend_from_slice(pixels);
         self.sampled = size;
         changed
     }
+}
+
+/// 一幅画面给 [`AreaSampler`] 用的抽样：每隔 [`SAMPLE_STEP`] 个像素取一个点，记下像素值和它的细节量。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AreaSample {
+    /// 画面的尺寸。
+    pub size: (u16, u16),
+    /// 抽样点的像素值。
+    pub pixels: Vec<u32>,
+    /// 每个抽样点的细节量（和右边、下边像素的亮度差，加一个底数 [`DETAIL_FLOOR`]）。
+    pub detail: Vec<u32>,
+}
+
+impl AreaSample {
+    /// 从画面抽样。
+    #[must_use]
+    pub fn of(screen: &Screen) -> Self {
+        let width = usize::from(screen.width());
+        let rows: Vec<&[u32]> = screen.pixels().chunks(width.max(1)).collect();
+        let mut pixels = Vec::new();
+        let mut detail = Vec::new();
+        for (y, row) in rows.iter().enumerate().step_by(SAMPLE_STEP) {
+            let below = rows.get(y.saturating_add(1));
+            for (x, p) in row.iter().enumerate().step_by(SAMPLE_STEP) {
+                let l = luma(*p);
+                let right = row.get(x.saturating_add(1)).map_or(l, |q| luma(*q));
+                let down = below.and_then(|r| r.get(x)).map_or(l, |q| luma(*q));
+                pixels.push(*p);
+                detail.push(l.abs_diff(right) + l.abs_diff(down) + DETAIL_FLOOR);
+            }
+        }
+        Self {
+            size: (screen.width(), screen.height()),
+            pixels,
+            detail,
+        }
+    }
+}
+
+/// 把一幅画面变成内容描述（[`ContentDesc`]）：编码器和假后端从像素里会算出来的那几样抽样，一次算好。
+/// `scales` 是可能用到的编码比例（千分比，例如原尺寸 1000 和降分辨率时的 500），每个比例一份亮度抽样；
+/// 亮度平面的算法和编码器转换画面时完全一样（缩到编码尺寸、补成偶数、RGB 转 I420），所以拿描述去编和拿像素去编，
+/// 模型后端看到的数相同。
+///
+/// # Errors
+/// 缩放失败（尺寸为 0）。
+pub fn describe(screen: &Screen, version: u64, scales: &[u16]) -> Result<ContentDesc, Error> {
+    let area = AreaSample::of(screen);
+    let native = (screen.width(), screen.height());
+    let mut luma: Vec<LumaDesc> = Vec::new();
+    let (mut y, mut u, mut v) = (Vec::new(), Vec::new(), Vec::new());
+    for permille in scales {
+        let size = encode_size(native, *permille, None);
+        let shrunk;
+        let source = if size == native {
+            screen
+        } else {
+            shrunk = screen.downscale(size.0, size.1)?;
+            &shrunk
+        };
+        let (w, h, pixels) = crate::even_pixels(source);
+        let coded = (
+            u16::try_from(w).unwrap_or(u16::MAX),
+            u16::try_from(h).unwrap_or(u16::MAX),
+        );
+        if luma.iter().any(|l| l.size == coded) {
+            continue;
+        }
+        crate::color::rgb_to_i420(&pixels, w, &mut y, &mut u, &mut v);
+        luma.push(LumaDesc {
+            size: coded,
+            sample: sample_luma(&y).into(),
+            detail_permille: detail_permille(&y),
+        });
+    }
+    Ok(ContentDesc {
+        version,
+        size: native,
+        area_pixels: area.pixels.into(),
+        area_detail: area.detail.into(),
+        luma,
+    })
 }
 
 /// 亮度平面的抽样步长（字节）：每隔这么多个字节取一个点（取质数，免得和行宽对齐）。
@@ -153,6 +229,45 @@ pub fn detail_permille(luma: &[u8]) -> u32 {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
     use super::*;
+
+    /// 先抽样再比较，和直接拿画面比是同一回事；内容描述里的抽样就是这两步的中间结果，
+    /// 亮度抽样和编码器转换出来的亮度平面上取的一样，每种编码比例一份。
+    #[test]
+    fn a_description_holds_the_same_samples_the_pixels_would_give() {
+        let mut a = Screen::new(320, 240, 0x0020_2020);
+        a.fill(10, 10, 120, 60, 0x00f0_f0f0);
+        let mut b = a.clone();
+        b.fill(200, 100, 64, 64, 0x0000_80ff);
+        let (mut by_screen, mut by_sample) = (AreaSampler::new(), AreaSampler::new());
+        for s in [&a, &b, &b, &a] {
+            let sample = AreaSample::of(s);
+            assert_eq!(
+                by_screen.observe(s),
+                by_sample.observe_sample(sample.size, &sample.pixels, &sample.detail)
+            );
+        }
+        let d = describe(&b, 3, &[1000, 500, 1000]).unwrap();
+        assert_eq!((d.version, d.size), (3, (320, 240)));
+        let sample = AreaSample::of(&b);
+        assert_eq!(
+            (&*d.area_pixels, &*d.area_detail),
+            (&*sample.pixels, &*sample.detail)
+        );
+        assert_eq!(d.luma.len(), 2, "同一个编码尺寸只留一份");
+        // 原尺寸：和编码器的转换（补偶数、RGB 转 I420）得到的亮度平面一致
+        let (w, _, pixels) = crate::even_pixels(&b);
+        let (mut y, mut u, mut v) = (Vec::new(), Vec::new(), Vec::new());
+        crate::color::rgb_to_i420(&pixels, w, &mut y, &mut u, &mut v);
+        let full = d.luma_at((320, 240)).unwrap();
+        assert_eq!(&*full.sample, &*sample_luma(&y));
+        assert_eq!(full.detail_permille, detail_permille(&y));
+        let half = d.luma_at((160, 120)).unwrap();
+        assert_eq!(
+            half.sample.len(),
+            (160usize * 120).div_ceil(LUMA_SAMPLE_STEP)
+        );
+        assert!(d.luma_at((64, 64)).is_none());
+    }
 
     fn flat(w: u16, h: u16, rgb: u32) -> Screen {
         Screen::new(w, h, rgb)
