@@ -12,8 +12,11 @@ use peerdesk_core::paths::Candidate;
 use peerdesk_core::relay::{
     unwrap, FreePolicy, Record, Relay, SessionId, Ticket, Usage, TICKET_LEN, TICKET_MAGIC,
 };
+use peerdesk_core::billing::{verify_enroll, EnrollTokenError};
+use peerdesk_core::devices::{DeviceInfo, DeviceStore, Refusal, Role, Row};
 use peerdesk_core::signal::{
-    format_code, parse_observe, Caller, DeviceId, Features, Registry, SignalMsg,
+    format_code, parse_observe, Caller, DeviceId, DeviceRow, Features, Registry, SignalMsg,
+    MAX_ROWS,
 };
 use peerdesk_core::Time;
 use tokio::net::UdpSocket;
@@ -272,6 +275,152 @@ struct SignalState {
     codes: Option<PathBuf>,
     /// 每台设备上一次传崩溃报告的时间（限频）。
     crash_seen: Mutex<BTreeMap<[u8; 32], Instant>>,
+    /// 账户设备表；没配就不提供（功能字段里不报 [`Features::DEVICES`]）。
+    accounts: Option<Accounts>,
+}
+
+/// 账户设备表的配置：表存在哪、用哪个密钥验证入表令牌（就是计费密钥，集群共用）。
+#[derive(Debug, Clone)]
+pub struct Accounts {
+    /// 存储。
+    pub store: Arc<dyn DeviceStore>,
+    /// 验证入表令牌的密钥。
+    pub key: Vec<u8>,
+}
+
+/// 现在的 Unix 秒。
+fn wall_s() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+fn wire_row(r: &Row) -> DeviceRow {
+    DeviceRow {
+        row: r.row,
+        fingerprint: r.fingerprint,
+        name: r.name.clone(),
+        os: r.os,
+        role: r.role.id(),
+        last_seen_s: r.last_seen_s,
+        removed: r.removed_s.is_some(),
+    }
+}
+
+/// 回答账户设备表的请求（入表、列出、改名、移除）。`device` 是这条连接的证书指纹：除了入表，别的请求都要求它
+/// 是账户成员，而且只能动自己账户里的设备——不是成员一律回“不在账户里”，不泄露别的账户有什么。
+/// 不是设备表的消息返回空。
+fn account_reply(
+    accounts: Option<&Accounts>,
+    device: &DeviceId,
+    msg: &SignalMsg,
+    now_s: u64,
+) -> Vec<SignalMsg> {
+    let refused = |why: Refusal| vec![SignalMsg::Refused { code: why.code() }];
+    let Some(accounts) = accounts else {
+        return refused(Refusal::Unsupported);
+    };
+    let store = &accounts.store;
+    let changed = |result: Result<u64, Refusal>| match result {
+        Ok(rev) => vec![SignalMsg::Changed { rev }],
+        Err(why) => refused(why),
+    };
+    match msg {
+        SignalMsg::Enroll {
+            token,
+            name,
+            os,
+            role,
+        } => {
+            let account = match verify_enroll(&accounts.key, token, now_s) {
+                Ok(account) => account,
+                Err(EnrollTokenError::Invalid) => return refused(Refusal::BadToken),
+                Err(EnrollTokenError::Expired) => return refused(Refusal::ExpiredToken),
+            };
+            let info = DeviceInfo {
+                fingerprint: *device,
+                name: name.clone(),
+                os: *os,
+                role: Role::from_id(*role),
+            };
+            match store.enroll(account, &info, now_s) {
+                Ok(e) => vec![SignalMsg::Enrolled {
+                    account: e.account,
+                    row: e.row,
+                    rev: e.rev,
+                }],
+                Err(why) => refused(why),
+            }
+        }
+        SignalMsg::Devices { since } => {
+            let Some((account, _)) = store.member(device) else {
+                return refused(Refusal::NotMember);
+            };
+            let changes = store.list(&account, *since);
+            let rows: Vec<DeviceRow> = changes.rows.iter().map(wire_row).collect();
+            let mut chunks: Vec<&[DeviceRow]> = rows.chunks(MAX_ROWS).collect();
+            if chunks.is_empty() {
+                chunks.push(&[]);
+            }
+            let last = chunks.len().saturating_sub(1);
+            chunks
+                .into_iter()
+                .enumerate()
+                .map(|(i, chunk)| SignalMsg::DeviceRows {
+                    rev: changes.rev,
+                    full: changes.full,
+                    more: i < last,
+                    rows: chunk.to_vec(),
+                })
+                .collect()
+        }
+        SignalMsg::Rename { row, name } => {
+            let Some((account, _)) = store.member(device) else {
+                return refused(Refusal::NotMember);
+            };
+            changed(store.rename(account, *row, name))
+        }
+        SignalMsg::Remove { row } => {
+            let Some((account, own)) = store.member(device) else {
+                return refused(Refusal::NotMember);
+            };
+            // 编号 0 是自己退出
+            let row = if *row == 0 { own } else { *row };
+            changed(store.remove(account, row, now_s))
+        }
+        SignalMsg::Register { .. }
+        | SignalMsg::Registered { .. }
+        | SignalMsg::Probe { .. }
+        | SignalMsg::Connect { .. }
+        | SignalMsg::ConnectCode { .. }
+        | SignalMsg::Peer { .. }
+        | SignalMsg::Incoming { .. }
+        | SignalMsg::NotFound
+        | SignalMsg::Nodes
+        | SignalMsg::NodeList { .. }
+        | SignalMsg::Check
+        | SignalMsg::CheckQuiet
+        | SignalMsg::Checked { .. }
+        | SignalMsg::Enrolled { .. }
+        | SignalMsg::Refused { .. }
+        | SignalMsg::DeviceRows { .. }
+        | SignalMsg::Changed { .. } => Vec::new(),
+    }
+}
+
+/// 这台服务器实际开着的功能：代码会、配置也开了的。
+fn features_of(accounts: Option<&Accounts>) -> Features {
+    if accounts.is_some() {
+        Features::DEVICES
+    } else {
+        Features::NONE
+    }
+}
+
+impl SignalState {
+    fn features(&self) -> Features {
+        features_of(self.accounts.as_ref())
+    }
 }
 
 /// 同一台设备两次崩溃报告至少隔这么久。
@@ -614,19 +763,37 @@ async fn serve_device(state: Arc<SignalState>, link: Link) -> Result<(), NetErro
                     lock(&state.outboxes).insert(conn, tx.clone());
                     if let Err(e) = write_signal(&mut send, &done.reply).await { break Err(e); }
                 }
-                Ok(SignalMsg::Check) => {
+                Ok(msg @ (SignalMsg::Check | SignalMsg::CheckQuiet)) => {
                     let me = *link.peer_fingerprint();
                     let checked = SignalMsg::Checked {
                         observed: link.remote_addr(),
                         probe: state.relay.as_ref().map(|r| r.addr()),
                         seen: state.relay.as_ref().and_then(|r| r.observed(&me)),
-                        features: Features::SERVER,
+                        features: state.features(),
                     };
-                    // 下一次体检看的是这次之后的探测包。
-                    if let Some(relay) = state.relay.as_ref() {
+                    // 下一次体检看的是这次之后的探测包。只问功能的（CheckQuiet）不动探测结果：
+                    // 它可能夹在“探测”和“发起连接”之间，忘掉的话打洞用的 NAT 判断就没了。
+                    if let (SignalMsg::Check, Some(relay)) = (&msg, state.relay.as_ref()) {
                         relay.forget(&me);
                     }
                     if let Err(e) = write_signal(&mut send, &checked).await { break Err(e); }
+                }
+                Ok(
+                    msg @ (SignalMsg::Enroll { .. }
+                    | SignalMsg::Devices { .. }
+                    | SignalMsg::Rename { .. }
+                    | SignalMsg::Remove { .. }),
+                ) => {
+                    let replies =
+                        account_reply(state.accounts.as_ref(), link.peer_fingerprint(), &msg, wall_s());
+                    let mut failed = None;
+                    for reply in &replies {
+                        if let Err(e) = write_signal(&mut send, reply).await {
+                            failed = Some(e);
+                            break;
+                        }
+                    }
+                    if let Some(e) = failed { break Err(e); }
                 }
                 Ok(SignalMsg::Connect { target, locals, account }) => {
                     if let Err(e) = introduce(&state, &link, Some(target), locals, account, &mut probed, &mut send).await { break Err(e); }
@@ -649,13 +816,21 @@ async fn serve_device(state: Arc<SignalState>, link: Link) -> Result<(), NetErro
                     | SignalMsg::Probe { .. }
                     | SignalMsg::Peer { .. }
                     | SignalMsg::Incoming { .. }
-                    | SignalMsg::NotFound,
+                    | SignalMsg::NotFound
+                    | SignalMsg::Enrolled { .. }
+                    | SignalMsg::Refused { .. }
+                    | SignalMsg::DeviceRows { .. }
+                    | SignalMsg::Changed { .. },
                 ) => break Err(NetError::Protocol("设备不该发这种信令")),
             },
         }
     };
+    let registered = lock(&state.outboxes).remove(&conn).is_some();
     lock(&state.registry).disconnect(conn);
-    lock(&state.outboxes).remove(&conn);
+    // 登记过的设备下线了：记上次在线时间（账户成员才记）
+    if let (true, Some(accounts)) = (registered, state.accounts.as_ref()) {
+        accounts.store.seen(link.peer_fingerprint(), wall_s());
+    }
     link.close("bye");
     result
 }
@@ -687,7 +862,20 @@ impl SignalService {
         directory: Arc<dyn Directory>,
         codes: Option<PathBuf>,
     ) -> Self {
+        Self::start_with_accounts(node, relay, directory, codes, None)
+    }
+
+    /// 同 [`SignalService::start_with_directory`]，另外提供账户设备表（`accounts` 为 `None` 时不提供）。
+    #[must_use]
+    pub fn start_with_accounts(
+        node: Arc<Node>,
+        relay: Option<Arc<RelayService>>,
+        directory: Arc<dyn Directory>,
+        codes: Option<PathBuf>,
+        accounts: Option<Accounts>,
+    ) -> Self {
         let mut registry = Registry::new();
+        registry.set_features(features_of(accounts.as_ref()));
         if let Some(path) = &codes {
             match std::fs::read_to_string(path) {
                 Ok(text) => {
@@ -711,6 +899,7 @@ impl SignalService {
             next_conn: AtomicU64::new(1),
             codes,
             crash_seen: Mutex::new(BTreeMap::new()),
+            accounts,
         });
         let accept_state = Arc::clone(&state);
         let task = tokio::spawn(async move {
