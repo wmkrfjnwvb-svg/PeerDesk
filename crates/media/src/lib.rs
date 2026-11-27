@@ -3360,6 +3360,53 @@ mod tests {
         let (took, sizes) = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
         assert!(sizes.iter().all(|s| *s > 0), "{took:?} {sizes:?}");
     }
+
+    /// 内容描述这条路（L0）：面积、细节从描述里取，交给后端的是描述里这个编码尺寸的亮度抽样。
+    /// 同一串画面，拿像素编（假后端从像素算）和拿描述编，每帧的大小和是不是关键帧都相同。
+    #[test]
+    fn described_content_is_encoded_like_the_same_pixels() {
+        use crate::fake::{FakeBackend, FakeConfig, ManualClock};
+        let make = |described: bool| {
+            let mut cfg = FakeConfig::like_openh264();
+            cfg.inputs.described = described;
+            let backend = FakeBackend::with_default_model(cfg, Arc::new(ManualClock::new()));
+            H264Encoder::with_max_bps(30, 30_000_000)
+                .with_hardware(|_, _, _, _| Err("只测软件".into()))
+                .with_soft_backend(Box::new(backend))
+        };
+        let first = picture(320, 192);
+        let mut second = first.clone();
+        second.fill(40, 100, 120, 60, 0x0020_4060);
+        let mut by_pixels = make(false);
+        let mut by_desc = make(true);
+        // 第一帧（关键帧）、变了的一帧、没变的一帧（往下补清晰）
+        for (version, screen, changed) in [
+            (0u64, &first, true),
+            (1, &second, true),
+            (1, &second, false),
+        ] {
+            let desc = content::describe(screen, version, &[1000]).unwrap();
+            let shape = |f: Option<EncodedFrame>| f.map(|f| (f.payload.len(), f.key));
+            let p = shape(by_pixels.encode(0, screen, changed, 50_000).unwrap());
+            let d = shape(by_desc.encode_described(0, &desc, changed, 50_000).unwrap());
+            assert_eq!(p, d, "第 {version} 版，变了：{changed}");
+            if changed {
+                assert!(p.is_some(), "变了的帧要编出来");
+            }
+        }
+        // 描述里没有编码尺寸的那一份：说清楚，不猜
+        let empty = content::describe(&second, 2, &[]).unwrap();
+        assert!(matches!(
+            by_desc.encode_described(0, &empty, true, 50_000),
+            Err(Error::InvalidArgument(_))
+        ));
+        // 后端不收内容描述却拿到了：后端违约，按编码失败报
+        let desc = content::describe(&second, 2, &[1000]).unwrap();
+        assert!(matches!(
+            by_pixels.encode_described(0, &desc, true, 50_000),
+            Err(Error::Inconsistent(_))
+        ));
+    }
 }
 
 /// Windows 的系统 H.264 解码器只对“和 Main 兼容”的码流用显卡（DXVA）：Baseline 要带
