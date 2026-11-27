@@ -28,6 +28,17 @@ pub enum Action {
 }
 
 impl Action {
+    /// 全部操作，（名字，值），世界文件读写用。
+    pub const ALL: [(&'static str, Action); 7] = [
+        ("idle", Action::Idle),
+        ("typing", Action::Typing),
+        ("scrolling", Action::Scrolling),
+        ("dragging", Action::Dragging),
+        ("switching", Action::Switching),
+        ("video", Action::Video),
+        ("pointer", Action::Pointer),
+    ];
+
     /// 名字，用于报告。
     #[must_use]
     pub const fn name(self) -> &'static str {

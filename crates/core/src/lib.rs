@@ -37,6 +37,7 @@ pub mod file;
 pub mod frame;
 pub mod governor;
 pub mod input;
+pub mod kv;
 pub mod media;
 pub mod pacer;
 pub mod paths;

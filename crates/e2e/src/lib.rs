@@ -12,6 +12,7 @@
 pub mod content;
 pub mod report;
 pub mod timeline;
+pub mod world;
 
 use peerdesk_core::adaptive::Profile;
 use peerdesk_core::error::Error;
@@ -27,7 +28,10 @@ use peerdesk_core::screen::Screen;
 use peerdesk_core::sim::{Link, Net, NetStats};
 use peerdesk_core::time::Time;
 use peerdesk_core::video::{TileDecoder, TileEncoder, VideoDecoder, VideoEncoder};
-use peerdesk_media::fake::{FakeBackend, FakeConfig, FakeDecoder, ManualClock};
+use peerdesk_media::fake::{
+    ByteModel, DefaultByteModel, FakeBackend, FakeConfig, FakeDecoder, ManualClock,
+};
+use peerdesk_media::fitted::FittedByteModel;
 use peerdesk_media::{H264Decoder, H264Encoder};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -60,6 +64,44 @@ const DEFAULT_SIZE: (u16, u16) = if cfg!(debug_assertions) {
 } else {
     (1280, 720)
 };
+
+/// 假后端用哪个字节模型（只对 L0、L0.5 有意义；L1、块编码是真编码器，不用）。世界文件里的 `byte_model` 键。
+/// 以后加新模型（例如输入改成脏区域和移动区域的）就在这里加一项，世界文件的键不用改。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ByteModelKind {
+    /// 占位的 [`DefaultByteModel`]（默认，现有结果都是它）。
+    Default,
+    /// M2 实测拟合的 openh264 模型，各类合在一起的系数（[`FittedByteModel::openh264_v1`]）。
+    Openh264V1,
+}
+
+impl ByteModelKind {
+    /// 全部，（文本里的名字，值）。
+    pub const ALL: [(&'static str, Self); 2] = [
+        ("default", Self::Default),
+        ("openh264-v1", Self::Openh264V1),
+    ];
+
+    /// 文本里的名字。
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Openh264V1 => "openh264-v1",
+        }
+    }
+
+    /// 造模型。
+    fn build(self) -> Result<Box<dyn ByteModel>, Error> {
+        Ok(match self {
+            Self::Default => Box::new(DefaultByteModel),
+            Self::Openh264V1 => Box::new(
+                FittedByteModel::openh264_v1()
+                    .map_err(|_| Error::Inconsistent("随包的 openh264-v1 字节模型文件读不出来"))?,
+            ),
+        })
+    }
+}
 
 /// 编码器。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,13 +150,15 @@ impl CodecKind {
         max_bps: u64,
         policy: &ContentPolicy,
         tag: &Arc<AtomicU64>,
+        byte_model: ByteModelKind,
     ) -> Result<Codecs, Error> {
         Ok(match self {
             CodecKind::H264L0 => {
                 // 和 L0.5 同一个假后端，只多收“内容描述”这种输入；版本号从描述里来，不用拨
                 let mut cfg = FakeConfig::like_openh264();
                 cfg.inputs.described = true;
-                let backend = FakeBackend::with_default_model(cfg, Arc::new(ManualClock::new()));
+                let backend =
+                    FakeBackend::new(cfg, Arc::new(ManualClock::new()), byte_model.build()?);
                 (
                     Box::new(
                         H264Encoder::with_max_bps(fps, max_bps)
@@ -127,9 +171,10 @@ impl CodecKind {
             }
             CodecKind::H264L05 => {
                 // 假后端的时钟不拨：A1 里编码耗时按 0 算（和 L1 一样）
-                let backend = FakeBackend::with_default_model(
+                let backend = FakeBackend::new(
                     FakeConfig::like_openh264(),
                     Arc::new(ManualClock::new()),
+                    byte_model.build()?,
                 )
                 .with_version_tag(Arc::clone(tag));
                 (
@@ -236,19 +281,35 @@ pub struct Scenario {
     /// 反馈里的探测结果带组号（产品里由握手的 `PROBE_ID` 决定；新版本之间都打开）。关掉是模拟对端是老版本：
     /// 反馈格式和探测行为照旧，没有运行中探测。
     pub probe_ids: bool,
+    /// 假后端的字节模型（只对 [`CodecKind::H264L05`]、[`CodecKind::H264L0`] 有意义）。默认是占位模型。
+    pub byte_model: ByteModelKind,
 }
 
 impl Scenario {
-    /// 一个默认的场景：720p、30 帧、H.264、局域网。
+    /// 一个默认的场景：720p、30 帧、H.264、局域网。编码种类、节奏器、纠错、起步探测、调试输出的默认值
+    /// 看环境变量（测试和对照用）；要“结果不受环境变量影响”的场景用 [`Self::fixed`]，世界文件读出来的就是它。
     #[must_use]
     pub fn new(name: &str, phases: Vec<Phase>) -> Self {
+        Self {
+            codec: default_codec(std::env::var_os("PEERDESK_E2E_CODEC").as_deref()),
+            pacing: peerdesk_core::pacer::enabled(),
+            fec: fec_from(std::env::var_os("PEERDESK_FEC").as_deref()),
+            trace: std::env::var_os("PEERDESK_EVENTS").is_some(),
+            start_probe: std::env::var("PEERDESK_START_PROBE").map_or(true, |v| v != "0"),
+            ..Self::fixed(name, phases)
+        }
+    }
+
+    /// 和 [`Self::new`] 一样的默认值，但一个环境变量也不读：L1 H.264、节奏器关、RS 纠错、起步探测开、不打调试输出。
+    #[must_use]
+    pub fn fixed(name: &str, phases: Vec<Phase>) -> Self {
         let (width, height) = DEFAULT_SIZE;
         Self {
             name: name.to_owned(),
             width,
             height,
             fps: 30,
-            codec: default_codec(std::env::var_os("PEERDESK_E2E_CODEC").as_deref()),
+            codec: CodecKind::H264,
             phases,
             network: vec![(0, Link::lan())],
             profile: Profile::STABLE,
@@ -256,12 +317,13 @@ impl Scenario {
             max_bps: 30_000_000,
             seed: 1,
             estimator: EstimatorKind::PRODUCT,
-            pacing: peerdesk_core::pacer::enabled(),
-            fec: fec_from(std::env::var_os("PEERDESK_FEC").as_deref()),
-            trace: std::env::var_os("PEERDESK_EVENTS").is_some(),
-            start_probe: std::env::var("PEERDESK_START_PROBE").map_or(true, |v| v != "0"),
+            pacing: false,
+            fec: peerdesk_core::transport::Fec::Rs,
+            trace: false,
+            start_probe: true,
             policy: ContentPolicy::OFFICE,
             probe_ids: true,
+            byte_model: ByteModelKind::Default,
         }
     }
 }
@@ -1031,6 +1093,23 @@ fn note_fingerprint(s: &Scenario, o: &Outcome) {
     }
 }
 
+/// 环境变量 `PEERDESK_E2E_WORLDS` 给出目录时，每次运行把这个场景的世界文件（[`world`]）写进去，文件名是内容哈希，
+/// 同一个场景重复跑只留一份。跑一遍现有测试就能拿到全部回归场景和微软轨迹的世界文件，交给批量运行器
+/// （`crates/e2e/examples/batch.rs`）。不设时什么都不做；写不出来（例如场景用了没命名的画像）会在标准错误里说明，不影响这次运行。
+fn note_world(s: &Scenario) {
+    use std::io::Write as _;
+    let Some(dir) = std::env::var_os("PEERDESK_E2E_WORLDS") else {
+        return;
+    };
+    if let Err(e) = world::export(std::path::Path::new(&dir), s) {
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "世界文件没写出来（场景 {}）：{e}",
+            s.name
+        );
+    }
+}
+
 /// 环境变量 `PEERDESK_E2E_SUMMARY` 给出文件路径时，每次运行往里追加一行关键数字（用来比 L1 和 L0.5 在同一批场景上的差别，
 /// 见 `scripts/e2e-tiers.sh`）：场景的身份（和指纹文件一样，不含编码器）、编码、帧数、关键帧数、冻结次数、最长等待、没解的帧、解码失败（花屏）、
 /// 发出的字节、停下阶段变清晰用的时间（毫秒，没清晰写 -）、仿真秒数、墙上毫秒。
@@ -1231,7 +1310,9 @@ fn run_inner(s: &Scenario, record: bool) -> Result<(Outcome, Option<Vec<u8>>), E
     let interval = 1_000_000 / u64::from(s.fps);
     let mut profile = Stopwatch::from_env();
     let tag = Arc::new(AtomicU64::new(0));
-    let (encoder, decoder) = s.codec.make(s.fps, s.max_bps, &s.policy, &tag)?;
+    let (encoder, decoder) = s
+        .codec
+        .make(s.fps, s.max_bps, &s.policy, &tag, s.byte_model)?;
     // L1 在收包的当场解码；L0.5、L0 走控制端用的延后解码（解码器交给量尺里的 DecodeWorker）
     let (mut stage, inline): (Box<dyn Stage>, Option<Box<dyn VideoDecoder>>) = match s.codec {
         CodecKind::H264L0 => {
@@ -1691,6 +1772,7 @@ fn run_inner(s: &Scenario, record: bool) -> Result<(Outcome, Option<Vec<u8>>), E
     }
     note_fingerprint(s, &outcome);
     note_summary(s, &outcome, wall.elapsed(), now);
+    note_world(s);
     Ok((outcome, recorded))
 }
 

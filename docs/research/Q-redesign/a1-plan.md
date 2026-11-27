@@ -195,3 +195,67 @@ A1 只回答两个问题：L0 能多快；它和 L1 差多少。
 - L0 的阶段快照是一个黑点、信噪比是 NaN（没有像素）；报告里的截图对 L0 没有意义。
 - 假后端的 `with_version_tag` 还留着：L0.5 是像素输入，版本号仍然靠它；L0 已经不用。
 - 时间线只准备了原尺寸和半尺寸两种亮度抽样（现在的分辨率策略只有这两档）；以后分辨率档位变多、或者按控制端窗口缩放时，描述里要多带几份，否则编码器会报“没有这个编码尺寸的亮度抽样”。
+
+## 11. S4 的结果（Sonnet，2026-11-27）
+
+**做了什么**
+- `peerdesk_core::kv`（`crates/core/src/kv.rs`，在 99% 覆盖率里）：通用的“一行一个键值”读写和内容哈希。读：键重复、没有值、键不合法、缺的键、值解析不了、
+  没人认的键（`Kv::finish` 列出全部）都报带行号和键名的中文错误；写：键的顺序就是调用顺序，写不进文本的值（空、换行、两端有空白）报错。
+  哈希是 blake3 的前 8 字节、16 位十六进制。值里的小字段写成 `名=值`，同一套规矩（`Kv::parse_fields`）。
+- `peerdesk_e2e::world`（`crates/e2e/src/world.rs`）：`Scenario` 和世界文件互转（`to_text`、`from_text`）、`export`（按哈希命名写进目录，先写临时文件再改名，
+  并行的测试写同一个场景不会互相截断）、`World::load`（文件名是 `<哈希>.world` 时核对内容的哈希）、`World::run`。
+  `to_text` 里**解构** `Scenario` 和 `Link`：以后加字段，这里编译不过，逼着决定写不写进文件。
+- `Scenario::fixed`：和 `Scenario::new` 同样的默认值，但一个环境变量也不读（L1 H.264、节奏器关、RS 纠错、起步探测开）；`new` 在它上面再叠环境变量，行为和以前一样。
+  世界文件读出来的场景用 `fixed` 打底、每一项都由文件填。`trace`（调试输出）不写，读出来是关。
+- `Scenario::byte_model`（`ByteModelKind::{Default, Openh264V1}`，世界文件的 `byte_model` 键）：`default` 是占位的 `DefaultByteModel`（默认，现有结果不变），
+  `openh264-v1` 是 `FittedByteModel::openh264_v1()`（各类合在一起的系数，残差扰动开）。只对 `h264-l05`、`h264-l0` 有意义；别的编码配了非 `default` 的模型，读写都报错
+  （否则同一个会话有两个哈希）。要加新模型（下一步的脏区域、移动区域输入），在 `ByteModelKind` 加一项和一个名字，文件格式不变。
+- `PEERDESK_E2E_WORLDS=<目录>`：`run()` 每跑一个场景就把它的世界文件写进去（同一个场景重复跑只留一份）。不设时什么都不做。
+- 批量运行器 `crates/e2e/examples/batch.rs`：`batch [--jobs N] [--out 文件.csv] <世界文件或目录>...`，每个会话一行 CSV，按输入顺序输出，出错的会话那行写原因、其余列空、退出码非 0。
+
+**世界文件的键**（顺序固定）：`world`（格式版本 1）、`name`、`width`、`height`、`fps`、`codec`（tile、h264、h264-l05、h264-l0）、`byte_model`、`rng_layout`（1）、`seed`、
+`estimator`（legacy、v1、gcc）、`profile`（stable、wireless、cellular、long-haul）、`policy`（office）、`start_bps`、`max_bps`、`pacing`、`fec`（rs、xor）、`start_probe`、`probe_ids`、
+`phases N` 加 `phase.0 …`（`action=… frames=…`）、`links N` 加 `link.0 …`（`at`、`delay_us`、`jitter_us`、`fifo_jitter`、`batch_us`、`loss_permille`、`rate_bps`、`max_queue_us`、`up`、
+`spikes`、`doze`、`busy`，一行一段，没有的写 `-`）。画像、策略写名字：没有命名的（自己造的 `Profile`、改过的 `ContentPolicy`）写不出来，报错。
+
+**设计决定和理由**
+1. **网络内联，不引用外部文件。** 微软轨迹每条几十到近 400 段（现有 99 个世界文件平均 10 KB、最大 62 KB（387 段））。引用外部文件要多一套“找不到、改过了没有、相对路径”的错误，
+   世界文件就不再自包含：拷走一个文件就丢了网络，哈希也管不到被引用的内容。几十 KB 的文本不是问题，所以内联；哈希覆盖全部输入。
+2. **线程，不用多进程。** 先查 `run()` 的全局状态：静态变量只有三处——RS 纠错的查表（`OnceLock`，进程内只初始化一次，之后只读）、节奏器倍数（`OnceLock`，读环境变量，只读）、
+   操作时间线的缓存（有锁，只影响速度）；运行中不读别的环境变量（`PEERDESK_E2E_PROFILE` 只开计时）；openh264 没有进程级状态。`cargo test` 本来就在一个进程里并行跑几十个会话，
+   指纹和单个跑的一致。线程省掉进程启动和结果回传。缺点：一个会话崩溃（panic）会带走整批；产品代码禁止 panic，可以接受。
+3. **结果不受环境变量影响。** 世界文件把原来从环境变量取默认值的四项（编码种类、节奏器、纠错、起步探测）都写明，读出来用 `Scenario::fixed`。
+   实测：设 `PEERDESK_E2E_CODEC=h264-l0 PEERDESK_FEC=xor PEERDESK_PACE=1 PEERDESK_START_PROBE=0 PEERDESK_EVENTS=1` 跑同一个世界文件，指纹和不设时相同。
+   **唯一的例外**是节奏器倍数 `PEERDESK_PACE_FACTOR`（产品代码里的全局，只在节奏器打开时起作用）：世界文件不写它，运行时发现它被改了、而世界里节奏器是开的，
+   就拒绝运行并说明原因（`world::env_conflict`），不静默用错。节奏器关着时它不起作用，照常跑。
+4. **随机数布局号**写在文件里（`rng_layout 1`），读到别的号报错；A2 引入布局 2 时再放开。它是引擎的常量，不是 `Scenario` 的字段。
+5. **文件名核对只在名字是 `<16 位十六进制>.world` 时做**（对不上说明文件被改过或拷坏了）；手写的世界文件用别的名字，不核对，内容照样逐项检查。
+   哈希是文件字节的哈希，不是“解析后重新写出来”的哈希：手工改过格式（多空格、注释）的文件有自己的哈希。
+
+**验收**
+| 验收 | 结果 |
+| --- | --- |
+| `Scenario` → 文本 → `Scenario` → 文本逐字节相同 | `world::tests::round_trips_are_byte_identical`：默认场景、带 3 段网络（spikes、doze、busy、fifo、批量、关掉的链路都有）、微软轨迹 ms-02560（387 段）、L0（`openh264-v1`）；另外 4 种编码、3 个估计器、4 个画像、7 种操作各来回一次。通过 |
+| 同一个世界文件跑两遍结果相同 | 单元测试：L0 世界跑两遍指纹相同，并且和直接跑原 `Scenario` 的指纹相同。批量运行器：24 个世界（4 线程跑一次、1 线程跑一次）指纹 24/24 相同 |
+| 批量运行器的指纹 = `cargo test` 里单个跑的指纹 | 先用 `PEERDESK_E2E_WORLDS` 跑一遍 `scripts/e2e-fingerprints.sh` 导出 99 个世界文件（全部回归场景 + 12 条微软轨迹各 3 个种子 + 3 个新测试自己的会话），再用批量运行器（4 线程，release）全部跑一遍，用 `PEERDESK_E2E_FINGERPRINTS` 比：批量的 99 行和基准的 96 个不同的行（118 行里有重复）逐字节相同，多出的 3 行是新测试的会话。0 个失败。墙上 175 秒（`cargo test --release` 全量约 5.7 分钟） |
+| 行为不变 | `scripts/e2e-fingerprints.sh`：基准的 118 行**一行没变**（`diff` 里没有 `<` 开头的行）。多出 6 行 `>`，都是这次新加的 2 个单元测试自己跑的会话（`model` 3 行、`world-run` 3 行，测试各跑了几次），和 S2、S3 一样：脚本报“指纹不同”（退出码 1）是因为只多不少。**我没有改基准文件**（没有人授权重录）；要接受这 6 行，合并时用 `--update` 或把这 6 行加进 `crates/e2e/golden/fingerprints.txt` |
+| 环境变量不影响 | 同一个世界设 `PEERDESK_E2E_CODEC=h264-l0 PEERDESK_FEC=xor PEERDESK_PACE=1 PEERDESK_START_PROBE=0 PEERDESK_EVENTS=1` 跑，指纹和不设时相同；节奏器开着的世界加 `PEERDESK_PACE_FACTOR=1500` 拒绝运行并说明原因 |
+| `cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace --no-fail-fast` | 全过；测试 1086 个通过、0 失败、9 个忽略（原来就有的） |
+| 覆盖率 `./scripts/coverage.sh` | 全工作区行覆盖率 99.09%（468 行没覆盖，共 51418 行）；`core/src/kv.rs` 99.72%（358 行里 1 行没覆盖）。e2e 包不算覆盖率，它的世界文件测试（12 个）是 `cargo test` 里的普通测试 |
+
+**批量运行器的 CSV 列**：`world_hash, name, codec, byte_model, sim_s, wall_ms, frames, keyframes, freezes, max_wait_ms, first_picture_ms, skipped, bad, recoveries, retransmitted, sent_bytes,
+net_lost, net_queue_dropped, rate_p50_kbps, rate_p5_kbps`，各码率状态的时间占比（千分比，6 列），`probe_run_sent, probe_verify_rounds, probe_periodic_rounds`，运行中探测的 4 种结论各几次，
+`probe_idle_sent, probe_bytes, sharp_ms`（每个停下阶段变清晰用的毫秒，分号隔开），`fingerprint`，`error`。`sim_s` 是各阶段帧数 × 每帧间隔（和 `run()` 的步长一样）。
+
+**a1-plan 第 4 节要的量里 `Outcome` 现在没有的**（没编，也没用别的东西顶替）：
+- 每两秒窗口的字节（只有每阶段的字节 `PhaseResult::bytes` 和全程 `sent_bytes`）；
+- 降码率次数；
+- 帧率换档次数（`SenderStats` 里可能有，没带进 `Outcome`）。
+
+“码率的中位和 5% 分位”用每次反馈一行的特征（`features[].rate_bps`）算，是按反馈条数，不是按时间加权；反馈在静止时 1 秒一次、有动静时 20 ms 一次，所以偏向有动静的时段。
+S5 要对账这几个量，要先在 `Outcome` 里加（不改行为，只是多带数；加了之后指纹要重录一次，因为指纹包含 `Outcome` 的字段）。
+
+**可疑的地方**
+- `FittedByteModel` 的 `scene_key_permille` 是 850，假后端用的常量 `SCENE_PERMILLE` 是 900（`fake.rs`）。拟合文档说假后端应当取模型的数，现在没接；`openh264-v1` 模型下整屏突变的关键帧门槛因此和实测差 50‰。没改（不属于这一步，改了会动 L0/L0.5 的行为）。
+- 墙上耗时在并行时包含被别的会话抢占的时间；量速度用 `--jobs 1`（24 个 L1 世界单线程：仿真 593 秒、墙上 229 秒，2.6 倍实时，和 S1 的 2.7 倍吻合）。
+- 时间线缓存是进程内共享、容量 3 条：多线程跑 L0 时会互相挤掉，只影响速度（A3 之前批量跑 L0 要先把同一份内容的会话放在一起）。
