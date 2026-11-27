@@ -1,0 +1,4 @@
+# 微软 MMSys 2024 带宽估计挑战赛仿真通话 05716（CC BY 4.0 / MIT），整通 127.92 秒（2132 步 × 60 ms）
+# 来源：https://github.com/microsoft/RL4BandwidthEstimationChallenge 的 data/ 目录；转换：scripts/ms-traces-full.py
+# 毫秒,带宽bps,丢包千分比
+0,9426000,0
