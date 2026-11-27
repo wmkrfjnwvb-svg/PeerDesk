@@ -16,8 +16,9 @@ use peerdesk_core::adaptive::Profile;
 use peerdesk_core::error::Error;
 pub use peerdesk_core::estimator::EstimatorKind;
 pub use peerdesk_core::estimator::RateState;
+use peerdesk_core::frame::{Described, Picture};
 pub use peerdesk_core::media::ProbeStats;
-use peerdesk_core::media::{MediaReceiver, MediaSender, SenderConfig, SenderStats};
+use peerdesk_core::media::{DecodeWorker, MediaReceiver, MediaSender, SenderConfig, SenderStats};
 pub use peerdesk_core::policy::ContentPolicy;
 use peerdesk_core::proto::{decode_datagram, encode_datagram, Channel, Header};
 use peerdesk_core::record::{self, Meta, Record, Role, Sink};
@@ -25,7 +26,10 @@ use peerdesk_core::screen::Screen;
 use peerdesk_core::sim::{Link, Net, NetStats};
 use peerdesk_core::time::Time;
 use peerdesk_core::video::{TileDecoder, TileEncoder, VideoDecoder, VideoEncoder};
+use peerdesk_media::fake::{FakeBackend, FakeConfig, FakeDecoder, ManualClock};
 use peerdesk_media::{H264Decoder, H264Encoder};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 pub use content::{Action, RealisticDesktop};
 
@@ -63,7 +67,14 @@ pub enum CodecKind {
     Tile,
     /// H.264（OpenH264）。
     H264,
+    /// L0.5（见 `docs/research/Q-redesign/a1-plan.md` 第 4 节）：画面是真像素，编码用假后端（面积、细节从像素算，字节由字节模型定，
+    /// 字节模型现在是占位），解码用假解码器；接收端走控制端用的“延后解码”那条路。显示端量尺按内容版本号和 QP 判清晰，
+    /// 没有像素可比：[`PhaseResult::end_psnr`] 是 NaN（没量）。和 L1（[`Self::H264`]）比，只差“字节模型准不准”。
+    H264L05,
 }
+
+/// L0.5 里 QP 不超过这个值算“清晰”。**占位**：M3 出数之前没有依据，结果只报告、不当门槛。
+pub const L05_QP_SHARP: u8 = 28;
 
 impl CodecKind {
     /// 名字。
@@ -72,11 +83,47 @@ impl CodecKind {
         match self {
             CodecKind::Tile => "tile",
             CodecKind::H264 => "h264",
+            CodecKind::H264L05 => "h264-l05",
         }
     }
 
-    fn make(self, fps: u32, max_bps: u64, policy: &ContentPolicy) -> Result<Codecs, Error> {
+    /// 是不是 H.264 一类（接收端要开关键帧宽限）。
+    #[must_use]
+    pub const fn is_h264(self) -> bool {
+        matches!(self, CodecKind::H264 | CodecKind::H264L05)
+    }
+
+    /// 解码器交出的是描述、不是像素（接收端走延后解码，量尺按版本号和 QP 判）。
+    const fn described(self) -> bool {
+        matches!(self, CodecKind::H264L05)
+    }
+
+    /// 造一对编码器和解码器。`tag` 是源画面的内容版本，只有 L0.5 用（假后端每交一帧读一次）。
+    fn make(
+        self,
+        fps: u32,
+        max_bps: u64,
+        policy: &ContentPolicy,
+        tag: &Arc<AtomicU64>,
+    ) -> Result<Codecs, Error> {
         Ok(match self {
+            CodecKind::H264L05 => {
+                // 假后端的时钟不拨：A1 里编码耗时按 0 算（和 L1 一样）
+                let backend = FakeBackend::with_default_model(
+                    FakeConfig::like_openh264(),
+                    Arc::new(ManualClock::new()),
+                )
+                .with_version_tag(Arc::clone(tag));
+                (
+                    Box::new(
+                        H264Encoder::with_max_bps(fps, max_bps)
+                            .with_policy(policy)
+                            .with_hardware(software_only)
+                            .with_soft_backend(Box::new(backend)),
+                    ),
+                    Box::new(FakeDecoder::new()),
+                )
+            }
             CodecKind::Tile => (Box::new(TileEncoder::new()), Box::new(TileDecoder::new())),
             CodecKind::H264 => (
                 Box::new(
@@ -106,6 +153,15 @@ fn fec_from(value: Option<&std::ffi::OsStr>) -> peerdesk_core::transport::Fec {
         peerdesk_core::transport::Fec::Xor
     } else {
         peerdesk_core::transport::Fec::Rs
+    }
+}
+
+/// 默认的编码器：环境变量 `PEERDESK_E2E_CODEC=h264-l05` 把所有默认场景换成 L0.5（对账用），其他是 H.264（L1）。
+fn default_codec(value: Option<&std::ffi::OsStr>) -> CodecKind {
+    if value.is_some_and(|v| v == "h264-l05") {
+        CodecKind::H264L05
+    } else {
+        CodecKind::H264
     }
 }
 
@@ -171,7 +227,7 @@ impl Scenario {
             width,
             height,
             fps: 30,
-            codec: CodecKind::H264,
+            codec: default_codec(std::env::var_os("PEERDESK_E2E_CODEC").as_deref()),
             phases,
             network: vec![(0, Link::lan())],
             profile: Profile::STABLE,
@@ -477,8 +533,259 @@ impl PhaseAcc {
     }
 }
 
-/// 运行一个场景。
-#[allow(clippy::too_many_lines)]
+/// 画面来源和显示端量尺：会话循环只认这个接口，不碰像素。
+///
+/// 两样放在一起，是因为“显示得对不对、清不清晰”只能拿显示端的画面和源画面比。现在只有像素版（[`PixelStage`]：
+/// 合成桌面、真编码、真解码、比亮度信噪比）；全模型仿真（L0，见 `docs/research/Q-redesign/a1-plan.md`）
+/// 以后实现同一个接口，用内容描述代替像素。
+trait Stage {
+    /// 被控端的画面按 `action` 走一拍；返回画面变没变。
+    fn step(&mut self, action: Action) -> Result<bool, Error>;
+
+    /// 把被控端现在的画面交给发送端编一帧，返回要发的数据报。
+    fn encode(
+        &self,
+        tx: &mut MediaSender,
+        now: Time,
+        changed: bool,
+        rtt_us: u64,
+    ) -> Result<Vec<peerdesk_core::media::Outgoing>, Error>;
+
+    /// 控制端收到一个画面数据报。收齐并显示了一帧时返回它的帧号。
+    fn receive(
+        &mut self,
+        rx: &mut MediaReceiver,
+        now: Time,
+        header: &Header,
+        body: &[u8],
+    ) -> Option<u32>;
+
+    /// 控制端显示的画面和被控端现在的画面比，算不算清晰（还什么都没显示时不算）。
+    fn sharp(&self) -> bool;
+
+    /// 阶段结束：（显示的画面和源画面的亮度信噪比，（源画面，显示的画面））。
+    fn snapshot(&self) -> (f64, (Screen, Screen));
+}
+
+/// 像素版：合成桌面出真像素，编解码器是真的，清晰度按亮度信噪比判。
+struct PixelStage {
+    desk: RealisticDesktop,
+    /// 控制端现在显示的画面。
+    shown: Option<Screen>,
+}
+
+impl Stage for PixelStage {
+    fn step(&mut self, action: Action) -> Result<bool, Error> {
+        self.desk.step(action)
+    }
+
+    fn encode(
+        &self,
+        tx: &mut MediaSender,
+        now: Time,
+        changed: bool,
+        rtt_us: u64,
+    ) -> Result<Vec<peerdesk_core::media::Outgoing>, Error> {
+        tx.on_frame(now, self.desk.screen(), changed, rtt_us)
+    }
+
+    fn receive(
+        &mut self,
+        rx: &mut MediaReceiver,
+        now: Time,
+        header: &Header,
+        body: &[u8],
+    ) -> Option<u32> {
+        let frame = rx
+            .on_datagram(now, header.send_time, header.seq, header.flags, body)
+            .ok()
+            .flatten()?;
+        self.shown = Some(frame.screen.clone());
+        Some(frame.frame_id)
+    }
+
+    fn sharp(&self) -> bool {
+        self.shown
+            .as_ref()
+            .is_some_and(|d| luma_psnr(d, self.desk.screen()) >= SHARP_DB)
+    }
+
+    fn snapshot(&self) -> (f64, (Screen, Screen)) {
+        let source = self.desk.screen();
+        let display = self
+            .shown
+            .clone()
+            .unwrap_or_else(|| Screen::new(source.width(), source.height(), 0));
+        (luma_psnr(&display, source), (source.clone(), display))
+    }
+}
+
+/// L0.5 版：合成桌面出真像素，编码是假后端、解码是假解码器；清晰度按内容版本号和 QP 判。
+///
+/// 源画面每变一次版本加一，同时拨给假后端（[`FakeBackend::with_version_tag`]），后端把它写进码流；假解码器从码流里读出来
+/// 交回，所以“显示的是第几版”是从传输、重组、解码这一整条链上走过来的，不是量尺自己猜的。
+struct DescribedStage {
+    desk: RealisticDesktop,
+    /// 源画面现在是第几版。
+    version: u64,
+    tag: Arc<AtomicU64>,
+    /// 解码器放在这里（和产品控制端的解码线程里一样，用 [`DecodeWorker`]；仿真是单线程，当场执行）。
+    worker: DecodeWorker,
+    /// 控制端现在显示的是什么。
+    shown: Option<Described>,
+}
+
+impl Stage for DescribedStage {
+    fn step(&mut self, action: Action) -> Result<bool, Error> {
+        let moved = self.desk.step(action)?;
+        if moved {
+            self.version = self.version.saturating_add(1);
+            self.tag.store(self.version, Ordering::Relaxed);
+        }
+        Ok(moved)
+    }
+
+    fn encode(
+        &self,
+        tx: &mut MediaSender,
+        now: Time,
+        changed: bool,
+        rtt_us: u64,
+    ) -> Result<Vec<peerdesk_core::media::Outgoing>, Error> {
+        tx.on_frame(now, self.desk.screen(), changed, rtt_us)
+    }
+
+    fn receive(
+        &mut self,
+        rx: &mut MediaReceiver,
+        now: Time,
+        header: &Header,
+        body: &[u8],
+    ) -> Option<u32> {
+        let jobs = rx
+            .on_datagram_deferred(now, header.send_time, header.seq, header.flags, body)
+            .ok()?;
+        // 和控制端一样：每个任务一个结果，成功了报给接收端，失败了让接收端等关键帧
+        let mut shown = None;
+        for job in &jobs {
+            match self.worker.decode(job) {
+                Ok(Some(Picture::Described(d))) => {
+                    rx.decode_succeeded();
+                    self.shown = Some(d);
+                    shown = Some(job.frame_id);
+                }
+                Ok(Some(Picture::Rgb(_) | Picture::Nv12(_)) | None) => {}
+                Err(_) => {
+                    rx.decode_failed();
+                    shown = None;
+                }
+            }
+        }
+        shown
+    }
+
+    fn sharp(&self) -> bool {
+        self.shown
+            .is_some_and(|d| d.version == self.version && d.qp <= L05_QP_SHARP)
+    }
+
+    /// 没有显示的像素：信噪比是 NaN（没量），截图的显示那一半是黑的。
+    fn snapshot(&self) -> (f64, (Screen, Screen)) {
+        let source = self.desk.screen();
+        let blank = Screen::new(source.width(), source.height(), 0);
+        (f64::NAN, (source.clone(), blank))
+    }
+}
+
+/// 一次会话的墙上时间花在哪（测量用）：环境变量 `PEERDESK_E2E_PROFILE` 打开，会话结束时往标准错误打一行。
+/// 只读时钟，不影响会话。用来回答“去掉像素之后仿真能多快”（`a1-plan.md` 第 3 节）。
+#[derive(Debug, Default)]
+struct Stopwatch {
+    on: bool,
+    spent: [std::time::Duration; Part::COUNT],
+}
+
+/// 计时的分段。
+#[derive(Debug, Clone, Copy)]
+enum Part {
+    /// 生成被控端的画面。
+    Render,
+    /// 发送端编一帧：转颜色、编码、切片、纠错。
+    Encode,
+    /// 节奏器出包、封数据报、交给仿真网络。
+    Send,
+    /// 仿真网络推进时间、取出到达的数据报、解数据报头。
+    Network,
+    /// 控制端：结算、出反馈；被控端：处理反馈（码率控制、重传）、定时任务。
+    Control,
+    /// 控制端收画面数据报，没收齐帧（只有重组、纠错）。
+    Reassemble,
+    /// 控制端收画面数据报，收齐了一帧（重组加解码）。
+    Decode,
+    /// 显示端量尺：比画面、算清晰。
+    Gauge,
+}
+
+impl Part {
+    const COUNT: usize = 8;
+    const ALL: [(Self, &'static str); Self::COUNT] = [
+        (Self::Render, "生成画面"),
+        (Self::Encode, "编码和切片"),
+        (Self::Send, "出包"),
+        (Self::Network, "仿真网络"),
+        (Self::Control, "反馈和控制"),
+        (Self::Reassemble, "收包重组"),
+        (Self::Decode, "收齐并解码"),
+        (Self::Gauge, "显示端量尺"),
+    ];
+}
+
+impl Stopwatch {
+    fn from_env() -> Self {
+        Self {
+            on: std::env::var_os("PEERDESK_E2E_PROFILE").is_some(),
+            ..Self::default()
+        }
+    }
+
+    /// 开始量一段（没打开时不读时钟）。
+    fn start(&self) -> Option<std::time::Instant> {
+        self.on.then(std::time::Instant::now)
+    }
+
+    /// 这一段结束，记到 `part` 名下。
+    fn stop(&mut self, part: Part, started: Option<std::time::Instant>) {
+        if let (Some(t), Some(slot)) = (started, self.spent.get_mut(part as usize)) {
+            *slot += t.elapsed();
+        }
+    }
+
+    /// 一行汇总：各段的毫秒数、其余、合计、仿真了多少秒、是实时的多少倍。
+    fn line(&self, name: &str, total: std::time::Duration, simulated: Time) -> String {
+        let parts: Vec<String> = Part::ALL
+            .iter()
+            .map(|(part, label)| {
+                let ms = self
+                    .spent
+                    .get(*part as usize)
+                    .map_or(0.0, std::time::Duration::as_secs_f64)
+                    * 1000.0;
+                format!("{label} {ms:.0}")
+            })
+            .collect();
+        let known: std::time::Duration = self.spent.iter().sum();
+        let wall = total.as_secs_f64().max(1e-9);
+        format!(
+            "计时 {name}：{}，其余 {:.0}，合计 {:.0} ms；仿真 {:.1} 秒，{:.2} 倍实时",
+            parts.join("，"),
+            total.saturating_sub(known).as_secs_f64() * 1000.0,
+            wall * 1000.0,
+            ms(simulated.micros()) / 1000.0,
+            ms(simulated.micros()) / 1000.0 / wall
+        )
+    }
+}
+
 /// 和产品（`peerdesk_net::host` 的 `send_paced`）一样：节奏器是唯一出口，发出的包记进发送历史。
 fn send_ready(
     pacer: &mut peerdesk_core::pacer::Pacer,
@@ -511,6 +818,161 @@ const CC_TICK_US: u64 = 25_000;
 
 pub fn run(s: &Scenario) -> Result<Outcome, Error> {
     run_inner(s, false).map(|(outcome, _)| outcome)
+}
+
+/// 结果的指纹：除了调试记录（`trace`，开不开看环境变量）以外的每一个字段，连同每个阶段结束时两端的画面像素。
+/// 重构时用它证明“行为逐字节不变”（见 `scripts/e2e-fingerprints.sh`）。同一提交、同一场景，指纹相同；
+/// 指纹和编码器的每个字节有关，所以只在同一种系统和处理器上可比。
+#[must_use]
+pub fn fingerprint(o: &Outcome) -> u64 {
+    fn eat(h: &mut u64, bytes: &[u8]) {
+        for b in bytes {
+            *h = (*h ^ u64::from(*b)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    let head = format!(
+        "{} {:?} {} {} {} {} {} {:?} {:?} {:?} {} {} {:?} {:?} {} {}",
+        o.name,
+        o.codec,
+        o.frames,
+        o.keyframes,
+        o.recoveries,
+        o.skipped,
+        o.bad,
+        o.net,
+        o.max_wait_ms.to_bits(),
+        o.first_picture_ms.map(f64::to_bits),
+        o.freezes,
+        o.retransmitted,
+        o.states,
+        o.probes,
+        o.sent_bytes,
+        o.estimator
+    );
+    eat(&mut h, head.as_bytes());
+    for p in &o.phases {
+        let line = format!(
+            "{:?} {} {} {} {} {} {} {} {} {:?}",
+            p.action,
+            p.bytes,
+            p.kbps,
+            p.frames_shown,
+            p.latency_ms.0.to_bits(),
+            p.latency_ms.1.to_bits(),
+            p.max_wait_ms.to_bits(),
+            p.freezes,
+            p.end_psnr.to_bits(),
+            p.sharp_ms.map(f64::to_bits)
+        );
+        eat(&mut h, line.as_bytes());
+        for screen in [&p.snapshot.0, &p.snapshot.1] {
+            eat(&mut h, &screen.width().to_le_bytes());
+            eat(&mut h, &screen.height().to_le_bytes());
+            for px in screen.pixels() {
+                eat(&mut h, &px.to_le_bytes());
+            }
+        }
+    }
+    for f in &o.features {
+        eat(&mut h, format!("{f:?}").as_bytes());
+    }
+    h
+}
+
+/// 环境变量 `PEERDESK_E2E_FINGERPRINTS` 给出文件路径时，每次运行往里追加一行：场景的身份和结果的指纹。
+/// 测试是并行跑的，行的顺序不定，比较前先排序（`scripts/e2e-fingerprints.sh`）。
+fn note_fingerprint(s: &Scenario, o: &Outcome) {
+    use std::io::Write as _;
+    let Some(path) = std::env::var_os("PEERDESK_E2E_FINGERPRINTS") else {
+        return;
+    };
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        // 一次写一整行：并行的测试各写各的，不会互相截断
+        let _ = file.write_all(fingerprint_line(s, o).as_bytes());
+    }
+}
+
+/// 环境变量 `PEERDESK_E2E_SUMMARY` 给出文件路径时，每次运行往里追加一行关键数字（用来比 L1 和 L0.5 在同一批场景上的差别，
+/// 见 `scripts/e2e-tiers.sh`）：场景的身份（和指纹文件一样，不含编码器）、编码、帧数、关键帧数、冻结次数、最长等待、没解的帧、解码失败（花屏）、
+/// 发出的字节、停下阶段变清晰用的时间（毫秒，没清晰写 -）、仿真秒数、墙上毫秒。
+/// 墙上时间在并行的测试里会被抢占，量速度要单线程跑（`-- --test-threads=1`）。
+fn note_summary(s: &Scenario, o: &Outcome, wall: std::time::Duration, sim: Time) {
+    use std::io::Write as _;
+    let Some(path) = std::env::var_os("PEERDESK_E2E_SUMMARY") else {
+        return;
+    };
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = file.write_all(summary_line(s, o, wall, sim).as_bytes());
+    }
+}
+
+/// 摘要文件里的一行（见 [`note_summary`]）。
+fn summary_line(s: &Scenario, o: &Outcome, wall: std::time::Duration, sim: Time) -> String {
+    let sharp: Vec<String> = o
+        .phases
+        .iter()
+        .filter_map(|p| p.sharp_ms.map(|ms| format!("{ms:.0}")))
+        .collect();
+    format!(
+        "{} {}x{} fps{} {} seed{} max{} start{} pace{} probe{}{} {:?}|{}|frames {}|keys {}|freezes {}|maxwait {:.0}|skipped {}|bad {}|bytes {}|sharp {}|sim {:.1}|wall {:.0}\n",
+        s.name,
+        s.width,
+        s.height,
+        s.fps,
+        o.estimator,
+        s.seed,
+        s.max_bps,
+        s.start_bps,
+        u8::from(s.pacing),
+        u8::from(s.start_probe),
+        u8::from(s.probe_ids),
+        s.fec,
+        o.codec.name(),
+        o.frames,
+        o.keyframes,
+        o.freezes,
+        o.max_wait_ms,
+        o.skipped,
+        o.bad,
+        o.sent_bytes,
+        if sharp.is_empty() {
+            "-".to_owned()
+        } else {
+            sharp.join(",")
+        },
+        ms(sim.micros()) / 1000.0,
+        wall.as_secs_f64() * 1000.0
+    )
+}
+
+/// 指纹文件里的一行：场景的身份（名字、尺寸、帧率、编码、估计器、种子、码率、开关）和结果的指纹。
+fn fingerprint_line(s: &Scenario, o: &Outcome) -> String {
+    format!(
+        "{} {}x{} fps{} {} {} seed{} max{} start{} pace{} probe{}{} {:?} {:016x}\n",
+        s.name,
+        s.width,
+        s.height,
+        s.fps,
+        o.codec.name(),
+        o.estimator,
+        s.seed,
+        s.max_bps,
+        s.start_bps,
+        u8::from(s.pacing),
+        u8::from(s.start_probe),
+        u8::from(s.probe_ids),
+        s.fec,
+        fingerprint(o)
+    )
 }
 
 /// 运行一个场景，同时把被控端的会话记录（`peerdesk_core::record` 的格式）写进内存，一起交回。
@@ -633,8 +1095,27 @@ fn run_inner(s: &Scenario, record: bool) -> Result<(Outcome, Option<Vec<u8>>), E
         return Err(Error::InvalidArgument("帧率和阶段都不能为空"));
     }
     let interval = 1_000_000 / u64::from(s.fps);
-    let mut desk = RealisticDesktop::new(s.width, s.height, s.seed)?;
-    let (encoder, decoder) = s.codec.make(s.fps, s.max_bps, &s.policy)?;
+    let mut profile = Stopwatch::from_env();
+    let wall = std::time::Instant::now();
+    let desk = RealisticDesktop::new(s.width, s.height, s.seed)?;
+    let tag = Arc::new(AtomicU64::new(0));
+    let (encoder, decoder) = s.codec.make(s.fps, s.max_bps, &s.policy, &tag)?;
+    // L1 在收包的当场解码；L0.5 走控制端用的延后解码（解码器交给量尺里的 DecodeWorker）
+    let (mut stage, inline): (Box<dyn Stage>, Option<Box<dyn VideoDecoder>>) =
+        if s.codec.described() {
+            (
+                Box::new(DescribedStage {
+                    desk,
+                    version: 0,
+                    tag,
+                    worker: DecodeWorker::new(decoder),
+                    shown: None,
+                }),
+                None,
+            )
+        } else {
+            (Box::new(PixelStage { desk, shown: None }), Some(decoder))
+        };
     let cfg = SenderConfig {
         fps: s.fps,
         start_bps: s.start_bps,
@@ -645,8 +1126,11 @@ fn run_inner(s: &Scenario, record: bool) -> Result<(Outcome, Option<Vec<u8>>), E
         ..SenderConfig::default()
     };
     let mut tx = MediaSender::new(cfg, encoder);
-    let mut rx = MediaReceiver::new(Time::ZERO, cfg.deadline_us, decoder);
-    rx.set_keyframe_grace(s.codec == CodecKind::H264);
+    let mut rx = match inline {
+        Some(decoder) => MediaReceiver::new(Time::ZERO, cfg.deadline_us, decoder),
+        None => MediaReceiver::detached(Time::ZERO, cfg.deadline_us),
+    };
+    rx.set_keyframe_grace(s.codec.is_h264());
     rx.set_fec(s.fec);
     tx.set_fec(s.fec);
     // 网络控制器要到达报告时两端都打开（产品里由握手的 TRANSPORT_CC 决定）
@@ -665,7 +1149,6 @@ fn run_inner(s: &Scenario, record: bool) -> Result<(Outcome, Option<Vec<u8>>), E
 
     // 每一帧的采集时间，按帧号。
     let mut captured: Vec<Time> = vec![Time::ZERO];
-    let mut shown: Option<Screen> = None;
     let mut results = Vec::new();
     let (mut seq, mut fb_seq) = (0u32, 0u32);
     let mut overall_wait = 0u64;
@@ -697,12 +1180,11 @@ fn run_inner(s: &Scenario, record: bool) -> Result<(Outcome, Option<Vec<u8>>), E
     for phase in &s.phases {
         let mut acc = PhaseAcc::new(now);
         // 阶段开始时画面已经清晰（例如上一阶段停下来之后补清晰了）。
-        if shown
-            .as_ref()
-            .is_some_and(|d| luma_psnr(d, desk.screen()) >= SHARP_DB)
-        {
+        let gauging = profile.start();
+        if stage.sharp() {
             acc.sharp_at = Some(now);
         }
+        profile.stop(Part::Gauge, gauging);
         for _ in 0..phase.frames {
             let tick_end = now.plus(interval);
             // 被控端：这一帧。
@@ -714,7 +1196,10 @@ fn run_inner(s: &Scenario, record: bool) -> Result<(Outcome, Option<Vec<u8>>), E
                 next_link += 1;
             }
             // 第一帧总要发：控制端还什么都没有。
-            let changed = desk.step(phase.action)? || std::mem::take(&mut first);
+            let rendering = profile.start();
+            let moved = stage.step(phase.action)?;
+            profile.stop(Part::Render, rendering);
+            let changed = moved || std::mem::take(&mut first);
             if changed && waiting_since.is_none() {
                 waiting_since = Some(now);
             }
@@ -743,7 +1228,9 @@ fn run_inner(s: &Scenario, record: bool) -> Result<(Outcome, Option<Vec<u8>>), E
                 let rtt = link.delay_us.saturating_mul(2).saturating_add(1_000);
                 let before = tx.stats();
                 let changed = std::mem::take(&mut pending);
-                let out = tx.on_frame(now, desk.screen(), changed, rtt)?;
+                let encoding = profile.start();
+                let out = stage.encode(&mut tx, now, changed, rtt)?;
+                profile.stop(Part::Encode, encoding);
                 if let Some(j) = journal.as_mut() {
                     j.frame(now, &tx, before, changed);
                 }
@@ -764,6 +1251,7 @@ fn run_inner(s: &Scenario, record: bool) -> Result<(Outcome, Option<Vec<u8>>), E
                 }
                 // 和产品一样经发送节奏控制发出（见 peerdesk_core::pacer）
                 pacer.push(out);
+                let sending = profile.start();
                 send_ready(
                     &mut pacer,
                     &mut tx,
@@ -773,6 +1261,7 @@ fn run_inner(s: &Scenario, record: bool) -> Result<(Outcome, Option<Vec<u8>>), E
                     &mut seq,
                     &mut acc.bytes,
                 )?;
+                profile.stop(Part::Send, sending);
             }
             // 这一帧的时间内：投递数据报、发反馈。
             loop {
@@ -792,8 +1281,11 @@ fn run_inner(s: &Scenario, record: bool) -> Result<(Outcome, Option<Vec<u8>>), E
                     net.backlog_us(HOST, VIEWER),
                     when.since(now),
                 );
+                let moving = profile.start();
                 net.advance_to(when);
+                profile.stop(Part::Network, moving);
                 now = when;
+                let controlling = profile.start();
                 if next_tick <= now {
                     tx.on_tick(now);
                     for cluster in tx.take_probes() {
@@ -823,6 +1315,8 @@ fn run_inner(s: &Scenario, record: bool) -> Result<(Outcome, Option<Vec<u8>>), E
                         }
                     }
                 }
+                profile.stop(Part::Control, controlling);
+                let sending = profile.start();
                 send_ready(
                     &mut pacer,
                     &mut tx,
@@ -832,6 +1326,8 @@ fn run_inner(s: &Scenario, record: bool) -> Result<(Outcome, Option<Vec<u8>>), E
                     &mut seq,
                     &mut acc.bytes,
                 )?;
+                profile.stop(Part::Send, sending);
+                let controlling = profile.start();
                 let feedback_due = next_feedback <= now && {
                     next_feedback = now.plus(FEEDBACK_US);
                     let (floor, _) = rx.settle(now);
@@ -858,16 +1354,31 @@ fn run_inner(s: &Scenario, record: bool) -> Result<(Outcome, Option<Vec<u8>>), E
                     let datagram = encode_datagram(&header, &fb)?;
                     net.send(VIEWER, HOST, datagram.len(), datagram);
                 }
-                while net.peek_time().is_some_and(|t| t <= now) {
-                    let Some(d) = net.pop() else { break };
-                    let Ok((header, body)) = decode_datagram(&d.payload) else {
+                profile.stop(Part::Control, controlling);
+                loop {
+                    let moving = profile.start();
+                    let arrived = net
+                        .peek_time()
+                        .is_some_and(|t| t <= now)
+                        .then(|| net.pop())
+                        .flatten();
+                    let Some(d) = arrived else {
+                        profile.stop(Part::Network, moving);
+                        break;
+                    };
+                    let parsed = decode_datagram(&d.payload);
+                    profile.stop(Part::Network, moving);
+                    let Ok((header, body)) = parsed else {
                         continue;
                     };
                     if d.to == HOST {
                         // 反馈；顺便按请求重传丢了的分片。
+                        let controlling = profile.start();
                         let again = tx.on_feedback_datagram(now, body).unwrap_or_default();
                         pacer.retain(|o| tx.wanted(o));
                         pacer.push_front(again);
+                        profile.stop(Part::Control, controlling);
+                        let sending = profile.start();
                         send_ready(
                             &mut pacer,
                             &mut tx,
@@ -877,6 +1388,7 @@ fn run_inner(s: &Scenario, record: bool) -> Result<(Outcome, Option<Vec<u8>>), E
                             &mut seq,
                             &mut acc.bytes,
                         )?;
+                        profile.stop(Part::Send, sending);
                         if trace_events {
                             for e in tx.take_events() {
                                 trace.push(format!("[{:>6} ms] {e}", now.micros() / 1000));
@@ -904,13 +1416,21 @@ fn run_inner(s: &Scenario, record: bool) -> Result<(Outcome, Option<Vec<u8>>), E
                         continue;
                     }
                     video_since_feedback = video_since_feedback.saturating_add(1);
-                    let Ok(Some(frame)) =
-                        rx.on_datagram(now, header.send_time, header.seq, header.flags, body)
-                    else {
+                    let receiving = profile.start();
+                    let got = stage.receive(&mut rx, now, &header, body);
+                    profile.stop(
+                        if got.is_some() {
+                            Part::Decode
+                        } else {
+                            Part::Reassemble
+                        },
+                        receiving,
+                    );
+                    let Some(frame_id) = got else {
                         continue;
                     };
                     let at = captured
-                        .get(usize::try_from(frame.frame_id).unwrap_or(usize::MAX))
+                        .get(usize::try_from(frame_id).unwrap_or(usize::MAX))
                         .copied()
                         .unwrap_or(now);
                     acc.latencies.push(now.since(at));
@@ -934,11 +1454,11 @@ fn run_inner(s: &Scenario, record: bool) -> Result<(Outcome, Option<Vec<u8>>), E
                             }
                         }
                     }
-                    let screen = frame.screen.clone();
-                    if acc.sharp_at.is_none() && luma_psnr(&screen, desk.screen()) >= SHARP_DB {
+                    let gauging = profile.start();
+                    if acc.sharp_at.is_none() && stage.sharp() {
                         acc.sharp_at = Some(now);
                     }
-                    shown = Some(screen);
+                    profile.stop(Part::Gauge, gauging);
                 }
             }
             states.add(
@@ -946,7 +1466,9 @@ fn run_inner(s: &Scenario, record: bool) -> Result<(Outcome, Option<Vec<u8>>), E
                 net.backlog_us(HOST, VIEWER),
                 tick_end.since(now),
             );
+            let moving = profile.start();
             net.advance_to(tick_end);
+            profile.stop(Part::Network, moving);
             now = tick_end;
             if let Some(j) = journal.as_mut() {
                 j.second(now, tx.stats());
@@ -960,9 +1482,9 @@ fn run_inner(s: &Scenario, record: bool) -> Result<(Outcome, Option<Vec<u8>>), E
                 acc.freezes += 1;
             }
         }
-        let blank = Screen::new(s.width, s.height, 0);
-        let display = shown.clone().unwrap_or(blank);
-        let end_psnr = luma_psnr(&display, desk.screen());
+        let gauging = profile.start();
+        let (end_psnr, snapshot) = stage.snapshot();
+        profile.stop(Part::Gauge, gauging);
         let duration = now.since(acc.start).max(1);
         let mut sorted = acc.latencies.clone();
         sorted.sort_unstable();
@@ -981,7 +1503,7 @@ fn run_inner(s: &Scenario, record: bool) -> Result<(Outcome, Option<Vec<u8>>), E
                 .sharp_at
                 .filter(|_| phase.action == Action::Idle)
                 .map(|t| ms(t.since(acc.start))),
-            snapshot: (desk.screen().clone(), display),
+            snapshot,
         });
     }
     let (tx_stats, rx_stats) = (tx.stats(), rx.stats());
@@ -1008,6 +1530,14 @@ fn run_inner(s: &Scenario, record: bool) -> Result<(Outcome, Option<Vec<u8>>), E
         features,
         trace,
     };
+    if profile.on {
+        use std::io::Write as _;
+        // 测量输出走标准错误，一次写一整行（并行的测试不互相打断）
+        let line = profile.line(&s.name, wall.elapsed(), now);
+        let _ = writeln!(std::io::stderr().lock(), "{line}");
+    }
+    note_fingerprint(s, &outcome);
+    note_summary(s, &outcome, wall.elapsed(), now);
     Ok((outcome, recorded))
 }
 
@@ -1026,6 +1556,72 @@ mod tests {
             }],
         ))
         .unwrap()
+    }
+
+    #[test]
+    fn l05_runs_the_real_session_code_with_a_fake_codec_and_no_corrupt_frames() {
+        let mut s = Scenario::new(
+            "l05",
+            vec![
+                Phase {
+                    action: Action::Typing,
+                    frames: 30,
+                },
+                Phase {
+                    action: Action::Idle,
+                    frames: 60,
+                },
+            ],
+        );
+        s.codec = CodecKind::H264L05;
+        let o = run(&s).unwrap();
+        assert_eq!(o.codec.name(), "h264-l05");
+        assert!(o.frames > 10 && o.keyframes >= 1, "{o:?}");
+        // 假解码器和真解码器一样严：接不上的帧会算解码失败。没有丢包的局域网上一帧也不该有
+        assert_eq!((o.bad, o.skipped), (0, 0));
+        assert!(o.first_picture_ms.is_some());
+        // 停下之后补清晰到 QP 够低；没有像素可比，信噪比是 NaN
+        assert!(o.phases[1].sharp_ms.is_some(), "{:?}", o.phases[1]);
+        assert!(o.phases[1].end_psnr.is_nan());
+        // 同一个场景再跑一遍，结果相同
+        assert_eq!(fingerprint(&o), fingerprint(&run(&s).unwrap()));
+        // 摘要行
+        let line = summary_line(
+            &s,
+            &o,
+            std::time::Duration::from_millis(50),
+            Time(2_000_000),
+        );
+        assert!(
+            line.contains(" seed1 ") && line.contains("|h264-l05|frames "),
+            "{line}"
+        );
+        assert!(line.contains("|sim 2.0|wall 50\n"), "{line}");
+        let plain = summary_line(
+            &s,
+            &Outcome {
+                phases: vec![],
+                ..o
+            },
+            std::time::Duration::ZERO,
+            Time::ZERO,
+        );
+        assert!(plain.contains("|sharp -|"), "{plain}");
+    }
+
+    #[test]
+    fn codec_kinds_and_the_environment_choice() {
+        assert!(CodecKind::H264.is_h264() && CodecKind::H264L05.is_h264());
+        assert!(!CodecKind::Tile.is_h264());
+        assert_eq!(default_codec(None), CodecKind::H264);
+        assert_eq!(
+            default_codec(Some(std::ffi::OsStr::new("h264-l05"))),
+            CodecKind::H264L05
+        );
+        assert_eq!(
+            default_codec(Some(std::ffi::OsStr::new("x"))),
+            CodecKind::H264
+        );
     }
 
     #[test]
@@ -1155,6 +1751,82 @@ mod tests {
         let o = run(&s).unwrap();
         assert!(o.freezes >= 1, "{}", o.freezes);
         assert!(o.max_wait_ms >= 400.0, "{}", o.max_wait_ms);
+    }
+
+    /// 指纹：同一场景跑两遍相同；结果里任何一个数、任何一个像素变了都不同；调试记录不算在内。
+    #[test]
+    fn the_fingerprint_covers_every_number_and_pixel_but_not_the_trace() {
+        let s = Scenario::new(
+            "fp",
+            vec![Phase {
+                action: Action::Typing,
+                frames: 8,
+            }],
+        );
+        let a = run(&s).unwrap();
+        let b = run(&s).unwrap();
+        assert_eq!(fingerprint(&a), fingerprint(&b));
+        let line = fingerprint_line(&s, &a);
+        assert!(line.starts_with("fp ") && line.ends_with(&format!("{:016x}\n", fingerprint(&a))));
+        let mut traced = a.clone();
+        traced.trace.push("调试".into());
+        assert_eq!(fingerprint(&traced), fingerprint(&a));
+        let mut other = a.clone();
+        other.sent_bytes += 1;
+        assert_ne!(fingerprint(&other), fingerprint(&a));
+        let mut other = a.clone();
+        if let Some(f) = other.features.last_mut() {
+            f.rate_bps += 1;
+        }
+        assert_ne!(fingerprint(&other), fingerprint(&a));
+        let mut other = a.clone();
+        if let Some(p) = other.phases.first_mut() {
+            p.snapshot.1.fill(0, 0, 1, 1, 0x00ab_cdef);
+        }
+        assert_ne!(fingerprint(&other), fingerprint(&a));
+        let mut other = a.clone();
+        if let Some(p) = other.phases.first_mut() {
+            p.freezes += 1;
+        }
+        assert_ne!(fingerprint(&other), fingerprint(&a));
+    }
+
+    /// 分段计时：没打开时不读时钟、什么都不记；打开时各段累加，汇总成一行。
+    #[test]
+    fn the_stopwatch_only_runs_when_asked_and_reports_one_line() {
+        let mut off = Stopwatch::default();
+        let t = off.start();
+        assert!(t.is_none());
+        off.stop(Part::Encode, t);
+        assert!(off.spent.iter().all(std::time::Duration::is_zero));
+        let mut on = Stopwatch {
+            on: true,
+            ..Stopwatch::default()
+        };
+        for (part, _) in Part::ALL {
+            let t = on.start();
+            assert!(t.is_some());
+            on.stop(part, t);
+        }
+        on.spent[Part::Encode as usize] += std::time::Duration::from_millis(40);
+        let line = on.line(
+            "会话",
+            std::time::Duration::from_millis(100),
+            Time(2_000_000),
+        );
+        assert!(
+            line.starts_with("计时 会话：生成画面 0，编码和切片 40，"),
+            "{line}"
+        );
+        assert!(
+            line.contains("合计 100 ms；仿真 2.0 秒，20.00 倍实时"),
+            "{line}"
+        );
+        // 环境变量没设时关着（测试环境里不设它）
+        assert_eq!(
+            Stopwatch::from_env().on,
+            std::env::var_os("PEERDESK_E2E_PROFILE").is_some()
+        );
     }
 
     #[test]
