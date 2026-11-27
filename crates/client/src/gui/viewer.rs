@@ -7,7 +7,10 @@ use peerdesk_core::frame::Picture;
 use peerdesk_core::proto::PeerOs;
 
 use super::assistant::{os_label, Shortcut};
-use super::theme::{font, icon, icon_button, pill, space, ControlSize, Palette, Signal};
+use super::theme::{
+    self, dot, font, font_id, icon, link_button, radius, space, text, Palette, Signal, Weight,
+};
+use super::toolbar::{self, show_collapsed, Collapse, Item};
 
 use eframe::egui::{
     self, pos2, vec2, Align2, Color32, FontId, Frame, Pos2, Rect, RichText, TextureHandle,
@@ -18,8 +21,23 @@ use super::coords::fit;
 use super::i18n::Strings;
 use super::input::InputState;
 use super::session::ViewHandle;
-use super::state::{detail_rows, net_texts, route_name, NetLevel, NetMeter, ViewPhase};
+use super::state::{detail_rows, route_name, NetMeter, ViewPhase};
 use super::stats::FpsMeter;
+
+/// 截图用：`PEERDESK_GUI_TOOLBAR=expanded` 工具条一直展开（不自动收起），`collapsed` 一开始就是小条，
+/// `advice` 展开并打开“怎么办”面板（有网络问题时才有内容）。
+const TOOLBAR_ENV: &str = "PEERDESK_GUI_TOOLBAR";
+
+/// 工具条的初始状态（见 [`TOOLBAR_ENV`]）。
+fn initial_collapse() -> Collapse {
+    let mut collapse = Collapse::default();
+    match std::env::var(TOOLBAR_ENV).as_deref() {
+        Ok("expanded" | "advice") => collapse.expand(Duration::ZERO),
+        Ok("collapsed") => collapse.collapse(),
+        _ => {}
+    }
+    collapse
+}
 
 /// 一次 [`Viewer::show`] 的结果。
 #[derive(Debug, Clone)]
@@ -67,8 +85,10 @@ pub struct Viewer {
     net: NetMeter,
     /// 最近一秒的链路质量和对方状态（详情面板）。
     quality: Option<peerdesk_net::controller::LinkQuality>,
-    /// 浮动助手是否展开。
-    assistant: bool,
+    /// 工具条收起和展开（自动收起的逻辑见 `toolbar.rs`）。
+    collapse: Collapse,
+    /// “怎么办”面板是否展开。
+    advice_open: bool,
     /// 助手的位置（顶边中点）；没拖过时在画面顶部居中。
     assistant_at: Option<Pos2>,
     /// 是否全屏。
@@ -102,7 +122,8 @@ impl Viewer {
             peer_name: String::new(),
             net: NetMeter::default(),
             quality: None,
-            assistant: true,
+            collapse: initial_collapse(),
+            advice_open: std::env::var(TOOLBAR_ENV).is_ok_and(|v| v == "advice"),
             assistant_at: None,
             fullscreen: false,
             original: false,
@@ -202,232 +223,9 @@ impl Viewer {
             .record(now, frames.saturating_sub(self.frames_seen));
         self.frames_seen = frames;
 
-        let p = Palette::of(ctx);
         let mut picture = None;
-        let live = matches!(self.phase, ViewPhase::Connected { .. });
-        // 远程画面上的悬浮工具条（助手）：快捷键、声音、全屏、统计、断开。默认在顶部居中，
-        // 按住空白处或左边的把手可以拖到任何位置；收起后是一个小图标，也能拖。
-        // 位置自己记：按住左边的把手拖（egui 的可拖动区域会被按钮、文字盖住，拖不动）
-        let screen = ctx.screen_rect();
-        let at = self
-            .assistant_at
-            .unwrap_or_else(|| screen.center_top() + vec2(0.0, 8.0));
-        egui::Area::new(egui::Id::new(("assistant", self.id)))
-            .pivot(Align2::CENTER_TOP)
-            .current_pos(at)
-            .constrain(true)
-            .order(egui::Order::Foreground)
-            .show(ctx, |ui| {
-                // 工具条上的字不能被选中（选字会吃掉拖动）
-                ui.style_mut().interaction.selectable_labels = false;
-                let frame = Frame::new()
-                    .fill(p.surface.gamma_multiply(0.96))
-                    .stroke(egui::Stroke::new(1.0_f32, p.line))
-                    .corner_radius(18)
-                    .inner_margin(egui::Margin::symmetric(10, 4))
-                    .shadow(egui::epaint::Shadow {
-                        offset: [0, 4],
-                        blur: 16,
-                        spread: 0,
-                        color: Color32::from_black_alpha(60),
-                    });
-                frame.show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 4.0;
-                        // 拖动把手：按住拖整个助手（收起时也能拖）
-                        let grip = ui
-                            .add(
-                                egui::Label::new(
-                                    RichText::new(icon::DOTS_SIX_VERTICAL)
-                                        .size(font::ICON)
-                                        .color(p.muted),
-                                )
-                                .selectable(false)
-                                .sense(egui::Sense::drag()),
-                            )
-                            .on_hover_cursor(egui::CursorIcon::Grab);
-                        if grip.dragged() {
-                            ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
-                            let moved = at + grip.drag_delta();
-                            // 不拖出窗口：顶边中点留在画面里
-                            self.assistant_at = Some(pos2(
-                                moved.x.clamp(screen.left() + 40.0, screen.right() - 40.0),
-                                moved.y.clamp(screen.top(), screen.bottom() - 40.0),
-                            ));
-                        }
-                        if !self.assistant {
-                            let open = egui::Button::new(
-                                RichText::new(format!("{}  {}", icon::MONITOR, icon::CARET_DOWN))
-                                    .size(font::ICON)
-                                    .color(p.ink),
-                            )
-                            .frame(false);
-                            if ui.add(open).on_hover_text(s.expand).clicked() {
-                                self.assistant = true;
-                            }
-                            return;
-                        }
-                        // 连接状态
-                        let mut net_hint: Option<String> = None;
-                        let (state, color) = match &self.phase {
-                            ViewPhase::Connecting => (s.connecting.to_owned(), Signal::Idle),
-                            ViewPhase::Reconnecting { .. } => {
-                                (self.phase.headline(s), Signal::Relay)
-                            }
-                            ViewPhase::Connected { route, .. } => {
-                                let base =
-                                    format!("{} · {}", s.connected, route_name(Some(*route), s));
-                                // 网络差时标签变色，并写上主要原因（例如“丢包 6%”）
-                                match self.net.shown() {
-                                    (NetLevel::Good, _) | (_, None) => (base, Signal::Direct),
-                                    (level, Some(cause)) => {
-                                        let (short, hint) = net_texts(cause, s);
-                                        net_hint = Some(hint);
-                                        let color = if level == NetLevel::Poor {
-                                            Signal::Problem
-                                        } else {
-                                            Signal::Relay
-                                        };
-                                        (format!("{base} · {short}"), color)
-                                    }
-                                }
-                            }
-                            ViewPhase::Ended { status, .. } => (
-                                status.text.clone(),
-                                if status.error {
-                                    Signal::Problem
-                                } else {
-                                    Signal::Idle
-                                },
-                            ),
-                        };
-                        let shown = pill(ui, &p, &state, color);
-                        if let Some(hint) = net_hint {
-                            let _ = shown.on_hover_text(hint);
-                        }
-                        ui.separator();
-                        // 快捷键菜单（按被控端系统选键）
-                        ui.add_enabled_ui(live, |ui| {
-                            ui.menu_button(
-                                RichText::new(format!("{}  {}", icon::KEYBOARD, s.shortcuts)),
-                                |ui| {
-                                    ui.label(
-                                        RichText::new(format!(
-                                            "{}：{}",
-                                            s.remote_os,
-                                            os_label(self.peer_os, s)
-                                        ))
-                                        .size(font::CAPTION)
-                                        .color(p.muted),
-                                    );
-                                    ui.separator();
-                                    // 只列对方系统有的快捷键，用对方系统的叫法，右边写组合键
-                                    for sc in Shortcut::available(self.peer_os) {
-                                        let events = sc.events(self.peer_os);
-                                        let combo = sc.combo(self.peer_os).unwrap_or_default();
-                                        let item = ui.add(
-                                            egui::Button::new(sc.label_on(self.peer_os, s))
-                                                .shortcut_text(combo)
-                                                .frame(false),
-                                        );
-                                        if item.clicked() {
-                                            for event in events {
-                                                let _ = self.handle.send(event);
-                                            }
-                                            ui.close();
-                                        }
-                                    }
-                                },
-                            );
-                        });
-                        // 声音：默认关
-                        let sound = self.handle.sound();
-                        let (glyph, tip) = if sound {
-                            (icon::SPEAKER_HIGH, s.sound)
-                        } else {
-                            (icon::SPEAKER_SLASH, s.sound)
-                        };
-                        let b = toolbar_toggle(ui, &p, glyph, tip, sound, live);
-                        if b.clicked() {
-                            self.handle.set_sound(!sound);
-                        }
-                        let glyph = if self.fullscreen {
-                            icon::CORNERS_IN
-                        } else {
-                            icon::CORNERS_OUT
-                        };
-                        if toolbar_toggle(ui, &p, glyph, s.fullscreen, self.fullscreen, true)
-                            .clicked()
-                        {
-                            self.fullscreen = !self.fullscreen;
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(
-                                self.fullscreen,
-                            ));
-                        }
-                        // 原始大小：一个远程像素对应一个屏幕像素，字最清楚；铺满窗口时放大会变软
-                        if toolbar_toggle(
-                            ui,
-                            &p,
-                            icon::NUMBER_SQUARE_ONE,
-                            s.original_size,
-                            self.original,
-                            true,
-                        )
-                        .clicked()
-                        {
-                            self.original = !self.original;
-                        }
-                        if toolbar_toggle(ui, &p, icon::CHART_BAR, s.stats, self.overlay, true)
-                            .clicked()
-                        {
-                            self.overlay = !self.overlay;
-                        }
-                        // 文件管理（对方支持时可点）
-                        let files_ok = self.handle.files_link().is_some();
-                        if toolbar_toggle(ui, &p, icon::FOLDER_OPEN, "文件管理", false, files_ok)
-                            .clicked()
-                        {
-                            outcome.open_files = true;
-                        }
-                        ui.separator();
-                        let (label, glyph) = if self.phase.is_ended() {
-                            (s.close, icon::X_CIRCLE)
-                        } else {
-                            (s.disconnect, icon::PHONE_DISCONNECT)
-                        };
-                        let stop = egui::Button::new(
-                            RichText::new(format!("{glyph}  {label}")).color(Color32::WHITE),
-                        )
-                        .fill(p.danger_fill)
-                        .corner_radius(12);
-                        if ui.add(stop).clicked() {
-                            self.stop();
-                            outcome.open = false;
-                        }
-                        if icon_button(ui, &p, icon::CARET_UP, s.collapse, ControlSize::Small)
-                            .clicked()
-                        {
-                            self.assistant = false;
-                        }
-                    });
-                });
-                // 剪贴板提示：工具条下方显示 6 秒
-                if let Some((text, at)) = &self.clip_toast {
-                    if at.elapsed() < Duration::from_secs(6) {
-                        ui.add_space(space::S6);
-                        Frame::new()
-                            .fill(p.relay.text.gamma_multiply(0.9))
-                            .corner_radius(10)
-                            .inner_margin(egui::Margin::symmetric(12, 6))
-                            .show(ui, |ui| {
-                                ui.label(RichText::new(text).color(Color32::BLACK));
-                            });
-                        ctx.request_repaint_after(Duration::from_millis(500));
-                    } else {
-                        self.clip_toast = None;
-                    }
-                }
-            });
+        // 远程画面上的悬浮工具条
+        self.toolbar(ctx, s, &mut outcome);
 
         egui::CentralPanel::default()
             .frame(Frame::NONE.fill(Color32::BLACK))
@@ -551,6 +349,416 @@ impl Viewer {
             outcome.open = false;
         }
         outcome
+    }
+
+    /// 远程画面上的悬浮工具条。默认在顶部居中，按住左边的把手可以拖到任何位置。
+    /// 展开时是一排按钮；一段时间没用自动收成一个带网络状态的小条，不挡画面（逻辑见 `toolbar.rs`）。
+    /// 网络变差时小条变色并写上原因，点“怎么办”在原地展开说明，不弹窗。
+    fn toolbar(&mut self, ctx: &egui::Context, s: &'static Strings, outcome: &mut Outcome) {
+        let p = Palette::of(ctx);
+        let live = matches!(self.phase, ViewPhase::Connected { .. });
+        let now = self.started.elapsed();
+        let screen = ctx.screen_rect();
+        let collapsed = show_collapsed(self.collapse.collapsed(), screen.width());
+        let rtt = self.quality.as_ref().map(|q| q.rtt_ms);
+        let status = toolbar::status(&self.phase, &self.net, rtt, &self.peer_name, !collapsed, s);
+        if status.advice.is_none() {
+            self.advice_open = false;
+        }
+        // 位置自己记：按住左边的把手拖（egui 的可拖动区域会被按钮、文字盖住，拖不动）
+        let at = self
+            .assistant_at
+            .unwrap_or_else(|| screen.center_top() + vec2(0.0, space::S8));
+        let area = egui::Area::new(egui::Id::new(("assistant", self.id)))
+            .pivot(Align2::CENTER_TOP)
+            .current_pos(at)
+            .constrain(true)
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                // 工具条上的字不能被选中（选字会吃掉拖动）
+                ui.style_mut().interaction.selectable_labels = false;
+                let edge = if collapsed && status.advice.is_some() {
+                    p.signal(status.signal).solid
+                } else {
+                    p.line
+                };
+                let frame = Frame::new()
+                    .fill(p.surface.gamma_multiply(0.96))
+                    .stroke(egui::Stroke::new(1.0_f32, edge))
+                    .corner_radius(if collapsed { radius::PILL } else { 12.0 })
+                    .inner_margin(egui::Margin::symmetric(8, 4))
+                    .shadow(egui::epaint::Shadow {
+                        offset: [0, 4],
+                        blur: 16,
+                        spread: 0,
+                        color: Color32::from_black_alpha(60),
+                    });
+                frame.show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = space::S4;
+                        // 条上的按钮都不带边框（和图标按钮一致），鼠标停上去才有底色
+                        ui.visuals_mut().widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
+                        ui.visuals_mut().widgets.inactive.bg_stroke = egui::Stroke::NONE;
+                        ui.spacing_mut().button_padding = vec2(space::S8, space::S4);
+                        self.grip(ui, ctx, &p, at, screen);
+                        if collapsed {
+                            self.collapsed_bar(ui, &p, &status, now, s);
+                        } else {
+                            self.expanded_bar(
+                                ui,
+                                ctx,
+                                &p,
+                                &status,
+                                live,
+                                screen.width(),
+                                s,
+                                outcome,
+                            );
+                        }
+                    });
+                });
+                if self.advice_open {
+                    if let Some(advice) = &status.advice {
+                        ui.add_space(space::S6);
+                        self.advice_panel(ui, &p, advice, status.signal, s);
+                    }
+                }
+                // 剪贴板提示：工具条下方显示 6 秒
+                self.clipboard_toast(ui, ctx, &p);
+            });
+        // 鼠标在条上（或它的菜单开着）就不自动收起
+        let hovered = area.response.contains_pointer() || egui::Popup::is_any_open(ctx);
+        self.collapse.tick(now, live, hovered);
+        if let Some(left) = self.collapse.auto_collapse_in(now) {
+            ctx.request_repaint_after(left.max(Duration::from_millis(100)));
+        }
+    }
+
+    /// 拖动把手：按住拖整个工具条（收起时也能拖）。
+    fn grip(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        p: &Palette,
+        at: Pos2,
+        screen: Rect,
+    ) {
+        let grip = ui
+            .add(
+                egui::Label::new(
+                    RichText::new(icon::DOTS_SIX_VERTICAL)
+                        .size(font::ICON)
+                        .color(p.muted),
+                )
+                .selectable(false)
+                .sense(egui::Sense::drag()),
+            )
+            .on_hover_cursor(egui::CursorIcon::Grab);
+        if grip.dragged() {
+            ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+            let moved = at + grip.drag_delta();
+            // 不拖出窗口：顶边中点留在画面里
+            self.assistant_at = Some(pos2(
+                moved.x.clamp(screen.left() + 40.0, screen.right() - 40.0),
+                moved.y.clamp(screen.top(), screen.bottom() - 40.0),
+            ));
+        }
+    }
+
+    /// 收起的小条：展开箭头、状态点、路径和延迟；网络差时写原因，后面有“怎么办”。点一下展开。
+    fn collapsed_bar(
+        &mut self,
+        ui: &mut egui::Ui,
+        p: &Palette,
+        status: &toolbar::Status,
+        now: Duration,
+        s: &'static Strings,
+    ) {
+        let group = ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = space::S8;
+            ui.label(
+                RichText::new(icon::CARET_DOWN)
+                    .size(font::SMALL)
+                    .color(p.muted),
+            );
+            let _ = dot(ui, p, status.signal);
+            ui.label(text(&status.text, font::SMALL, Weight::Regular).color(p.ink));
+        });
+        let id = egui::Id::new(("toolbar-expand", self.id));
+        let click = ui
+            .interact(group.response.rect, id, egui::Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text(s.expand);
+        if click.clicked() {
+            self.collapse.expand(now);
+        }
+        if status.advice.is_some() {
+            let label = text(s.tb_what_to_do, font::SMALL, Weight::Medium)
+                .color(p.signal(status.signal).text);
+            if ui.add(egui::Button::new(label).frame(false)).clicked() {
+                self.advice_open = !self.advice_open;
+            }
+        }
+    }
+
+    /// 展开的工具条：状态、快捷键、声音、全屏、文件、更多、断开、收起。放不下的按钮挪进“更多”。
+    #[allow(clippy::too_many_arguments)]
+    fn expanded_bar(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        p: &Palette,
+        status: &toolbar::Status,
+        live: bool,
+        window_width: f32,
+        s: &'static Strings,
+        outcome: &mut Outcome,
+    ) {
+        // 状态：点和文字；网络差时后面有“怎么办”
+        let label = text(&status.text, font::SMALL, Weight::Regular).color(p.ink);
+        let status_width = ui
+            .painter()
+            .layout_no_wrap(
+                status.text.clone(),
+                font_id(font::SMALL, Weight::Regular),
+                p.ink,
+            )
+            .size()
+            .x
+            + space::S24;
+        let _ = dot(ui, p, status.signal);
+        ui.add(egui::Label::new(label).truncate());
+        if status.advice.is_some() {
+            let label = text(s.tb_what_to_do, font::SMALL, Weight::Medium)
+                .color(p.signal(status.signal).text);
+            if ui.add(egui::Button::new(label).frame(false)).clicked() {
+                self.advice_open = !self.advice_open;
+            }
+        }
+        ui.separator();
+        let layout = toolbar::arrange(window_width, status_width);
+        for item in &layout.inline {
+            match item {
+                Item::Shortcuts => self.shortcuts_menu(ui, p, live, s),
+                Item::Sound => {
+                    let sound = self.handle.sound();
+                    let glyph = if sound {
+                        icon::SPEAKER_HIGH
+                    } else {
+                        icon::SPEAKER_SLASH
+                    };
+                    if toolbar_toggle(ui, p, glyph, s.sound, sound, live).clicked() {
+                        self.handle.set_sound(!sound);
+                    }
+                }
+                Item::Fullscreen => {
+                    let glyph = if self.fullscreen {
+                        icon::CORNERS_IN
+                    } else {
+                        icon::CORNERS_OUT
+                    };
+                    if toolbar_toggle(ui, p, glyph, s.fullscreen, self.fullscreen, true).clicked() {
+                        self.fullscreen = !self.fullscreen;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
+                    }
+                }
+                Item::Files => {
+                    let ok = self.handle.files_link().is_some();
+                    if toolbar_toggle(ui, p, icon::FOLDER_OPEN, s.open_files, false, ok).clicked() {
+                        outcome.open_files = true;
+                    }
+                }
+                Item::Original | Item::Details => {}
+            }
+        }
+        ui.menu_button(RichText::new(icon::DOTS_THREE).size(font::ICON), |ui| {
+            for item in &layout.menu {
+                self.more_item(ui, *item, live, s, outcome);
+            }
+        })
+        .response
+        .on_hover_text(s.tb_more);
+        ui.separator();
+        let (label, glyph) = if self.phase.is_ended() {
+            (s.close, icon::X_CIRCLE)
+        } else {
+            (s.disconnect, icon::PHONE_DISCONNECT)
+        };
+        let stop =
+            egui::Button::new(RichText::new(format!("{glyph}  {label}")).color(theme::ON_DANGER))
+                .fill(p.danger_fill)
+                .corner_radius(radius::CONTROL);
+        if ui.add(stop).clicked() {
+            self.stop();
+            outcome.open = false;
+        }
+        if toolbar_toggle(ui, p, icon::CARET_UP, s.collapse, false, true).clicked() {
+            self.collapse.collapse();
+        }
+    }
+
+    /// “更多”菜单里的一项：开关类的前面打勾。
+    fn more_item(
+        &mut self,
+        ui: &mut egui::Ui,
+        item: Item,
+        live: bool,
+        s: &'static Strings,
+        outcome: &mut Outcome,
+    ) {
+        let check = |on: bool, label: &str| {
+            if on {
+                format!("{}  {label}", icon::CHECK)
+            } else {
+                format!("     {label}")
+            }
+        };
+        match item {
+            Item::Sound => {
+                let sound = self.handle.sound();
+                let button = egui::Button::new(check(sound, s.sound)).frame(false);
+                if ui.add_enabled(live, button).clicked() {
+                    self.handle.set_sound(!sound);
+                    ui.close();
+                }
+            }
+            Item::Files => {
+                let ok = self.handle.files_link().is_some();
+                let button = egui::Button::new(format!("     {}", s.open_files)).frame(false);
+                if ui.add_enabled(ok, button).clicked() {
+                    outcome.open_files = true;
+                    ui.close();
+                }
+            }
+            Item::Original => {
+                let button = egui::Button::new(check(self.original, s.tb_original)).frame(false);
+                if ui.add(button).on_hover_text(s.original_size).clicked() {
+                    self.original = !self.original;
+                    ui.close();
+                }
+            }
+            Item::Details => {
+                let button = egui::Button::new(check(self.overlay, s.d_title))
+                    .shortcut_text("F12")
+                    .frame(false);
+                if ui.add(button).clicked() {
+                    self.overlay = !self.overlay;
+                    ui.close();
+                }
+            }
+            Item::Shortcuts | Item::Fullscreen => {}
+        }
+    }
+
+    /// 快捷键菜单（按被控端系统选键）。
+    fn shortcuts_menu(&mut self, ui: &mut egui::Ui, p: &Palette, live: bool, s: &'static Strings) {
+        ui.add_enabled_ui(live, |ui| {
+            let button = ui.menu_button(
+                RichText::new(icon::KEYBOARD).size(font::ICON).color(p.ink),
+                |ui| {
+                    ui.label(
+                        RichText::new(format!("{}：{}", s.remote_os, os_label(self.peer_os, s)))
+                            .size(font::CAPTION)
+                            .color(p.muted),
+                    );
+                    ui.separator();
+                    // 只列对方系统有的快捷键，用对方系统的叫法，右边写组合键
+                    for sc in Shortcut::available(self.peer_os) {
+                        let events = sc.events(self.peer_os);
+                        let combo = sc.combo(self.peer_os).unwrap_or_default();
+                        let item = ui.add(
+                            egui::Button::new(sc.label_on(self.peer_os, s))
+                                .shortcut_text(combo)
+                                .frame(false),
+                        );
+                        if item.clicked() {
+                            for event in events {
+                                let _ = self.handle.send(event);
+                            }
+                            ui.close();
+                        }
+                    }
+                },
+            );
+            button.response.on_hover_text(s.shortcuts);
+        });
+    }
+
+    /// 网络情况面板（点“怎么办”展开）：四个数、原因和办法，还能打开全部详情。
+    fn advice_panel(
+        &mut self,
+        ui: &mut egui::Ui,
+        p: &Palette,
+        advice: &toolbar::Advice,
+        signal: Signal,
+        s: &'static Strings,
+    ) {
+        let colors = p.signal(signal);
+        Frame::new()
+            .fill(p.surface.gamma_multiply(0.96))
+            .stroke(egui::Stroke::new(1.0_f32, colors.solid))
+            .corner_radius(12.0)
+            .inner_margin(egui::Margin::symmetric(16, 12))
+            .show(ui, |ui| {
+                ui.set_max_width(380.0);
+                ui.spacing_mut().item_spacing.y = space::S8;
+                ui.label(
+                    text(
+                        format!("{}：{}", s.tb_net_title, advice.short),
+                        font::BODY,
+                        Weight::Semibold,
+                    )
+                    .color(colors.text),
+                );
+                if let Some(q) = &self.quality {
+                    let fps =
+                        u32::try_from(self.fps.fps(self.started.elapsed())).unwrap_or(u32::MAX);
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = space::S24;
+                        for m in toolbar::metrics(q, fps, s) {
+                            ui.vertical(|ui| {
+                                ui.spacing_mut().item_spacing.y = 0.0;
+                                ui.label(
+                                    text(m.label, font::CAPTION, Weight::Regular).color(p.muted),
+                                );
+                                let color = if m.culprit { colors.text } else { p.ink };
+                                ui.label(text(m.value, font::BODY, Weight::Semibold).color(color));
+                            });
+                        }
+                    });
+                }
+                ui.add(
+                    egui::Label::new(text(&advice.hint, font::SMALL, Weight::Regular).color(p.ink))
+                        .wrap(),
+                );
+                ui.horizontal(|ui| {
+                    if link_button(ui, p, s.tb_all_details).clicked() {
+                        self.overlay = true;
+                    }
+                    if link_button(ui, p, s.close).clicked() {
+                        self.advice_open = false;
+                    }
+                });
+            });
+    }
+
+    /// 剪贴板提示：工具条下方显示 6 秒。
+    fn clipboard_toast(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, p: &Palette) {
+        if let Some((text, at)) = &self.clip_toast {
+            if at.elapsed() < Duration::from_secs(6) {
+                ui.add_space(space::S6);
+                Frame::new()
+                    .fill(p.relay.text.gamma_multiply(0.9))
+                    .corner_radius(10)
+                    .inner_margin(egui::Margin::symmetric(12, 6))
+                    .show(ui, |ui| {
+                        ui.label(RichText::new(text).color(Color32::BLACK));
+                    });
+                ctx.request_repaint_after(Duration::from_millis(500));
+            } else {
+                self.clip_toast = None;
+            }
+        }
     }
 
     fn forward_input(&mut self, ctx: &egui::Context, picture: Option<Rect>) {

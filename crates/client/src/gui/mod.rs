@@ -27,6 +27,7 @@ pub mod settings;
 pub mod state;
 pub mod stats;
 pub mod theme;
+pub mod toolbar;
 pub mod transfers;
 mod tray;
 pub mod tray_logic;

@@ -425,6 +425,16 @@ pub struct Strings {
     pub collapse: &'static str,
     /// 展开工具条
     pub expand: &'static str,
+    /// 更多（工具条上的菜单）
+    pub tb_more: &'static str,
+    /// 怎么办（网络差时小条上的入口）
+    pub tb_what_to_do: &'static str,
+    /// 网络情况（面板标题）
+    pub tb_net_title: &'static str,
+    /// 全部详情（面板里打开详情窗口）
+    pub tb_all_details: &'static str,
+    /// 原始大小（菜单里的短名字）
+    pub tb_original: &'static str,
     /// 局域网地址
     pub lan_addresses: &'static str,
     /// 开启后，别人可以用设备码连接这台电脑
@@ -763,6 +773,11 @@ pub const ZH: Strings = Strings {
     shortcuts: "快捷键",
     collapse: "收起工具条",
     expand: "展开工具条",
+    tb_more: "更多",
+    tb_what_to_do: "怎么办",
+    tb_net_title: "网络情况",
+    tb_all_details: "全部详情",
+    tb_original: "原始大小 (1:1)",
     lan_addresses: "局域网地址",
     host_off_hint: "开启后，别人可以用设备码连接这台电脑",
     unattended: "无人值守",
@@ -1045,6 +1060,11 @@ pub const EN: Strings = Strings {
     shortcuts: "Shortcuts",
     collapse: "Hide toolbar",
     expand: "Show toolbar",
+    tb_more: "More",
+    tb_what_to_do: "What to do",
+    tb_net_title: "Network",
+    tb_all_details: "All details",
+    tb_original: "Original size (1:1)",
     lan_addresses: "LAN addresses",
     host_off_hint: "Turn on to let others connect to this computer",
     unattended: "Unattended",
