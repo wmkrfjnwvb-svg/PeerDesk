@@ -116,6 +116,7 @@ fn checked(reply: SignalMsg) -> Result<Checked, NetError> {
         observed,
         probe,
         seen,
+        features: _,
     } = reply
     {
         return Ok((observed, probe, seen));
@@ -265,6 +266,7 @@ mod tests {
             observed: a,
             probe: None,
             seen: Some(a),
+            features: peerdesk_core::signal::Features::NONE,
         };
         assert_eq!(checked(reply).unwrap(), (a, None, Some(a)));
     }

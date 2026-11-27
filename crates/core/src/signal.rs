@@ -15,6 +15,48 @@ use crate::Error;
 /// 设备指纹。
 pub type DeviceId = [u8; 32];
 
+/// 信令服务器会哪些后来加的功能（一个位一种）。
+///
+/// 为什么要它：服务器遇到不认识的信令消息会关掉这条信令流（解不出来就当对端走了），被控端的登记也跟着断。
+/// 所以客户端不能直接把新消息发给老服务器，得先知道服务器会什么。服务器在 [`SignalMsg::Registered`] 和
+/// [`SignalMsg::Checked`] 的末尾带上这个字段：老服务器不带，读到的是 [`Features::NONE`]；老客户端读完认识的
+/// 字段就不往后看了（消息末尾可以追加字段）。和会话握手的能力位（[`crate::proto::Caps`]）无关，那是两台设备之间的。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Features(pub u32);
+
+impl Features {
+    /// 什么新功能都不会（老服务器）。
+    pub const NONE: Features = Features(0);
+    /// 账户设备表：入表、列出、改名、移除（见 `docs/research/N-devices.md` S1）。
+    pub const DEVICES: Features = Features(1);
+    /// 在线状态订阅推送（S2）。
+    pub const WATCH: Features = Features(1 << 1);
+    /// 设备自报状态（S3）。
+    pub const STATUS: Features = Features(1 << 2);
+    /// 这个版本的服务器会的全部功能。每做完一步，把那一步的位加进来。
+    pub const SERVER: Features = Features::NONE;
+
+    /// 是否包含 `other` 的全部功能。
+    #[must_use]
+    pub const fn has(self, other: Features) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    /// 并集。
+    #[must_use]
+    pub const fn with(self, other: Features) -> Features {
+        Features(self.0 | other.0)
+    }
+
+    /// 从消息末尾读：没有这个字段（老服务器发的）就是 [`Features::NONE`]。
+    fn get(r: &mut Reader<'_>) -> Result<Self, Error> {
+        if r.remaining() < 4 {
+            return Ok(Features::NONE);
+        }
+        Ok(Features(r.u32()?))
+    }
+}
+
 /// 一条中继通道的使用凭据。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RelayGrant {
@@ -46,6 +88,8 @@ pub enum SignalMsg {
         /// 探测地址：设备从同一个端口向这里发 [`observe_packet`]，服务器比较两次看到的端口，
         /// 判断设备的 NAT 是不是“换目的地就换端口”（难打洞）。服务器没开中继时为 `None`。
         probe: Option<SocketAddr>,
+        /// 服务器会哪些后来加的功能（老服务器不发，读到的是 [`Features::NONE`]）。
+        features: Features,
     },
     /// 服务器 → 控制端：先从连接用的端口向 `relay` 发几个 [`observe_packet`]，再重发连接请求。
     Probe {
@@ -120,6 +164,9 @@ pub enum SignalMsg {
         probe: Option<SocketAddr>,
         /// 上一次体检以后，服务器在探测地址看到的本机地址。
         seen: Option<SocketAddr>,
+        /// 服务器会哪些后来加的功能（老服务器不发，读到的是 [`Features::NONE`]）。控制端不登记，
+        /// 用体检来问。
+        features: Features,
     },
 }
 
@@ -445,11 +492,13 @@ impl SignalMsg {
                 observed,
                 code,
                 probe,
+                features,
             } => {
                 w.u8(2);
                 put_addr(&mut w, observed);
                 w.u32(*code);
                 put_opt_addr(&mut w, probe.as_ref());
+                w.u32(features.0);
             }
             SignalMsg::Probe { relay } => {
                 w.u8(8);
@@ -515,11 +564,13 @@ impl SignalMsg {
                 observed,
                 probe,
                 seen,
+                features,
             } => {
                 w.u8(10);
                 put_addr(&mut w, observed);
                 put_opt_addr(&mut w, probe.as_ref());
                 put_opt_addr(&mut w, seen.as_ref());
+                w.u32(features.0);
             }
             SignalMsg::ConnectCode {
                 code,
@@ -545,6 +596,7 @@ impl SignalMsg {
                 observed: get_addr(&mut r)?,
                 code: r.u32()?,
                 probe: get_opt_addr(&mut r)?,
+                features: Features::get(&mut r)?,
             },
             8 => SignalMsg::Probe {
                 relay: get_addr(&mut r)?,
@@ -590,6 +642,7 @@ impl SignalMsg {
                 observed: get_addr(&mut r)?,
                 probe: get_opt_addr(&mut r)?,
                 seen: get_opt_addr(&mut r)?,
+                features: Features::get(&mut r)?,
             },
             7 => SignalMsg::ConnectCode {
                 code: r.u32()?,
@@ -773,6 +826,7 @@ impl Registry {
                 observed,
                 code,
                 probe,
+                features: Features::SERVER,
             },
             code,
             new_code,
@@ -924,11 +978,13 @@ mod tests {
                 observed: addr("203.0.113.9:40000"),
                 code: 123_456_789,
                 probe: Some(addr("203.0.113.1:3478")),
+                features: Features::DEVICES.with(Features::STATUS),
             },
             SignalMsg::Registered {
                 observed: addr("203.0.113.9:40000"),
                 code: 123_456_789,
                 probe: None,
+                features: Features::NONE,
             },
             SignalMsg::Probe {
                 relay: addr("203.0.113.1:3478"),
@@ -942,6 +998,7 @@ mod tests {
                 observed: addr("203.0.113.9:4000"),
                 probe: Some(addr("203.0.113.1:3478")),
                 seen: None,
+                features: Features::WATCH,
             },
             SignalMsg::Connect {
                 target: [1; 32],
@@ -1165,6 +1222,7 @@ mod tests {
                     observed: addr("198.51.100.1:5000"),
                     code: CODE_MIN + 5,
                     probe: None,
+                    features: Features::SERVER,
                 },
                 code: CODE_MIN + 5,
                 new_code: true,
@@ -1379,12 +1437,79 @@ mod tests {
             observed: addr("1.2.3.4:5"),
             code: 1,
             probe: None,
+            features: Features::NONE,
         }
         .encode();
-        *bad.last_mut().unwrap() = 9;
+        // 探测地址的“有没有”标志在末尾的功能字段（4 字节）之前
+        let flag = bad.len() - 5;
+        bad[flag] = 9;
         assert_eq!(
             SignalMsg::decode(&bad),
             Err(Error::Inconsistent("地址标志不合法"))
         );
+    }
+
+    /// 服务器的功能字段在消息末尾：老服务器不发（读到“什么都不会”），老客户端不读（多出的字节忽略）。
+    #[test]
+    fn server_features_ride_at_the_end_and_old_peers_are_unaffected() {
+        let all = Features::DEVICES
+            .with(Features::WATCH)
+            .with(Features::STATUS);
+        assert_eq!(all, Features(7));
+        assert!(all.has(Features::WATCH) && all.has(Features::DEVICES.with(Features::STATUS)));
+        assert!(!Features::DEVICES.has(Features::WATCH));
+        assert!(Features::NONE.has(Features::NONE) && !Features::NONE.has(Features::DEVICES));
+        assert_eq!(Features::default(), Features::NONE);
+        // 这个版本的服务器还没有做任何一步：不许谎报
+        assert_eq!(Features::SERVER, Features::NONE);
+
+        let registered = |features| SignalMsg::Registered {
+            observed: addr("203.0.113.9:40000"),
+            code: 123_456_789,
+            probe: Some(addr("203.0.113.1:3478")),
+            features,
+        };
+        let checked = |features| SignalMsg::Checked {
+            observed: addr("203.0.113.9:4000"),
+            probe: None,
+            seen: Some(addr("203.0.113.9:4001")),
+            features,
+        };
+        for (new, none) in [
+            (registered(all), registered(Features::NONE)),
+            (checked(all), checked(Features::NONE)),
+        ] {
+            let bytes = new.encode();
+            assert_eq!(SignalMsg::decode(&bytes).unwrap(), new);
+            // 老服务器发的：没有末尾的 4 个字节 → 什么都不会
+            let old = &bytes[..bytes.len() - 4];
+            assert_eq!(SignalMsg::decode(old).unwrap(), none);
+            // 末尾只剩半个字段（不该出现）：也当成没有，不报错
+            assert_eq!(SignalMsg::decode(&bytes[..bytes.len() - 2]).unwrap(), none);
+            // 以后的版本在后面再追加字段：这个版本照样读得出功能字段
+            let mut longer = bytes.clone();
+            longer.extend_from_slice(&[1, 2, 3]);
+            assert_eq!(SignalMsg::decode(&longer).unwrap(), new);
+        }
+        // 老客户端的解码器读到探测地址为止：新服务器多发的 4 个字节在它认识的字段之后，前面的字节一个没变
+        let with = registered(all).encode();
+        let without = registered(Features::NONE).encode();
+        assert_eq!(with[..with.len() - 4], without[..without.len() - 4]);
+        // 登记的回复带着这个版本服务器的功能
+        let mut reg = Registry::new();
+        let done = reg
+            .register(
+                1,
+                [7; 32],
+                addr("198.51.100.1:5000"),
+                &[],
+                None,
+                &mut || CODE_MIN,
+            )
+            .unwrap();
+        assert!(matches!(
+            done.reply,
+            SignalMsg::Registered { features, .. } if features == Features::SERVER
+        ));
     }
 }

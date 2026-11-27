@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use peerdesk_core::paths::{Candidate, Limits, PathKind, NAT_PENALTY_US};
 use peerdesk_core::relay::{parse_notice, unwrap, wrap, SessionId, RELAY_HEADER};
 use peerdesk_core::signal::{
-    format_code, observe_packet, PunchInfo, PunchPlan, RelayGrant, SignalMsg,
+    format_code, observe_packet, Features, PunchInfo, PunchPlan, RelayGrant, SignalMsg,
 };
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
@@ -221,6 +221,9 @@ pub struct Registration {
     pub observed: SocketAddr,
     /// 服务器分配的 9 位设备码。
     pub code: u32,
+    /// 服务器会哪些后来加的功能（老服务器是 [`Features::NONE`]）。只有服务器会的消息才能在这条登记上发：
+    /// 发了它不认识的，它会关掉这条流，登记就断了。
+    pub features: Features,
     /// 连接请求从这里来。服务器断开时通道关闭。
     pub incoming: mpsc::Receiver<Incoming>,
     _link: Arc<Link>,
@@ -271,6 +274,7 @@ pub async fn register_with(
         observed,
         code,
         probe,
+        features,
     } = read_signal(&mut recv).await?
     else {
         return Err(NetError::Protocol("服务器没有确认登记"));
@@ -307,10 +311,28 @@ pub async fn register_with(
     Ok(Registration {
         observed,
         code,
+        features,
         incoming,
         _link: link,
         task,
     })
+}
+
+/// 问服务器会哪些后来加的功能（不登记的一方用，例如控制端）。老服务器回答的是 [`Features::NONE`]。
+///
+/// 用的是体检消息（[`SignalMsg::Check`]），所有版本的服务器都认识。注意体检有一个副作用：服务器会忘掉这台设备
+/// 上一次 NAT 探测的结果，所以别在“探测”和“发起连接”之间调用它；会话开始前单独问一次，结果可以一直用。
+pub async fn server_features(node: &Node, server: &Server) -> Result<Features, NetError> {
+    let link = node.connect(server.addr, server.pin.as_ref()).await?;
+    let (mut send, mut recv) = link.open_stream().await?;
+    write_kind(&mut send, StreamKind::Signal).await?;
+    write_signal(&mut send, &SignalMsg::Check).await?;
+    let reply = read_signal(&mut recv).await;
+    link.close("done");
+    if let SignalMsg::Checked { features, .. } = reply? {
+        return Ok(features);
+    }
+    Err(NetError::Protocol("服务器的体检应答不对"))
 }
 
 /// 从连接用的端口向服务器的探测地址发几个 NAT 探测包（丢一两个没关系）。

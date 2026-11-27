@@ -7,7 +7,7 @@ use peerdesk_core::paths::{Candidate, PathKind};
 use peerdesk_core::proto::{
     decode_datagram, encode_datagram, Caps, Channel, Control, Header, VERSION,
 };
-use peerdesk_core::signal::{Nat, PunchInfo, SignalMsg};
+use peerdesk_core::signal::{Features, Nat, PunchInfo, SignalMsg};
 use peerdesk_core::Time;
 
 fn hex(b: &[u8]) -> String {
@@ -55,6 +55,7 @@ fn registered() -> SignalMsg {
         observed: "203.0.113.5:40000".parse().unwrap(),
         code: 123_456_789,
         probe: None,
+        features: Features::NONE,
     }
 }
 
@@ -136,14 +137,16 @@ fn accept_name_extension_is_frozen() {
 
 #[test]
 fn signal_bytes_are_frozen() {
+    // 第三项是冻结之后在末尾追加的字段（现在发出的字节 = 冻结的字节 + 追加的）。冻结的那一段不许变。
+    // `Registered` 追加了服务器的功能字段（4 字节，见 `Features`）。
     let cases = [
-        (REGISTER, register()),
-        (CONNECT_CODE, connect_code()),
-        (REGISTERED, registered()),
-        (PEER, peer()),
+        (REGISTER, register(), ""),
+        (CONNECT_CODE, connect_code(), ""),
+        (REGISTERED, registered(), "00000000"),
+        (PEER, peer(), ""),
     ];
-    for (bytes, msg) in cases {
-        assert_eq!(hex(&msg.encode()), bytes, "{msg:?}");
+    for (bytes, msg, appended) in cases {
+        assert_eq!(hex(&msg.encode()), format!("{bytes}{appended}"), "{msg:?}");
         let mut b = unhex(bytes);
         assert_eq!(SignalMsg::decode(&b).unwrap(), msg);
         b.extend_from_slice(&EXTENSION);
