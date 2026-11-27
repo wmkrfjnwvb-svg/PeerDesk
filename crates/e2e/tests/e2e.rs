@@ -417,6 +417,122 @@ fn light_activity_on_wifi_keeps_the_rate() {
     );
 }
 
+/// 真实用户日志的操作节奏（回归，`docs/research/P-fps-bitrate.md` M1、W3）。
+///
+/// 2026-11-27 三份日志（Mac 公网 Wi-Fi、两台 Windows 局域网 Wi-Fi）：大部分时间静止或只有零星小帧，突然来一个大帧
+/// （切窗口、滚动），又停下。链路没有丢包、容量远高于要发的量，排队读数平时 0–5 ms、每秒有一两份 12–28 ms。
+/// 修之前：大帧一出来状态切回“跟踪”，碰上一份 12 ms 以上的读数就按“送达速率 × 0.85”降，而那时的送达速率只是
+/// 静止时要发的量——46 分钟里降到 1 Mbps 以下 317 次，降帧率 82 次里 67 次跟在后面；局域网上画面因此变糊。
+/// 这里按那个节奏重放：静止 → 切窗口 → 指针 → 打字 → 静止 → 滚动 → 指针，重复 4 遍，局域网 Wi-Fi（往返 16 ms）。
+fn real_log_rhythm(name: &str) -> Scenario {
+    let mut phases = Vec::new();
+    for _ in 0..4 {
+        phases.extend([
+            phase(Action::Idle, 90),
+            // 切过去马上接着动鼠标、打字：大帧之后紧跟着零星小帧（日志里降码率就发生在这种时候）
+            phase(Action::Switching, 6),
+            phase(Action::Pointer, 150),
+            phase(Action::Typing, 90),
+            phase(Action::Idle, 60),
+            phase(Action::Scrolling, 60),
+            phase(Action::Pointer, 120),
+        ]);
+    }
+    Scenario {
+        network: vec![(
+            0,
+            Link {
+                rate_bps: Some(50_000_000),
+                delay_us: 8_000,
+                jitter_us: 1_000,
+                fifo_jitter: true,
+                doze: Some(Doze {
+                    idle_us: 50_000,
+                    wake_us: 25_000,
+                }),
+                // 按日志的排队读数标定：中位 3 ms，95% 分位 13–20 ms，每秒有机会碰上一次十几到二十几毫秒的尖峰
+                spikes: Some(Spikes {
+                    every_us: 700_000,
+                    length_us: 30_000,
+                    max_us: 28_000,
+                }),
+                busy: Some(Busy {
+                    every_us: 500_000,
+                    length_us: 20_000,
+                }),
+                ..Link::lan()
+            },
+        )],
+        trace: true,
+        // 和产品一样 60 帧：每帧预算减半，滚动、切窗口的帧顶着预算，状态才会像日志里那样频繁回到“跟踪”
+        fps: 60,
+        // 日志里是 2880×1800、上限 30 Mbps；这里画面小 5.6 倍（省仿真时间），上限按像素数折算，
+        // 帧和预算的比例才和日志里差不多（预算 24–50 KB，大帧 100 KB 以上）
+        max_bps: 6_000_000,
+        ..Scenario::new(name, phases)
+    }
+}
+
+/// 一行“降码率 A → B kbps”里的两个数。
+fn cut_of(line: &str) -> Option<(u64, u64)> {
+    let rest = line.split("降码率 ").nth(1)?;
+    let mut parts = rest.split(' ');
+    let from = parts.next()?.parse().ok()?;
+    let to = parts.nth(1)?.parse().ok()?;
+    Some((from, to))
+}
+
+#[test]
+fn real_log_rhythm_keeps_the_rate_and_the_frame_rate() {
+    let o = run(&real_log_rhythm("real-log-rhythm")).unwrap();
+    finish(&o);
+    gates(&o);
+    // 链路没有拥塞：不该有“趋势正常”却把码率砍掉一半以上的降码率（修之前这个场景里有十几次）
+    let deep: Vec<&String> = o
+        .trace
+        .iter()
+        .filter(|l| l.contains("趋势正常"))
+        .filter(|l| cut_of(l).is_some_and(|(from, to)| to.saturating_mul(2) < from))
+        .collect();
+    gate(
+        &o,
+        "没有拥塞证据时不把码率砍掉一半以上",
+        deep.len() <= 1,
+        &format!("{} 次：{:?}", deep.len(), deep.iter().take(3).collect::<Vec<_>>()),
+    );
+    let mut after: Vec<u64> = o
+        .features
+        .iter()
+        .filter(|f| f.t_ms >= 2_000)
+        .map(|f| f.rate_bps)
+        .collect();
+    after.sort_unstable();
+    let min = after.first().copied().unwrap_or(0);
+    let p5 = after.get(after.len() / 20).copied().unwrap_or(0);
+    gate(
+        &o,
+        "码率不被 Wi-Fi 的抖动打下去",
+        min >= 1_000_000 && p5 >= 3_000_000,
+        &format!(
+            "2 秒之后最低 {} kbps、5% 分位 {} kbps（链路 50000 kbps、上限 6000，要求不低于 1000 和 3000）",
+            min / 1000,
+            p5 / 1000
+        ),
+    );
+    // 帧率档位不来回跳：链路宽，内容装得进预算
+    let steps = o
+        .trace
+        .iter()
+        .filter(|l| l.contains("内容装不进预算"))
+        .count();
+    gate(
+        &o,
+        "帧率不因为码率误降而降档",
+        steps <= 1,
+        &format!("降档 {steps} 次"),
+    );
+}
+
 // ---- 运行中探测的四个场景（状态机第 2 步）----
 
 /// 一条不乱序、往返 30 ms 的链路。
