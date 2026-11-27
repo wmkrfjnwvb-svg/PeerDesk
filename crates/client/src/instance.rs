@@ -33,9 +33,7 @@ pub fn acquire(dir: &Path) -> std::io::Result<Instance> {
         .truncate(false)
         .write(true)
         .open(dir.join(LOCK_FILE))?;
-    // `File::try_lock` 从 Rust 1.89 起稳定，而工作区声明的最低版本是 1.85；但仓库用 rust-toolchain.toml 固定了
-    // 1.97.0，实际构建、CI 都用它。需要降低最低版本时，改用 fd-lock 之类的库。
-    #[allow(clippy::incompatible_msrv)]
+    // `File::try_lock` 从 Rust 1.89 起稳定（工作区最低版本因此是 1.89）
     let locked = file.try_lock();
     match locked {
         Ok(()) => Ok(Instance::First(file)),

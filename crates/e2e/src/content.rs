@@ -424,7 +424,7 @@ impl RealisticDesktop {
         let changed = match action {
             Action::Idle => false,
             Action::Typing => {
-                if self.frame % 3 == 0 {
+                if self.frame.is_multiple_of(3) {
                     if let Some(editor) = self.windows.get_mut(EDITOR) {
                         let per_line = editor.w.saturating_sub(24) / GLYPH_W;
                         let (line, col) =

@@ -13,11 +13,22 @@ peerdesk-net = { workspace = true, features = ["media", "portmap"] }
 peerdesk-media.workspace = true
 peerdesk-platform.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
-# 测试控制台的图形界面。只开 glow 后端和必要的功能，控制体积。
-eframe = { version = "0.32", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
+# 图形界面。只开 glow 后端和必要的功能，控制体积。
+# - accesskit：读屏软件支持（eframe 默认开，我们关了默认特性，要单独打开）。
+# - 不开 default_fonts：字体用自己打进程序的 Inter、思源黑体子集（见 src/gui/fonts.rs），
+#   egui 自带的 Ubuntu-Light、Hack 等约 1.4 MB 不再带。
+# - 停在 0.32，暂不升级到 0.36（2026-11 评估）：跨四个大版本，eframe 的应用入口、弹出层、字体栅格化
+#   都有变化，接线文件（app.rs、viewer.rs、files_window.rs）要重写，而它们正在被并行修改；egui 0.36
+#   要求 Rust 1.95（我们声明的最低版本是 1.85）；媒体层的 GL 显示和 eframe 共用同一个 glow，要一起升。
+#   升级想要的两样东西（图标子集、读屏）现在都已经有了：图标子集由 scripts/build-fonts.py 生成。
+#   界面改版合并完之后单独做升级。
+eframe = { version = "0.32", default-features = false, features = ["glow", "accesskit", "x11", "wayland"] }
+# 只用其中的单色表情字体（Noto Emoji），其余几个字体不引用，不会打进程序。
+epaint_default_fonts = "0.32"
 sys-locale = "0.3"
 getrandom = "0.2"
 num-traits = "0.2"
+# 只用图标的码位常量；字体用自己裁的子集（assets/fonts/phosphor-subset.ttf），整套字体不会打进程序。
 egui-phosphor = "=0.10.0"
 ab_glyph = "0.2.32"
 # 保存的连接密码加密（XChaCha20-Poly1305，见 src/vault.rs）

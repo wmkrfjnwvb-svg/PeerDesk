@@ -310,7 +310,9 @@ impl InputState {
             Event::MouseMoved(_)
             | Event::Zoom(_)
             | Event::Touch { .. }
-            | Event::Screenshot { .. } => {}
+            | Event::Screenshot { .. }
+            // 读屏软件发来的操作由 egui 自己处理，不是给远端的输入
+            | Event::AccessKitActionRequest(_) => {}
         }
     }
 
@@ -709,6 +711,8 @@ mod layer_probe {
     #[test]
     fn toolbar_is_found_above_the_picture() {
         let ctx = egui::Context::default();
+        // 程序不带 egui 的默认字体，要先装上自己的字体才能排文字
+        let _ = crate::gui::theme::install(&ctx);
         let mut found = Vec::new();
         for _ in 0..3 {
             let input = egui::RawInput {

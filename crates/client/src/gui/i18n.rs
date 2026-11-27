@@ -235,6 +235,128 @@ pub struct Strings {
     pub saved: &'static str,
     /// 打开日志文件夹。
     pub open_logs: &'static str,
+    /// 没找到兜底用的系统中文字体：原因和办法。
+    pub font_fallback_missing: &'static str,
+    /// 主窗口：“这台电脑”。
+    pub this_pc: &'static str,
+    /// 开关：允许别人连接。
+    pub allow_incoming: &'static str,
+    /// 状态标签：等别人连接。
+    pub badge_waiting: &'static str,
+    /// 说明：等别人连接时。
+    pub hint_waiting: &'static str,
+    /// 说明：开关关着。
+    pub hint_host_off: &'static str,
+    /// 说明：正在开启。
+    pub hint_starting: &'static str,
+    /// 说明：没设置服务器，没有设备码。
+    pub hint_no_server: &'static str,
+    /// 说明：系统权限不齐，开不了。
+    pub hint_need_permission: &'static str,
+    /// 说明：对方正在验证密码。
+    pub hint_handshaking: &'static str,
+    /// 说明：正在被控制。
+    pub hint_controlled: &'static str,
+    /// 文字按钮：去设置。
+    pub go_settings: &'static str,
+    /// 标题：连接另一台电脑。
+    pub connect_heading: &'static str,
+    /// 按钮：连上以后打开文件管理。
+    pub send_files: &'static str,
+    /// 文字按钮：指纹核对等高级选项。
+    pub verify_fingerprint: &'static str,
+    /// 连接进度：`{target}` 是设备码或名字。
+    pub connecting_to: &'static str,
+    /// 没连上的开头：`{target}` 是设备码或名字，后面接原因。
+    pub connect_failed: &'static str,
+    /// 取消。
+    pub cancel: &'static str,
+    /// 重试。
+    pub retry: &'static str,
+    /// 设备列表的切换：最近。
+    pub tab_recent: &'static str,
+    /// 设备列表的切换：收藏。
+    pub tab_favorites: &'static str,
+    /// 设备列表的切换：分组。
+    pub tab_groups: &'static str,
+    /// 设备列表的切换：同一网络。
+    pub tab_network: &'static str,
+    /// 表头：名称。
+    pub col_name: &'static str,
+    /// 表头：上次连接。
+    pub col_last: &'static str,
+    /// 表头：操作。
+    pub col_actions: &'static str,
+    /// 行里的按钮：文件。
+    pub row_files: &'static str,
+    /// “更多操作”按钮的名字：`{name}` 是设备或分组的名字。
+    pub more_actions: &'static str,
+    /// 菜单：加入收藏。
+    pub add_favorite: &'static str,
+    /// 菜单：取消收藏。
+    pub remove_favorite: &'static str,
+    /// 菜单：改名。
+    pub rename: &'static str,
+    /// 菜单：移到分组。
+    pub move_to_group: &'static str,
+    /// 未分组。
+    pub ungrouped: &'static str,
+    /// 新建分组。
+    pub new_group: &'static str,
+    /// 菜单：新建下级分组。
+    pub new_subgroup: &'static str,
+    /// 菜单：删除分组。
+    pub delete_group: &'static str,
+    /// 菜单：复制设备码或地址。
+    pub copy_address: &'static str,
+    /// 菜单：删除这条设备记录。
+    pub forget_device: &'static str,
+    /// 删除分组后的提示。
+    pub group_deleted: &'static str,
+    /// 输入框提示：分组名称。
+    pub group_name_hint: &'static str,
+    /// 输入框提示：设备的名字。
+    pub device_name_hint: &'static str,
+    /// 分组里的设备数：`{n}`。
+    pub device_count: &'static str,
+    /// 收藏是空的。
+    pub empty_favorites: &'static str,
+    /// 分组视图是空的。
+    pub empty_groups: &'static str,
+    /// 同一网络：这一版还不能自动发现。
+    pub network_unavailable: &'static str,
+    /// 没连过。
+    pub ago_never: &'static str,
+    /// 刚刚。
+    pub ago_now: &'static str,
+    /// `{n}` 分钟前。
+    pub ago_minutes: &'static str,
+    /// `{n}` 小时前。
+    pub ago_hours: &'static str,
+    /// `{n}` 天前。
+    pub ago_days: &'static str,
+    /// 分组名是空的。
+    pub err_group_empty: &'static str,
+    /// 名称太长：`{n}` 是上限。
+    pub err_name_long: &'static str,
+    /// 同一层有同名的分组。
+    pub err_group_duplicate: &'static str,
+    /// 嵌套太深：`{n}` 是上限。
+    pub err_group_deep: &'static str,
+    /// 设备或分组已经不在了。
+    pub err_gone: &'static str,
+    /// 设备列表保存失败的开头，后面接原因。
+    pub err_book_save: &'static str,
+    /// 本机网络容易直连。
+    pub nat_easy: &'static str,
+    /// 本机网络难直连。
+    pub nat_hard: &'static str,
+    /// 文件传输页：还没有连接。
+    pub files_need_session: &'static str,
+    /// 按钮：打开文件管理。
+    pub open_files: &'static str,
+    /// 复制密码。
+    pub copy_password: &'static str,
     /// 网络体检。
     pub network_check: &'static str,
     /// 网络重连中。
@@ -544,6 +666,68 @@ pub const ZH: Strings = Strings {
     save: "保存",
     saved: "服务器设置已保存",
     open_logs: "打开日志文件夹",
+    font_fallback_missing:
+        "系统里没找到中文字体，文件名里的生僻字会显示成方框。装上思源黑体（Linux 上是 fonts-noto-cjk 包）再重新打开程序。",
+    this_pc: "这台电脑",
+    allow_incoming: "允许别人连接",
+    badge_waiting: "等别人连接",
+    hint_waiting: "把设备码和密码告诉对方。每次会话结束后可以换一个密码。",
+    hint_host_off: "现在别人连不进来。打开右上角的开关就能恢复。",
+    hint_starting: "正在准备，几秒钟就好。",
+    hint_no_server: "还没设置服务器，所以没有设备码。同一网络里的电脑可以用 IP 地址连过来。",
+    hint_need_permission: "系统还没授权屏幕和输入，开不了。按上面的提示完成授权。",
+    hint_handshaking: "有人正在输入密码。",
+    hint_controlled: "对方现在能看到屏幕、操作键盘和鼠标。",
+    go_settings: "去设置",
+    connect_heading: "连接另一台电脑",
+    send_files: "传文件",
+    verify_fingerprint: "核对指纹",
+    connecting_to: "正在连接 {target}",
+    connect_failed: "没连上 {target}：",
+    cancel: "取消",
+    retry: "重试",
+    tab_recent: "最近",
+    tab_favorites: "收藏",
+    tab_groups: "分组",
+    tab_network: "同一网络",
+    col_name: "名称",
+    col_last: "上次连接",
+    col_actions: "操作",
+    row_files: "文件",
+    more_actions: "更多操作：{name}",
+    add_favorite: "加入收藏",
+    remove_favorite: "取消收藏",
+    rename: "改名",
+    move_to_group: "移到分组…",
+    ungrouped: "未分组",
+    new_group: "新建分组",
+    new_subgroup: "新建下级分组",
+    delete_group: "删除分组",
+    copy_address: "复制设备码",
+    forget_device: "删除这条记录",
+    group_deleted: "分组已删除，里面的设备回到“未分组”",
+    group_name_hint: "分组名称，按回车保存",
+    device_name_hint: "给这台设备起个名字，按回车保存",
+    device_count: "{n} 台",
+    empty_favorites: "还没有收藏。在设备那一行的“…”里选“加入收藏”。",
+    empty_groups: "还没有设备。连接一次后会出现在这里，再建分组来整理。",
+    network_unavailable: "这一版还不能自动发现同一网络里的电脑。在对方电脑的“设置”里看局域网地址，填到上面的输入框就能直连。",
+    ago_never: "没连过",
+    ago_now: "刚刚",
+    ago_minutes: "{n} 分钟前",
+    ago_hours: "{n} 小时前",
+    ago_days: "{n} 天前",
+    err_group_empty: "分组要有名称",
+    err_name_long: "名称太长，最多 {n} 个字",
+    err_group_duplicate: "这一层已经有同名的分组，换一个名称",
+    err_group_deep: "分组最多嵌套 {n} 层",
+    err_gone: "这一项已经不在了，可能刚被删掉",
+    err_book_save: "设备列表没存上：",
+    nat_easy: "本机网络支持直连",
+    nat_hard: "本机网络较难直连，可能走中继",
+    files_need_session: "文件走远程会话的连接。先在“设备”里连接一台电脑。",
+    open_files: "打开文件管理",
+    copy_password: "复制密码",
     network_check: "网络体检（NAT、路由器、服务器、IPv6、端口映射）",
     reconnecting: "网络重连中，正在切换到其他通道",
     busy_title: "免费服务器拥挤",
@@ -763,6 +947,68 @@ pub const EN: Strings = Strings {
     save: "Save",
     saved: "Server settings saved",
     open_logs: "Open log folder",
+    font_fallback_missing:
+        "No system CJK font was found, so rare characters in file names show as boxes. Install Noto Sans CJK (fonts-noto-cjk on Linux), then reopen the app.",
+    this_pc: "This computer",
+    allow_incoming: "Allow incoming connections",
+    badge_waiting: "Ready for connections",
+    hint_waiting: "Share the code and password with the other person. You can change the password after each session.",
+    hint_host_off: "Nobody can connect right now. Turn the switch back on to allow it.",
+    hint_starting: "Getting ready. This takes a few seconds.",
+    hint_no_server: "No server is set, so there is no device code. Computers on the same network can connect by IP address.",
+    hint_need_permission: "The system has not granted screen and input access yet. Follow the steps above.",
+    hint_handshaking: "Someone is entering the password.",
+    hint_controlled: "The other person can see the screen and use the keyboard and mouse.",
+    go_settings: "Open settings",
+    connect_heading: "Connect to another computer",
+    send_files: "Send files",
+    verify_fingerprint: "Verify fingerprint",
+    connecting_to: "Connecting to {target}",
+    connect_failed: "Could not connect to {target}: ",
+    cancel: "Cancel",
+    retry: "Try again",
+    tab_recent: "Recent",
+    tab_favorites: "Favorites",
+    tab_groups: "Groups",
+    tab_network: "Same network",
+    col_name: "Name",
+    col_last: "Last connected",
+    col_actions: "Actions",
+    row_files: "Files",
+    more_actions: "More actions: {name}",
+    add_favorite: "Add to favorites",
+    remove_favorite: "Remove from favorites",
+    rename: "Rename",
+    move_to_group: "Move to group…",
+    ungrouped: "Ungrouped",
+    new_group: "New group",
+    new_subgroup: "New subgroup",
+    delete_group: "Delete group",
+    copy_address: "Copy device code",
+    forget_device: "Remove this device",
+    group_deleted: "Group deleted. Its devices are now under Ungrouped",
+    group_name_hint: "Group name, press Enter to save",
+    device_name_hint: "Name this device, press Enter to save",
+    device_count: "{n}",
+    empty_favorites: "No favorites yet. Open “…” on a device row and choose “Add to favorites”.",
+    empty_groups: "No devices yet. They appear here after you connect once; then create groups to organize them.",
+    network_unavailable: "This version cannot discover computers on the same network yet. Look up the LAN address in Settings on the other computer and type it in the box above.",
+    ago_never: "Never",
+    ago_now: "Just now",
+    ago_minutes: "{n} min ago",
+    ago_hours: "{n} h ago",
+    ago_days: "{n} d ago",
+    err_group_empty: "A group needs a name",
+    err_name_long: "The name is too long ({n} characters at most)",
+    err_group_duplicate: "A group with this name already exists here. Pick another name",
+    err_group_deep: "Groups can be nested {n} levels at most",
+    err_gone: "This item no longer exists. It may have just been deleted",
+    err_book_save: "The device list could not be saved: ",
+    nat_easy: "This network supports direct connections",
+    nat_hard: "Direct connections are hard on this network; relay may be used",
+    files_need_session: "Files travel over a remote session. Connect to a computer under Devices first.",
+    open_files: "Open file manager",
+    copy_password: "Copy password",
     network_check: "Network check (NAT, router, server, IPv6, port mapping)",
     reconnecting: "Network lost, reconnecting through another channel",
     busy_title: "Free servers are busy",

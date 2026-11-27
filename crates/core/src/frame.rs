@@ -117,7 +117,7 @@ impl Nv12 {
     /// 尺寸或数据长度不对。
     pub fn new(width: u16, height: u16, data: Vec<u8>) -> Result<Self, Error> {
         let (w, h) = (usize::from(width), usize::from(height));
-        if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 {
+        if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
             return Err(Error::InvalidArgument("NV12 的宽高必须是正偶数"));
         }
         if data.len() != w * h * 3 / 2 {

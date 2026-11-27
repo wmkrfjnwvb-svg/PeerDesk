@@ -7,7 +7,7 @@ use peerdesk_core::frame::Picture;
 use peerdesk_core::proto::PeerOs;
 
 use super::assistant::{os_label, Shortcut};
-use super::theme::{icon, icon_button, pill, Palette};
+use super::theme::{font, icon, icon_button, pill, space, ControlSize, Palette, Signal};
 
 use eframe::egui::{
     self, pos2, vec2, Align2, Color32, FontId, Frame, Pos2, Rect, RichText, TextureHandle,
@@ -123,6 +123,12 @@ impl Viewer {
         &self.title
     }
 
+    /// 会话处在哪个阶段（主窗口据此在连接表单下面显示进度和失败原因）。
+    #[must_use]
+    pub const fn phase(&self) -> &ViewPhase {
+        &self.phase
+    }
+
     /// 文件管理用的连接（见 [`ViewHandle::files_link`]）。
     #[must_use]
     pub fn files_link(&self) -> Option<std::sync::Arc<peerdesk_net::Link>> {
@@ -215,8 +221,8 @@ impl Viewer {
                 // 工具条上的字不能被选中（选字会吃掉拖动）
                 ui.style_mut().interaction.selectable_labels = false;
                 let frame = Frame::new()
-                    .fill(p.card.gamma_multiply(0.96))
-                    .stroke(egui::Stroke::new(1.0_f32, p.border))
+                    .fill(p.surface.gamma_multiply(0.96))
+                    .stroke(egui::Stroke::new(1.0_f32, p.line))
                     .corner_radius(18)
                     .inner_margin(egui::Margin::symmetric(10, 4))
                     .shadow(egui::epaint::Shadow {
@@ -233,7 +239,7 @@ impl Viewer {
                             .add(
                                 egui::Label::new(
                                     RichText::new(icon::DOTS_SIX_VERTICAL)
-                                        .size(18.0)
+                                        .size(font::ICON)
                                         .color(p.muted),
                                 )
                                 .selectable(false)
@@ -252,8 +258,8 @@ impl Viewer {
                         if !self.assistant {
                             let open = egui::Button::new(
                                 RichText::new(format!("{}  {}", icon::MONITOR, icon::CARET_DOWN))
-                                    .size(17.0)
-                                    .color(p.accent),
+                                    .size(font::ICON)
+                                    .color(p.ink),
                             )
                             .frame(false);
                             if ui.add(open).on_hover_text(s.expand).clicked() {
@@ -264,21 +270,23 @@ impl Viewer {
                         // 连接状态
                         let mut net_hint: Option<String> = None;
                         let (state, color) = match &self.phase {
-                            ViewPhase::Connecting => (s.connecting.to_owned(), p.warning),
-                            ViewPhase::Reconnecting { .. } => (self.phase.headline(s), p.warning),
+                            ViewPhase::Connecting => (s.connecting.to_owned(), Signal::Idle),
+                            ViewPhase::Reconnecting { .. } => {
+                                (self.phase.headline(s), Signal::Relay)
+                            }
                             ViewPhase::Connected { route, .. } => {
                                 let base =
                                     format!("{} · {}", s.connected, route_name(Some(*route), s));
                                 // 网络差时标签变色，并写上主要原因（例如“丢包 6%”）
                                 match self.net.shown() {
-                                    (NetLevel::Good, _) | (_, None) => (base, p.success),
+                                    (NetLevel::Good, _) | (_, None) => (base, Signal::Direct),
                                     (level, Some(cause)) => {
                                         let (short, hint) = net_texts(cause, s);
                                         net_hint = Some(hint);
                                         let color = if level == NetLevel::Poor {
-                                            p.danger
+                                            Signal::Problem
                                         } else {
-                                            p.warning
+                                            Signal::Relay
                                         };
                                         (format!("{base} · {short}"), color)
                                     }
@@ -286,10 +294,14 @@ impl Viewer {
                             }
                             ViewPhase::Ended { status, .. } => (
                                 status.text.clone(),
-                                if status.error { p.danger } else { p.muted },
+                                if status.error {
+                                    Signal::Problem
+                                } else {
+                                    Signal::Idle
+                                },
                             ),
                         };
-                        let shown = pill(ui, &state, color);
+                        let shown = pill(ui, &p, &state, color);
                         if let Some(hint) = net_hint {
                             let _ = shown.on_hover_text(hint);
                         }
@@ -305,7 +317,7 @@ impl Viewer {
                                             s.remote_os,
                                             os_label(self.peer_os, s)
                                         ))
-                                        .size(12.0)
+                                        .size(font::CAPTION)
                                         .color(p.muted),
                                     );
                                     ui.separator();
@@ -386,13 +398,15 @@ impl Viewer {
                         let stop = egui::Button::new(
                             RichText::new(format!("{glyph}  {label}")).color(Color32::WHITE),
                         )
-                        .fill(p.danger)
+                        .fill(p.danger_fill)
                         .corner_radius(12);
                         if ui.add(stop).clicked() {
                             self.stop();
                             outcome.open = false;
                         }
-                        if icon_button(ui, icon::CARET_UP, s.collapse).clicked() {
+                        if icon_button(ui, &p, icon::CARET_UP, s.collapse, ControlSize::Small)
+                            .clicked()
+                        {
                             self.assistant = false;
                         }
                     });
@@ -400,9 +414,9 @@ impl Viewer {
                 // 剪贴板提示：工具条下方显示 6 秒
                 if let Some((text, at)) = &self.clip_toast {
                     if at.elapsed() < Duration::from_secs(6) {
-                        ui.add_space(6.0);
+                        ui.add_space(space::S6);
                         Frame::new()
-                            .fill(p.warning.gamma_multiply(0.9))
+                            .fill(p.relay.text.gamma_multiply(0.9))
                             .corner_radius(10)
                             .inner_margin(egui::Margin::symmetric(12, 6))
                             .show(ui, |ui| {
@@ -484,7 +498,7 @@ impl Viewer {
                 .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
                 .show(ctx, |ui| {
                     ui.label(text);
-                    ui.add_space(8.0);
+                    ui.add_space(space::S8);
                     if ui.button(RichText::new(s.upgrade).strong()).clicked() {
                         self.show_upgrade = true;
                     }
@@ -524,7 +538,7 @@ impl Viewer {
                                     ui.end_row();
                                 }
                             });
-                        ui.add_space(8.0);
+                        ui.add_space(space::S8);
                     }
                 });
             if !open {
@@ -590,13 +604,9 @@ fn toolbar_toggle(
     on: bool,
     enabled: bool,
 ) -> egui::Response {
-    let fill = if on {
-        p.accent_soft
-    } else {
-        Color32::TRANSPARENT
-    };
-    let color = if on { p.accent } else { p.text };
-    let button = egui::Button::new(RichText::new(glyph).size(17.0).color(color))
+    let fill = if on { p.hover } else { Color32::TRANSPARENT };
+    let color = p.ink;
+    let button = egui::Button::new(RichText::new(glyph).size(font::ICON).color(color))
         .fill(fill)
         .stroke(egui::Stroke::NONE)
         .corner_radius(8)
