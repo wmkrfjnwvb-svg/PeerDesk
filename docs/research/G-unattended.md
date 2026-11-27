@@ -365,3 +365,50 @@ IPC：      本机的进程间通信，两边认证；视频帧不走 service �
 - [Sunshine 排障](https://docs.lizardbyte.dev/projects/sunshine/latest/md_docs_2troubleshooting.html)
 - 仅看到搜索摘要、未读原文：Chromium 的 Linux 远程桌面主机脚本和 systemd 单元，FileVault 相关社区讨论和文章（链接见正文）。
 - 未能取到（404/403/拦截）：`WTSGetActiveConsoleSessionId` 文档页、RustDesk 手册页、Parsec 支持页、Arch Wiki（Anubis 拦截）。这些内容相关结论都已标 **[未核实]**。
+
+## 7. 关闭退到托盘和进程守护（2026-11-27）
+
+产品要求：关闭窗口不退出，退到托盘（菜单栏）；只有用户从托盘点“退出”才真退出；被杀、崩溃后自动恢复。
+这是 GUI 进程的常驻，和上面的 Windows SYSTEM 服务（锁屏、登录界面）是两件事：服务没有桌面，出不了托盘图标。
+
+### 7.1 退出码约定（守护靠它区分“用户要退”和“出事了”）
+
+| 退出码 | 含义 | 守护 |
+|---|---|---|
+| 0 | 用户从托盘退出；第二次启动发现已有实例 | 不重启 |
+| 78（`EXIT_NO_RETRY`） | 缺系统库等重试也没用的错误 | 不重启，原因在日志和标准错误里 |
+| 其他、被信号杀 | 崩溃、被杀、任务管理器结束 | 重启 |
+
+### 7.2 各平台机制
+
+| 系统 | 机制 | 备注 |
+|---|---|---|
+| macOS | `~/Library/LaunchAgents/org.peerdesk.client.plist`：`RunAtLoad`，`KeepAlive` 里 `SuccessfulExit=false`，`ThrottleInterval=10`，`LimitLoadToSessionType=Aqua` | 下次登录由 launchd 加载；不在运行时 `launchctl bootstrap`（会多起一个实例） |
+| Linux | systemd 用户单元 `peerdesk.service`：`Restart=on-failure`，`RestartPreventExitStatus=78`，`WantedBy=graphical-session.target` | 没有 systemd 用户实例时改写 XDG 自启动项，运行 `peerdesk guard` |
+| Windows | `HKCU\...\Run` 里的 `peerdesk.exe guard` | 守护模式是同一个二进制的子命令，不新增第三个二进制；不需要管理员 |
+
+Windows 没用计划任务：它的“失败后重启”是否覆盖进程崩溃的退出码没有核实；守护模式的行为是确定的，也能测试。
+代价：守护进程本身被杀就没人拉起了，要等下次登录。守护只做等待和重启，几乎不会出错。
+
+### 7.3 托盘库
+
+| 系统 | 库 | 许可证 | 系统库依赖 |
+|---|---|---|---|
+| Windows、macOS | `tray-icon` 0.24（Tauri 维护） | MIT OR Apache-2.0 | 无 |
+| Linux | `ksni` 0.3（StatusNotifierItem，纯 Rust D-Bus） | Unlicense（公有领域） | 无（运行时要桌面有 StatusNotifierWatcher） |
+
+没有用 `tray-icon` 的 Linux 实现：它需要 GTK3 和 libayatana-appindicator（LGPL 系统库），还要在另一个线程里跑 GTK 主循环，
+和 winit 的事件循环打架。`ksni` 不依赖系统库，和 keyring 的纯 Rust D-Bus 路线一致。
+代价：GNOME 默认没有托盘宿主，要装 AppIndicator 扩展（Ubuntu 默认带）；没有时建不了托盘，**此时关闭窗口就是退出**，
+并在状态栏告诉用户原因，不静默降级成“藏起来找不到”。
+
+### 7.4 同行做法（凭产品行为的印象，**[未核实]**，没读原文）
+
+- Tailscale、RustDesk：关闭窗口只是隐藏，托盘菜单里退出才真退出；Windows 左键点托盘图标打开窗口。
+- 我们的差异：第一次关闭发一条系统通知说“还在后台运行”（窗口马上隐藏，窗口里的提示没人看得到）。
+
+### 7.5 待实机验证
+
+- macOS：窗口隐藏后 eframe 是否还收到托盘点击的重绘；从 launchd 直接启动 `.app/Contents/MacOS/peerdesk` 时屏幕录制、辅助功能授权是否仍然生效；Dock 图标在窗口隐藏后仍在（要用 `NSApplicationActivationPolicyAccessory` 隐藏，未做）。
+- Windows：窗口隐藏后重绘是否继续；`Run` 项加守护的开机行为；PowerShell 气泡通知。
+- Linux：GNOME（带 AppIndicator 扩展）、KDE 上托盘显示和菜单；`graphical-session.target` 下环境变量（DISPLAY、WAYLAND_DISPLAY）是否已导入单元。

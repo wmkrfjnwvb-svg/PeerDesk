@@ -6,6 +6,7 @@
 
 mod app;
 pub mod assistant;
+mod background;
 pub mod coords;
 pub mod files;
 pub mod files_window;
@@ -24,6 +25,8 @@ pub mod state;
 pub mod stats;
 pub mod theme;
 pub mod transfers;
+mod tray;
+pub mod tray_logic;
 mod viewer;
 pub mod viewsize;
 mod yuv;

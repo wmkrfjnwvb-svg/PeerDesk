@@ -428,6 +428,19 @@ pub struct Strings {
     pub err_identity: &'static str,
     pub err_other: &'static str,
     pub warn_unpinned: &'static str,
+    pub tray_open: &'static str,
+    pub tray_disconnect: &'static str,
+    pub tray_quit: &'static str,
+    pub tray_tip_idle: &'static str,
+    pub tray_tip_active: &'static str,
+    pub tray_hint: &'static str,
+    pub tray_unavailable: &'static str,
+    pub autostart_label: &'static str,
+    pub autostart_hint: &'static str,
+    pub autostart_on: &'static str,
+    pub autostart_off: &'static str,
+    pub autostart_fallback: &'static str,
+    pub autostart_failed: &'static str,
 }
 
 /// 中文。
@@ -633,6 +646,19 @@ pub const ZH: Strings = Strings {
     err_identity: "无法读取或创建本机身份",
     err_other: "出错了",
     warn_unpinned: "没有核对指纹：无法确认连到的是你的设备",
+    tray_open: "打开 PeerDesk",
+    tray_disconnect: "断开连接",
+    tray_quit: "退出 PeerDesk",
+    tray_tip_idle: "PeerDesk：没有人连接",
+    tray_tip_active: "PeerDesk：有人正在连接这台电脑",
+    tray_hint: "PeerDesk 还在后台运行，这台电脑仍可被连接。从托盘（菜单栏）图标可以打开窗口或退出。",
+    tray_unavailable: "这个桌面没有系统托盘，关闭窗口会退出 PeerDesk（被控也会停止）。",
+    autostart_label: "开机自启，被杀或崩溃后自动恢复",
+    autostart_hint: "从托盘选“退出”才会真正退出，不会被自动拉起。",
+    autostart_on: "已开启开机自启和自动恢复",
+    autostart_off: "已关闭开机自启和自动恢复",
+    autostart_fallback: "系统的服务管理器用不了，已改用 PeerDesk 自带的守护进程开机自启（守护进程本身被杀时不会恢复）",
+    autostart_failed: "设置开机自启失败",
 };
 
 /// 英文。
@@ -842,6 +868,19 @@ pub const EN: Strings = Strings {
     err_identity: "Cannot read or create this device's identity",
     err_other: "Something went wrong",
     warn_unpinned: "Fingerprint not pinned: cannot confirm this is your device",
+    tray_open: "Open PeerDesk",
+    tray_disconnect: "Disconnect",
+    tray_quit: "Quit PeerDesk",
+    tray_tip_idle: "PeerDesk: nobody connected",
+    tray_tip_active: "PeerDesk: someone is connected to this computer",
+    tray_hint: "PeerDesk is still running in the background and this computer can still be reached. Use the tray (menu bar) icon to open the window or quit.",
+    tray_unavailable: "This desktop has no system tray, so closing the window quits PeerDesk (and stops hosting).",
+    autostart_label: "Start at login and restart automatically after a crash or kill",
+    autostart_hint: "Quitting from the tray really quits, and it is not restarted.",
+    autostart_on: "Start at login and auto-restart are on",
+    autostart_off: "Start at login and auto-restart are off",
+    autostart_fallback: "The system service manager is not available, so PeerDesk uses its own guard process at login (it is not restarted if the guard itself is killed)",
+    autostart_failed: "Could not set up start at login",
 };
 
 #[cfg(test)]

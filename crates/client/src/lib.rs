@@ -5,8 +5,11 @@
 
 use std::io::Write;
 
+pub mod autostart;
 pub mod crashreport;
+pub mod guard;
 pub mod gui;
+pub mod instance;
 pub mod keychain;
 pub mod libcheck;
 pub mod logfile;
@@ -38,6 +41,9 @@ pub const EXIT_OK: u8 = 0;
 pub const EXIT_FAILED: u8 = 1;
 /// 用法错误。
 pub const EXIT_USAGE: u8 = 2;
+/// 重试也没用的错误（缺系统库、没有图形环境等，要用户先处理）：进程守护看到这个退出码就不再重启。
+/// 取 BSD `sysexits.h` 的 `EX_CONFIG`；systemd 单元里的 `RestartPreventExitStatus` 要和它一致。
+pub const EXIT_NO_RETRY: u8 = 78;
 
 const USAGE: &str = "\
 用法：peerdesk <命令> [参数]
@@ -59,6 +65,8 @@ const USAGE: &str = "\
   hw-check                编码器体检：软件和硬件编码的耗时、关键帧，结果存到日志目录
   service install|uninstall|status|password <密码>
                           Windows 无人值守：注册系统服务，锁屏和登录界面也能远程（需管理员）
+  guard                   守护模式：运行图形界面，被杀或崩溃（退出码非 0）就重启，用户从托盘退出（退出码 0）则不重启
+  autostart on|off        开启/关闭开机自启和崩溃自动恢复
   help                    显示本帮助
 
 host 的选项：
@@ -310,6 +318,8 @@ pub fn run(args: &[String], out: &mut dyn Write) -> u8 {
             let result = unattended::cmd_service(rest, out);
             return report(out, result);
         }
+        "guard" => return guard::cmd_guard(out),
+        "autostart" => return autostart::cmd_autostart(rest, out),
         "agent" => {
             let result = unattended::cmd_agent(rest, out);
             return report(out, result);
