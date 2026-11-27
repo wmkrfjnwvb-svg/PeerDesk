@@ -237,6 +237,10 @@ pub struct Strings {
     pub saved: &'static str,
     /// 打开日志文件夹。
     pub open_logs: &'static str,
+    /// 设置里“诊断记录”开关的名字。
+    pub diag_records: &'static str,
+    /// 诊断记录开关的说明：记什么、不记什么、放在哪、保留多少。
+    pub diag_records_hint: &'static str,
     /// 没找到兜底用的系统中文字体：原因和办法。
     pub font_fallback_missing: &'static str,
     /// 主窗口：“这台电脑”。
@@ -669,6 +673,8 @@ pub const ZH: Strings = Strings {
     save: "保存",
     saved: "服务器设置已保存",
     open_logs: "打开日志文件夹",
+    diag_records: "诊断记录",
+    diag_records_hint: "每次连接在本机记一份很小的记录（延迟、码率、帧率、丢包等数字），用来改进连接质量。不记画面、键盘鼠标内容、地址、设备码和电脑名。只保存在本机的 records 文件夹，最近 20 次或 200 MB。",
     font_fallback_missing:
         "系统里没找到中文字体，文件名里的生僻字会显示成方框。装上思源黑体（Linux 上是 fonts-noto-cjk 包）再重新打开程序。",
     this_pc: "这台电脑",
@@ -951,6 +957,8 @@ pub const EN: Strings = Strings {
     save: "Save",
     saved: "Server settings saved",
     open_logs: "Open log folder",
+    diag_records: "Diagnostic records",
+    diag_records_hint: "Keeps a small record of each connection on this computer (latency, bitrate, frame rate, packet loss and similar numbers) to help improve connection quality. It never contains the screen, keyboard or mouse content, addresses, device codes or the computer name. Stored only in the records folder here: the last 20 sessions or 200 MB.",
     font_fallback_missing:
         "No system CJK font was found, so rare characters in file names show as boxes. Install Noto Sans CJK (fonts-noto-cjk on Linux), then reopen the app.",
     this_pc: "This computer",

@@ -7,6 +7,7 @@ use std::io::Write;
 
 pub mod autostart;
 pub mod crashreport;
+pub mod diag_record;
 pub mod guard;
 pub mod gui;
 pub mod instance;
