@@ -546,7 +546,7 @@ pub async fn run(
                     rx.tick();
                     // 每 500 ms 把丢包率报告给被控端（它据此决定带不带冗余）
                     audio_ticks = audio_ticks.wrapping_add(1);
-                    if audio_ticks % (crate::audio::REPORT_MS / 10) == 0 {
+                    if audio_ticks.is_multiple_of(crate::audio::REPORT_MS / 10) {
                         let loss = rx.loss_report();
                         if let Some(send) = audio_stream.as_mut() {
                             let _ = send.write_all(&loss.to_be_bytes()).await;

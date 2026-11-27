@@ -162,7 +162,7 @@ impl Lossy {
         self.rng ^= self.rng << 13;
         self.rng ^= self.rng >> 7;
         self.rng ^= self.rng << 17;
-        if self.rng % 100 == 0 {
+        if self.rng.is_multiple_of(100) {
             self.lost += 1;
             return 0;
         }

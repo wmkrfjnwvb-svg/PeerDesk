@@ -389,7 +389,7 @@ pub fn run_agent(base: &Path, agent: &Path, port: u16, stop: &AtomicBool) -> Res
     while !stop.load(Ordering::Relaxed) {
         // 管理员改了密码：之后的连接用新密码（每 2 秒看一次）
         ticks = ticks.wrapping_add(1);
-        if ticks % 10 == 0 {
+        if ticks.is_multiple_of(10) {
             match load_password(agent) {
                 Ok(p) if p != current => {
                     log::info!("无人值守：密码已更新");

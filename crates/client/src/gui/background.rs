@@ -10,7 +10,7 @@ use eframe::egui;
 
 use super::i18n::Strings;
 use super::state::Status;
-use super::theme::{card, card_title, icon, muted, toggle, Palette};
+use super::theme::{muted, panel, section_title, toggle, Palette};
 use super::tray::{self, Tray};
 use super::tray_logic::{self, CloseAction, Lifecycle, TrayCommand, WindowAction};
 use crate::{autostart, instance};
@@ -170,9 +170,9 @@ impl Background {
         s: &'static Strings,
     ) -> Option<Status> {
         let mut on = self.autostart;
-        card(ui, p, |ui| {
-            card_title(ui, p, icon::ARROWS_CLOCKWISE, s.autostart_label, |ui| {
-                let _ = toggle(ui, p, &mut on, true);
+        panel(ui, p, |ui| {
+            section_title(ui, s.autostart_label, |ui| {
+                let _ = toggle(ui, p, &mut on, s.autostart_label, true);
             });
             let _ = muted(ui, p, s.autostart_hint);
         });
