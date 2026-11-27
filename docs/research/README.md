@@ -16,6 +16,7 @@
 | [J-keyboard.md](J-keyboard.md) | 远程键盘：跨系统快捷键映射、输入法、键盘布局、系统快捷键捕获 |
 | [K-pipeline.md](K-pipeline.md) | 编解码与传输链路排查（2026-11-25）：模块互相影响的根因、业内做法、模块边界、分步修改计划 |
 | [L-framework.md](L-framework.md) | 传输与画质控制的总框架（按 WebRTC 流程）：三种时钟、每个信号一个主人、每个算法的触发条件和保持时间、分步计划 |
+| [N-devices.md](N-devices.md) | 核心用户第 1 阶段骨干的分步方案（2026-11-27）：账户设备表（服务端为准）、在线状态订阅推送、本机 MCP 只读；协议兼容、存储、测试、要决定的 8 个问题 |
 | [O-modes-industry.md](O-modes-industry.md) | 电影、音乐模式的同行调研（2026-11-26）：AnyDesk、GeForce NOW、Moonlight 的模式或预设，Zoom、Teams 的音乐模式，W3C contentHint，Chromium 投屏的视频检测，对 PeerDesk 的建议 |
 | [P-industry.md](P-industry.md) | 业内资料摘录（2026-11-27）：帧率稳定、QSV MFT、显卡读回、软件编码帧数、局域网探测（Sunshine、OBS、FFmpeg、Chromium、WebRTC；引文经转述，关键处要回原文核对） |
 | [P-fps-bitrate.md](P-fps-bitrate.md) | 帧率和码率为什么保持不住（2026-11-27 用户日志分析）：Mac Wi-Fi 和 Windows 局域网的根因排序、谁在决定帧率、探测该加什么不该加什么、修法和回归测试、日志缺的数据 |
@@ -42,7 +43,7 @@ fpsfix 第 2、3 步暂停，等设计定了再决定保留什么。和对手（
 | --- | --- | --- | --- | --- |
 | 1 | 界面改版：第 3 阶段远程工具条，第 4 阶段文件管理（第 1、2 阶段已合进 dev） | 我 + Sonnet | 第 3 阶段准备中 | 分支 `ui-redesign` |
 | 2 | 新安装包 3ca4b71 真机复测：托盘修复（Windows 启动不闪、托盘叫回窗口、退出立即生效；Mac 点程序坞打开） | 你 | 已发包 | dev |
-| 3 | 核心用户第 1 阶段骨干：账户下的设备表（服务端为准）；在线状态改成服务器推送（撑几百台，现在一次最多查 64 台）；本机 MCP（只读） | Fable | 06:00（UTC）额度恢复后开始 | [核心用户功能设计](reports/PeerDesk%20核心用户功能设计.md)；在线状态半成品在分支 `presence` |
+| 3 | 核心用户第 1 阶段骨干：账户下的设备表（服务端为准）；在线状态改成服务器推送（撑几百台，现在一次最多查 64 台）；本机 MCP（只读） | 我 | 并进第一阶段计划 P1、P3、P4、P9、P10 | [方案 N-devices](N-devices.md)；[第一阶段计划](O-phase1-plan.md)；在线状态半成品在分支 `presence`（不合并，换成订阅） |
 
 帧率、码率修复（2026-11-27 产品负责人定，设备表 S1 往后让）：分支 `fpsfix`，设计和进度见 [P-fps-bitrate.md](P-fps-bitrate.md) 第 9 节。
 第 1 步已合进 dev（7e58d72）；第 2 步写了一半（WIP e6ee2ad），和第 3 步一起暂停，等整体设计。
