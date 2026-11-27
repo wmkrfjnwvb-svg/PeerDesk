@@ -2975,7 +2975,12 @@ mod tests {
                     rng.below(4_000)
                 };
                 let loss = if rng.chance(200) { rng.below(400) } else { 0 };
-                let recv = rng.below(v.rate_bps() / 4 + 1);
+                // 偶尔一份反馈里没有送达速率（接收端刚醒来）
+                let recv = if rng.chance(30) {
+                    0
+                } else {
+                    rng.below(v.rate_bps() / 4 + 1)
+                };
                 let o = Observation {
                     feedback: fb(
                         u32::try_from(queue).unwrap(),
@@ -2983,7 +2988,12 @@ mod tests {
                         u32::try_from(recv).unwrap(),
                     ),
                     ext: Extension {
-                        trend_tenth_ms: i32::try_from(rng.below(400)).unwrap() - 200,
+                        // 多数在门限附近，偶尔远远超出（门限更新只看离门限不到 15 ms 的）
+                        trend_tenth_ms: if rng.chance(100) {
+                            i32::try_from(rng.below(4_000)).unwrap() - 2_000
+                        } else {
+                            i32::try_from(rng.below(400)).unwrap() - 200
+                        },
                         train_bytes_per_s: if rng.chance(100) {
                             u32::try_from(rng.below(2_000_000)).unwrap()
                         } else {
@@ -3451,5 +3461,199 @@ mod tests {
             v.threshold
         );
         assert!(v.threshold <= THRESHOLD_MAX);
+    }
+
+    /// 只实现必须实现的几个方法的估计器：其余都用 trait 的默认实现。默认值就是约定——
+    /// 不用到达报告、没有探测、没有节奏器速率、一直是“跟踪”、有探测结果送来就当没这回事。
+    #[derive(Debug)]
+    struct Bare {
+        profile: Profile,
+    }
+
+    impl RateEstimator for Bare {
+        fn name(&self) -> &'static str {
+            "bare"
+        }
+        fn rate_bps(&self) -> u64 {
+            1_000_000
+        }
+        fn on_observation(&mut self, _now: Time, _obs: &Observation) {}
+        fn profile(&self) -> &Profile {
+            &self.profile
+        }
+        fn set_profile(&mut self, profile: Profile) {
+            self.profile = profile;
+        }
+    }
+
+    #[test]
+    fn an_estimator_that_overrides_nothing_opts_out_of_every_optional_feature() {
+        let mut e = Bare {
+            profile: Profile::STABLE,
+        };
+        e.set_profile(Profile::WIRELESS);
+        assert_eq!(e.profile().name, Profile::WIRELESS.name);
+        assert!(e.take_notes().is_empty());
+        assert!(!e.uses_reports(), "默认不要到达报告");
+        // 这些通知默认都没有副作用
+        let packet = SentPacket {
+            seq: 1,
+            send_time: Time(1),
+            size: 1200,
+            kind: crate::cc::report::PacketKind::Media,
+        };
+        e.on_sent(Time(1), &packet);
+        e.on_report(Time(2), &[], 20_000);
+        e.on_tick(Time(3));
+        e.on_idle_probe(Time(4), 5_000_000);
+        e.on_start_probe(Time(5), 5_000_000);
+        e.set_startup(true, "测试");
+        e.on_net_limited(NetCause::FrameBlocked);
+        assert_eq!(e.rate_bps(), 1_000_000, "这些通知都不改码率");
+        assert_eq!(e.pacing_bps(), None, "没有节奏器速率：按老规则");
+        assert!(e.take_probes().is_empty());
+        assert!(!e.wants_idle_probe());
+        assert_eq!(e.state_line(), None);
+        assert_eq!(e.state(), RateState::Tracking);
+        // 不探测：发送端不会收到探测的要求；万一回报了结果，结论是中止
+        assert_eq!(e.probe_wanted(Time(6)), None);
+        assert_eq!(
+            e.on_probe_end(Time(7), ProbeEnd::Result(9_000_000)),
+            ProbeVerdict::Aborted
+        );
+    }
+
+    #[test]
+    fn the_gcc_estimator_forwards_to_the_network_controller() {
+        use crate::cc::report::{PacketKind, PacketResult};
+        assert_eq!(EstimatorKind::parse("gcc"), Some(EstimatorKind::GccV1));
+        assert_eq!(EstimatorKind::parse("gcc-v1"), Some(EstimatorKind::GccV1));
+        let mut g = EstimatorKind::GccV1.build(Profile::STABLE, 2_000_000, 100_000, 30_000_000);
+        assert_eq!(g.name(), "gcc-v1");
+        assert!(g.uses_reports(), "网络控制器只看到达报告");
+        assert_eq!(g.rate_bps(), 2_000_000);
+        assert_eq!(
+            g.pacing_bps(),
+            Some(5_000_000),
+            "还没有反馈：节奏速率是码率的 2.5 倍"
+        );
+        // 接收端算的排队延迟、趋势它都不用：喂一份过载的反馈，码率不动
+        g.on_observation(Time(1), &obs(fb(80_000, 300, 10_000), OVER));
+        assert_eq!(g.rate_bps(), 2_000_000);
+        g.set_profile(Profile::WIRELESS);
+        assert_eq!(g.profile().name, Profile::WIRELESS.name);
+        // 1 秒、每 5 ms 一个包（1.9 Mbps），单程延迟不变，全部到达：链路没有压力，码率不降
+        let mut results = Vec::new();
+        for i in 0..200u32 {
+            let send = Time(u64::from(i) * 5_000);
+            let sent = SentPacket {
+                seq: i,
+                send_time: send,
+                size: 1200,
+                kind: PacketKind::Media,
+            };
+            g.on_sent(send, &sent);
+            results.push(PacketResult {
+                sent,
+                recv_time: Some(send.plus(20_000)),
+            });
+        }
+        g.on_report(Time(1_040_000), &results, 40_000);
+        g.on_tick(Time(1_050_000));
+        assert!(g.rate_bps() >= 2_000_000, "{}", g.rate_bps());
+        assert_eq!(
+            g.pacing_bps(),
+            Some(g.rate_bps() * 1100 / 1000),
+            "有了反馈：节奏速率是码率的 1.1 倍"
+        );
+        assert!(
+            g.take_probes().is_empty(),
+            "会话开头不探测，也还没有应用受限那么久"
+        );
+        let line = g.state_line().unwrap();
+        assert!(line.contains("网络控制 目标"), "{line}");
+        g.take_notes();
+        assert!(g.take_notes().is_empty(), "说明取走一次就空了");
+        // 没有状态机：一直报告“跟踪”，也没有探测
+        assert_eq!(g.state(), RateState::Tracking);
+        assert_eq!(g.probe_wanted(Time(2_000_000)), None);
+    }
+
+    /// 探测的包一个紧接一个发出去（发送跨度不到 1 ms）：没有发送速率可言，只能按到达间隔算，
+    /// 接收端一次读走一批包时间隔不可信（到达跨度也不到 1 ms），就报“测不出”，不能编一个速率。
+    #[test]
+    fn a_burst_probe_is_measured_by_arrivals_and_a_too_tight_one_is_not_measured() {
+        let mut m = ReceiverMetrics::new();
+        // 5 个包同一时刻发出，每 1 ms 到一个：首包之后 4 个包 4800 字节、跨度 4 ms，1.2 MB/s
+        for i in 0..5u64 {
+            m.on_probe(Time(10_000 + i * 1_000), Time(0), 11, 5, 1200);
+        }
+        assert_eq!(m.report().train_bytes_per_s, 1_200_000);
+        // 同样的包每 200 µs 到一个，全在 1 ms 内到齐（接收端一次读走了一批）：不可信
+        let mut tight = ReceiverMetrics::new();
+        for i in 0..5u64 {
+            tight.on_probe(Time(10_000 + i * 200), Time(0), 12, 5, 1200);
+        }
+        assert_eq!(
+            tight.report().train_bytes_per_s,
+            0,
+            "到达跨度不到 1 ms：测不出"
+        );
+    }
+
+    /// 说明攒满了（会话每秒才取走一次）：后面的降码率不再写说明，码率照降，不能因为说明满了就不降。
+    #[test]
+    fn a_full_note_buffer_keeps_the_first_notes_and_never_blocks_a_cut() {
+        let mut f = Feed::new(Profile::STABLE, 30_000_000);
+        f.put(1_000, 0, 3_500_000, FLAT, NET);
+        // 持续拥塞 6 秒、会话一直没取走说明：每个往返（100 ms）写一条降码率的说明
+        for _ in 0..300 {
+            f.put(20_000, 0, 125_000, FLAT, NET);
+        }
+        assert_eq!(f.v.rate_bps(), 850_000, "降到送达速率（1 Mbps）的 85%");
+        // 说明满了以后再来一次更严重的拥塞：码率照降
+        for _ in 0..10 {
+            f.put(20_000, 0, 12_500, FLAT, NET);
+        }
+        assert_eq!(f.v.rate_bps(), 100_000, "说明满了不影响降码率");
+        let notes = f.v.take_notes();
+        assert_eq!(notes.len(), MAX_NOTES, "降码率的说明最多攒这么多条");
+        assert!(
+            notes.iter().any(|n| n.contains("降码率 32400 → 850 kbps")),
+            "{notes:?}"
+        );
+        assert!(
+            !notes.iter().any(|n| n.contains("→ 100 kbps")),
+            "满了以后的不再写"
+        );
+    }
+
+    /// 周期探测证实了、码率却没涨多少（不到一成：已经贴着上限）：到头了，链路能力记作已知，不再接着探。
+    #[test]
+    fn a_confirmed_periodic_probe_that_gains_under_ten_percent_ends_the_climb() {
+        // 应用受限、码率 46 Mbps、上限 50 Mbps、测得的容量很大（探得动）、但还没确认过到头了
+        let mut f = probing(46_000_000, Some(100_000_000));
+        assert!(!f.v.probing.limit_known);
+        let start = f.t;
+        while f.t < start + 5_000_000 {
+            f.put(1_000, 0, 25_000, FLAT, SendLimit::App);
+        }
+        let ask = f.v.probe_wanted(Time(f.t)).unwrap();
+        assert_eq!(
+            ask,
+            ProbeAsk {
+                kind: ProbeKind::Periodic,
+                target_bps: 50_000_000
+            }
+        );
+        f.t += 100_000;
+        assert_eq!(
+            f.v.on_probe_end(Time(f.t), ProbeEnd::Result(50_000_000)),
+            ProbeVerdict::Confirmed
+        );
+        // 证实了，但按安全比例只能到 45 Mbps，比现在的 46 低：码率不动
+        assert_eq!(f.v.rate_bps(), 46_000_000);
+        assert!(f.v.probing.limit_known, "没探上去多少：链路能力记作已知");
+        assert_eq!(f.v.probe_wanted(Time(f.t)), None, "这一串探测到此为止");
     }
 }

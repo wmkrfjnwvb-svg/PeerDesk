@@ -413,4 +413,43 @@ mod tests {
         }
         assert!(halved, "{}", g.target_bps());
     }
+
+    /// 降码率的说明写明原因：丢包限制压下来的（码率已经被丢包限制压到了目标）、延迟趋势判过载的，
+    /// 以及这时发送端是不是在用满码率。码率没怎么变就不写。
+    #[test]
+    fn rate_changes_are_explained_with_their_cause() {
+        let mut g = Gcc::new(2_000_000, 100_000, 30_000_000);
+        // 没怎么变（升不到 25%）：不写
+        g.target_bps = 1_000_000;
+        g.explain(1_000_000, Usage::Normal, None, None);
+        g.target_bps = 1_200_000;
+        g.explain(1_000_000, Usage::Normal, None, None);
+        assert!(g.take_notes().is_empty());
+        // 丢包限制把码率压到 1 Mbps（限制不高于现在的码率）：原因是拥塞丢包，不管延迟趋势怎么说
+        g.target_bps = 1_000_000;
+        g.explain(2_000_000, Usage::Over, Some(900_000), Some(1_000_000));
+        let notes = g.take_notes();
+        assert_eq!(notes.len(), 1);
+        assert!(
+            notes[0].contains("码率 2000 → 1000 kbps：拥塞丢包（排队满了还在丢）"),
+            "{notes:?}"
+        );
+        assert!(notes[0].contains("已确认 900 kbps"), "{notes:?}");
+        assert!(notes[0].contains("发送端在用满码率"), "{notes:?}");
+        // 没有丢包限制、延迟判过载：原因是延迟趋势；发送端只发了一点点（应用受限）：说明里写明
+        let mut seq = 0;
+        run(&mut g, 0, 6_000, 300_000, 20_000_000, &mut seq);
+        assert!(g.in_alr());
+        g.take_notes();
+        g.target_bps = 800_000;
+        g.explain(1_000_000, Usage::Over, None, None);
+        let notes = g.take_notes();
+        assert!(notes[0].contains("延迟趋势判过载"), "{notes:?}");
+        assert!(notes[0].contains("已确认 未知"), "{notes:?}");
+        assert!(notes[0].contains("发送端少发（应用受限）"), "{notes:?}");
+        // 升了 25% 以上也写：延迟正常，逐步上升
+        g.target_bps = 1_300_000;
+        g.explain(1_000_000, Usage::Normal, None, None);
+        assert!(g.take_notes()[0].contains("延迟正常，逐步上升"));
+    }
 }

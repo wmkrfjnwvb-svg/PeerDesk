@@ -14,7 +14,12 @@
 # - gui/tray.rs、gui/background.rs：系统托盘（菜单栏）图标和系统通知的接线，只调用托盘库（Windows、macOS 的 tray-icon，Linux 的 ksni），
 #   要有桌面的托盘宿主才能运行。关闭退到托盘、退出、首次提示、图标状态的逻辑在 gui/tray_logic.rs，开机自启和进程守护在
 #   autostart.rs、guard.rs，单实例在 instance.rs，这些照常计入覆盖率。
+#
+# 不含端到端仿真（crates/e2e，peerdesk-e2e）：它的测试在覆盖率插桩下要跑约 30 分钟，整个脚本从 4 分钟变成 35 分钟。
+# 仿真单独跑（`cargo test --release -p peerdesk-e2e`，CI 的 e2e 任务），只在改了传输、编解码、网络、仿真时才跑，见 CLAUDE.md。
+# 代价是码率控制状态机、运行中探测等逻辑不能靠仿真场景“顺便”算进覆盖率，必须有自己的单元测试
+# （estimator.rs、media.rs、cc/ 里的测试），门槛仍是 99%。
 set -euo pipefail
 cd "$(dirname "$0")/.."
-cargo llvm-cov --workspace --fail-under-lines 99 --summary-only \
+cargo llvm-cov --workspace --exclude peerdesk-e2e --fail-under-lines 99 --summary-only \
   --ignore-filename-regex 'crates/net/src/tls_verifier\.rs|crates/platform/src/(x11|windows|wingpu|winsession|winservice|macos|clipboard_sys|audio_sys)\.rs|crates/media/src/(mf|vt|vaapi|gl)\.rs|crates/client/src/gui/(app|viewer|files_window|yuv|tray|background)\.rs|crates/client/src/keychain\.rs' "$@"
