@@ -10,23 +10,21 @@
 //! - 丢了帧：下一帧编关键帧。以后改为从长期参考帧恢复。
 
 use openh264::decoder::Decoder;
-use openh264::encoder::{
-    BitRate, Complexity, Encoder, EncoderConfig, FrameRate, FrameType, IntraFramePeriod, Level,
-    QpRange, RateControlMode, UsageType,
-};
-use openh264::formats::{YUVSlices, YUVSource};
+use openh264::formats::YUVSource;
 
 pub mod annexb;
 pub mod audio;
+pub mod backend;
 mod color;
 /// Linux 的显卡和 VA-API 能力（检测和给用户的说明）。
 #[cfg(target_os = "linux")]
 pub mod gpu;
 pub mod qp;
+pub mod soft;
 pub mod stall;
 #[cfg(target_os = "linux")]
 mod vaapi;
-use openh264::OpenH264API;
+use backend::{EncoderBackend, Finished, FrameAsk, FrameInput, Rates, Submitted};
 use peerdesk_core::error::Error;
 use peerdesk_core::frame::{Frame, GpuFrame, GpuHandle, Nv12, Picture};
 use peerdesk_core::policy::ContentPolicy;
@@ -567,7 +565,10 @@ pub fn open_system_hardware(
 pub struct H264Encoder {
     fps: u32,
     max_bps: u64,
-    inner: Option<(u16, u16, Encoder)>,
+    /// 软件编码后端（现在是 openh264；硬件编码器搬到同一个接口之后，硬件、软件走同一条路）。
+    soft: Box<dyn EncoderBackend>,
+    /// 交给软件后端的帧的编号（对号用）。
+    soft_token: u64,
     bps: u64,
     force_key: bool,
     refine_left: u8,
@@ -625,8 +626,6 @@ pub struct H264Encoder {
     /// 上一次编的画面的抽样（每 [`SAMPLE_STEP`] 像素取一个），估计画面变了多少。
     samples: Vec<u32>,
     sampled: (u16, u16),
-    /// 编码器现在用的每层固定 QP（没变就不再设，省一次取参数、设参数）。
-    layer_qp: Option<u8>,
 }
 
 /// 硬件编码这一步的结果。
@@ -675,7 +674,8 @@ impl H264Encoder {
         Self {
             fps: fps.max(1),
             max_bps: max_bps.clamp(MIN_BPS, u64::from(u32::MAX)),
-            inner: None,
+            soft: Box::new(soft::OpenH264Backend::new()),
+            soft_token: 0,
             bps: 0,
             force_key: false,
             refine_left: 0,
@@ -707,7 +707,6 @@ impl H264Encoder {
             rate_stale: false,
             samples: Vec::new(),
             sampled: (0, 0),
-            layer_qp: None,
         }
     }
 
@@ -1134,20 +1133,28 @@ impl H264Encoder {
             self.convert_us = self.convert_us.saturating_add(micros_since(reading));
         }
         self.timing.convert_us = self.convert_us.saturating_sub(self.timing.scale_us);
-        let mut encoding = std::time::Instant::now();
-        let fresh = self.inner.as_ref().is_none_or(|(w, h, _)| (*w, *h) != size);
-        // 编码器先拿出来用，编完放回去；编码出错时丢掉，下一帧重新打开（从关键帧开始）。
+        let encoding = std::time::Instant::now();
+        // 后端按实际编的尺寸配置：奇数的宽高在转换时已经补成偶数（`w`、`h`），帧头里写的还是原来的 `size`
+        let coded = (
+            u16::try_from(w).unwrap_or(u16::MAX),
+            u16::try_from(h).unwrap_or(u16::MAX),
+        );
+        let fresh = self.soft.size() != Some(coded);
+        // 尺寸变了（或上一帧出错复位了）：重新配置，从关键帧开始；否则只告诉后端现在的码率、帧率。
         self.bps = self.budget_bps(budget);
-        let mut enc = match self.inner.take() {
-            Some((_, _, enc)) if !fresh => enc,
-            Some(_) | None => self.open()?,
+        let rates = Rates {
+            bps: self.bps,
+            fps: self.fps,
         };
-        if self.force_key && !fresh {
-            enc.force_intra_frame();
+        if fresh {
+            self.soft
+                .reconfigure(coded, rates)
+                .map_err(|_| Error::Inconsistent("创建 H.264 编码器失败"))?;
+        } else {
+            self.soft
+                .set_rates(rates)
+                .map_err(|_| Error::Inconsistent("H.264 编码失败"))?;
         }
-        // 画面变了多少（CPU 画面按抽样估计，每帧约 3600 个像素；显卡画面不读回来比，不知道）。每一帧变化都看
-        // （Chromium 远程桌面也是逐帧按更新面积判断大帧）：拖动小窗口之后马上切换整个窗口，按上一帧的大小
-        // 推算会把整屏变化按拖动时的 QP 12 编（实测蜂窝网络上 203 KB）。关键帧时记一次抽样作比较的基准。
         let area = match input {
             Input::Rgb(screen) if changed && !fresh && !self.force_key => {
                 Some(self.changed_permille(screen))
@@ -1158,11 +1165,6 @@ impl H264Encoder {
             }
             Input::Rgb(_) | Input::Gpu(_) => None,
         };
-        let yuv = YUVSlices::new(
-            (&self.planes.0, &self.planes.1, &self.planes.2),
-            (w, h),
-            (w, w / 2, w / 2),
-        );
         // 这一帧的 QP（见 qp 模块）：关键帧按大帧规则装进时限，在变的帧跟着目标，停下的帧往下补
         let kind = if fresh || self.force_key {
             qp::Kind::Key
@@ -1196,42 +1198,21 @@ impl H264Encoder {
         // 不再编（否则画面不动也一直按同一个 QP 编空帧）。画面再变时重新开始补。
         if kind == qp::Kind::Refine && !fresh && self.qp.qp().is_some_and(|now| qp >= now) {
             self.refine_left = 0;
-            self.inner = Some((size.0, size.1, enc));
             return Ok(None);
         }
-        // 新开的编码器第一帧只能按默认 QP（26）编，除非先编一次让它初始化：openh264 的 Rust 封装到第一次
-        // 编码时才真正初始化编码器，之前取不到、也改不了参数。只有要明显更粗（窄带宽上的大帧规则）时才多编
-        // 这一次；要更细或差不多时就按 26 编，之后补清晰补上（局域网上省掉一次编码：会话开头本来就忙）。
-        let qp = if fresh && qp < DEFAULT_LAYER_QP.saturating_add(PRIME_ABOVE) {
-            DEFAULT_LAYER_QP
-        } else {
-            qp
+        // 后端新开之后第一帧只能按它的默认 QP 编、要别的就得多编一次初始化时（见 BackendTraits::first_frame_qp，
+        // openh264 就是这样）：只有要明显更粗（窄带宽上的大帧规则）才值得多编这一次；要更细或差不多时就按默认的编，
+        // 之后补清晰补上（局域网上省掉一次编码：会话开头本来就忙）。
+        let qp = match self.soft.info().traits.first_frame_qp {
+            Some(default) if fresh && qp < default.saturating_add(PRIME_ABOVE) => default,
+            Some(_) | None => qp,
         };
-        if fresh && qp != DEFAULT_LAYER_QP {
-            // 先编一次让编码器初始化（结果丢掉），再按定好的 QP 重新编成关键帧。
-            enc.encode(&yuv).map_err(codec_error("H.264 编码失败"))?;
-            enc.force_intra_frame();
-            // 这一次是初始化的开销（和打开编码器一样），不算进编码耗时：帧率调节按编码耗时判断 CPU
-            // 跟不跟得上，算进去的话每次新开编码器都像 CPU 过载（实测 100 帧时被降到 50 帧）。
-            encoding = std::time::Instant::now();
-        }
-        if fresh {
-            self.layer_qp = Some(DEFAULT_LAYER_QP);
-        }
-        if self.layer_qp != Some(qp) && set_layer_qp(&mut enc, qp) {
-            self.layer_qp = Some(qp);
-        }
-        let encode = |enc: &mut Encoder| {
-            enc.encode(&yuv)
-                .map(|stream| {
-                    (
-                        matches!(stream.frame_type(), FrameType::IDR | FrameType::I),
-                        stream.to_vec(),
-                    )
-                })
-                .map_err(codec_error("H.264 编码失败"))
-        };
-        let (mut key, mut data) = encode(&mut enc)?;
+        let first = self.submit_soft(budget, qp, self.force_key || fresh)?;
+        // 多编的那一次是初始化的开销（和打开编码器一样），不算进编码耗时：帧率调节按编码耗时判断 CPU
+        // 跟不跟得上，算进去的话每次新开编码器都像 CPU 过载（实测 100 帧时被降到 50 帧）。
+        let primed = first.timing.setup_us > 0;
+        let mut computed = first.timing.compute_us;
+        let (mut key, mut data) = (first.key, first.data);
         let mut qp = qp;
         // 整屏变化（切换窗口这类“场景切换”）编出来远超大帧时限：上一帧的大小推算不出这种帧。按它的实际大小
         // 推一个装得进的 QP 重编（照 libvpx 屏幕内容实时模式的 vp9_encodedframe_overshoot）。openh264 编完
@@ -1243,15 +1224,17 @@ impl H264Encoder {
             .then(|| self.qp.overshoot_qp(bytes, qp, key_allowed))
             .flatten()
         {
-            enc.force_intra_frame();
-            if set_layer_qp(&mut enc, q) {
-                self.layer_qp = Some(q);
-            }
-            (key, data) = encode(&mut enc)?;
+            let again = self.submit_soft(budget, q, true)?;
+            computed = computed.saturating_add(again.timing.compute_us);
+            (key, data) = (again.key, again.data);
             qp = q;
             self.key_reason = "整屏变化编出来远超大帧时限，按实际大小重编成关键帧";
         }
-        self.timing.encode_us = micros_since(encoding);
+        self.timing.encode_us = if primed {
+            computed
+        } else {
+            micros_since(encoding)
+        };
         let kind = if key { qp::Kind::Key } else { kind };
         self.qp.on_frame(
             kind,
@@ -1260,7 +1243,6 @@ impl H264Encoder {
             pixels,
         );
         self.soft_converged = Some(self.qp.converged());
-        self.inner = Some((size.0, size.1, enc));
         Ok(Some(self.finish(&data, key, size, changed, fresh)))
     }
 
@@ -1331,29 +1313,35 @@ impl H264Encoder {
         self.fps / 5
     }
 
-    /// 打开编码器：关掉 openh264 自己的码控，每帧的 QP 由 [`qp::QpControl`] 定（为什么见 [`qp`]）。
-    fn open(&self) -> Result<Encoder, Error> {
-        let bps = u32::try_from(self.bps).unwrap_or(u32::MAX);
-        let fps = u16::try_from(self.fps).unwrap_or(u16::MAX);
-        let config = EncoderConfig::new()
-            .usage_type(UsageType::ScreenContentRealTime)
-            .rate_control_mode(RateControlMode::Off)
-            .bitrate(BitRate::from_bps(bps))
-            .max_frame_rate(FrameRate::from_hz(f32::from(fps)))
-            // 帧率由发送端决定；编码器自己跳帧会让画面停住。
-            .skip_frames(false)
-            // 屏幕内容模式不支持这两项，关掉免得 OpenH264 打警告。
-            .adaptive_quantization(false)
-            .background_detection(false)
-            // 不定期插关键帧：关键帧只在开始和丢包恢复时出现。
-            .intra_frame_period(IntraFramePeriod::from_num_frames(u32::MAX))
-            .qp(QpRange::new(MIN_QP, qp::MAX_QP))
-            // 级别决定码率上限；不指定时按分辨率自动选，小画面的上限很低。
-            .level(Level::Level_5_2)
-            .complexity(Complexity::Low)
-            .debug(false);
-        Encoder::with_api_config(OpenH264API::from_source(), config)
-            .map_err(codec_error("创建 H.264 编码器失败"))
+    /// 把 `planes` 里转好的这一帧交给软件后端，按 `qp` 编；`keyframe` 要关键帧。
+    ///
+    /// # Errors
+    /// 后端出错（它已经复位，下一帧会重新配置、从关键帧开始）。
+    fn submit_soft(
+        &mut self,
+        budget: usize,
+        qp: u8,
+        keyframe: bool,
+    ) -> Result<backend::EncodedOut, Error> {
+        self.soft_token = self.soft_token.wrapping_add(1);
+        let ask = FrameAsk {
+            token: self.soft_token,
+            budget,
+            qp: Some(qp),
+            keyframe,
+        };
+        let input = FrameInput::I420 {
+            y: &self.planes.0,
+            u: &self.planes.1,
+            v: &self.planes.2,
+        };
+        match self.soft.submit(input, ask) {
+            Ok(Submitted::Ready(Finished::Frame(frame))) if frame.token == ask.token => Ok(frame),
+            // 软件后端按 QP 同步编：不攒帧、不丢帧。别的回答都是后端违约
+            Ok(Submitted::Ready(_) | Submitted::Pending) | Err(_) => {
+                Err(Error::Inconsistent("H.264 编码失败"))
+            }
+        }
     }
 
     /// 每帧预算换算成码率。
@@ -1377,41 +1365,8 @@ fn hw_floor_bps(w: usize, h: usize) -> u64 {
         .unwrap_or(0)
 }
 
-/// openh264 每层固定 QP 的默认值（`SVC_QUALITY_BASE_QP`）：新开的编码器第一帧就是按它编的。
-const DEFAULT_LAYER_QP: u8 = 26;
-/// 新开的编码器要比 [`DEFAULT_LAYER_QP`] 粗这么多以上才多编一次去改第一帧的 QP。
+/// 后端新开之后的第一帧，要比它的默认 QP 粗这么多以上才多编一次去改第一帧的 QP。
 const PRIME_ABOVE: u8 = 4;
-
-/// 码控关掉时每层用的固定 QP 改成 `qp`（运行中可改、不重建编码器、不出额外的关键帧：
-/// `WelsEncoderParamAdjust` 不重置时会拷贝 `iDLayerQp`）。返回是否生效。
-#[allow(unsafe_code)]
-fn set_layer_qp(enc: &mut Encoder, qp: u8) -> bool {
-    let mut param = std::mem::MaybeUninit::<openh264_sys2::SEncParamExt>::zeroed();
-    // SAFETY: 编码器已经初始化（编过一帧）；ENCODER_OPTION_SVC_ENCODE_PARAM_EXT 的参数就是 SEncParamExt，
-    // 指针指向本函数里全零初始化的局部变量（纯 C 结构），调用期间有效，GetOption 只往里写。
-    let got = unsafe {
-        enc.raw_api().get_option(
-            openh264_sys2::ENCODER_OPTION_SVC_ENCODE_PARAM_EXT,
-            param.as_mut_ptr().cast(),
-        )
-    };
-    if got != 0 {
-        return false;
-    }
-    // SAFETY: 全零对这个纯 C 结构是合法值；GetOption 成功时填好了当前参数。
-    let mut param = unsafe { param.assume_init() };
-    for layer in &mut param.sSpatialLayers {
-        layer.iDLayerQp = i32::from(qp);
-    }
-    // SAFETY: 参数是刚取回的当前参数，只改了每层的固定 QP（不重建编码器的那一类参数）；指针指向局部变量。
-    let set = unsafe {
-        enc.raw_api().set_option(
-            openh264_sys2::ENCODER_OPTION_SVC_ENCODE_PARAM_EXT,
-            std::ptr::addr_of_mut!(param).cast(),
-        )
-    };
-    set == 0
-}
 
 fn micros_since(t: std::time::Instant) -> u64 {
     u64::try_from(t.elapsed().as_micros()).unwrap_or(u64::MAX)
@@ -2221,6 +2176,167 @@ mod tests {
         hw.encode_frame(1, &frame, true, 50_000).unwrap().unwrap();
         let t = hw.timing();
         assert!(t.hardware && t.wait_us <= t.convert_us, "{t:?}");
+    }
+
+    /// 软件编码一段固定的操作，返回每一帧的（是否出帧、是否关键帧、字节数、码流的哈希）。
+    /// 覆盖软件路径的每个分支：新开编码器（按默认 QP、窄带上先初始化再按粗 QP 编）、在变的帧、静止后补清晰、
+    /// 丢帧后要关键帧、整屏变化超出大帧时限重编、换尺寸、显卡画面读回、码率估计过期。
+    fn software_script() -> Vec<(bool, bool, usize, u64)> {
+        fn hash(data: &[u8]) -> u64 {
+            data.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+                (h ^ u64::from(*b)).wrapping_mul(0x0000_0100_0000_01b3)
+            })
+        }
+        let mut out = Vec::new();
+        let mut push = |f: Option<EncodedFrame>| {
+            out.push(f.map_or((false, false, 0, 0), |f| {
+                (true, f.key, f.payload.len(), hash(&f.payload))
+            }));
+        };
+        let a = picture(640, 360);
+        let mut b = a.clone();
+        b.fill(40, 40, 200, 120, 0x0020_40ff);
+        let mut c = Screen::new(640, 360, 0x00f0_f0f0);
+        for i in 0..40u16 {
+            c.fill(
+                i * 16,
+                (i * 7) % 300,
+                12,
+                40,
+                0x0010_1010 + u32::from(i) * 0x0003_0507,
+            );
+        }
+        // 宽带：新开按默认 QP；变化；静止补清晰直到不再出帧
+        let mut enc = H264Encoder::new(30).with_hardware(fake_none);
+        push(enc.encode(1, &a, true, 50_000).unwrap());
+        push(enc.encode(2, &b, true, 50_000).unwrap());
+        for id in 3..30 {
+            push(enc.encode(id, &b, false, 50_000).unwrap());
+        }
+        // 丢帧后要关键帧；整屏变化（预算小，触发按实际大小重编）；再变回来
+        enc.on_lost(30);
+        push(enc.encode(31, &b, true, 20_000).unwrap());
+        push(enc.encode(32, &c, true, 1_500).unwrap());
+        push(enc.encode(33, &a, true, 1_500).unwrap());
+        // 码率估计过期时的变化和补清晰
+        enc.set_rate_stale(true);
+        push(enc.encode(34, &b, true, 3_000).unwrap());
+        for id in 35..45 {
+            push(enc.encode(id, &b, false, 3_000).unwrap());
+        }
+        enc.set_rate_stale(false);
+        // 换尺寸（编码比例减半）：重新打开；再换回来
+        enc.set_scale(500);
+        push(enc.encode(45, &a, true, 8_000).unwrap());
+        push(enc.encode(46, &b, true, 8_000).unwrap());
+        enc.set_scale(peerdesk_core::scale::FULL_PERMILLE);
+        push(enc.encode(47, &b, true, 8_000).unwrap());
+        // 窄带：新开时要明显更粗的 QP（先初始化一次再编）；之后在变、补清晰
+        let mut narrow = H264Encoder::new(30).with_hardware(fake_none);
+        push(narrow.encode(1, &a, true, 300).unwrap());
+        push(narrow.encode(2, &b, true, 300).unwrap());
+        for id in 3..12 {
+            push(narrow.encode(id, &b, false, 300).unwrap());
+        }
+        // 奇数的宽高（转换时补成偶数再编）
+        let mut odd = H264Encoder::new(30).with_hardware(fake_none);
+        let o = picture(641, 361);
+        push(odd.encode(1, &o, true, 20_000).unwrap());
+        let mut o2 = o.clone();
+        o2.fill(100, 100, 301, 151, 0x00a0_2020);
+        push(odd.encode(2, &o2, true, 20_000).unwrap());
+        push(odd.encode(3, &o2, true, 400).unwrap());
+        // 显卡画面：读回 NV12 再编
+        let mut gpu = H264Encoder::new(60).with_hardware(fake_none);
+        let g = Frame::Gpu(gpu_frame(320, 192));
+        push(gpu.encode_frame(1, &g, true, 20_000).unwrap());
+        push(gpu.encode_frame(2, &g, true, 20_000).unwrap());
+        push(gpu.encode_frame(3, &g, false, 20_000).unwrap());
+        out
+    }
+
+    /// 搬到后端接口（整体重新设计 C1）前后，软件编码逐字节不变。基准是在搬迁之前的提交（dev 2513645）上
+    /// 用同一段 [`software_script`] 录的：每一帧是否出帧、是否关键帧、字节数、码流的哈希。
+    /// 只在 Linux x86_64 上比：openh264 在别的系统、别的指令集上不保证每个字节都一样，那里只检查跑得通。
+    #[test]
+    fn software_encoding_is_byte_identical_to_before_the_backend_interface() {
+        let got = software_script();
+        assert_eq!(got.len(), 63);
+        assert!(
+            got.iter().filter(|r| r.0).count() > 20,
+            "多数分支都要真的出帧"
+        );
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            let before: [(bool, bool, usize, u64); 63] = [
+                (true, true, 10140, 12467316667972714207),
+                (true, false, 64957, 11245756257944888205),
+                (false, false, 0, 0),
+                (false, false, 0, 0),
+                (false, false, 0, 0),
+                (false, false, 0, 0),
+                (false, false, 0, 0),
+                (false, false, 0, 0),
+                (false, false, 0, 0),
+                (false, false, 0, 0),
+                (false, false, 0, 0),
+                (false, false, 0, 0),
+                (false, false, 0, 0),
+                (false, false, 0, 0),
+                (false, false, 0, 0),
+                (false, false, 0, 0),
+                (false, false, 0, 0),
+                (false, false, 0, 0),
+                (false, false, 0, 0),
+                (false, false, 0, 0),
+                (false, false, 0, 0),
+                (false, false, 0, 0),
+                (false, false, 0, 0),
+                (false, false, 0, 0),
+                (false, false, 0, 0),
+                (false, false, 0, 0),
+                (false, false, 0, 0),
+                (false, false, 0, 0),
+                (false, false, 0, 0),
+                (true, true, 28622, 14855844185393296398),
+                (true, true, 1730, 8188028110477398655),
+                (true, true, 2442, 9569077134605663632),
+                (true, false, 3879, 2594102178545637662),
+                (false, false, 0, 0),
+                (false, false, 0, 0),
+                (false, false, 0, 0),
+                (false, false, 0, 0),
+                (false, false, 0, 0),
+                (true, false, 14623, 8189313834945198341),
+                (true, false, 14839, 11486710695334218289),
+                (true, false, 13989, 18086222159814628434),
+                (true, false, 12649, 12899486267850091652),
+                (true, false, 25497, 14568573672304195533),
+                (true, true, 1384, 13416966219816767039),
+                (true, false, 10580, 14652061378435444301),
+                (true, true, 10175, 14646049696086142616),
+                (true, true, 1352, 5247130174107880173),
+                (true, false, 244, 10110679835351519157),
+                (false, false, 0, 0),
+                (false, false, 0, 0),
+                (false, false, 0, 0),
+                (false, false, 0, 0),
+                (false, false, 0, 0),
+                (true, false, 35, 16337137600208355028),
+                (true, false, 185, 10120661390380055447),
+                (true, false, 78, 9882511896813594477),
+                (true, false, 123, 17342484993396303408),
+                (true, true, 10556, 10426616145667090634),
+                (true, false, 40928, 8284539310635470557),
+                (true, false, 18, 16216706742597887763),
+                (true, true, 3254, 2722084851986203129),
+                (true, false, 18, 12542253289644810899),
+                (false, false, 0, 0),
+            ];
+            for (i, (now, was)) in got.iter().zip(before.iter()).enumerate() {
+                assert_eq!(now, was, "第 {i} 帧和搬迁之前不一样");
+            }
+        }
     }
 
     /// 显卡画面 + 软件编码：读回一次 NV12（只拷贝、拆平面，不转颜色、不缩放），尺寸就是画面的尺寸

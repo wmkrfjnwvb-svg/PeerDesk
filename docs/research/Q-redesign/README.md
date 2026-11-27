@@ -9,6 +9,7 @@
 | `industry-codec-layer.md` | 业内编解码层架构、厂商 SDK 许可、低延迟参数、解码显示 |
 | `industry-hires-quality.md` | 2K/4K/8K、4:4:4、游戏和电影模式、编码格式分层（H.264/HEVC/AV1） |
 | `../P-industry.md` | 帧率稳定、QSV、GPU 读回、软编帧率、局域网带宽探测 |
+| `codec-c1.md` | C1：编码后端的接口和契约、openh264 搬迁的证据、三个平台后端的搬迁清单和冲突 |
 | `design.md` | 整体设计（Fable 写，待审） |
 
 调研文件里标“未核实”“二手”的数字不能直接当设计依据，要先核实或实测。
