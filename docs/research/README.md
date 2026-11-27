@@ -17,6 +17,7 @@
 | [K-pipeline.md](K-pipeline.md) | 编解码与传输链路排查（2026-11-25）：模块互相影响的根因、业内做法、模块边界、分步修改计划 |
 | [L-framework.md](L-framework.md) | 传输与画质控制的总框架（按 WebRTC 流程）：三种时钟、每个信号一个主人、每个算法的触发条件和保持时间、分步计划 |
 | [O-modes-industry.md](O-modes-industry.md) | 电影、音乐模式的同行调研（2026-11-26）：AnyDesk、GeForce NOW、Moonlight 的模式或预设，Zoom、Teams 的音乐模式，W3C contentHint，Chromium 投屏的视频检测，对 PeerDesk 的建议 |
+| [P-fps-bitrate.md](P-fps-bitrate.md) | 帧率和码率为什么保持不住（2026-11-27 用户日志分析）：Mac Wi-Fi 和 Windows 局域网的根因排序、谁在决定帧率、探测该加什么不该加什么、修法和回归测试、日志缺的数据 |
 | [reports/](reports/) | 给产品负责人的报告：AI Agent 业内调研、美国市场赚钱方案、核心用户功能设计（设备管理、MCP、无显示器主机、规模化、计费单位） |
 
 ## 待办与进度（2026-11-27，每完成一项就更新这里）
