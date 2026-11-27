@@ -4,11 +4,20 @@
 用法：scripts/m2-pages.py <输出目录>
 字体：仓库里的 Inter、思源黑体简体（OFL）和系统的 DejaVu Sans Mono；文字是自己写的，没有许可问题。
 画面是 Pillow 画的（灰度抗锯齿，真字体），不是真实程序的画面；Xvfb 录屏另算。
+
+M2b（B3）起，每个序列目录里多一个 regions.txt：第 k 行是第 k 帧相对第 k-1 帧的变化区域，和采集接口交的东西同一种
+（脏区域 `d:x,y,w,h`、移动 `m:来源x,来源y,x,y,w,h`），第 0 行是 `whole`。区域是页面生成器自己交的，不是事后从像素里猜的：
+- 打字：新字的外框（和上一张逐像素比出来的外接矩形，各外扩 1 像素）；
+- 滚动：整页上移 4 像素 = 一个移动（目的地是除了最下面 4 行以外的整块）加最下面露出来的 4 行脏区域；
+生成时逐像素核对：实际变了的像素都在区域里，移动区域里的像素确实是上一帧来源那一块的拷贝（核对不过就报错退出）。
+另外生成一组“滚动窗口”（win25/50/75/100-<字体>-<字号>-<主题>）：窗口宽高取整屏的 25%、50%、75%、100%，
+窗口居中，窗口外是静止的灰底，窗口里的文字每帧上移 4 像素；100% 就是整屏滚动（和 scroll-* 同样的画面）。
 """
 import os
 import sys
 
-from PIL import Image, ImageDraw, ImageFont
+import numpy as np
+from PIL import Image, ImageChops, ImageDraw, ImageFont
 
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 FONTS = {
@@ -77,11 +86,55 @@ def page(lines, font, size, bg, fg, w, h, margin, upto=None, top=0):
     return img
 
 
-def main(out):
+def save(img, d, k):
+    img.save(os.path.join(d, f"{k:04d}.png"), compress_level=1)
+
+
+def bbox_region(prev, cur, w, h):
+    """两张图逐像素比出来的外接矩形，各外扩 1 像素；没变返回 None。"""
+    box = ImageChops.difference(prev, cur).getbbox()
+    if box is None:
+        return None
+    x0, y0 = max(box[0] - 1, 0), max(box[1] - 1, 0)
+    x1, y1 = min(box[2] + 1, w), min(box[3] + 1, h)
+    return (x0, y0, x1 - x0, y1 - y0)
+
+
+def check(prev, cur, dirty, moves):
+    """实际变了的像素都在区域里，移动区域里的像素确实是上一帧来源那一块的拷贝。"""
+    a, b = np.asarray(prev), np.asarray(cur)
+    changed = np.any(a != b, axis=2)
+    covered = np.zeros(changed.shape, bool)
+    for (x, y, w, h) in dirty:
+        covered[y:y + h, x:x + w] = True
+    for (fx, fy, x, y, w, h) in moves:
+        covered[y:y + h, x:x + w] = True
+        assert np.array_equal(b[y:y + h, x:x + w], a[fy:fy + h, fx:fx + w]), "移动区域不是上一帧来源的拷贝"
+    assert not (changed & ~covered).any(), f"{int((changed & ~covered).sum())} 个变了的像素不在区域里"
+
+
+def write_regions(d, lines):
+    with open(os.path.join(d, "regions.txt"), "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def scroll_tokens(x0, y0, w, h, step=4):
+    """窗口 (x0,y0,w,h) 里的内容上移 step 像素：移动加底下露出来的一条。"""
+    mv = (x0, y0 + step, x0, y0, w, h - step)
+    dr = (x0, y0 + h - step, w, step)
+    return [dr], [mv], f"d:{dr[0]},{dr[1]},{dr[2]},{dr[3]} m:{mv[0]},{mv[1]},{mv[2]},{mv[3]},{mv[4]},{mv[5]}"
+
+
+WINDOW_BG = (52, 54, 58)
+
+
+def main(out, kinds=("en", "zh", "code"), sizes=(11, 14), themes=("light", "dark")):
     w, h, n, margin = 1920, 1080, 60, 40
-    for kind in ("en", "zh", "code"):
-        for size in (11, 14):
+    for kind in kinds:
+        for size in sizes:
             for theme, (bg, fg) in THEMES.items():
+                if theme not in themes:
+                    continue
                 font, lines = layout(kind, size, w, margin)
                 step = int(size * 1.5)
                 per_page = (h - 2 * margin) // step
@@ -89,18 +142,55 @@ def main(out):
                 # 打字：页面里已经有一半字，之后每帧多出一个字
                 d = os.path.join(out, f"type-{kind}-{size}-{theme}")
                 os.makedirs(d, exist_ok=True)
+                prev, regs = None, ["whole"]
                 for k in range(n):
-                    page(lines, font, size, bg, fg, w, h, margin, upto=total // 2 + k).save(
-                        os.path.join(d, f"{k:04d}.png")
-                    )
+                    img = page(lines, font, size, bg, fg, w, h, margin, upto=total // 2 + k)
+                    save(img, d, k)
+                    if prev is not None:
+                        r = bbox_region(prev, img, w, h)
+                        # 新的一个字是空格时画面一点没变：区域是空的（这样的帧 M2 也编了）
+                        check(prev, img, [r] if r else [], [])
+                        regs.append("d:%d,%d,%d,%d" % r if r else "")
+                    prev = img
+                write_regions(d, regs)
                 # 滚动：整页每帧上移 4 像素
                 d = os.path.join(out, f"scroll-{kind}-{size}-{theme}")
                 os.makedirs(d, exist_ok=True)
+                prev, regs = None, ["whole"]
                 for k in range(n):
-                    page(lines, font, size, bg, fg, w, h, margin, top=4 * k).save(
-                        os.path.join(d, f"{k:04d}.png")
-                    )
+                    img = page(lines, font, size, bg, fg, w, h, margin, top=4 * k)
+                    save(img, d, k)
+                    if prev is not None:
+                        dirty, moves, tok = scroll_tokens(0, 0, w, h)
+                        check(prev, img, dirty, moves)
+                        regs.append(tok)
+                    prev = img
+                write_regions(d, regs)
+                # 滚动窗口：窗口宽高取整屏的 25%、50%、75%、100%，居中，窗口外是静止的灰底
+                for pct in (25, 50, 75, 100):
+                    ww, wh = w * pct // 100, h * pct // 100
+                    x0, y0 = (w - ww) // 2, (h - wh) // 2
+                    wfont, wlines = layout(kind, size, ww, margin)
+                    d = os.path.join(out, f"win{pct}-{kind}-{size}-{theme}")
+                    os.makedirs(d, exist_ok=True)
+                    prev, regs = None, ["whole"]
+                    for k in range(n):
+                        inner = page(wlines, wfont, size, bg, fg, ww, wh, margin, top=4 * k)
+                        img = Image.new("RGB", (w, h), WINDOW_BG)
+                        img.paste(inner, (x0, y0))
+                        save(img, d, k)
+                        if prev is not None:
+                            dirty, moves, tok = scroll_tokens(x0, y0, ww, wh)
+                            check(prev, img, dirty, moves)
+                            regs.append(tok)
+                        prev = img
+                    write_regions(d, regs)
 
 
 if __name__ == "__main__":
-    main(sys.argv[1])
+    # 可选的第二个参数只用来试跑：字体种类、字号、主题，例如 code,14,light
+    if len(sys.argv) > 2:
+        k, z, t = sys.argv[2].split(",")
+        main(sys.argv[1], (k,), (int(z),), (t,))
+    else:
+        main(sys.argv[1])

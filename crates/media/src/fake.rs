@@ -30,7 +30,7 @@ use crate::backend::{
     Timing,
 };
 use crate::content;
-use peerdesk_core::changes::{union_area, ChangeFeed, Rect};
+use peerdesk_core::changes::{union_area, Accum, ChangeFeed, Rect};
 use peerdesk_core::error::Error;
 use peerdesk_core::frame::{Described, Picture};
 use peerdesk_core::screen::Screen;
@@ -120,6 +120,10 @@ pub struct Regions {
     pub moved_px: u64,
     /// 累计的变化里，有一次移动的目的地占整帧 [`peerdesk_core::changes::FULL_MOVE_PERMILLE`]‰ 以上（整屏滚动）。
     pub full_move: bool,
+    /// 脏区域碰到的宏块数（编码器按整块编，改一个像素也要编整个宏块；B3 拟合用它 ×256 当“新内容的面积”）。
+    pub dirty_mbs: u32,
+    /// 移动区域碰到、脏区域没碰到的宏块数（和 `moved_px` 同一个口径：目的地并集减去脏区域，按宏块数）。
+    pub moved_mbs: u32,
     /// 脏区域里的细节（千分之几）：脏区域碰到的宏块里，有细节的抽样点占全部抽样点的比例。没有脏区域为 0。
     pub dirty_detail_permille: u32,
     /// 静止宏块的画质差分布：`static_gap[g - 1]` 是“现在画质比这一帧的 QP 粗 g 档”的静止宏块个数（g = 1…51）。
@@ -136,6 +140,8 @@ impl Default for Regions {
             dirty_px: 0,
             moved_px: 0,
             full_move: false,
+            dirty_mbs: 0,
+            moved_mbs: 0,
             dirty_detail_permille: 0,
             static_gap: [0; GAP_BINS],
             repeat: 0,
@@ -408,8 +414,8 @@ pub struct FakeBackend {
     version: Option<Arc<AtomicU64>>,
     /// 画面哪里变了，由外面（仿真的画面来源）每变一版推进来；没接的话区域类输入只有“刚配置的第一帧整屏都是新的”。
     feed: Option<ChangeFeed>,
-    /// 宏块的“现在画质”表。
-    mbs: MbTable,
+    /// 区域类输入（宏块的“现在画质”表和累计变化的换算）。
+    regions: RegionTracker,
 }
 
 impl FakeBackend {
@@ -442,7 +448,7 @@ impl FakeBackend {
             stall_spent: false,
             version: None,
             feed: None,
-            mbs: MbTable::default(),
+            regions: RegionTracker::default(),
         }
     }
 
@@ -488,7 +494,7 @@ impl FakeBackend {
         self.last_qp = None;
         self.last_submit_us = None;
         self.key_countdown = None;
-        self.mbs = MbTable::default();
+        self.regions.reset();
     }
 
     /// 出错：按契约第 9 条复位（违约的后端不复位），攒着的帧作废。
@@ -583,12 +589,15 @@ struct MbTable {
     points: Vec<u16>,
 }
 
-/// 一帧编之前对宏块的盘点。
-struct Survey {
+/// 一帧编之前对宏块的盘点（[`RegionTracker::survey`] 的结果）。
+#[derive(Debug)]
+pub struct Survey {
     /// 脏区域或移动区域碰到的宏块。
     touched: Vec<bool>,
     dirty_px: u64,
     moved_px: u64,
+    dirty_mbs: u32,
+    moved_mbs: u32,
     full_move: bool,
     detail_permille: u32,
     /// 静止宏块按现在画质（QP）分的个数、连续次数的最大值。
@@ -632,6 +641,10 @@ impl MbTable {
         self.mark(dirty, &mut by_dirty);
         let mut touched = by_dirty.clone();
         self.mark(moved, &mut touched);
+        let count_of =
+            |v: &[bool]| u32::try_from(v.iter().filter(|b| **b).count()).unwrap_or(u32::MAX);
+        let dirty_mbs = count_of(&by_dirty);
+        let moved_mbs = count_of(&touched).saturating_sub(dirty_mbs);
         // 脏区域里的细节：碰到的宏块里有细节的抽样点 ÷ 全部抽样点
         let (mut hit, mut all) = (0u64, 0u64);
         for (i, _) in by_dirty.iter().enumerate().filter(|(_, d)| **d) {
@@ -659,6 +672,8 @@ impl MbTable {
             touched,
             dirty_px,
             moved_px: union_area(&both) - dirty_px,
+            dirty_mbs,
+            moved_mbs,
             full_move,
             detail_permille: content::permille(
                 usize::try_from(hit).unwrap_or(usize::MAX),
@@ -683,8 +698,9 @@ impl MbTable {
 }
 
 impl Survey {
-    /// 按这一帧的 QP 算区域类输入。
-    fn regions(&self, qp: u8) -> Regions {
+    /// 按这一帧的 QP 算区域类输入（字节模型的 [`ModelInput::regions`]）。
+    #[must_use]
+    pub fn regions(&self, qp: u8) -> Regions {
         let q = usize::from(qp.min(MODEL_MAX_QP));
         let mut static_gap = [0u32; GAP_BINS];
         for (g, slot) in static_gap.iter_mut().enumerate() {
@@ -694,10 +710,56 @@ impl Survey {
             dirty_px: self.dirty_px,
             moved_px: self.moved_px,
             full_move: self.full_move,
+            dirty_mbs: self.dirty_mbs,
+            moved_mbs: self.moved_mbs,
             dirty_detail_permille: self.detail_permille,
             static_gap,
             repeat: u32::from(self.run_max.get(q).copied().unwrap_or(0)),
         }
+    }
+}
+
+/// 区域类输入的跟踪：宏块画质表加上“累计的变化 → 这一帧的 [`Regions`]”的全部计算。
+///
+/// 假后端（L0、L0.5）和 M2b 的测量工具（`crates/e2e/examples/measure.rs`）用的是这同一份代码：拟合时每帧的特征和
+/// 假后端运行时算出来的逐位相同，不是另写一份（`docs/research/Q-redesign/m2b-plan.md` 第 5 节）。
+/// 用法：每交一帧先 [`Self::survey`]，编出来之后 [`Self::commit`]；重新配置时 [`Self::reset`]。
+#[derive(Debug, Default)]
+pub struct RegionTracker {
+    mbs: MbTable,
+}
+
+impl RegionTracker {
+    /// 重新配置：宏块画质表作废。
+    pub fn reset(&mut self) {
+        self.mbs = MbTable::default();
+    }
+
+    /// 盘点这一帧：`size` 是编码尺寸；`first` 是配置之后的第一帧（此前没有“上一帧”，整屏都算新的，不看 `acc`）；
+    /// `acc` 是从上一帧编出来起累计的变化（没接信道为 `None`，区域类输入就只有“第一帧整屏是新的”）；
+    /// `edges` 是每个宏块里有细节的抽样点数（[`content::mb_edges`]，L0 里在内容描述中）。
+    pub fn survey(
+        &mut self,
+        size: (u16, u16),
+        first: bool,
+        acc: Option<&Accum>,
+        edges: &[u16],
+    ) -> Survey {
+        self.mbs.ensure(size);
+        let (dirty, moved, full_move) = if first {
+            (vec![Rect::whole(size)], Vec::new(), false)
+        } else if let Some(acc) = acc {
+            let (d, m) = acc.rects(size);
+            (d, m, acc.full_move())
+        } else {
+            (Vec::new(), Vec::new(), false)
+        };
+        self.mbs.survey(&dirty, &moved, edges, full_move)
+    }
+
+    /// 这一帧编出来了：按 QP `qp` 更新宏块画质表（`key` 是不是关键帧：关键帧整表设成这一帧的 QP）。
+    pub fn commit(&mut self, survey: &Survey, qp: u8, key: bool) {
+        self.mbs.commit(&survey.touched, qp, key);
     }
 }
 
@@ -864,16 +926,7 @@ impl EncoderBackend for FakeBackend {
         let pixels = u64::from(w) * u64::from(h);
 
         // 区域类输入：累计的变化换算到编码尺寸，和宏块画质表一起盘点
-        self.mbs.ensure((w, h));
         let acc = self.feed.as_ref().map(ChangeFeed::peek);
-        let (dirty, moved, full_move) = if self.prev.is_none() {
-            (vec![Rect::whole((w, h))], Vec::new(), false)
-        } else if let Some(acc) = &acc {
-            let (d, m) = acc.rects((w, h));
-            (d, m, acc.full_move())
-        } else {
-            (Vec::new(), Vec::new(), false)
-        };
         let edges_owned;
         let edges: &[u16] = match described {
             Some((_, _, _, e)) => e,
@@ -882,7 +935,9 @@ impl EncoderBackend for FakeBackend {
                 &edges_owned
             }
         };
-        let survey = self.mbs.survey(&dirty, &moved, edges, full_move);
+        let survey = self
+            .regions
+            .survey((w, h), self.prev.is_none(), acc.as_ref(), edges);
 
         // 是不是关键帧：要了（可能晚几帧给）、第一帧、整屏突变、固定 GOP、改码率时顺带
         let faults = self.cfg.faults;
@@ -972,7 +1027,7 @@ impl EncoderBackend for FakeBackend {
         let index = self.index;
         let timing = self.timing(key, gap, primed);
         self.prev = Some(sample);
-        self.mbs.commit(&survey.touched, qp, key);
+        self.regions.commit(&survey, qp, key);
         if let Some(feed) = &self.feed {
             feed.clear();
         }
@@ -2219,6 +2274,7 @@ mod tests {
         // 第一帧：整屏都是新的，没有静止宏块
         let r = go(&mut b, 0, 30, false);
         assert_eq!((r.dirty_px, r.moved_px, r.full_move), (64 * 64, 0, false));
+        assert_eq!((r.dirty_mbs, r.moved_mbs), (16, 0), "整屏 4×4 个宏块");
         assert_eq!(r.static_gap, [0; GAP_BINS]);
         // 补清晰：什么都没变，16 个静止宏块都是 QP 30，比这一帧（20）粗 10 档
         let r = go(&mut b, 1, 20, false);
@@ -2241,6 +2297,11 @@ mod tests {
         ));
         let r = go(&mut b, 4, 28, false);
         assert_eq!((r.dirty_px, r.moved_px), (40, 512));
+        assert_eq!(
+            (r.dirty_mbs, r.moved_mbs),
+            (2, 2),
+            "按碰到的宏块数，不是像素数"
+        );
         assert!(!r.full_move);
         // 静止宏块都是 20，比这一帧（28）细：不计入画质差
         assert_eq!(r.static_gap, [0; GAP_BINS]);
@@ -2257,6 +2318,11 @@ mod tests {
         feed.push(&changes(&[Rect::new(4, 4, 8, 8)], &[]));
         let r = go(&mut b, 6, 20, false);
         assert_eq!(r.dirty_px, 64 + 64 - 16);
+        assert_eq!(
+            (r.dirty_mbs, r.moved_mbs),
+            (1, 0),
+            "两块都落在宏块 (0,0) 里"
+        );
         // 整屏移动一次就记着
         feed.push(&changes(
             &[Rect::new(0, 60, 64, 4)],
@@ -2268,6 +2334,11 @@ mod tests {
         let r = go(&mut b, 7, 20, false);
         assert!(r.full_move);
         assert_eq!((r.dirty_px, r.moved_px), (256, 64 * 60));
+        assert_eq!(
+            (r.dirty_mbs, r.moved_mbs),
+            (4, 12),
+            "脏的一条 4 个宏块，移动的 4×4 里除去它们（宏块 (c,3) 被条碰到）"
+        );
         // 关键帧：整屏设成这一帧的 QP；之后补清晰按它算
         let _ = go(&mut b, 8, 40, true);
         assert_eq!(go(&mut b, 9, 30, false).static_gap[9], 16);
