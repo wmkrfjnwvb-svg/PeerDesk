@@ -190,6 +190,8 @@ mod tests {
             scale_us: 30_000,
             convert_us: 20_000,
             encode_us: 10_000,
+            wait_us: 0,
+            dropped: false,
             hardware: true,
             nv12_direct: false,
             width: 1872,

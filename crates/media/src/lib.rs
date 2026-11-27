@@ -23,6 +23,7 @@ mod color;
 #[cfg(target_os = "linux")]
 pub mod gpu;
 pub mod qp;
+pub mod stall;
 #[cfg(target_os = "linux")]
 mod vaapi;
 use openh264::OpenH264API;
@@ -41,6 +42,20 @@ pub const REFINE_FRAMES: u8 = 12;
 const REFINE_DONE_BYTES: usize = 64;
 /// 码率下限（比特每秒）。
 const MIN_BPS: u64 = 64_000;
+/// 硬件编码器运行中出错、改用软件编码之后，过这么久再试一次硬件。
+/// 硬件出错多半是一时的（驱动忙、显卡在切换），整场会话都用软件编码代价太大（1080p 以上帧率、耗电都差一截）；
+/// 但每次换编码器要出一个关键帧，不能试得太勤。RustDesk 是连续失败 3 次才停用硬件（`P-industry.md` 主题 2）。
+const HW_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
+/// 一场会话里最多再试这么多次，还出错就一直用软件编码。
+const HW_RETRY_MAX: u32 = 3;
+/// 硬件编码器的码率不能低到放不下一帧：每个像素至少按这么多分之一字节算一帧的量（0.02 比特每像素，
+/// 2880×1800 约 13 KB、1080p 约 5 KB），码控窗口（[`BIG_FRAME_US`]）里至少放得下这么多。
+///
+/// 为什么：硬件编码器的码控是硬上限，窗口里放不下就把整帧丢掉。2026-11-27 用户日志（Mac，2880×1800）：
+/// 码率 344 kbps 时 100 ms 的窗口只有 4.3 KB，编码器每秒编 30–50 帧、出帧 0，画面停了 8 秒
+/// （`docs/research/P-fps-bitrate.md` M2）。链路窄时该让的是帧率（帧大、发得慢，由发送端的在途上限和帧率调节管），
+/// 不是“一帧也不出”。这个数是按日志里放不下、放得下的帧大小定的，真机上还要按分辨率核对。
+const HW_FRAME_FLOOR_PIXELS_PER_BYTE: u64 = 400;
 /// 码率上限的默认值。
 pub const DEFAULT_MAX_BPS: u64 = 50_000_000;
 /// 大帧规则默认的时限（微秒）：关键帧、大面积变化要在这么久里按目标码率发得完，发不完就粗编、之后补清晰
@@ -562,8 +577,18 @@ pub struct H264Encoder {
     planes: (Vec<u8>, Vec<u8>, Vec<u8>),
     /// 硬件编码器（打开了就优先用）。
     hw: Option<Box<dyn HardwareEncoder>>,
-    /// 硬件编码不能用（没有、打不开或失败过）：之后一直用软件编码。
+    /// 硬件编码现在不用（没有、打不开或失败过）；到了 `hw_retry_at` 会再试。
     hw_off: bool,
+    /// 硬件编码器运行中出过几次错。
+    hw_failures: u32,
+    /// 什么时候再试硬件（`None`：不再试）。
+    hw_retry_at: Option<std::time::Instant>,
+    /// 出错后隔多久再试（测试里改短）。
+    hw_retry_after: std::time::Duration,
+    /// 硬件编码器丢过帧之后学到的码率下限（这个尺寸下低于它放不下一帧；0：还没丢过）。
+    hw_floor: u64,
+    /// 上一次交给硬件编码器的码率。
+    hw_last_bps: u64,
     hw_open: HardwareOpener,
     /// 硬件编码器的输入（NV12），每帧复用。
     nv12: Vec<u8>,
@@ -658,6 +683,11 @@ impl H264Encoder {
             planes: (Vec::new(), Vec::new(), Vec::new()),
             hw: None,
             hw_off: false,
+            hw_failures: 0,
+            hw_retry_at: None,
+            hw_retry_after: HW_RETRY_AFTER,
+            hw_floor: 0,
+            hw_last_bps: 0,
             hw_open: open_system_hardware,
             nv12: Vec::new(),
             encoded_size: None,
@@ -773,9 +803,28 @@ impl H264Encoder {
         }
     }
 
-    /// 硬件出错：之后一直用软件编码（从关键帧开始）。
+    /// 交给硬件编码器的码率：不低于“放得下一帧”的下限（按尺寸算的，和丢过帧之后学到的，取大的）。
+    fn hw_bps(&self, bps: u64, w: usize, h: usize) -> u64 {
+        bps.max(hw_floor_bps(w, h)).max(self.hw_floor)
+    }
+
+    /// 硬件出错：改用软件编码（从关键帧开始）；过一阵再试硬件，试够了次数就一直用软件。
     fn hardware_failed(&mut self, why: &str) {
-        log::warn!("硬件编码失败，改用软件编码（OpenH264）：{why}");
+        self.hw_failures = self.hw_failures.saturating_add(1);
+        if self.hw_failures <= HW_RETRY_MAX {
+            self.hw_retry_at = std::time::Instant::now().checked_add(self.hw_retry_after);
+            log::warn!(
+                "硬件编码失败，改用软件编码（OpenH264），{} 秒后再试硬件（第 {} 次出错，最多再试 {HW_RETRY_MAX} 次）：{why}",
+                self.hw_retry_after.as_secs(),
+                self.hw_failures
+            );
+        } else {
+            self.hw_retry_at = None;
+            log::warn!(
+                "硬件编码失败，改用软件编码（OpenH264），已经出错 {} 次，这次会话不再试硬件：{why}",
+                self.hw_failures
+            );
+        }
         self.soft_reason = Some(format!("硬件出错：{why}"));
         self.hw = None;
         self.hw_off = true;
@@ -787,6 +836,24 @@ impl H264Encoder {
     /// 取回了一个硬件编好的帧：对上它交的时候是否要求了关键帧，检查“没要求却是关键帧”。
     fn hardware_output(&mut self, data: Vec<u8>, key: bool, fresh: bool) -> Hw {
         let asked = self.hw_sent.pop_front().unwrap_or(true);
+        // 编码器把这一帧丢了（码控放不下）：告诉发送端，这是预算不够，不是没东西要发；
+        // 同时把给它的码率下限翻倍——丢帧必须有出口，不能一直丢下去（每丢一次翻一倍，几帧之内一定放得下）
+        self.timing.dropped = data.is_empty();
+        if data.is_empty() && self.hw_last_bps > 0 {
+            let raised = self
+                .hw_floor
+                .max(self.hw_last_bps)
+                .saturating_mul(2)
+                .min(self.max_bps);
+            if raised > self.hw_floor {
+                log::info!(
+                    "视频编码：硬件编码器在 {} kbps 下把帧丢了（码控放不下一帧），给它的码率下限抬到 {} kbps",
+                    self.hw_last_bps / 1000,
+                    raised / 1000
+                );
+                self.hw_floor = raised;
+            }
+        }
         // 要了关键帧、编码器却交出空帧（码率控制把它丢了：2026-11-25 CI 实测 VideoToolbox 低延迟码控
         // 300 kbps 时丢掉了强制要的关键帧）：要求还没满足，下一帧接着要；否则接收端一直等不到关键帧。
         if asked && data.is_empty() && !self.force_key {
@@ -818,17 +885,36 @@ impl H264Encoder {
     /// 准备硬件编码器：没打开或尺寸变了就（重新）打开。返回 `None` 表示不用硬件，否则是否刚打开。
     fn hardware_ready(&mut self, w: usize, h: usize, bps: u64) -> Option<bool> {
         if self.hw_off {
-            return None;
+            // 运行中出过错：到时间了再试一次（打不开、每帧都是关键帧的不试，那不是一时的毛病）
+            match self.hw_retry_at {
+                Some(at) if std::time::Instant::now() >= at => {
+                    self.hw_retry_at = None;
+                    self.hw_off = false;
+                    log::info!(
+                        "视频编码：再试一次硬件编码（之前出错 {} 次）",
+                        self.hw_failures
+                    );
+                }
+                Some(_) | None => return None,
+            }
         }
         let size = (u32::try_from(w).unwrap_or(0), u32::try_from(h).unwrap_or(0));
+        // 码率不能低到放不下一帧（见 HW_FRAME_FLOOR_PIXELS_PER_BYTE）
+        let bps = self.hw_bps(bps, w, h);
         let reopen = self.hw.as_ref().is_none_or(|e| e.size() != size);
         if reopen {
             self.hw = None;
             self.hw_sent.clear();
+            // 学到的下限是这个尺寸的，换了尺寸重新学
+            self.hw_floor = 0;
             match (self.hw_open)(size.0, size.1, self.fps, bps) {
                 Ok(e) => {
                     log::info!("视频编码：硬件 {}（{}×{}）", e.name(), size.0, size.1);
                     self.hw = Some(e);
+                    self.soft_reason = None;
+                    if self.key_reason.is_empty() && self.hw_failures > 0 {
+                        self.key_reason = "再试硬件编码";
+                    }
                 }
                 Err(why) => {
                     log::info!("视频编码：软件 OpenH264（不用硬件编码：{why}）");
@@ -875,6 +961,8 @@ impl H264Encoder {
         let Some(reopen) = self.hardware_ready(w, h, bps) else {
             return Hw::Off;
         };
+        let bps = self.hw_bps(bps, w, h);
+        self.hw_last_bps = bps;
         let packing = std::time::Instant::now();
         color::i420_to_nv12(
             &self.planes.0,
@@ -902,6 +990,8 @@ impl H264Encoder {
         let Some(reopen) = self.hardware_ready(usize::from(w), usize::from(h), bps) else {
             return Ok(Hw::Off);
         };
+        let bps = self.hw_bps(bps, usize::from(w), usize::from(h));
+        self.hw_last_bps = bps;
         let force_key = self.force_key || reopen;
         let handle = frame.handle();
         let direct = self.hw.as_ref().is_some_and(|e| e.accepts(&handle));
@@ -912,6 +1002,8 @@ impl H264Encoder {
         } else {
             let reading = std::time::Instant::now();
             let nv12 = frame.read_nv12()?;
+            // 读回是在等显卡（和它的锁），不是 CPU 在算：单独记，CPU 过载的判断不算它
+            self.timing.wait_us = self.timing.wait_us.saturating_add(micros_since(reading));
             self.convert_us = self.convert_us.saturating_add(micros_since(reading));
             self.hw
                 .as_mut()
@@ -1029,6 +1121,8 @@ impl H264Encoder {
             // 软件编码：显卡画面读回一次（只拷贝、拆平面，不转颜色、不缩放）
             let reading = std::time::Instant::now();
             let nv12 = frame.read_nv12()?;
+            // 读回是在等显卡（和它的锁），不是 CPU 在算；后面拆平面才是 CPU 的活
+            self.timing.wait_us = self.timing.wait_us.saturating_add(micros_since(reading));
             color::nv12_to_i420(
                 nv12.data(),
                 w,
@@ -1270,6 +1364,17 @@ impl H264Encoder {
             .saturating_mul(u64::from(self.fps))
             .clamp(MIN_BPS, self.max_bps)
     }
+}
+
+/// 硬件编码器在这个尺寸下的码率下限：码控窗口里至少放得下一帧（见 [`HW_FRAME_FLOOR_PIXELS_PER_BYTE`]）。
+fn hw_floor_bps(w: usize, h: usize) -> u64 {
+    let pixels = u64::try_from(w.saturating_mul(h)).unwrap_or(u64::MAX);
+    let frame_bytes = pixels / HW_FRAME_FLOOR_PIXELS_PER_BYTE;
+    frame_bytes
+        .saturating_mul(8)
+        .saturating_mul(1_000_000)
+        .checked_div(BIG_FRAME_US)
+        .unwrap_or(0)
 }
 
 /// openh264 每层固定 QP 的默认值（`SVC_QUALITY_BASE_QP`）：新开的编码器第一帧就是按它编的。
@@ -1966,6 +2071,158 @@ mod tests {
         Arc::new(TestGpuFrame::new(Nv12::new(w, h, nv12).unwrap()))
     }
 
+    /// 回归（2026-11-27 Windows 局域网日志，`P-fps-bitrate.md` W1）：硬件编码器运行中出错改用软件之后，过一阵再试硬件；
+    /// 每次换编码器从关键帧开始，接收端一路都解得出；出错次数多了就一直用软件。
+    #[test]
+    fn hardware_is_tried_again_after_a_failure_and_given_up_after_a_few() {
+        let mut enc = H264Encoder::new(30).with_hardware(fake_failing);
+        // 默认隔 30 秒才再试：出错后紧接着的帧还是软件
+        let mut dec = H264Decoder::new().unwrap();
+        let mut id = 0u32;
+        let mut next = |enc: &mut H264Encoder, dec: &mut H264Decoder| {
+            id += 1;
+            let f = enc
+                .encode(id, &picture(320, 192), true, 5000)
+                .unwrap()
+                .unwrap();
+            decode(dec, &f).unwrap();
+            (f.key, enc.timing().hardware)
+        };
+        assert_eq!(next(&mut enc, &mut dec), (true, true));
+        assert_eq!(next(&mut enc, &mut dec), (false, true));
+        assert_eq!(
+            next(&mut enc, &mut dec),
+            (true, false),
+            "第 3 帧出错，软件从关键帧开始"
+        );
+        assert_eq!(next(&mut enc, &mut dec), (false, false), "没到时间，不试");
+        assert!(enc.backend_name().starts_with("软件 OpenH264（硬件出错"));
+        // 到时间了（测试里把间隔改成 0）：再试硬件，从关键帧开始
+        enc.hw_retry_after = std::time::Duration::ZERO;
+        enc.hw_retry_at = Some(std::time::Instant::now());
+        assert_eq!(next(&mut enc, &mut dec), (true, true));
+        assert_eq!(enc.timing().key_reason, "再试硬件编码");
+        assert_eq!(enc.backend_name(), "硬件 假硬件");
+        assert_eq!(next(&mut enc, &mut dec), (false, true));
+        // 假硬件每次打开后的第 3 帧都出错：第 2、3、4 次出错
+        for failures in 2..=4u32 {
+            assert_eq!(
+                next(&mut enc, &mut dec),
+                (true, false),
+                "第 {failures} 次出错"
+            );
+            assert_eq!(enc.hw_failures, failures);
+            if failures <= HW_RETRY_MAX {
+                assert_eq!(next(&mut enc, &mut dec), (true, true), "再试");
+                assert_eq!(next(&mut enc, &mut dec), (false, true));
+            }
+        }
+        // 出错 4 次（再试了 3 次）：这场会话一直用软件
+        assert!(enc.hw_retry_at.is_none());
+        for _ in 0..3 {
+            assert_eq!(next(&mut enc, &mut dec), (false, false));
+        }
+    }
+
+    /// 回归（2026-11-27 Mac 日志，`P-fps-bitrate.md` M2）：码率低到硬件编码器的码控放不下一帧时，它把帧整个丢掉；
+    /// 不能一直丢下去——每丢一次把给它的码率下限翻倍，几帧之内一定出帧；丢的那几帧告诉发送端“是预算不够”。
+    #[test]
+    fn a_hardware_encoder_that_drops_frames_for_lack_of_bitrate_is_given_more() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static LAST_BPS: AtomicU64 = AtomicU64::new(0);
+        /// 码率不到 1 Mbps 就把帧丢掉的硬件编码器（像 VideoToolbox 带 100 ms 的 DataRateLimits）。
+        #[derive(Debug)]
+        struct Starved(FakeHw);
+        impl HardwareEncoder for Starved {
+            fn name(&self) -> &str {
+                "码率不够就丢帧"
+            }
+            fn size(&self) -> (u32, u32) {
+                self.0.size
+            }
+            fn encode(
+                &mut self,
+                nv12: &[u8],
+                bps: u64,
+                force_key: bool,
+            ) -> Result<Option<(Vec<u8>, bool)>, String> {
+                LAST_BPS.store(bps, Ordering::Relaxed);
+                if bps < 1_000_000 {
+                    return Ok(Some((Vec::new(), false)));
+                }
+                // 之前要的关键帧都被丢了：出帧的这一次必须还带着关键帧要求（假硬件的第一帧会检查）
+                self.0.encode(nv12, bps, force_key)
+            }
+        }
+        fn starved(w: u32, h: u32, fps: u32, _: u64) -> Result<Box<dyn HardwareEncoder>, String> {
+            Ok(Box::new(Starved(FakeHw {
+                size: (w, h),
+                frames: 0,
+                fail_at: 0,
+                soft: H264Encoder::new(fps).with_hardware(fake_none),
+                always_key: false,
+                hold_back: false,
+                held: None,
+                ready: None,
+                poll_error: false,
+                drop_keys: 0,
+            })))
+        }
+        let mut enc = H264Encoder::new(30).with_hardware(starved);
+        let screen = picture(64, 64);
+        // 预算 100 字节一帧：24 kbps，按下限是 64 kbps。64 → 128 → 256 → 512 kbps 都被丢，1024 kbps 出帧
+        let mut seen = Vec::new();
+        let mut out = None;
+        for id in 1..=8 {
+            let f = enc.encode(id, &screen, true, 100).unwrap();
+            seen.push((LAST_BPS.load(Ordering::Relaxed), enc.timing().dropped));
+            if f.is_some() {
+                out = f;
+                break;
+            }
+            assert!(enc.wants_refine(), "丢了的帧还要接着编");
+        }
+        assert_eq!(
+            seen,
+            [
+                (64_000, true),
+                (128_000, true),
+                (256_000, true),
+                (512_000, true),
+                (1_024_000, false)
+            ]
+        );
+        assert!(out.unwrap().key);
+        assert!(enc.timing().hardware, "不因为丢帧换软件");
+        // 学到的下限留着：之后预算再小也不低于它
+        assert!(enc.encode(9, &screen, true, 100).unwrap().is_some());
+        assert_eq!(LAST_BPS.load(Ordering::Relaxed), 1_024_000);
+        // 按尺寸算的下限：码控的 100 ms 窗口里放得下 0.02 比特每像素的一帧
+        assert_eq!(hw_floor_bps(2880, 1800), 1_036_800);
+        assert_eq!(hw_floor_bps(1920, 1080), 414_720);
+        assert_eq!(hw_floor_bps(0, 0), 0);
+    }
+
+    /// 读回显卡画面的时间单独记（等显卡，不是 CPU 在算）；CPU 上转换的画面没有这一项。
+    #[test]
+    fn gpu_readback_time_is_reported_separately_from_cpu_work() {
+        let mut enc = H264Encoder::new(30).with_hardware(fake_none);
+        let frame = Frame::Gpu(gpu_frame(320, 192));
+        enc.encode_frame(1, &frame, true, 50_000).unwrap().unwrap();
+        let t = enc.timing();
+        assert!(t.wait_us <= t.convert_us, "读回包含在转换里：{t:?}");
+        assert!(!t.dropped);
+        enc.encode(2, &picture(320, 192), true, 50_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(enc.timing().wait_us, 0, "CPU 画面没有读回");
+        // 硬件编码器不认这个句柄：读回一次再交，也记在等待里
+        let mut hw = H264Encoder::new(30).with_hardware(fake_ok);
+        hw.encode_frame(1, &frame, true, 50_000).unwrap().unwrap();
+        let t = hw.timing();
+        assert!(t.hardware && t.wait_us <= t.convert_us, "{t:?}");
+    }
+
     /// 显卡画面 + 软件编码：读回一次 NV12（只拷贝、拆平面，不转颜色、不缩放），尺寸就是画面的尺寸
     /// （采集端已经按编码尺寸采好，比例和窗口不再管）；画面没变不读；读不出来报错。
     #[test]
@@ -2409,6 +2666,41 @@ mod tests {
             }
             Err(why) => assert!(!why.is_empty()),
         }
+    }
+
+    /// Windows 实机回归（2026-11-27 两台 Intel 核显的日志，`P-fps-bitrate.md` W1）：画面静止超过卡住的时限（2 秒）
+    /// 之后再交帧，硬件编码器不能被判成“没有响应”。没有硬件编码器的机器（CI 的虚拟机）什么都不测。
+    #[cfg(windows)]
+    #[test]
+    fn windows_hardware_encoder_survives_a_pause_longer_than_the_stall_limit() {
+        let Ok(mut hw) = open_system_hardware(640, 360, 30, 2_000_000) else {
+            return;
+        };
+        let screen = picture(640, 360);
+        let (mut y, mut u, mut v, mut nv12) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let (w, _, pixels) = even_pixels(&screen);
+        color::rgb_to_i420(&pixels, w, &mut y, &mut u, &mut v);
+        color::i420_to_nv12(&y, &u, &v, &mut nv12);
+        let mut got = 0usize;
+        // 三轮之间各静止 2.5 秒、其间不碰编码器：第一次停之前不排空，第二次像会话里一样先把攒着的帧取走
+        for round in 0..3 {
+            for i in 0..5 {
+                let out = hw
+                    .encode(&nv12, 2_000_000, round == 0 && i == 0)
+                    .map_err(|e| format!("第 {round} 轮第 {i} 帧：{e}"));
+                got += usize::from(out.unwrap().is_some());
+            }
+            if round == 1 {
+                hw.drain().unwrap();
+                while hw.poll().unwrap().is_some() {
+                    got += 1;
+                }
+            }
+            if round < 2 {
+                std::thread::sleep(std::time::Duration::from_millis(2_500));
+            }
+        }
+        assert!(got > 0, "编码器一帧都没交出");
     }
 
     /// Windows 实机：真的调 Media Foundation。有硬件编码器就编几帧并用 OpenH264 解出来（验证是 Baseline、

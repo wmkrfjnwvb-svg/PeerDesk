@@ -29,6 +29,39 @@ const POLL: Duration = Duration::from_millis(100);
 const RETRY_MIN: Duration = Duration::from_millis(100);
 const RETRY_MAX: Duration = Duration::from_secs(2);
 
+/// 等画面变化时，每隔这么久问系统一次（问的那一下不等）。
+///
+/// 为什么不让系统自己等：Windows 桌面复制的 `AcquireNextFrame` 在等的整段时间里都拿着显卡设备的锁，而且这把锁不公平
+/// （Sunshine `src/platform/windows/display_base.cpp` 的注释：“held the entire time that AcquireNextFrame() is running…
+/// we can monopolize it while the encoding thread is starved”）。画面静止时采集线程几乎一直在等，编码线程读回显卡画面
+/// 的每一步都要排在它后面：2026-11-27 两台 Intel 核显的日志里，读回一帧 200–390 ms（画面一直在变时只要 20–50 ms），
+/// 软件编码因此只有每秒 4–5 帧（`docs/research/P-fps-bitrate.md` W2）。
+/// 做法和 WebRTC 的桌面采集一样（`AcquireNextFrame` 超时给 0），等待放在锁外面；Sunshine 在帧间隔里也是不带超时地问。
+/// 2 ms：发现新画面最多晚 2 ms（一帧 16.7 ms 的八分之一），每秒最多醒 500 次，几乎不占 CPU。
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) const ASK_EVERY: Duration = Duration::from_millis(2);
+
+/// 不让系统拿着锁等：反复“问一次（不等）→ 没有就睡 `every`”，直到问到了或过了 `timeout`。
+/// `ask` 返回 `Some` 表示有结果（新画面，或者出错），`None` 表示现在还没有。至少问一次。
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn ask_until<T>(
+    timeout: Duration,
+    every: Duration,
+    mut ask: impl FnMut() -> Option<T>,
+) -> Option<T> {
+    let started = Instant::now();
+    loop {
+        if let Some(got) = ask() {
+            return Some(got);
+        }
+        let left = timeout.saturating_sub(started.elapsed());
+        if left.is_zero() {
+            return None;
+        }
+        std::thread::sleep(every.min(left));
+    }
+}
+
 /// 各系统的画面读取器。只在采集线程上创建和使用，不需要 `Send`。
 pub(crate) trait Grabber {
     /// 等待画面变化，最多 `timeout`。返回 `true` 表示画面（可能）变了，接着会调用 [`Grabber::grab`]。
@@ -746,5 +779,40 @@ mod tests {
         assert_eq!(retry_delay(2), RETRY_MIN * 2);
         assert_eq!(retry_delay(100), RETRY_MAX);
         assert_eq!(CaptureStats::default().mean_grab(), Duration::ZERO);
+    }
+
+    /// 回归（2026-11-27 Windows 局域网日志）：等画面变化时不拿着锁等，而是隔一会儿问一次；
+    /// 画面一来马上返回，一直没有就到时间为止，时间给 0 也问一次。
+    #[test]
+    fn waiting_for_a_change_asks_repeatedly_instead_of_blocking() {
+        // 第 3 次问到了
+        let mut asked = 0;
+        let got = ask_until(Duration::from_secs(5), Duration::from_millis(1), || {
+            asked += 1;
+            (asked == 3).then_some("新画面")
+        });
+        assert_eq!((got, asked), (Some("新画面"), 3));
+        // 一直没有：到时间返回，中间问了不止一次，也没有死等
+        let mut asked = 0;
+        let started = Instant::now();
+        let got: Option<()> =
+            ask_until(Duration::from_millis(30), Duration::from_millis(2), || {
+                asked += 1;
+                None
+            });
+        assert!(got.is_none() && asked >= 2, "{asked}");
+        let took = started.elapsed();
+        assert!(
+            took >= Duration::from_millis(30) && took < Duration::from_secs(2),
+            "{took:?}"
+        );
+        // 时间给 0：只问一次
+        let mut asked = 0;
+        let got: Option<()> = ask_until(Duration::ZERO, ASK_EVERY, || {
+            asked += 1;
+            None
+        });
+        assert!(got.is_none());
+        assert_eq!(asked, 1);
     }
 }

@@ -252,6 +252,34 @@ mod tests {
         assert_eq!(g.overflowing_for(t.plus(500_000)), 0);
     }
 
+    /// 回归（2026-11-27 Windows 局域网日志，`P-fps-bitrate.md` W2）：软件编码一帧 18 ms，但读回显卡画面要等锁 200 ms，
+    /// 每秒 4.5 帧。整个任务的时间算进去是“编码占用 98%”，帧率 60 → 30 → 20；只算 CPU 在忙的时间是 8%，不该降。
+    #[test]
+    fn waiting_for_the_gpu_is_not_cpu_overuse() {
+        use crate::video::EncodeTiming;
+        let timing = EncodeTiming {
+            wait_us: 200_000,
+            ..EncodeTiming::default()
+        };
+        let took = 218_000u64;
+        assert_eq!(timing.busy_us(took), 18_000);
+        assert_eq!(EncodeTiming::default().busy_us(took), took);
+        assert_eq!(timing.busy_us(1_000), 0, "等待比总时间长（计时误差）不下溢");
+        let run = |encode_us: u64| {
+            let mut g = FpsGovernor::new(60);
+            let mut t = Time::ZERO;
+            for _ in 0..90 {
+                g.on_start(t);
+                t = t.plus(222_000);
+                g.on_frame(t, encode_us, false, 1_000, 10_000);
+            }
+            (g.fps(), g.take_change())
+        };
+        let (fps, why) = run(took);
+        assert!(fps < 60 && why.is_some_and(|w| w.contains("CPU 跟不上")));
+        assert_eq!(run(timing.busy_us(took)), (60, None));
+    }
+
     #[test]
     fn frame_interval_counts_from_when_the_frame_started() {
         // 30 帧（33 ms 一拍），编一帧 15 ms：下一拍离开始 33 ms、离编完只有 18 ms，照样该编

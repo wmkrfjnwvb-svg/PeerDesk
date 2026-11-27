@@ -590,7 +590,11 @@ pub async fn serve(
                     Some(done) => done,
                     None => break "编码线程结束".to_owned(),
                 };
-                media.set_encode_time(took, timing.hardware);
+                // CPU 跟不上的判断只算在算的时间：等显卡读回（和它的锁）的时间扣掉
+                media.set_encode_time(timing.busy_us(took), timing.hardware);
+                if timing.dropped {
+                    media.encoder_dropped(link.now());
+                }
                 last_encode_us = took;
                 window = (window.0.saturating_add(took), window.1.saturating_add(convert), window.2 + 1);
                 encode_window.add(took, &timing, result.as_ref().ok().and_then(|(e, _)| e.as_ref()).map(|e| e.payload.len()));

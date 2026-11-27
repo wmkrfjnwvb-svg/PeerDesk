@@ -1189,7 +1189,8 @@ impl MediaSender {
     }
 
     /// 编码线程报告这一帧编了多久（微秒）、是不是硬件编码（流水线的，CPU 过载门限放宽），
-    /// 在 [`Self::finish_frame`] 之前调用。
+    /// 在 [`Self::finish_frame`] 之前调用。只算在算的时间：等显卡读回、等锁的时间调用方要先扣掉
+    /// （[`crate::video::EncodeTiming::wait_us`]），那不是 CPU 跟不上。
     pub const fn set_encode_time(&mut self, us: u64, hardware: bool) {
         self.encode_us = us;
         self.encode_hw = hardware;
@@ -1269,6 +1270,13 @@ impl MediaSender {
         } else {
             SendLimit::Network(NetCause::UsingRate)
         }
+    }
+
+    /// 编码器把这一帧丢了（硬件码控：预算放不下一帧）。这是网络受限——有画面要发、是码率不让发——
+    /// 不能等 500 ms 没发东西就判成应用受限：应用受限不升码率，画面会一直停着
+    /// （2026-11-27 用户日志，Mac：码率 344 kbps、编码器每秒丢 30–50 帧，停了 8 秒，`P-fps-bitrate.md` M2）。
+    pub fn encoder_dropped(&mut self, now: Time) {
+        self.net_event(now, NetCause::EncoderDropped);
     }
 
     /// 采集到的画面变了（编码器在别的线程时由会话循环调用；[`Self::on_frame`] 自己会调）。
@@ -2430,6 +2438,47 @@ mod tests {
         assert!(
             events.iter().any(|e| e.contains("降分辨率是最后手段")),
             "{events:?}"
+        );
+    }
+
+    /// 回归（2026-11-27 Mac 日志，`P-fps-bitrate.md` M2）：硬件编码器因为预算放不下把帧丢了，发送端什么都没发出去；
+    /// 这是网络受限，不能判成应用受限（应用受限不升码率，画面一直停着）。
+    #[test]
+    fn frames_dropped_by_the_encoder_for_lack_of_budget_are_network_limited() {
+        use crate::estimator::RateState;
+        let screen = Screen::new(64, 64, 1);
+        let acked = |id: u32| Feedback {
+            floor: id,
+            delivered: 1,
+            ..Feedback::default()
+        };
+        let mut tx = MediaSender::new(cfg(), Box::new(FakeEncoder::default()));
+        tx.scale = ScalePolicy::full();
+        let _ = tx.on_frame(Time(0), &screen, true, 10_000).unwrap();
+        tx.observe(Time(50_000), &acked(1), Extension::default());
+        // 600 ms 没有任何原因、也没发东西：应用受限
+        let mut t = 50_000;
+        while t < 700_000 {
+            t += 25_000;
+            tx.on_tick(Time(t));
+        }
+        tx.observe(Time(t), &acked(1), Extension::default());
+        assert_eq!(tx.rate_state(), RateState::AppLimited);
+        // 编码器丢帧：马上回跟踪，原因写进日志；之后 500 ms 内的反馈都算网络受限
+        tx.encoder_dropped(Time(t + 10_000));
+        assert_eq!(
+            tx.net_limited,
+            Some((Time(t + 10_000), NetCause::EncoderDropped))
+        );
+        assert_eq!(tx.rate_state(), RateState::Tracking);
+        assert!(tx
+            .take_events()
+            .join("\n")
+            .contains("应用受限 → 跟踪：网络受限：编码器因为预算放不下把帧丢了"),);
+        tx.observe(Time(t + 300_000), &acked(1), Extension::default());
+        assert_eq!(
+            tx.last_observation().unwrap().limit,
+            SendLimit::Network(NetCause::EncoderDropped)
         );
     }
 

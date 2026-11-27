@@ -521,11 +521,24 @@ impl Grabber for DxgiGrabber {
         }
         let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
         let mut resource: Option<IDXGIResource> = None;
-        // 第一帧不等太久：DXGI 没有现成的画面就改用 GDI
-        let ms = if self.first { 50 } else { timeout.as_millis() };
-        let ms = u32::try_from(ms).unwrap_or(u32::MAX);
-        // SAFETY: 两个输出参数都指向局部变量；成功后必须 ReleaseFrame（见下面）。
-        let acquired = unsafe { self.dup.AcquireNextFrame(ms, &mut info, &mut resource) };
+        // 第一帧让系统等 50 ms（DXGI 没有现成的画面就改用 GDI；这时还没有编码线程来抢锁）。
+        // 之后不让系统等：AcquireNextFrame 等的时候一直拿着显卡设备的锁，编码线程读回画面会被饿住，
+        // 所以每次问一下（超时 0），没有就在锁外面睡一小会儿再问（见 capture::ASK_EVERY 的说明）。
+        let first = self.first;
+        let dup = &self.dup;
+        let mut ask = |ms: u32| {
+            // SAFETY: 两个输出参数都指向局部变量；成功后必须 ReleaseFrame（见下面）。
+            unsafe { dup.AcquireNextFrame(ms, &mut info, &mut resource) }
+        };
+        let acquired = if first {
+            ask(50)
+        } else {
+            crate::capture::ask_until(timeout, crate::capture::ASK_EVERY, || match ask(0) {
+                Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => None,
+                other => Some(other),
+            })
+            .unwrap_or_else(|| Err(DXGI_ERROR_WAIT_TIMEOUT.into()))
+        };
         if let Err(e) = acquired {
             if e.code() == DXGI_ERROR_WAIT_TIMEOUT {
                 if self.first {
