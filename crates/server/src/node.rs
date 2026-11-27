@@ -11,7 +11,9 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use peerdesk_core::billing::{issue, month_of};
+use peerdesk_core::billing::{
+    account_hex, issue, issue_enroll, month_of, parse_account, ENROLL_MAX_DAYS,
+};
 use peerdesk_core::cluster::{self, Cluster, ClusterConfig, ClusterMsg, NodeInfo};
 use peerdesk_core::config::{ServerConfig, SignalConfig};
 use peerdesk_core::crypto::Policy;
@@ -19,7 +21,7 @@ use peerdesk_core::region::NodeId;
 use peerdesk_core::relay::FreePolicy;
 use peerdesk_core::{Error, Time};
 use peerdesk_net::identity::to_hex;
-use peerdesk_net::service::{Directory, RelayOptions, RelayService, SignalService};
+use peerdesk_net::service::{Accounts, Directory, RelayOptions, RelayService, SignalService};
 use peerdesk_net::{Fingerprint, Identity, NetError};
 
 use crate::accounting::{hex, Accounting, ClusterDirectory};
@@ -70,6 +72,7 @@ impl Services {
         policy: &Policy,
         options: RelayOptions,
         directory: ClusterDirectory,
+        accounts: Accounts,
     ) -> Result<Self, Error> {
         let fail = |e: NetError| Error::Config(format!("启动信令服务失败：{e}"));
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -90,11 +93,12 @@ impl Services {
                 let addr = node.local_addr()?;
                 let directory: Arc<dyn Directory> = Arc::new(directory);
                 Ok::<_, NetError>((
-                    SignalService::start_with_directory(
+                    SignalService::start_with_accounts(
                         node,
                         relay.clone(),
                         directory,
                         Some(cfg.data_dir.join("device-codes.txt")),
+                        Some(accounts),
                     ),
                     relay,
                     addr,
@@ -268,6 +272,33 @@ impl Api for Shared {
                 Ok(format!(
                     "{{\"account\":\"{}\",\"token\":{}}}",
                     hex(&id),
+                    crate::json::string(&token)
+                ))
+            }
+            Admin::IssueEnroll { account, days } => {
+                let id = parse_account(&account)
+                    .ok_or((400, "account 应为 16 位十六进制的账户号".to_owned()))?;
+                if days == 0 || days > ENROLL_MAX_DAYS {
+                    return Err((400, format!("days 应在 1 到 {ENROLL_MAX_DAYS} 之间")));
+                }
+                let mut nonce = [0u8; 4];
+                {
+                    use ring::rand::SecureRandom;
+                    ring::rand::SystemRandom::new()
+                        .fill(&mut nonce)
+                        .map_err(|_| (500, "取随机数失败".to_owned()))?;
+                }
+                let expires_s = (wall_ms() / 1000).saturating_add(days.saturating_mul(86_400));
+                let token =
+                    issue_enroll(&self.billing_key, id, expires_s, u32::from_be_bytes(nonce));
+                peerdesk_net::note!(
+                    info,
+                    "管理中心：给账户 {} 签发入表令牌，{days} 天有效",
+                    account_hex(&id)
+                );
+                Ok(format!(
+                    "{{\"account\":\"{}\",\"enroll_token\":{},\"expires\":{expires_s}}}",
+                    account_hex(&id),
                     crate::json::string(&token)
                 ))
             }
@@ -508,7 +539,23 @@ impl Node {
         };
         let services = cfg
             .signal()?
-            .map(|signal| Services::start(&signal, &policy, options, directory))
+            .map(|signal| {
+                // 账户设备表存在信令的数据目录里；入表令牌用计费密钥验证（集群共用）
+                let dir = signal.data_dir.join("devices");
+                let (store, skipped) =
+                    crate::devices::FileDeviceStore::open(&dir, wall_ms() / 1000);
+                peerdesk_net::note!(
+                    info,
+                    "账户设备表 {}：{} 个账户，跳过 {skipped} 行",
+                    dir.display(),
+                    store.counts().len()
+                );
+                let accounts = Accounts {
+                    store: Arc::new(store),
+                    key: billing_key.clone(),
+                };
+                Services::start(&signal, &policy, options, directory, accounts)
+            })
             .transpose()?;
         if let Some(services) = &services {
             let info = services.info;

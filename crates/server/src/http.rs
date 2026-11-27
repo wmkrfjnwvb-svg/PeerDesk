@@ -213,6 +213,13 @@ pub enum Admin {
     AddPeer(String),
     /// 签发一个会员令牌，每月中继额度（GB，0 表示不限）。
     IssueAccount(u64),
+    /// 给账户签发一枚入表令牌（设备拿它加入账户的设备表）：账户号（16 位十六进制）、有效天数。
+    IssueEnroll {
+        /// 账户号。
+        account: String,
+        /// 有效天数。
+        days: u64,
+    },
 }
 
 fn error_json(message: &str) -> String {
@@ -245,6 +252,25 @@ pub fn respond(
                     request,
                     addr.map(|a| Admin::AddPeer(a.to_owned()))
                         .ok_or("缺少 addr"),
+                )
+            }
+            "/api/enroll-tokens" => {
+                let account = json_field(&request.body, "account").filter(|a| !a.is_empty());
+                // 不写天数用默认的 7 天；写了就必须是整数
+                let days = match json_field(&request.body, "days") {
+                    None => Some(peerdesk_core::billing::ENROLL_DEFAULT_DAYS),
+                    Some(d) => d.parse().ok(),
+                };
+                admin(
+                    api,
+                    request,
+                    account
+                        .zip(days)
+                        .map(|(account, days)| Admin::IssueEnroll {
+                            account: account.to_owned(),
+                            days,
+                        })
+                        .ok_or("要有 account（账户号），days（有效天数）应为整数"),
                 )
             }
             "/api/accounts" => {
@@ -386,6 +412,20 @@ mod tests {
         assert_eq!(post("/api/accounts", "{\"quota_gb\":\"x\"}").status, 400);
         assert_eq!(post("/api/peers", "{\"addr\":\"1.2.3.4:9\"}").status, 403);
         assert_eq!(post("/api/accounts", "{\"quota_gb\":5}").status, 403);
+        // 入表令牌：缺账户号、天数不是整数是 400；参数对了才轮到权限检查
+        assert_eq!(post("/api/enroll-tokens", "{}").status, 400);
+        assert_eq!(
+            post("/api/enroll-tokens", "{\"account\":\"00\",\"days\":\"x\"}").status,
+            400
+        );
+        assert_eq!(
+            post("/api/enroll-tokens", "{\"account\":\"00\"}").status,
+            403
+        );
+        assert_eq!(
+            post("/api/enroll-tokens", "{\"account\":\"00\",\"days\":30}").status,
+            403
+        );
         assert_eq!(post("/api/nope", "").status, 405);
         let request = parse_request("PUT / HTTP/1.1\r\n\r\n").unwrap();
         assert_eq!(respond(&request, &Fake, ASSETS).status, 405);

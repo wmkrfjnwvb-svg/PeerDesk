@@ -682,11 +682,12 @@ async fn host_reports_the_port_its_router_mapped() {
 #[tokio::test]
 async fn the_server_tells_clients_which_features_it_has() {
     let w = world(false).await;
+    // 这台服务器没开账户设备表：两种问法都说“什么新功能都没有”（开了的见 tests/devices.rs）
     let registration = register(&w.host, &w.server).await.unwrap();
-    assert_eq!(registration.features, Features::SERVER);
+    assert_eq!(registration.features, Features::NONE);
     assert_eq!(
         server_features(&w.ctrl, &w.server).await.unwrap(),
-        Features::SERVER
+        Features::NONE
     );
     // 问完之后被控端的登记还在
     assert_eq!(w.signal.online(), 1);
