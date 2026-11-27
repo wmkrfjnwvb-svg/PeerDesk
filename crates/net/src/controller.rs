@@ -10,6 +10,7 @@ use peerdesk_core::frame::Picture;
 use peerdesk_core::input::{InputEvent, InputSender};
 use peerdesk_core::media::{DecodeJob, DecodeWorker, MediaReceiver};
 use peerdesk_core::proto::{Caps, Channel, Control, RejectReason};
+use peerdesk_core::record::ViewResult;
 use peerdesk_core::screen::Screen;
 use peerdesk_core::session::{Session, SessionConfig, State};
 use peerdesk_core::trace::{Stage, TraceId, Tracer};
@@ -19,7 +20,9 @@ use tokio::time::MissedTickBehavior;
 
 use crate::files::{send_files, FileResult};
 use crate::host::{control_reader, HELLO_TIMEOUT};
+use crate::host_record::{end_reason, wall_now_us};
 use crate::stream::{read_control, write_control, write_kind, StreamKind};
+use crate::view_record::{view_frame, ViewJournal, ViewParams};
 use crate::{Fingerprint, Link, NetError};
 
 /// 输入包的重发间隔：有未确认的事件时按这个间隔重发。
@@ -68,6 +71,8 @@ pub struct ControllerOptions {
     /// 显示画面的区域（像素，0×0 表示不限）：变了就告诉被控端，被控端按这个大小编码。
     /// 对方不支持（老版本）时不发。
     pub view: Option<tokio::sync::watch::Receiver<(u16, u16)>>,
+    /// 会话记录（见 [`crate::recorder`]）：`None` 表示不记录。打不开时写日志说明原因，会话照常进行。
+    pub record: Option<crate::recorder::ViewRecordSetup>,
 }
 
 /// 交出连接的回调（见 [`ControllerOptions::on_link`]）。
@@ -437,6 +442,22 @@ pub async fn run(
     let session_start = link.now();
     let mut first_frame: Option<u64> = None;
     let mut max_gap_us = 0u64;
+    // 会话记录：握手完成、循环开始时打开（见 crate::view_record）。`failed` 是本端自己出的错，
+    // `silent` 是对端太久没有任何数据（还没等到连接层报断开），一起决定结束原因。
+    let mut journal = opts.record.as_ref().and_then(|setup| {
+        let params = ViewParams {
+            session_id: link.session_id().ok(),
+            caps: caps.0,
+            codec: if caps.common(Caps::H264) == Caps::H264 {
+                "h264"
+            } else {
+                "tile"
+            },
+            wall_start_us: wall_now_us(),
+        };
+        ViewJournal::open(setup, &params, link.now(), last_quic)
+    });
+    let (mut failed, mut silent) = (false, false);
 
     let end = loop {
         if time_up && upload_task.is_none() {
@@ -470,12 +491,28 @@ pub async fn run(
                     let presenting = std::time::Instant::now();
                     sink.present(&picture);
                     frame_log.shown(frame_id, crate::framelog::unix_us());
-                    window.present.add(u64::try_from(presenting.elapsed().as_micros()).unwrap_or(u64::MAX));
+                    let present_us = u64::try_from(presenting.elapsed().as_micros()).unwrap_or(u64::MAX);
+                    window.present.add(present_us);
+                    if let Some(j) = &journal {
+                        j.frame(now, view_frame(frame_id, ViewResult::Shown, took, present_us));
+                    }
                     last_picture = Some(picture);
                 }
-                Some((_, Ok(None), _)) => {}
-                Some((_, Err(_), _)) => media.decode_failed(),
-                None => break "解码线程结束".to_owned(),
+                Some((frame_id, Ok(None), took)) => {
+                    if let Some(j) = &journal {
+                        j.frame(link.now(), view_frame(frame_id, ViewResult::NoPicture, took, 0));
+                    }
+                }
+                Some((frame_id, Err(_), took)) => {
+                    media.decode_failed();
+                    if let Some(j) = &journal {
+                        j.frame(link.now(), view_frame(frame_id, ViewResult::DecodeFailed, took, 0));
+                    }
+                }
+                None => {
+                    failed = true;
+                    break "解码线程结束".to_owned();
+                }
             },
             result = async {
                 match upload_task.as_mut() {
@@ -566,7 +603,10 @@ pub async fn run(
                         video_since_feedback = video_since_feedback.saturating_add(1);
                         match media.on_datagram_deferred(now, header.send_time, header.seq, header.flags, &payload) {
                             Ok(jobs) => {
-                                if jobs.into_iter().any(|job| decode_jobs.send(job).is_err()) { break "解码线程结束".to_owned(); }
+                                if jobs.into_iter().any(|job| decode_jobs.send(job).is_err()) {
+                                    failed = true;
+                                    break "解码线程结束".to_owned();
+                                }
                             }
                             Err(_) => bad_datagrams = bad_datagrams.saturating_add(1),
                         }
@@ -662,6 +702,9 @@ pub async fn run(
                         host: host_stats.clone(),
                     });
                 }
+                if let Some(j) = journal.as_mut() {
+                    j.second(now, quic, input_sent, &window.reactions);
+                }
                 window = StatsWindow {
                     bytes: stats.video_bytes,
                     expired: reassembly.expired,
@@ -683,6 +726,7 @@ pub async fn run(
                     last_received = received;
                     last_heard = now;
                 } else if now.since(last_heard) >= SILENCE_LOST_US {
+                    silent = true;
                     break format!("connection lost：{} 秒没有收到对端的数据", SILENCE_LOST_US / 1_000_000);
                 }
                 // 反馈：哪些帧到了、排队延迟、丢包率、接收速率。
@@ -729,6 +773,21 @@ pub async fn run(
         t.abort();
     }
     frame_log.flush();
+    // 会话记录收尾：最后不足一秒的汇总和结束记录；不等记录线程写完（它自己收尾、改名、清理）
+    if let Some(j) = journal.take() {
+        let reason = end_reason(
+            failed,
+            link.peer_quit(),
+            silent || link.lost_reason().is_some(),
+        );
+        drop(j.finish(
+            link.now(),
+            link.quic_stats(),
+            input_sent,
+            &window.reactions,
+            reason,
+        ));
+    }
 
     let bye = session.close(link.now(), &mut tracer);
     let _ = write_control(&mut ctrl_send, &bye).await;

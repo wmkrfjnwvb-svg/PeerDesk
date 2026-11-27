@@ -731,6 +731,7 @@ async fn connect_session(
     let report = controller::run(
         link,
         ControllerOptions {
+            record: None,
             session: session(identity, policy, args.auth.clone()),
             deadline_us: 100_000,
             duration: Some(Duration::from_secs(args.seconds)),

@@ -59,6 +59,8 @@ pub mod sidechannel;
 pub mod stream;
 mod tls;
 mod tls_verifier;
+#[cfg(feature = "media")]
+mod view_record;
 
 pub use error::NetError;
 pub use identity::{Fingerprint, Identity};

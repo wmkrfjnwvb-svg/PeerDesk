@@ -475,6 +475,7 @@ pub async fn serve(
     // 会话记录：握手完成、循环开始时打开（见 crate::host_record）。本端自己出的错记在 `failed` 里，决定结束原因。
     let mut journal = opts.record.as_ref().and_then(|setup| {
         let params = RecordParams {
+            session_id: link.session_id().ok(),
             caps: caps.0,
             codec: if codec == Codec::H264 { "h264" } else { "tile" },
             estimator: media.estimator(),

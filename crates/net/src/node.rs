@@ -531,6 +531,16 @@ impl Link {
         Ok(out)
     }
 
+    /// 会话号（会话记录用）：由这条连接的 TLS 密钥导出的 16 字节，两端相同，别的连接得不到，
+    /// 也不能反推出设备身份。走中继时中继只转发 UDP 包，两端仍是同一条 QUIC 连接，所以两端相同。
+    pub fn session_id(&self) -> Result<[u8; 16], NetError> {
+        let mut out = [0u8; 16];
+        self.conn
+            .export_keying_material(&mut out, b"peerdesk session record", b"")
+            .map_err(|_| NetError::Protocol("无法导出会话号"))?;
+        Ok(out)
+    }
+
     /// 这条连接在网络上实际发出和收到的字节数（含握手、保活、确认等一切开销）。
     #[must_use]
     pub fn wire_bytes(&self) -> (u64, u64) {

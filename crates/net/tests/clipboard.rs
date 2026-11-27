@@ -87,6 +87,7 @@ async fn session_with<F, Fut>(
     let ctrl = tokio::spawn(controller::run(
         ctrl_link,
         ControllerOptions {
+            record: None,
             session: session(&ctrl_id, Caps::CLIPBOARD.with(Caps::CLIPBOARD_FILES)),
             deadline_us: 200_000,
             duration: None,

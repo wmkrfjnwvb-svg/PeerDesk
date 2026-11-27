@@ -61,6 +61,27 @@ pub struct RecordSetup {
     pub commit: Option<String>,
 }
 
+/// 控制端的记录设置：在 [`RecordSetup`] 之外，带着访问号和“接着哪一份”。
+#[derive(Debug, Clone)]
+pub struct ViewRecordSetup {
+    /// 目录、保留策略、版本。
+    pub setup: RecordSetup,
+    /// 访问号：从用户点连接到最终断开不变，写进每份记录的文件头。
+    pub visit_id: [u8; 16],
+    /// 升级直连、断线重连产生的新会话，写上一份的会话号和原因；第一份为 `None`。
+    pub previous: Option<peerdesk_core::record::Previous>,
+}
+
+/// 新的访问号：16 字节随机数，控制端从用户点连接到最终断开用同一个。
+pub fn new_visit_id() -> io::Result<[u8; 16]> {
+    use ring::rand::SecureRandom;
+    let mut id = [0u8; 16];
+    ring::rand::SystemRandom::new()
+        .fill(&mut id)
+        .map_err(|_| io::Error::other("系统随机数不可用"))?;
+    Ok(id)
+}
+
 /// 一次清理的结果。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RetentionReport {
@@ -406,24 +427,33 @@ fn run(rx: &Receiver<Item>, mut writer: Writer, flush_every: Duration) -> Report
 }
 
 /// 会话线程这一侧的记录器。
+///
+/// 没有调用 [`Self::finish`] 就被丢掉（会话的 future 被取消：升级直连时丢掉旧连接、用户取消）时，
+/// 写一条原因为 [`EndReason::Cancelled`] 的结束记录，时间取最后放进来的那条记录的时间——
+/// 这样“本端放弃了这次会话”和“进程崩了或被杀”（没有结束记录）读回来是两回事。
 #[derive(Debug)]
 pub struct Recorder {
-    tx: SyncSender<Item>,
+    tx: Option<SyncSender<Item>>,
     shared: Arc<Shared>,
-    thread: JoinHandle<Report>,
+    thread: Option<JoinHandle<Report>>,
     /// 记录线程没了之后，又放了多少条（放不进去，只计数）。
     after_exit: std::sync::atomic::AtomicU64,
+    /// 放进来的记录里最大的时间（微秒）。
+    last_at: std::sync::atomic::AtomicU64,
 }
 
 /// 等记录线程收尾。会话结束时不用等（直接丢掉它，线程自己收尾）；测试和需要账的地方用 [`Self::wait`]。
 #[derive(Debug)]
-pub struct Finishing(JoinHandle<Report>);
+pub struct Finishing(Option<JoinHandle<Report>>);
 
 impl Finishing {
     /// 等记录线程写完、改名、清理，返回账。
     #[must_use]
     pub fn wait(self) -> Report {
-        self.0.join().unwrap_or_else(|_| {
+        let Some(thread) = self.0 else {
+            return Report::default();
+        };
+        thread.join().unwrap_or_else(|_| {
             crate::note!(warn, "会话记录：记录线程崩溃了");
             Report {
                 thread_crashed: true,
@@ -482,17 +512,25 @@ impl Recorder {
             .name("peerdesk-recorder".to_owned())
             .spawn(move || run(&rx, writer, flush_every))?;
         Ok(Self {
-            tx,
+            tx: Some(tx),
             shared,
-            thread,
+            thread: Some(thread),
             after_exit: std::sync::atomic::AtomicU64::new(0),
+            last_at: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
     /// 放一条记录。**永不阻塞**：队列满就丢掉并计数，记录线程没了也只计数。`at_us` 是本端单调时钟从会话开始算的微秒。
     pub fn record(&self, at_us: u64, record: Record) {
         let kind = record.kind();
-        match self.tx.try_send((at_us, record)) {
+        self.last_at
+            .fetch_max(at_us, std::sync::atomic::Ordering::Relaxed);
+        let Some(tx) = &self.tx else {
+            self.after_exit
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return;
+        };
+        match tx.try_send((at_us, record)) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => self.shared.note_drop(kind, at_us),
             Err(TrySendError::Disconnected(_)) => {
@@ -510,15 +548,28 @@ impl Recorder {
 
     /// 会话结束：交代结束时间（微秒，从会话开始算）和原因，关闭队列。不等记录线程写完。
     #[must_use]
-    pub fn finish(self, at_us: u64, reason: EndReason) -> Finishing {
+    pub fn finish(mut self, at_us: u64, reason: EndReason) -> Finishing {
         *self
             .shared
             .end
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some((at_us, reason));
-        let Self { tx, thread, .. } = self;
-        drop(tx);
-        Finishing(thread)
+        drop(self.tx.take());
+        Finishing(self.thread.take())
+    }
+}
+
+impl Drop for Recorder {
+    fn drop(&mut self) {
+        if self.tx.is_some() {
+            let at = self.last_at.load(std::sync::atomic::Ordering::Relaxed);
+            *self
+                .shared
+                .end
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some((at, EndReason::Cancelled));
+            drop(self.tx.take());
+        }
     }
 }
 
@@ -728,15 +779,49 @@ mod tests {
         let probe = Probe::default();
         let rec = start(&probe);
         rec.record(0, input(0));
-        let Recorder { tx, thread, .. } = rec;
-        drop(tx);
-        let report = Finishing(thread).wait();
+        let mut rec = rec;
+        drop(rec.tx.take());
+        let report = Finishing(rec.thread.take()).wait();
         assert!(!report.ended);
         assert_eq!(report.written[Kind::Retransmit.slot()], 1);
         assert_eq!(*probe.finished.lock().unwrap(), Some(false));
         let parsed = Recording::parse(&probe.bytes.lock().unwrap()).unwrap();
         assert_eq!(parsed.count(Kind::Retransmit), 1);
         assert!(parsed.end().is_none());
+    }
+
+    #[test]
+    fn a_cancelled_session_ends_with_a_cancelled_record_not_a_missing_one() {
+        let probe = Probe::default();
+        let rec = start(&probe);
+        rec.record(10, input(1));
+        rec.record(30, input(2));
+        let thread = rec.thread.as_ref().map(|t| t.thread().id());
+        assert!(thread.is_some());
+        drop(rec);
+        // 记录线程自己收尾：等它把结束记录写进去
+        let t0 = std::time::Instant::now();
+        let parsed = loop {
+            let parsed = Recording::parse(&probe.bytes.lock().unwrap()).unwrap();
+            if parsed.end().is_some() {
+                break parsed;
+            }
+            assert!(t0.elapsed() < Duration::from_secs(10), "没有写结束记录");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        let end = parsed.end().unwrap();
+        assert_eq!((end.reason, end.duration_us), (EndReason::Cancelled, 30));
+        assert_eq!(parsed.count(Kind::Retransmit), 2);
+    }
+
+    #[test]
+    fn recording_after_finish_only_counts() {
+        let probe = Probe::default();
+        let mut rec = start(&probe);
+        drop(rec.tx.take());
+        rec.record(1, input(1));
+        assert_eq!(rec.lost_after_thread_exit(), 1);
+        let _ = Finishing(rec.thread.take()).wait();
     }
 
     #[test]
@@ -747,9 +832,9 @@ mod tests {
         rec.shared.note_drop(Kind::Frame, 50);
         rec.shared.note_drop(Kind::Frame, 40);
         rec.shared.note_drop(Kind::Feedback, 70);
-        let Recorder { tx, thread, .. } = rec;
-        drop(tx);
-        let report = Finishing(thread).wait();
+        let mut rec = rec;
+        drop(rec.tx.take());
+        let report = Finishing(rec.thread.take()).wait();
         assert_eq!(report.dropped[Kind::Frame.slot()], 2);
         assert_eq!(report.dropped[Kind::Feedback.slot()], 1);
         assert_eq!(report.dropped_total(), 3);
@@ -798,10 +883,11 @@ mod tests {
         drop(rx);
         let thread = std::thread::spawn(Report::default);
         let rec = Recorder {
-            tx,
+            tx: Some(tx),
             shared: Arc::new(Shared::default()),
-            thread,
+            thread: Some(thread),
             after_exit: std::sync::atomic::AtomicU64::new(0),
+            last_at: std::sync::atomic::AtomicU64::new(0),
         };
         rec.record(1, input(1));
         rec.record(2, input(2));
@@ -814,8 +900,9 @@ mod tests {
         // resume_unwind 不经过 panic 钩子，不会往测试输出里打一堆栈
         let thread =
             std::thread::spawn(|| -> Report { std::panic::resume_unwind(Box::new("崩了")) });
-        let report = Finishing(thread).wait();
+        let report = Finishing(Some(thread)).wait();
         assert!(report.thread_crashed);
+        assert_eq!(Finishing(None).wait(), Report::default());
     }
 
     #[test]
@@ -845,9 +932,9 @@ mod tests {
         let rec = Recorder::start_in_dir(&dir, &meta(1_000), Retention::default()).unwrap();
         rec.record(10, input(1));
         // 没有 finish：进程被杀，队列关闭，.part 留着
-        let Recorder { tx, thread, .. } = rec;
-        drop(tx);
-        let _ = Finishing(thread).wait();
+        let mut rec = rec;
+        drop(rec.tx.take());
+        let _ = Finishing(rec.thread.take()).wait();
         let part = dir.join(part_name(&file_name(&meta(1_000))));
         assert!(part.exists());
         // 下一次会话开始：遗留的 .part 原样保留，照样读得出来
@@ -959,6 +1046,12 @@ mod tests {
         let missing = apply_retention(&dir.join("nope"), &policy, None, 0);
         assert!(missing.list_error.is_some());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn visit_ids_are_random() {
+        let (a, b) = (new_visit_id().unwrap(), new_visit_id().unwrap());
+        assert_ne!(a, b);
     }
 
     #[test]

@@ -22,6 +22,8 @@ use crate::recorder::{Finishing, RecordSetup, Recorder};
 /// 会话开始时已知的、写进文件头的参数。
 #[derive(Debug)]
 pub(crate) struct Params<'a> {
+    /// 会话号（见 `Link::session_id`）；导不出来时为 `None`。
+    pub session_id: Option<[u8; 16]>,
     /// 握手协商出的共同能力位。
     pub caps: u32,
     /// 编码格式。
@@ -61,6 +63,7 @@ impl HostJournal {
         let mut meta = Meta::new(Role::Host, params.wall_start_us);
         meta.program_version.clone_from(&setup.program_version);
         meta.commit.clone_from(&setup.commit);
+        meta.session_id = params.session_id;
         meta.os = Some(PeerOs::current());
         meta.codec = Some(params.codec.to_owned());
         meta.estimator = Some(params.estimator.to_owned());
@@ -401,6 +404,7 @@ mod tests {
             commit: None,
         };
         let params = Params {
+            session_id: None,
             caps: 0,
             codec: "h264",
             estimator: "gcc-v1",

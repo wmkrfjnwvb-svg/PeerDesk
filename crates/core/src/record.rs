@@ -273,6 +273,29 @@ pub struct Meta {
     pub max_bps: Option<u64>,
     /// 握手协商出来的共同能力位。
     pub caps: Option<u32>,
+    /// 访问号：控制端本机生成，从用户点连接到最终断开保持不变（中间升级直连、断线重连会换会话号，访问号不变）。
+    /// 被控端不知道它，为 `None`。
+    pub visit_id: Option<[u8; 16]>,
+    /// 这份记录接着哪一份：升级直连、断线重连产生的新会话，写上一份的会话号和原因。
+    pub previous: Option<Previous>,
+}
+
+/// 新会话为什么接着上一份。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviousReason {
+    /// 走中继时在后台打通了直连，在直连上重新开始。
+    Upgraded,
+    /// 网络断了，重新连上。
+    Reconnected,
+}
+
+/// 上一份记录。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Previous {
+    /// 上一份的会话号。
+    pub session_id: [u8; 16],
+    /// 为什么有这一份。
+    pub reason: PreviousReason,
 }
 
 impl Meta {
@@ -293,6 +316,8 @@ impl Meta {
             start_bps: None,
             max_bps: None,
             caps: None,
+            visit_id: None,
+            previous: None,
         }
     }
 
@@ -334,6 +359,17 @@ impl Meta {
         Self::put_tlv_number(&mut out, 11, self.start_bps);
         Self::put_tlv_number(&mut out, 12, self.max_bps);
         Self::put_tlv_number(&mut out, 13, self.caps.map(u64::from));
+        if let Some(id) = &self.visit_id {
+            Self::put_tlv(&mut out, 14, id);
+        }
+        if let Some(prev) = &self.previous {
+            let mut value = prev.session_id.to_vec();
+            value.push(match prev.reason {
+                PreviousReason::Upgraded => 0,
+                PreviousReason::Reconnected => 1,
+            });
+            Self::put_tlv(&mut out, 15, &value);
+        }
         out
     }
 
@@ -375,6 +411,23 @@ impl Meta {
                 11 => meta.start_bps = Some(value.varint().ok_or_else(bad)?),
                 12 => meta.max_bps = Some(value.varint().ok_or_else(bad)?),
                 13 => meta.caps = Some(value.u32().ok_or_else(bad)?),
+                14 => {
+                    let id = value.take(16).ok_or_else(bad)?;
+                    let mut out = [0u8; 16];
+                    out.copy_from_slice(id);
+                    meta.visit_id = Some(out);
+                }
+                15 => {
+                    let id = value.take(16).ok_or_else(bad)?;
+                    let mut session_id = [0u8; 16];
+                    session_id.copy_from_slice(id);
+                    let reason = match value.u8().ok_or_else(bad)? {
+                        0 => PreviousReason::Upgraded,
+                        1 => PreviousReason::Reconnected,
+                        _ => return Err(bad()),
+                    };
+                    meta.previous = Some(Previous { session_id, reason });
+                }
                 // 不认识的标签：按长度跳过（上面已经取走了）
                 _ => {}
             }
@@ -440,6 +493,10 @@ pub enum Kind {
     Transport,
     /// 每秒的输入活跃度。
     Input,
+    /// 控制端每一帧的结局：解码、交给界面。
+    ViewFrame,
+    /// 控制端每秒的“操作到画面”延迟。
+    Reaction,
     /// 缺口：队列满了丢记录。
     Gap,
     /// 结束。
@@ -448,12 +505,14 @@ pub enum Kind {
 
 impl Kind {
     /// 全部种类，顺序也是 [`Self::slot`] 的顺序。
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 9] = [
         Self::Feedback,
         Self::Frame,
         Self::Retransmit,
         Self::Transport,
         Self::Input,
+        Self::ViewFrame,
+        Self::Reaction,
         Self::Gap,
         Self::End,
     ];
@@ -467,6 +526,8 @@ impl Kind {
             Self::Retransmit => 3,
             Self::Transport => 4,
             Self::Input => 5,
+            Self::ViewFrame => 6,
+            Self::Reaction => 7,
             Self::Gap => 14,
             Self::End => 15,
         }
@@ -481,6 +542,8 @@ impl Kind {
             3 => Some(Self::Retransmit),
             4 => Some(Self::Transport),
             5 => Some(Self::Input),
+            6 => Some(Self::ViewFrame),
+            7 => Some(Self::Reaction),
             14 => Some(Self::Gap),
             15 => Some(Self::End),
             _ => None,
@@ -496,8 +559,10 @@ impl Kind {
             Self::Retransmit => 2,
             Self::Transport => 3,
             Self::Input => 4,
-            Self::Gap => 5,
-            Self::End => 6,
+            Self::ViewFrame => 5,
+            Self::Reaction => 6,
+            Self::Gap => 7,
+            Self::End => 8,
         }
     }
 
@@ -510,6 +575,8 @@ impl Kind {
             Self::Retransmit => "重传",
             Self::Transport => "传输",
             Self::Input => "输入",
+            Self::ViewFrame => "控制端帧",
+            Self::Reaction => "操作到画面",
             Self::Gap => "缺口",
             Self::End => "结束",
         }
@@ -800,6 +867,61 @@ impl InputLevel {
     }
 }
 
+/// 控制端一帧的结局。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewResult {
+    /// 解出了画面，交给了界面。
+    Shown,
+    /// 解码没有出错，但这一帧没有可显示的新画面。
+    NoPicture,
+    /// 解码失败。
+    DecodeFailed,
+}
+
+impl ViewResult {
+    const fn code(self) -> u8 {
+        match self {
+            Self::Shown => 0,
+            Self::NoPicture => 1,
+            Self::DecodeFailed => 2,
+        }
+    }
+
+    const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Shown),
+            1 => Some(Self::NoPicture),
+            2 => Some(Self::DecodeFailed),
+            _ => None,
+        }
+    }
+}
+
+/// 控制端帧记录：解码线程交回一帧。时间是交回的时刻。
+/// 收到、收齐的时间、纠错和重传次数要改核心库才取得到（R5），这里没有。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ViewFrame {
+    /// 帧号。
+    pub frame_id: u32,
+    /// 结局。
+    pub result: ViewResult,
+    /// 解码耗时（微秒）。
+    pub decode_us: u64,
+    /// 交给界面（`present`）用的时间（微秒）；没交给界面时为 0。
+    pub present_us: u64,
+}
+
+/// 操作到画面的延迟：这一秒里“按下键或鼠标键，到下一幅画面显示”的统计。没有操作的秒不写。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Reaction {
+    /// 这一秒的次数。
+    pub count: u32,
+    /// 中位数（微秒）。
+    pub median_us: u64,
+    /// 最大值（微秒）。
+    pub max_us: u64,
+}
+
 /// 某个种类的条数：种类号和数目（读的一方可能遇到自己不认识的种类号，所以存号不存 [`Kind`]）。
 pub type KindCount = (u64, u64);
 
@@ -823,6 +945,9 @@ pub enum EndReason {
     LinkLost,
     /// 本端出错结束。
     Failed,
+    /// 本端放弃了这次会话：走中继时打通了直连、丢掉旧连接，或者用户取消。
+    /// 和“没有结束记录”（进程崩了或被杀）不同。
+    Cancelled,
 }
 
 impl EndReason {
@@ -832,6 +957,7 @@ impl EndReason {
             Self::PeerQuit => 1,
             Self::LinkLost => 2,
             Self::Failed => 3,
+            Self::Cancelled => 4,
         }
     }
 
@@ -841,6 +967,7 @@ impl EndReason {
             1 => Some(Self::PeerQuit),
             2 => Some(Self::LinkLost),
             3 => Some(Self::Failed),
+            4 => Some(Self::Cancelled),
             _ => None,
         }
     }
@@ -881,6 +1008,10 @@ pub enum Record {
     Transport(Transport),
     /// 输入。
     Input(InputLevel),
+    /// 控制端帧。
+    ViewFrame(ViewFrame),
+    /// 操作到画面。
+    Reaction(Reaction),
     /// 缺口。
     Gap(Gap),
     /// 结束。
@@ -896,6 +1027,8 @@ struct Deltas {
     frame_id: u32,
     /// 上一条反馈记录的确认帧号。
     floor: u32,
+    /// 上一条控制端帧记录的帧号。
+    view_id: u32,
 }
 
 impl Deltas {
@@ -904,6 +1037,7 @@ impl Deltas {
             last_at: [block_start_us; Kind::ALL.len()],
             frame_id: 0,
             floor: 0,
+            view_id: 0,
         }
     }
 }
@@ -930,6 +1064,8 @@ impl Record {
             Self::Retransmit(_) => Kind::Retransmit,
             Self::Transport(_) => Kind::Transport,
             Self::Input(_) => Kind::Input,
+            Self::ViewFrame(_) => Kind::ViewFrame,
+            Self::Reaction(_) => Kind::Reaction,
             Self::Gap(_) => Kind::Gap,
             Self::End(_) => Kind::End,
         }
@@ -994,6 +1130,17 @@ impl Record {
                 }
             }
             Self::Input(level) => out.push(level.code()),
+            Self::ViewFrame(v) => {
+                put_delta(out, v.frame_id, &mut st.view_id);
+                out.push(v.result.code());
+                put_varint(out, v.decode_us);
+                put_varint(out, v.present_us);
+            }
+            Self::Reaction(r) => {
+                put_varint(out, u64::from(r.count));
+                put_varint(out, r.median_us);
+                put_varint(out, r.max_us);
+            }
             Self::Gap(g) => {
                 put_varint(out, g.span_us);
                 put_varint(out, u64::try_from(g.dropped.len()).unwrap_or(u64::MAX));
@@ -1093,6 +1240,17 @@ impl Record {
                 mtu: cur.u16()?,
             }),
             Kind::Input => Self::Input(InputLevel::from_code(cur.u8()?)?),
+            Kind::ViewFrame => Self::ViewFrame(ViewFrame {
+                frame_id: get_delta(cur, &mut st.view_id)?,
+                result: ViewResult::from_code(cur.u8()?)?,
+                decode_us: cur.varint()?,
+                present_us: cur.varint()?,
+            }),
+            Kind::Reaction => Self::Reaction(Reaction {
+                count: cur.u32()?,
+                median_us: cur.varint()?,
+                max_us: cur.varint()?,
+            }),
             Kind::Gap => {
                 let span_us = cur.varint()?;
                 let n = cur.varint()?;
@@ -1576,6 +1734,8 @@ impl Recording {
             | Record::Retransmit(_)
             | Record::Transport(_)
             | Record::Input(_)
+            | Record::ViewFrame(_)
+            | Record::Reaction(_)
             | Record::Gap(_) => None,
         })
     }
@@ -1589,6 +1749,8 @@ impl Recording {
             | Record::Retransmit(_)
             | Record::Transport(_)
             | Record::Input(_)
+            | Record::ViewFrame(_)
+            | Record::Reaction(_)
             | Record::End(_) => None,
         })
     }
@@ -1601,6 +1763,8 @@ impl Recording {
             | Record::Retransmit(_)
             | Record::Transport(_)
             | Record::Input(_)
+            | Record::ViewFrame(_)
+            | Record::Reaction(_)
             | Record::Gap(_)
             | Record::End(_) => None,
         })
@@ -1614,8 +1778,21 @@ impl Recording {
             | Record::Retransmit(_)
             | Record::Transport(_)
             | Record::Input(_)
+            | Record::ViewFrame(_)
+            | Record::Reaction(_)
             | Record::Gap(_)
             | Record::End(_) => None,
+        })
+    }
+
+    /// 控制端帧记录：时间和内容。
+    pub fn view_frames(&self) -> impl Iterator<Item = (u64, &ViewFrame)> {
+        self.entries.iter().filter_map(|e| {
+            if let Record::ViewFrame(v) = &e.record {
+                Some((e.at_us, v))
+            } else {
+                None
+            }
         })
     }
 
@@ -1627,6 +1804,8 @@ impl Recording {
             | Record::Frame(_)
             | Record::Transport(_)
             | Record::Input(_)
+            | Record::ViewFrame(_)
+            | Record::Reaction(_)
             | Record::Gap(_)
             | Record::End(_) => None,
         })
@@ -1804,6 +1983,32 @@ mod tests {
             ),
             (10_002, Record::Input(InputLevel::Many)),
             (
+                10_003,
+                Record::ViewFrame(ViewFrame {
+                    frame_id: 9,
+                    result: ViewResult::Shown,
+                    decode_us: 12_000,
+                    present_us: 800,
+                }),
+            ),
+            (
+                10_004,
+                Record::ViewFrame(ViewFrame {
+                    frame_id: 8,
+                    result: ViewResult::DecodeFailed,
+                    decode_us: 0,
+                    present_us: 0,
+                }),
+            ),
+            (
+                10_005,
+                Record::Reaction(Reaction {
+                    count: 3,
+                    median_us: 41_000,
+                    max_us: 90_000,
+                }),
+            ),
+            (
                 20_000,
                 Record::Gap(Gap {
                     span_us: 800,
@@ -1840,6 +2045,11 @@ mod tests {
             start_bps: Some(2_000_000),
             max_bps: Some(30_000_000),
             caps: Some(0xffff),
+            visit_id: Some([9; 16]),
+            previous: Some(Previous {
+                session_id: [3; 16],
+                reason: PreviousReason::Upgraded,
+            }),
         }
     }
 
@@ -1945,6 +2155,14 @@ mod tests {
         for class in [FrameClass::Content, FrameClass::Refine, FrameClass::Key] {
             assert_eq!(FrameClass::from_code(class.code()), Some(class));
         }
+        for r in [
+            ViewResult::Shown,
+            ViewResult::NoPicture,
+            ViewResult::DecodeFailed,
+        ] {
+            assert_eq!(ViewResult::from_code(r.code()), Some(r));
+        }
+        assert_eq!(ViewResult::from_code(9), None);
         for level in [InputLevel::None, InputLevel::Few, InputLevel::Many] {
             assert_eq!(InputLevel::from_code(level.code()), Some(level));
         }
@@ -1953,6 +2171,7 @@ mod tests {
             EndReason::PeerQuit,
             EndReason::LinkLost,
             EndReason::Failed,
+            EndReason::Cancelled,
         ] {
             assert_eq!(EndReason::from_code(reason.code()), Some(reason));
         }
@@ -2432,7 +2651,7 @@ mod tests {
         let gap = GapInfo {
             first_us: 900,
             last_us: 1_400,
-            dropped: [3, 0, 0, 0, 0, 0, 0],
+            dropped: [3, 0, 0, 0, 0, 0, 0, 0, 0],
         };
         sink.push(
             1_000,
@@ -2464,7 +2683,7 @@ mod tests {
         let last = GapInfo {
             first_us: 2_600_000,
             last_us: 2_700_000,
-            dropped: [0, 2, 0, 0, 0, 0, 0],
+            dropped: [0, 2, 0, 0, 0, 0, 0, 0, 0],
         };
         sink.finish(
             3_000_000,
@@ -2526,7 +2745,7 @@ mod tests {
         assert_eq!(tally(Kind::End), None, "结束记录不数自己");
         assert_eq!(tally(Kind::Transport), None, "没写过也没丢过的不列");
         assert_eq!(sink.written()[Kind::End.slot()], 1);
-        assert_eq!(sink.dropped(), &[3, 2, 0, 0, 0, 0, 0]);
+        assert_eq!(sink.dropped(), &[3, 2, 0, 0, 0, 0, 0, 0, 0]);
         assert_eq!(sink.blocks(), rec.stats.blocks);
     }
 
@@ -2561,6 +2780,30 @@ mod tests {
                 (7, outcomes[3], None)
             ]
         );
+    }
+
+    #[test]
+    fn visit_and_previous_session_are_in_the_header() {
+        let mut m = Meta::new(Role::Controller, 5);
+        m.visit_id = Some([1; 16]);
+        m.previous = Some(Previous {
+            session_id: [2; 16],
+            reason: PreviousReason::Reconnected,
+        });
+        assert_eq!(Recording::parse(&encode_header(&m)).unwrap().meta, m);
+        // 原因号不认识、值太短：文件头坏
+        let mut bad = Vec::new();
+        Meta::put_tlv(&mut bad, 2, &[1]);
+        Meta::put_tlv(&mut bad, 3, &0u64.to_be_bytes());
+        let mut value = vec![0u8; 16];
+        value.push(7);
+        Meta::put_tlv(&mut bad, 15, &value);
+        assert_eq!(Meta::decode(&bad).unwrap_err(), RecordError::BadHeader);
+        let mut short = Vec::new();
+        Meta::put_tlv(&mut short, 2, &[1]);
+        Meta::put_tlv(&mut short, 3, &0u64.to_be_bytes());
+        Meta::put_tlv(&mut short, 14, &[1, 2]);
+        assert_eq!(Meta::decode(&short).unwrap_err(), RecordError::BadHeader);
     }
 
     #[test]

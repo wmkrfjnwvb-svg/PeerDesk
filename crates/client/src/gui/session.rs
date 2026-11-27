@@ -1093,6 +1093,7 @@ async fn one_session(
     let session = controller::run(
         link,
         ControllerOptions {
+            record: None,
             session: session(identity, policy, auth.clone()),
             deadline_us: FRAME_DEADLINE_US,
             duration: None,
