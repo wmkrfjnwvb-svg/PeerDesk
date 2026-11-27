@@ -227,6 +227,22 @@ pub enum Picture {
     Rgb(Arc<Screen>),
     /// NV12（BT.601 有限范围）：界面用显卡转颜色。
     Nv12(Arc<Nv12>),
+    /// 只有“显示的是什么”、没有像素（仿真里的假解码器出的，见 `docs/research/Q-redesign/a1-plan.md`）。
+    /// 界面用不了它：产品里不会出现。
+    Described(Described),
+}
+
+/// 假解码器交出的“显示出来的是什么”（没有像素）：仿真的显示端量尺按它判清晰、判有没有追上源画面。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Described {
+    /// 显示的是源画面的第几版（源画面每变一次加一）。
+    pub version: u64,
+    /// 这一帧按哪个 QP 编的。
+    pub qp: u8,
+    /// 是不是关键帧。
+    pub key: bool,
+    /// 画面尺寸（像素）。
+    pub size: (u16, u16),
 }
 
 impl Picture {
@@ -236,13 +252,14 @@ impl Picture {
         match self {
             Self::Rgb(s) => (s.width(), s.height()),
             Self::Nv12(n) => (n.width(), n.height()),
+            Self::Described(d) => d.size,
         }
     }
 
     /// 转成 RGB 画面（在 CPU 上转颜色：只给测试、截图检查用，界面不用）。
     ///
     /// # Errors
-    /// 尺寸不对（不会发生：NV12 创建时已经检查过）。
+    /// 尺寸不对（不会发生：NV12 创建时已经检查过）；或者是 [`Self::Described`]（没有像素）。
     pub fn to_screen(&self) -> Result<Screen, Error> {
         match self {
             Self::Rgb(s) => Ok(Screen::clone(s)),
@@ -253,6 +270,9 @@ impl Picture {
                 nv12_to_rgb(y, uv, w, w, h, &mut pixels);
                 Screen::from_pixels(n.width(), n.height(), pixels)
             }
+            Self::Described(_) => Err(Error::InvalidArgument(
+                "只有描述、没有像素的画面不能转成 RGB",
+            )),
         }
     }
 }
@@ -420,6 +440,15 @@ mod tests {
         let white = Picture::Nv12(Arc::new(gray(4, 2, 235)));
         assert_eq!(white.size(), (4, 2));
         assert_eq!(white.to_screen().unwrap(), Screen::new(4, 2, 0x00ff_ffff));
+        // 只有描述的画面：有尺寸，没有像素
+        let described = Picture::Described(Described {
+            version: 3,
+            qp: 30,
+            key: false,
+            size: (8, 6),
+        });
+        assert_eq!(described.size(), (8, 6));
+        assert!(described.to_screen().is_err());
     }
 
     #[test]

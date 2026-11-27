@@ -29,6 +29,11 @@ use crate::backend::{
     Finished, Format, FrameAsk, FrameInput, Inputs, RateControl, Rates, Reconfigured, Submitted,
     Timing,
 };
+use crate::content;
+use peerdesk_core::error::Error;
+use peerdesk_core::frame::{Described, Picture};
+use peerdesk_core::screen::Screen;
+use peerdesk_core::video::{FrameHeader, VideoDecoder};
 
 /// 最小 QP：假后端能编到的最细（和 [`crate::qp::MIN_QP`] 无关，只是模型的范围）。
 pub const MODEL_MIN_QP: u8 = 10;
@@ -36,10 +41,6 @@ pub const MODEL_MIN_QP: u8 = 10;
 pub const MODEL_MAX_QP: u8 = 51;
 /// 画面变了这么多（千分之几）以上算整屏突变，[`SceneKeyframes`] 打开时会自己出关键帧。
 pub const SCENE_PERMILLE: u32 = 900;
-/// 抽样步长：每隔这么多个字节取一个亮度点估计“变了多少、有多少细节”（取质数，免得和行宽对齐）。
-const SAMPLE_STEP: usize = 13;
-/// 相邻两点亮度差超过这个值算“有细节”。
-const DETAIL_EDGE: u8 = 24;
 /// [`Faults::first_frame_prime`] 打开时，多编一次初始化花的时间（微秒，占位）。
 pub const PRIME_SETUP_US: u64 = 6_000;
 
@@ -282,6 +283,28 @@ impl FakeConfig {
         }
     }
 
+    /// 和软件编码后端（openh264）声明的属性一样的假后端：按 QP 编、只收 I420、同步、要了关键帧就是这一帧、
+    /// 新开之后第一帧按默认 QP、整屏突变会自己出关键帧。仿真里它代替 openh264，上面的码控、补清晰、大帧规则
+    /// 看到的后端脾气不变。计算时间按 0 算（A1 里编码耗时不进仿真，和 L1 一样）。
+    #[must_use]
+    pub fn like_openh264() -> Self {
+        Self {
+            name: "假后端（照 openh264 的属性）".to_owned(),
+            inputs: Inputs {
+                i420: true,
+                nv12: false,
+                gpu: false,
+            },
+            compute_us: 0,
+            faults: Faults {
+                first_frame_prime: Some(crate::soft::DEFAULT_LAYER_QP),
+                scene_keyframes: SceneKeyframes::Declared,
+                ..Faults::default()
+            },
+            ..Self::default()
+        }
+    }
+
     /// 按脾气算出来的诚实声明。
     #[must_use]
     pub fn honest_traits(&self) -> BackendTraits {
@@ -327,6 +350,8 @@ pub struct FakeBackend {
     stalled_since: Option<u64>,
     /// 卡住已经发生过了（只卡一次）。
     stall_spent: bool,
+    /// 画面内容的版本，由外面（仿真的画面来源）拨；每一帧的码流里写着交帧时的读数。
+    version: Option<Arc<AtomicU64>>,
 }
 
 impl FakeBackend {
@@ -356,7 +381,18 @@ impl FakeBackend {
             ready: VecDeque::new(),
             stalled_since: None,
             stall_spent: false,
+            version: None,
         }
+    }
+
+    /// 画面内容的版本从 `tag` 读（每交一帧读一次，写进这一帧的码流）。
+    ///
+    /// 吃真像素的假后端（L0.5）没有别的办法知道“这是源画面的第几版”：像素里没有版本。仿真的画面来源每变一次拨一下 `tag`，
+    /// 假解码器（[`FakeDecoder`]）把它交给显示端量尺。吃内容描述的假后端（L0）从描述里读版本，不用这个。
+    #[must_use]
+    pub fn with_version_tag(mut self, tag: Arc<AtomicU64>) -> Self {
+        self.version = Some(tag);
+        self
     }
 
     /// 用默认字节模型。
@@ -444,37 +480,34 @@ impl FakeBackend {
     }
 }
 
-/// 抽样亮度，算“和上一帧比变了多少、有多少细节”（千分之几）。
+/// 抽样亮度，算“和上一帧比变了多少、有多少细节”（千分之几）；定义在 [`crate::content`]（产品、M2 测量共用）。
 fn features(luma: &[u8], prev: Option<&Vec<u8>>) -> (Vec<u8>, u32, u32) {
-    let sample: Vec<u8> = luma.iter().copied().step_by(SAMPLE_STEP).collect();
-    let n = sample.len().max(1);
-    let changed = match prev {
-        Some(p) if p.len() == sample.len() => {
-            let diff = sample.iter().zip(p).filter(|(a, b)| a != b).count();
-            permille(diff, n)
-        }
-        // 第一帧、尺寸变了：整屏都是新的
-        _ => 1000,
-    };
-    let edges = luma
-        .iter()
-        .zip(luma.iter().skip(1))
-        .step_by(SAMPLE_STEP)
-        .filter(|(a, b)| a.abs_diff(**b) > DETAIL_EDGE)
-        .count();
-    (sample, changed, permille(edges, n))
+    let sample = content::sample_luma(luma);
+    let changed = content::luma_changed_permille(&sample, prev);
+    (sample, changed, content::detail_permille(luma))
 }
 
-/// `part` 占 `whole` 的千分之几（不超过 1000）。
-fn permille(part: usize, whole: usize) -> u32 {
-    u32::try_from(part.saturating_mul(1000) / whole.max(1))
-        .unwrap_or(1000)
-        .min(1000)
+/// 假码流开头的固定部分的长度：起始码 4 字节 + NAL 头 1 字节 + 内容版本 8 + 帧序号 4 + QP 1。
+pub const STREAM_HEAD_LEN: usize = 18;
+
+/// 假码流开头的内容：假解码器（[`FakeDecoder`]）靠它知道“这一帧显示的是什么、接不接得上”。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StreamHead {
+    key: bool,
+    /// 画面内容的版本（见 [`FakeBackend::with_version_tag`]）。
+    version: u64,
+    /// 配置之后编出的第几帧（参考链按它接：增量帧要接在上一帧后面）。
+    serial: u32,
+    qp: u8,
 }
 
-/// 确定性的假码流：Annex B 起始码 + NAL 头（IDR 或普通片）+ 按种子生成的字节。
-fn fake_stream(len: usize, key: bool, seed: u64) -> Vec<u8> {
-    let mut data = vec![0, 0, 0, 1, if key { 0x65 } else { 0x41 }];
+/// 确定性的假码流：Annex B 起始码 + NAL 头（IDR 或普通片）+ [`StreamHead`] + 按种子生成的字节。
+/// 长度至少 [`STREAM_HEAD_LEN`]。
+fn fake_stream(len: usize, head: StreamHead, seed: u64) -> Vec<u8> {
+    let mut data = vec![0, 0, 0, 1, if head.key { 0x65 } else { 0x41 }];
+    data.extend_from_slice(&head.version.to_le_bytes());
+    data.extend_from_slice(&head.serial.to_le_bytes());
+    data.push(head.qp);
     let mut x = seed | 1;
     while data.len() < len {
         // xorshift64
@@ -483,8 +516,24 @@ fn fake_stream(len: usize, key: bool, seed: u64) -> Vec<u8> {
         x ^= x << 17;
         data.extend_from_slice(&x.to_le_bytes());
     }
-    data.truncate(len.max(5));
+    data.truncate(len.max(STREAM_HEAD_LEN));
     data
+}
+
+/// 拆开假码流的开头；不是假码流（太短、起始码或 NAL 头不对）返回 `None`。
+fn parse_head(data: &[u8]) -> Option<StreamHead> {
+    let head = data.get(..STREAM_HEAD_LEN)?;
+    let key = match head.get(..5)? {
+        [0, 0, 0, 1, 0x65] => true,
+        [0, 0, 0, 1, 0x41] => false,
+        _ => return None,
+    };
+    Some(StreamHead {
+        key,
+        version: u64::from_le_bytes(*head.get(5..13)?.first_chunk::<8>()?),
+        serial: u32::from_le_bytes(*head.get(13..17)?.first_chunk::<4>()?),
+        qp: *head.get(17)?,
+    })
 }
 
 impl EncoderBackend for FakeBackend {
@@ -661,9 +710,18 @@ impl EncoderBackend for FakeBackend {
             ^ u64::from(qp) << 8
             ^ u64::from(index) << 16
             ^ u64::from(key);
+        let head = StreamHead {
+            key,
+            version: self
+                .version
+                .as_ref()
+                .map_or(0, |v| v.load(Ordering::Relaxed)),
+            serial: index,
+            qp,
+        };
         let done = Finished::Frame(EncodedOut {
             token: ask.token,
-            data: fake_stream(bytes, key, seed),
+            data: fake_stream(bytes, head, seed),
             key,
             qp: Some(qp),
             timing,
@@ -731,10 +789,98 @@ impl FakeBackend {
     }
 }
 
+/// 假解码器：读假码流（[`FakeBackend`] 编的）开头的内容，交出 [`Picture::Described`]（显示的是源画面的第几版、QP 多少），
+/// 不出像素。
+///
+/// **参考链和真解码器一样严：缺了参考帧就不出画面，要等关键帧。** 关键帧随时能接；增量帧只能接在上一帧后面
+/// （帧序号差一），否则报错、并且之后的增量帧一律拒绝，直到下一个关键帧。不能出现“接不上也照样显示”：
+/// 那样仿真里的花屏会被悄悄吞掉，量尺就失真了（真解码器接不上的增量帧要么报错、要么出花屏，两种都不能算好画面）。
+/// 码流格式不对（太短、起始码不对、NAL 头和帧头说的关键帧对不上）也报错、等关键帧。
+#[derive(Debug, Default)]
+pub struct FakeDecoder {
+    /// 最近一个成功解出的帧的序号；`None`：还没有，或者出过错，要等关键帧。
+    last: Option<u32>,
+    /// 解出的帧数。
+    decoded: u32,
+    /// 因为接不上（缺参考帧）或码流不对而拒绝的帧数。
+    refused: u32,
+}
+
+impl FakeDecoder {
+    /// 创建（等第一个关键帧）。
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            last: None,
+            decoded: 0,
+            refused: 0,
+        }
+    }
+
+    /// 解出了几帧。
+    #[must_use]
+    pub const fn decoded(&self) -> u32 {
+        self.decoded
+    }
+
+    /// 拒绝了几帧（缺参考帧、码流不对）。
+    #[must_use]
+    pub const fn refused(&self) -> u32 {
+        self.refused
+    }
+
+    fn refuse(&mut self, why: &'static str) -> Error {
+        self.last = None;
+        self.refused = self.refused.saturating_add(1);
+        Error::Inconsistent(why)
+    }
+}
+
+impl VideoDecoder for FakeDecoder {
+    fn decode(&mut self, _header: &FrameHeader, _data: &[u8]) -> Result<Option<&Screen>, Error> {
+        Err(Error::InvalidArgument(
+            "假解码器不出像素：用 decode_picture 取描述",
+        ))
+    }
+
+    fn screen(&self) -> Option<&Screen> {
+        None
+    }
+
+    fn decode_picture(
+        &mut self,
+        header: &FrameHeader,
+        data: &[u8],
+    ) -> Result<Option<Picture>, Error> {
+        let Some(head) = parse_head(data) else {
+            return Err(self.refuse("假码流格式不对"));
+        };
+        if head.key != header.key {
+            return Err(self.refuse("假码流的 NAL 头和帧头说的关键帧对不上"));
+        }
+        if !head.key && self.last != Some(head.serial.wrapping_sub(1)) {
+            return Err(self.refuse("缺参考帧，等关键帧"));
+        }
+        self.last = Some(head.serial);
+        self.decoded = self.decoded.saturating_add(1);
+        Ok(Some(Picture::Described(Described {
+            version: head.version,
+            qp: head.qp,
+            key: head.key,
+            size: (header.width, header.height),
+        })))
+    }
+
+    fn backend(&self) -> String {
+        "假解码器".to_owned()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
     use super::*;
+    use peerdesk_core::video::Codec;
 
     const RATES: Rates = Rates {
         bps: 2_000_000,
@@ -1501,5 +1647,148 @@ mod tests {
             Arc::new(ManualClock::new()),
         );
         assert_eq!(liar.info().traits.max_held, 9);
+    }
+
+    /// 编一帧，交出码流和它的帧头。
+    fn encode_one(
+        b: &mut FakeBackend,
+        token: u64,
+        qp: u8,
+        keyframe: bool,
+    ) -> (FrameHeader, Vec<u8>) {
+        let p = planes(0);
+        let Finished::Frame(f) = ready(b.submit(i420(&p), ask(token, Some(qp), 100_000, keyframe)))
+        else {
+            panic!("应当编出帧");
+        };
+        let header = FrameHeader {
+            codec: Codec::H264,
+            key: f.key,
+            width: SIZE.0,
+            height: SIZE.1,
+        };
+        (header, f.data)
+    }
+
+    fn described(p: Option<Picture>) -> Described {
+        match p {
+            Some(Picture::Described(d)) => d,
+            other => panic!("应当是描述，不是 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fake_decoder_follows_the_reference_chain_like_the_real_one() {
+        let (mut b, _) = backend(FakeConfig::like_openh264());
+        let mut dec = FakeDecoder::new();
+        let frames: Vec<_> = (0..8u64)
+            .map(|i| encode_one(&mut b, i, 30, false))
+            .collect();
+        // 第一帧是关键帧（新配置），接着的增量帧一帧接一帧
+        assert!(frames[0].0.key && !frames[1].0.key);
+        for (h, d) in &frames[..3] {
+            assert!(dec.decode_picture(h, d).unwrap().is_some());
+        }
+        // 丢了第 3 帧：第 4 帧接不上，不出画面
+        assert!(dec.decode_picture(&frames[4].0, &frames[4].1).is_err());
+        // 之后的增量帧哪怕恰好接得上第 4 帧，也一律拒绝：要等关键帧
+        assert!(dec.decode_picture(&frames[5].0, &frames[5].1).is_err());
+        assert!(dec.decode_picture(&frames[6].0, &frames[6].1).is_err());
+        assert_eq!((dec.decoded(), dec.refused()), (3, 3));
+        // 关键帧随时能接，之后的增量帧又能解
+        let key = encode_one(&mut b, 8, 30, true);
+        assert!(key.0.key);
+        assert!(dec.decode_picture(&key.0, &key.1).unwrap().is_some());
+        let next = encode_one(&mut b, 9, 30, false);
+        assert!(dec.decode_picture(&next.0, &next.1).unwrap().is_some());
+        assert_eq!((dec.decoded(), dec.refused()), (5, 3));
+    }
+
+    #[test]
+    fn fake_decoder_refuses_a_stream_that_starts_without_a_keyframe_and_garbage() {
+        let (mut b, _) = backend(FakeConfig::like_openh264());
+        let first = encode_one(&mut b, 0, 30, false);
+        let second = encode_one(&mut b, 1, 30, false);
+        let mut dec = FakeDecoder::new();
+        // 没见过关键帧就来了增量帧
+        assert!(dec.decode_picture(&second.0, &second.1).is_err());
+        // 不是假码流 / 太短 / 帧头说是关键帧、NAL 头不是
+        assert!(dec.decode_picture(&first.0, &[1, 2, 3]).is_err());
+        let mut bad_start = first.1.clone();
+        bad_start[0] = 9;
+        assert!(dec.decode_picture(&first.0, &bad_start).is_err());
+        let wrong_key = FrameHeader {
+            key: false,
+            ..first.0
+        };
+        assert!(dec.decode_picture(&wrong_key, &first.1).is_err());
+        assert_eq!(dec.decoded(), 0);
+        assert_eq!(dec.refused(), 4);
+        // 不出像素
+        assert!(dec.decode(&first.0, &first.1).is_err());
+        assert!(dec.screen().is_none());
+        assert_eq!(dec.backend(), "假解码器");
+        // 正常的关键帧能接
+        assert!(dec.decode_picture(&first.0, &first.1).unwrap().is_some());
+    }
+
+    #[test]
+    fn fake_decoder_hands_over_version_qp_and_size() {
+        let tag = Arc::new(AtomicU64::new(7));
+        let clock = ManualClock::new();
+        let mut b = FakeBackend::with_default_model(FakeConfig::like_openh264(), Arc::new(clock))
+            .with_version_tag(tag.clone());
+        b.reconfigure(SIZE, RATES).unwrap();
+        let mut dec = FakeDecoder::new();
+        let (h, d) = encode_one(&mut b, 0, 33, false);
+        assert!(d.len() >= STREAM_HEAD_LEN);
+        assert_eq!(
+            described(dec.decode_picture(&h, &d).unwrap()),
+            Described {
+                version: 7,
+                qp: 33,
+                key: true,
+                size: SIZE
+            }
+        );
+        // 内容变了一版，下一帧写新的版本；补清晰（版本不变）QP 变细
+        tag.store(8, Ordering::Relaxed);
+        let (h, d) = encode_one(&mut b, 1, 40, false);
+        let got = described(dec.decode_picture(&h, &d).unwrap());
+        assert_eq!((got.version, got.qp, got.key), (8, 40, false));
+        let (h, d) = encode_one(&mut b, 2, 20, false);
+        let got = described(dec.decode_picture(&h, &d).unwrap());
+        assert_eq!((got.version, got.qp), (8, 20));
+    }
+
+    #[test]
+    fn fake_decoder_through_the_decode_worker_waits_for_a_keyframe() {
+        use peerdesk_core::media::{DecodeJob, DecodeWorker};
+        let (mut b, _) = backend(FakeConfig::like_openh264());
+        let mut worker = DecodeWorker::new(Box::new(FakeDecoder::new()));
+        let job = |frame_id: u32, (header, data): (FrameHeader, Vec<u8>)| DecodeJob {
+            frame_id,
+            header,
+            data,
+        };
+        let f0 = encode_one(&mut b, 0, 30, false);
+        let _lost = encode_one(&mut b, 1, 30, false);
+        let f2 = encode_one(&mut b, 2, 30, false);
+        let f3 = encode_one(&mut b, 3, 30, false);
+        assert!(worker.decode(&job(0, f0)).unwrap().is_some());
+        assert!(worker.decode(&job(2, f2)).is_err());
+        assert!(worker.decode(&job(3, f3)).is_err());
+        let key = encode_one(&mut b, 4, 30, true);
+        assert!(worker.decode(&job(4, key)).unwrap().is_some());
+    }
+
+    #[test]
+    fn like_openh264_declares_what_openh264_declares() {
+        let fake = FakeBackend::with_default_model(
+            FakeConfig::like_openh264(),
+            Arc::new(ManualClock::new()),
+        );
+        let real = crate::soft::OpenH264Backend::new();
+        assert_eq!(fake.info().traits, real.info().traits);
     }
 }

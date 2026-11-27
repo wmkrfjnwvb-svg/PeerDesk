@@ -17,6 +17,7 @@ pub mod audio;
 pub mod backend;
 pub mod checkup;
 mod color;
+pub mod content;
 pub mod fake;
 /// Linux 的显卡和 VA-API 能力（检测和给用户的说明）。
 #[cfg(target_os = "linux")]
@@ -68,18 +69,6 @@ pub const DEFAULT_MAX_BPS: u64 = 50_000_000;
 pub const BIG_FRAME_US: u64 = ContentPolicy::OFFICE.big_frame_us;
 /// 最小 QP：补清晰时能达到的画质上限。
 const MIN_QP: u8 = qp::MIN_QP;
-/// 估计画面变了多少时每隔多少像素抽一个（横竖都是）：720p 约 3600 个，几乎不花时间。
-const SAMPLE_STEP: usize = 16;
-/// 抽样点细节量的底数：平坦的地方变了也要编一点。也是“按细节”和“按点数”之间的折中：底数越大越接近只数点数。
-/// 2026-11 微软轨迹 12 条 × 3 个种子（冻结 / 最长等待平均 / 停下后最差 PSNR）：只数点数 145 / 642 ms / 27.3 dB；
-/// 底数 8 77 / 366 ms / 25.8 dB；24 95 / 392 ms / 26.8 dB；64 112 / 447 ms / 26.7 dB。取 24：清晰度最后让步。
-const DETAIL_FLOOR: u32 = 24;
-
-/// 近似亮度（0–255）：(2R + 5G + B) / 8。
-fn luma(p: u32) -> u32 {
-    ((p >> 16 & 0xff) * 2 + (p >> 8 & 0xff) * 5 + (p & 0xff)) / 8
-}
-
 fn codec_error(what: &'static str) -> impl Fn(openh264::Error) -> Error {
     move |_| Error::Inconsistent(what)
 }
@@ -625,9 +614,8 @@ pub struct H264Encoder {
     big_frame_us: u64,
     /// 码率估计过期了（发送端判断，见 `VideoEncoder::set_rate_stale`）：大帧不按时限放宽，最多一帧的预算。
     rate_stale: bool,
-    /// 上一次编的画面的抽样（每 [`SAMPLE_STEP`] 像素取一个），估计画面变了多少。
-    samples: Vec<u32>,
-    sampled: (u16, u16),
+    /// 估计画面变了多少（变化面积，见 [`content`]）。
+    area: content::AreaSampler,
 }
 
 /// 硬件编码这一步的结果。
@@ -707,9 +695,17 @@ impl H264Encoder {
             soft_converged: None,
             big_frame_us: BIG_FRAME_US,
             rate_stale: false,
-            samples: Vec::new(),
-            sampled: (0, 0),
+            area: content::AreaSampler::new(),
         }
+    }
+
+    /// 换掉软件编码后端（默认是 openh264）。仿真里换成假后端（[`fake::FakeBackend`]）：码控、补清晰、大帧规则、
+    /// 超限重编这些上层逻辑一行不变，只有“编出多少字节”由后端定。后端要收 I420、按 QP 编（[`backend::RateControl::PerFrameQp`]），
+    /// 否则软件这条路用不了（交帧时报错）。要在第一帧之前换。
+    #[must_use]
+    pub fn with_soft_backend(mut self, backend: Box<dyn EncoderBackend>) -> Self {
+        self.soft = backend;
+        self
     }
 
     /// 大帧规则的时限（微秒，0 不限）：关键帧要在这么久里按目标码率发得完，发不完就粗编、之后补清晰。
@@ -718,54 +714,6 @@ impl H264Encoder {
     pub const fn with_big_frame_us(mut self, us: u64) -> Self {
         self.big_frame_us = us;
         self
-    }
-
-    /// 画面和上一次编的相比变了多少（千分比），按抽样估计；尺寸变了算全变。顺便记下这一次的抽样。
-    /// 画面变了多少（千分比）：`(按点数, 按细节加权)`。按细节加权的用来估计这一帧多大；
-    /// 按点数的用来判断是不是整屏变化（滚动文字时细节集中在文字上，按细节加权常常过半，但有运动补偿，
-    /// 不该当成整屏变化重编成关键帧：8 Mbps、12% 丢包时关键帧更难送到，实测卡顿变多）。
-    fn changed_permille(&mut self, screen: &Screen) -> (u64, u64) {
-        let width = usize::from(screen.width());
-        let size = (screen.width(), screen.height());
-        let pixels = screen.pixels();
-        let rows: Vec<&[u32]> = pixels.chunks(width.max(1)).collect();
-        // 每个抽样点：像素值，和它在新画面里的细节量（和右边、下边像素的亮度差，加一个底数）
-        let mut now = Vec::with_capacity(self.samples.len());
-        let mut detail = Vec::with_capacity(self.samples.len());
-        for (y, row) in rows.iter().enumerate().step_by(SAMPLE_STEP) {
-            let below = rows.get(y.saturating_add(1));
-            for (x, p) in row.iter().enumerate().step_by(SAMPLE_STEP) {
-                let l = luma(*p);
-                let right = row.get(x.saturating_add(1)).map_or(l, |q| luma(*q));
-                let down = below.and_then(|r| r.get(x)).map_or(l, |q| luma(*q));
-                now.push(*p);
-                detail.push(l.abs_diff(right) + l.abs_diff(down) + DETAIL_FLOOR);
-            }
-        }
-        // 按细节加权的变化比例：编码出来的大小大致按细节分布（关键帧的大小估计也是整幅画面的细节），
-        // 只数变了几个点会把“文字密集的弹窗盖在白底上”估得很小（弹窗占 36%，变了的点只有 19%，按点数估计
-        // 比实际小 5 倍以上，2026-11 微软轨迹里切换窗口的帧在 1 Mbps 上编出 89–125 KB）
-        let changed = if size == self.sampled && now.len() == self.samples.len() {
-            let total: u64 = detail.iter().map(|d| u64::from(*d)).sum();
-            let (count, weight) = now
-                .iter()
-                .zip(&self.samples)
-                .zip(&detail)
-                .filter(|((a, b), _)| a != b)
-                .fold((0u64, 0u64), |(c, w), (_, d)| {
-                    (c.saturating_add(1), w.saturating_add(u64::from(*d)))
-                });
-            let points = u64::try_from(now.len()).unwrap_or(u64::MAX).max(1);
-            (
-                count.saturating_mul(1000) / points,
-                weight.saturating_mul(1000) / total.max(1),
-            )
-        } else {
-            (1000, 1000)
-        };
-        self.samples = now;
-        self.sampled = size;
-        changed
     }
 
     /// 下一帧（软件编码）强制用 QP `qp` 编（测量、以后按画面变化面积判断大帧时用），之后照常逐帧控制。
@@ -1159,10 +1107,10 @@ impl H264Encoder {
         }
         let area = match input {
             Input::Rgb(screen) if changed && !fresh && !self.force_key => {
-                Some(self.changed_permille(screen))
+                Some(self.area.observe(screen))
             }
             Input::Rgb(screen) if fresh || self.force_key => {
-                let _ = self.changed_permille(screen);
+                let _ = self.area.observe(screen);
                 None
             }
             Input::Rgb(_) | Input::Gpu(_) => None,
@@ -1188,13 +1136,8 @@ impl H264Encoder {
             self.bps.saturating_mul(self.big_frame_us) / 8_000_000
         };
         let qp = self.coarse_qp.take().unwrap_or_else(|| {
-            self.qp.next(
-                kind,
-                target,
-                key_allowed,
-                pixels,
-                area.map(|(_, weighted)| weighted),
-            )
+            self.qp
+                .next(kind, target, key_allowed, pixels, area.map(|a| a.by_detail))
         });
         // 补清晰补不动了（降一步的量链路一次装不下，见 qp::REFINE_STEP_KEY_TIMES）：这个码率下就算补完，
         // 不再编（否则画面不动也一直按同一个 QP 编空帧）。画面再变时重新开始补。
@@ -1220,7 +1163,7 @@ impl H264Encoder {
         // 推一个装得进的 QP 重编（照 libvpx 屏幕内容实时模式的 vp9_encodedframe_overshoot）。openh264 编完
         // 参考帧就更新了，不能原样重编，只能重编成关键帧——整屏都换了，关键帧和增量帧差不多大。openh264 自己
         // 检测到场景切换出的关键帧（用的还是我们给的 QP）也一样处理。
-        let whole = area.is_none_or(|(count, _)| count >= qp::LARGE_CHANGE_PERMILLE);
+        let whole = area.is_none_or(|a| a.by_points >= qp::LARGE_CHANGE_PERMILLE);
         let bytes = u64::try_from(data.len()).unwrap_or(u64::MAX);
         if let Some(q) = (kind == qp::Kind::Change && whole && self.big_frame_us != 0)
             .then(|| self.qp.overshoot_qp(bytes, qp, key_allowed))
