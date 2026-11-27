@@ -2518,6 +2518,8 @@ mod tests {
             area_pixels: Arc::from(Vec::new()),
             area_detail: Arc::from(Vec::new()),
             luma: Vec::new(),
+            dirty: Vec::new(),
+            moves: Vec::new(),
         };
         assert!(content.luma_at((64, 64)).is_none());
         assert!(by_frame

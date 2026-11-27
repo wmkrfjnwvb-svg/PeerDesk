@@ -15,6 +15,7 @@ pub mod timeline;
 pub mod world;
 
 use peerdesk_core::adaptive::Profile;
+use peerdesk_core::changes::{ChangeFeed, Changes};
 use peerdesk_core::error::Error;
 pub use peerdesk_core::estimator::EstimatorKind;
 pub use peerdesk_core::estimator::RateState;
@@ -29,7 +30,7 @@ use peerdesk_core::sim::{Link, Net, NetStats};
 use peerdesk_core::time::Time;
 use peerdesk_core::video::{TileDecoder, TileEncoder, VideoDecoder, VideoEncoder};
 use peerdesk_media::fake::{
-    ByteModel, DefaultByteModel, FakeBackend, FakeConfig, FakeDecoder, ManualClock,
+    ByteModel, DefaultByteModel, FakeBackend, FakeConfig, FakeDecoder, ManualClock, ModelInput,
 };
 use peerdesk_media::fitted::FittedByteModel;
 use peerdesk_media::{H264Decoder, H264Encoder};
@@ -91,8 +92,17 @@ impl ByteModelKind {
         }
     }
 
-    /// 造模型。
+    /// 造模型。[`run_probed`] 在跑的时候，外面再套一层记录。
     fn build(self) -> Result<Box<dyn ByteModel>, Error> {
+        let model = self.build_plain()?;
+        Ok(if PROBE.with(|p| p.borrow().is_some()) {
+            Box::new(Probed(model))
+        } else {
+            model
+        })
+    }
+
+    fn build_plain(self) -> Result<Box<dyn ByteModel>, Error> {
         Ok(match self {
             Self::Default => Box::new(DefaultByteModel),
             Self::Openh264V1 => Box::new(
@@ -101,6 +111,38 @@ impl ByteModelKind {
             ),
         })
     }
+}
+
+thread_local! {
+    /// [`run_probed`] 正在记的模型输入（没在记为 `None`）。仿真是单线程的，一个线程一份。
+    static PROBE: std::cell::RefCell<Option<Vec<ModelInput>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// 套在真正的字节模型外面：把每一帧的模型输入记下来，字节数照旧由里面的模型定，所以会话和不记时逐字节相同。
+#[derive(Debug)]
+struct Probed(Box<dyn ByteModel>);
+
+impl ByteModel for Probed {
+    fn bytes(&self, input: &ModelInput) -> usize {
+        PROBE.with(|p| {
+            if let Some(log) = p.borrow_mut().as_mut() {
+                log.push(*input);
+            }
+        });
+        self.0.bytes(input)
+    }
+}
+
+/// 和 [`run`] 一样，另外交回假后端的字节模型这一路上看到的每一帧的输入（只对 L0.5、L0 有，其他编码器是空的）。
+/// 对账用：L0.5（像素）和 L0（内容描述）交给假后端的输入必须逐帧相同。
+///
+/// # Errors
+/// 同 [`run`]。
+pub fn run_probed(s: &Scenario) -> Result<(Outcome, Vec<ModelInput>), Error> {
+    PROBE.with(|p| *p.borrow_mut() = Some(Vec::new()));
+    let outcome = run(s);
+    let log = PROBE.with(|p| p.borrow_mut().take()).unwrap_or_default();
+    outcome.map(|o| (o, log))
 }
 
 /// 编码器。
@@ -150,6 +192,7 @@ impl CodecKind {
         max_bps: u64,
         policy: &ContentPolicy,
         tag: &Arc<AtomicU64>,
+        feed: &ChangeFeed,
         byte_model: ByteModelKind,
     ) -> Result<Codecs, Error> {
         Ok(match self {
@@ -158,7 +201,8 @@ impl CodecKind {
                 let mut cfg = FakeConfig::like_openh264();
                 cfg.inputs.described = true;
                 let backend =
-                    FakeBackend::new(cfg, Arc::new(ManualClock::new()), byte_model.build()?);
+                    FakeBackend::new(cfg, Arc::new(ManualClock::new()), byte_model.build()?)
+                        .with_change_feed(feed.clone());
                 (
                     Box::new(
                         H264Encoder::with_max_bps(fps, max_bps)
@@ -176,7 +220,8 @@ impl CodecKind {
                     Arc::new(ManualClock::new()),
                     byte_model.build()?,
                 )
-                .with_version_tag(Arc::clone(tag));
+                .with_version_tag(Arc::clone(tag))
+                .with_change_feed(feed.clone());
                 (
                     Box::new(
                         H264Encoder::with_max_bps(fps, max_bps)
@@ -709,6 +754,8 @@ impl Stage for PixelStage {
 /// 交回，所以“显示的是第几版”是从传输、重组、解码这一整条链上走过来的，不是量尺自己猜的。
 struct DescribedStage {
     desk: RealisticDesktop,
+    /// 画面哪里变了：每变一版推进一次（假后端从上一帧编出来起累计）。
+    feed: ChangeFeed,
     /// 源画面现在是第几版。
     version: u64,
     tag: Arc<AtomicU64>,
@@ -724,6 +771,7 @@ impl Stage for DescribedStage {
         if moved {
             self.version = self.version.saturating_add(1);
             self.tag.store(self.version, Ordering::Relaxed);
+            self.feed.push(self.desk.changes());
         }
         Ok(moved)
     }
@@ -800,6 +848,8 @@ struct TimelineStage {
     next: usize,
     /// 现在的画面（走过第一拍之后才有）。
     content: Option<Arc<peerdesk_core::frame::ContentDesc>>,
+    /// 画面哪里变了：每走到一个变了的拍就把描述里的区域推进去（和 L0.5 一样）。
+    feed: ChangeFeed,
     worker: DecodeWorker,
     shown: Option<Described>,
 }
@@ -811,6 +861,13 @@ impl Stage for TimelineStage {
             .timeline
             .tick(self.next)
             .ok_or(Error::InvalidArgument("操作时间线比场景的阶段短"))?;
+        if moved {
+            self.feed.push(&Changes {
+                size: content.size,
+                dirty: content.dirty.clone(),
+                moves: content.moves.clone(),
+            });
+        }
         self.content = Some(Arc::clone(content));
         self.next = self.next.saturating_add(1);
         Ok(moved)
@@ -1310,9 +1367,10 @@ fn run_inner(s: &Scenario, record: bool) -> Result<(Outcome, Option<Vec<u8>>), E
     let interval = 1_000_000 / u64::from(s.fps);
     let mut profile = Stopwatch::from_env();
     let tag = Arc::new(AtomicU64::new(0));
-    let (encoder, decoder) = s
-        .codec
-        .make(s.fps, s.max_bps, &s.policy, &tag, s.byte_model)?;
+    let feed = ChangeFeed::default();
+    let (encoder, decoder) =
+        s.codec
+            .make(s.fps, s.max_bps, &s.policy, &tag, &feed, s.byte_model)?;
     // L1 在收包的当场解码；L0.5、L0 走控制端用的延后解码（解码器交给量尺里的 DecodeWorker）
     let (mut stage, inline): (Box<dyn Stage>, Option<Box<dyn VideoDecoder>>) = match s.codec {
         CodecKind::H264L0 => {
@@ -1325,6 +1383,7 @@ fn run_inner(s: &Scenario, record: bool) -> Result<(Outcome, Option<Vec<u8>>), E
                     timeline,
                     next: 0,
                     content: None,
+                    feed,
                     worker: DecodeWorker::new(decoder),
                     shown: None,
                 }),
@@ -1334,6 +1393,7 @@ fn run_inner(s: &Scenario, record: bool) -> Result<(Outcome, Option<Vec<u8>>), E
         CodecKind::H264L05 => (
             Box::new(DescribedStage {
                 desk: RealisticDesktop::new(s.width, s.height, s.seed)?,
+                feed,
                 version: 0,
                 tag,
                 worker: DecodeWorker::new(decoder),

@@ -162,6 +162,8 @@ pub enum FrameInput<'a> {
         sample: &'a [u8],
         /// 细节（千分之几）。
         detail_permille: u32,
+        /// 每个 16×16 宏块里有细节的抽样点数（`content::mb_edges`）：模型后端汇总脏区域的细节用。
+        mb_edges: &'a [u16],
     },
 }
 

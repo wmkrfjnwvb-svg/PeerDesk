@@ -1319,6 +1319,7 @@ impl H264Encoder {
                 version,
                 sample: &luma.sample,
                 detail_permille: luma.detail_permille,
+                mb_edges: &luma.mb_edges,
             },
             None => FrameInput::I420 {
                 y: &self.planes.0,
