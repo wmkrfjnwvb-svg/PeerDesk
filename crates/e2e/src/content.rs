@@ -22,6 +22,9 @@ pub enum Action {
     Switching,
     /// 播放视频：视频区域每帧都变。
     Video,
+    /// 小动静：鼠标指针每帧移一点（光标、悬停效果、时钟这类），每帧只变一小块。
+    /// 真实桌面很少完全静止：2026-11-26 用户日志里轻操作时每秒 22–28 帧、每帧 0–3 KB，发送端远用不满码率。
+    Pointer,
 }
 
 impl Action {
@@ -35,6 +38,26 @@ impl Action {
             Action::Dragging => "dragging",
             Action::Switching => "switching",
             Action::Video => "video",
+            Action::Pointer => "pointer",
+        }
+    }
+}
+
+/// 画一个 12×19 的箭头鼠标指针（黑边白芯），左上角在 (x, y)。超出画面的部分不画。
+fn draw_pointer(out: &mut [u32], w: u32, x: u32, y: u32) {
+    const BLACK: u32 = 0xff00_0000;
+    const WHITE: u32 = 0xffff_ffff;
+    for dy in 0u32..19 {
+        // 上面 12 行是三角形，下面是一小截柄
+        let (from, to) = if dy < 12 { (0, dy) } else { (4, 7) };
+        for dx in from..=to {
+            let edge = dx == from || dx == to || dy == 11 || dy == 18;
+            let at = usize::try_from((y + dy) * w + x + dx).unwrap_or(usize::MAX);
+            if x + dx < w {
+                if let Some(p) = out.get_mut(at) {
+                    *p = if edge { BLACK } else { WHITE };
+                }
+            }
         }
     }
 }
@@ -213,6 +236,9 @@ pub struct RealisticDesktop {
     frame: u32,
     typed: u32,
     drag_dir: i32,
+    /// 鼠标指针的位置（还没出现时为 `None`）和移动方向。
+    pointer: Option<(u32, u32)>,
+    pointer_dir: (i32, i32),
     rng: Rng,
     screen: Screen,
 }
@@ -315,6 +341,8 @@ impl RealisticDesktop {
             frame: 0,
             typed: 0,
             drag_dir: 1,
+            pointer: None,
+            pointer_dir: (5, 3),
             rng,
             screen: Screen::new(width, height, 0),
         };
@@ -380,6 +408,9 @@ impl RealisticDesktop {
                 out.push(color);
             }
         }
+        if let Some((px, py)) = self.pointer {
+            draw_pointer(&mut out, self.w, px, py);
+        }
         let (w, h) = (u16::try_from(self.w), u16::try_from(self.h));
         if let (Ok(w), Ok(h)) = (w, h) {
             self.screen = Screen::from_pixels(w, h, out)?;
@@ -442,6 +473,24 @@ impl RealisticDesktop {
                 self.render_video();
                 true
             }
+            Action::Pointer => {
+                // 在屏幕中间一块区域里来回移动
+                let (x, y) = self.pointer.unwrap_or((self.w / 3, self.h / 3));
+                let (dx, dy) = self.pointer_dir;
+                let bounce = |v: u32, d: i32, lo: u32, hi: u32| -> (u32, i32) {
+                    let next = i64::from(v) + i64::from(d);
+                    if next < i64::from(lo) || next > i64::from(hi) {
+                        (v, -d)
+                    } else {
+                        (u32::try_from(next).unwrap_or(v), d)
+                    }
+                };
+                let (x, dx) = bounce(x, dx, self.w / 4, self.w * 3 / 4);
+                let (y, dy) = bounce(y, dy, self.h / 4, self.h * 3 / 4);
+                self.pointer = Some((x, y));
+                self.pointer_dir = (dx, dy);
+                true
+            }
         };
         if changed {
             self.compose()?;
@@ -469,6 +518,7 @@ mod tests {
             Action::Dragging,
             Action::Switching,
             Action::Video,
+            Action::Pointer,
         ] {
             assert!(!action.name().is_empty());
             let before = d.screen().clone();
@@ -483,7 +533,7 @@ mod tests {
                 Action::Idle => assert!(changed == 0 && !differs),
                 Action::Typing => assert!(changed == 2 && differs, "每 3 帧一个字"),
                 Action::Switching => assert!(changed == 1 && differs, "只在第一帧突变"),
-                Action::Scrolling | Action::Dragging | Action::Video => {
+                Action::Scrolling | Action::Dragging | Action::Video | Action::Pointer => {
                     assert!(changed == 6 && differs);
                 }
             }

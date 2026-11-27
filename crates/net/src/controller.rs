@@ -403,6 +403,9 @@ pub async fn run(
     media.set_keyframe_grace(caps.common(Caps::H264) == Caps::H264);
     // 双方都支持时在反馈里带到达报告（发送端的网络控制器用）
     media.set_reports(caps.has(Caps::TRANSPORT_CC));
+    // 只看 PROBE_ID：控制端拿到的能力里第 24–26 位是被控端的系统，PROBE_TRAIN（第 24 位）在这边读不准
+    // （被控端是 Mac 时是 0）。被控端只在自己也支持 PROBE_TRAIN 时才用新格式，见 host.rs
+    media.set_probe_ids(caps.has(Caps::PROBE_ID));
     // 详情面板：本机到路由器的往返在后台测；被控端的状态和画面尺寸随时更新
     let router_ms = Arc::new(std::sync::atomic::AtomicU32::new(u32::MAX));
     let router_task = opts

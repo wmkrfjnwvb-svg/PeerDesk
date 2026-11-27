@@ -285,6 +285,12 @@ impl Caps {
     /// 变差，发送端要能察觉，见 #26）。接收端先支持、先发出去，发送端开始探测时用户手上的版本已经能配合。
     /// 起步探测实测不如保守的起步码率，没用它（docs/research/L-framework.md T7）。
     pub const PROBE_TRAIN: Caps = Caps(1 << 24);
+    /// 反馈里的探测结果带组号（见 [`crate::estimator::ProbeReport`]）：发送端能分清结果是哪一组探测的、不会和帧的
+    /// 包串混，才做运行中探测（应用受限时降过码率之后核实、码率偏低时定期往上探）。对端没有这一位时反馈格式和
+    /// 探测行为都照旧。
+    /// 用第 31 位：24–26 是被控端的系统（见下，`PROBE_TRAIN` 和它撞了第 24 位，Mac 被控端的 Accept 里这一位是 0），
+    /// 其他分支上 27 是音画同步、28 是模式、29 是挪过位置的 `PROBE_TRAIN`、30 是剪贴板按需取。
+    pub const PROBE_ID: Caps = Caps(1 << 31);
 
     // 第 24–26 位不是能力，是被控端在 Accept 里告诉控制端自己的系统（见 [`PeerOs`]），
     // 控制端据此把快捷键里的 Ctrl 换成 Cmd 等。老版本只看能力位，会忽略这几位。
@@ -319,7 +325,8 @@ impl Caps {
             | Self::FILE_BROWSE.0
             | Self::VIEW_SIZE.0
             | Self::TRANSPORT_CC.0
-            | Self::PROBE_TRAIN.0,
+            | Self::PROBE_TRAIN.0
+            | Self::PROBE_ID.0,
     );
 
     /// 并集。
@@ -633,6 +640,42 @@ impl Control {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_probe_id_bit_survives_the_os_bits() {
+        // 第 24–26 位是被控端的系统；探测组号的能力位在第 31 位，带上哪个系统都不受影响
+        for os in [PeerOs::Unknown, PeerOs::Windows, PeerOs::Mac, PeerOs::Linux] {
+            let caps = Caps::ALL.with_os(os);
+            assert!(caps.has(Caps::PROBE_ID));
+            assert_eq!(caps.os(), os);
+        }
+        assert_eq!(Caps::PROBE_ID.0, 1 << 31);
+        // 握手的能力位怎么流：被控端取自己和控制端 Hello 的交集（Hello 不带系统位），Accept 里带上自己的系统；
+        // 控制端取自己和 Accept 的交集、保留被控端的系统。被控端是哪个系统，两边看到的 PROBE_ID 都对；
+        // PROBE_TRAIN（第 24 位）只有被控端读得准——控制端那边这一位是系统位，Mac 是 0（所以控制端不许读它，
+        // 见 peerdesk_net::controller）。
+        for os in [PeerOs::Windows, PeerOs::Mac, PeerOs::Linux] {
+            let host = Caps::ALL.common(Caps::ALL);
+            assert!(host.has(Caps::PROBE_TRAIN) && host.has(Caps::PROBE_ID));
+            let accept = host.with_os(os);
+            let controller = Caps::ALL.common(accept).with_os(accept.os());
+            assert!(controller.has(Caps::PROBE_ID), "{os:?}");
+            assert_eq!(controller.os(), os);
+            assert_eq!(
+                controller.has(Caps::PROBE_TRAIN),
+                os != PeerOs::Mac,
+                "控制端读到的第 24 位是系统位"
+            );
+            // 对端是老版本（没有 PROBE_ID）：两边都协商不出来
+            let old = Caps(Caps::ALL.0 & !Caps::PROBE_ID.0);
+            assert!(!old.common(Caps::ALL).has(Caps::PROBE_ID));
+            let from_old_host = Caps::ALL.common(old.with_os(os)).with_os(os);
+            assert!(!from_old_host.has(Caps::PROBE_ID));
+        }
+        // 老版本没有这一位：协商出来就没有
+        let old = Caps(Caps::ALL.0 & !Caps::PROBE_ID.0);
+        assert!(!Caps::ALL.common(old).has(Caps::PROBE_ID));
+    }
 
     #[test]
     fn long_names_are_clipped_on_char_boundaries() {
