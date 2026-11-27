@@ -377,7 +377,12 @@ fn wifi_light_activity(name: &str) -> Scenario {
 }
 
 #[test]
-#[ignore = "暂时：状态机三步做完后再决定（第 1 步之后实测能过：2 秒后最低 23.9 Mbps、5% 分位 23.9 Mbps；基线 360 kbps、10.2 Mbps）"]
+// 2880×1800 一分多钟：调试构建插桩后要跑一个小时以上（2026-11-27 覆盖率任务实测 50 分钟没跑完），所以只在发布构建
+// 里跑。CI 的端到端任务每次推送都跑发布构建，门槛照样每次都守。
+#[cfg_attr(
+    debug_assertions,
+    ignore = "大屏场景只在发布构建跑（端到端任务），调试构建太慢"
+)]
 fn light_activity_on_wifi_keeps_the_rate() {
     let o = run(&wifi_light_activity("wifi-light")).unwrap();
     finish(&o);

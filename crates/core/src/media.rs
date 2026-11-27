@@ -27,7 +27,7 @@ use crate::scale::ScalePolicy;
 use crate::screen::Screen;
 use crate::time::Time;
 use crate::transport::{
-    fragment, parity_for, rs_parity_for, Fec, Reassembler, VideoPacket, RS_PARITY_PREFIX,
+    fragment, parity_for, rs_parity_for, Fec, Reassembler, VideoPacket, PROGRESS, RS_PARITY_PREFIX,
     WHOLE_FRAME,
 };
 use crate::video::{Codec, EncodedFrame, FrameHeader, VideoDecoder, VideoEncoder};
@@ -49,6 +49,8 @@ const IN_FLIGHT_RECENT_US: u64 = 100_000;
 
 /// 一条反馈最多带多少个重传请求。
 pub const MAX_NACKS: usize = 48;
+/// 一份反馈里最多带几帧的进度（见 [`crate::transport::PROGRESS`]）。
+const PROGRESS_FRAMES: usize = 4;
 /// 分片缺了多久才请求重传（微秒）：短于这个时间可能只是乱序。
 const NACK_AFTER_US: u64 = 10_000;
 
@@ -596,6 +598,8 @@ pub struct MediaSender {
     probing_at: Time,
     probing_late: bool,
     pacer_busy: bool,
+    /// 接收端报告的每一帧到了几个分片（见 [`crate::transport::PROGRESS`]）。
+    progress: BTreeMap<u32, u16>,
 }
 
 impl std::fmt::Debug for MediaSender {
@@ -666,6 +670,7 @@ impl MediaSender {
             probing_at: Time(0),
             probing_late: false,
             pacer_busy: false,
+            progress: BTreeMap::new(),
             scale: if codec == Codec::H264 {
                 ScalePolicy::new()
             } else {
@@ -830,7 +835,7 @@ impl MediaSender {
 
     /// 现在为什么不能发运行中探测（能发时为 `None`）。真拥塞时不探：探测是满速的流量，只会添堵。
     fn probe_blocked(&self, now: Time) -> Option<&'static str> {
-        let p = self.rate.profile();
+        // （排队平不平静由估计器判：它知道哪些读数是断档的零星小包，不算数）
         let fb = self.last_obs.map(|o| o.feedback);
         if self.pending_probe.is_some() || self.probing.is_some() {
             Some("另一组探测还没完")
@@ -840,8 +845,6 @@ impl MediaSender {
             Some("在途数据满了")
         } else if self.pacer_busy {
             Some("上一帧还没发完")
-        } else if fb.is_some_and(|f| f.queue_delay_us >= p.low_delay_us) {
-            Some("最近的反馈里还有排队")
         } else if fb.is_some_and(|f| f.loss_permille >= FEC_FROM_LOSS_PERMILLE) {
             // 和起步探测一样：有丢包的链路上探测结果不准（ms-02560，8 Mbps、12% 丢包，按探测升码率后卡顿 0 → 3 次）
             Some("有丢包")
@@ -1616,9 +1619,24 @@ impl MediaSender {
                 one.into_iter().chain(all)
             })
             .collect();
-        // 接收端还在为这些帧要重传：它们在路上、在进展，不能按超时判丢（判丢就要重发关键帧）。
+        // 新反馈格式里的进度标记（不是重传请求）：这一帧到的分片比上次多了，说明它还在路上、在进展
+        type Marks = Vec<(u32, u16)>;
+        let (marks, nacks): (Marks, Marks) = nacks
+            .into_iter()
+            .partition(|(_, frag)| self.probe_ids && *frag != WHOLE_FRAME && frag & PROGRESS != 0);
+        let mut alive: Vec<u32> = Vec::new();
+        for (frame, mark) in marks {
+            let arrived = mark & (PROGRESS - 1);
+            if self.progress.get(&frame).is_none_or(|seen| arrived > *seen) {
+                self.progress.insert(frame, arrived);
+                alive.push(frame);
+            }
+        }
+        self.progress
+            .retain(|frame, _| self.unacked.iter().any(|(id, _, _)| id == frame));
+        // 在进展的帧，和接收端还在要重传的帧：不能按超时判丢（判丢就要重发关键帧），也继续算在途（拦着新帧）。
         for (id, at, _) in &mut self.unacked {
-            if nacks.iter().any(|(frame, _)| frame == id) {
+            if alive.contains(id) || nacks.iter().any(|(frame, _)| frame == id) {
                 *at = now;
             }
         }
@@ -2269,17 +2287,31 @@ impl MediaReceiver {
     /// 有没有缺了一阵子的分片要请求重传。
     #[must_use]
     pub fn wants_nack(&self, now: Time) -> bool {
-        !self.reassembler.missing(now, NACK_AFTER_US, 1).is_empty()
+        !self.nacks(now, 1).is_empty()
+    }
+
+    /// 要请求重传的分片：这一帧第一片到了 10 ms，缺的全要（发送端按“发出之后过了往返加排队”决定真的重传哪些）。
+    /// 按空洞和超时判丢（RFC 9002）试过：虚假重传少了很多，但丢一大片时恢复变慢（drop-while-idle 冻结 1666 ms），
+    /// 先没用，见 docs/research/L-framework.md 6.9。
+    fn nacks(&self, now: Time, limit: usize) -> Vec<(u32, u16)> {
+        self.reassembler.missing(now, NACK_AFTER_US, limit)
     }
 
     /// 生成一个反馈数据报：反馈加上缺失分片的重传请求。
     pub fn feedback_datagram(&mut self, now: Time) -> Vec<u8> {
         let feedback = self.feedback(now);
-        let nacks = self.reassembler.missing(now, NACK_AFTER_US, MAX_NACKS);
+        let mut nacks = self.nacks(now, MAX_NACKS);
         self.stats.nacks_sent = self
             .stats
             .nacks_sent
             .saturating_add(u32::try_from(nacks.len()).unwrap_or(u32::MAX));
+        // 新反馈格式：正在收的帧的进度排在前面（“还活着”和“要重传”是两个信号，见 PROGRESS）
+        if self.probe_ids {
+            let mut list = self.reassembler.progress(PROGRESS_FRAMES);
+            nacks.truncate(MAX_NACKS.saturating_sub(list.len()));
+            list.extend(nacks);
+            nacks = list;
+        }
         if self.reports {
             let report = self.arrivals.report();
             return encode_feedback_v2(&feedback, &nacks, report.as_ref());
@@ -3570,8 +3602,6 @@ mod tests {
             loss_permille: loss,
             ..Feedback::default()
         };
-        tx.observe(Time(0), &fb(5_000, 0), Extension::default());
-        assert_eq!(tx.probe_blocked(Time(0)), Some("最近的反馈里还有排队"));
         tx.observe(Time(0), &fb(0, 20), Extension::default());
         assert_eq!(tx.probe_blocked(Time(0)), Some("有丢包"));
         tx.observe(Time(0), &fb(0, 0), Extension::default());
@@ -3670,6 +3700,69 @@ mod tests {
             rx.feedback_datagram(Time(140_000)).len(),
             Feedback::LEN + Extension::LEN
         );
+    }
+
+    /// “这一帧还活着”和“要重传”是两个信号：接收端报进度，发送端按进度增加刷新这一帧的存活时间，
+    /// 进度标记不当成重传请求；对端是老版本时不发进度。
+    #[test]
+    fn progress_marks_keep_a_frame_alive_without_asking_for_retransmits() {
+        let screen = Screen::new(64, 64, 1);
+        let mut tx = MediaSender::new(cfg(), Box::new(FakeEncoder::default()));
+        tx.set_probe_ids(true);
+        let key = tx.on_frame(Time(0), &screen, true, 10_000).unwrap();
+        assert!(key.len() > 3);
+        for (i, o) in key.iter().enumerate() {
+            tx.on_packet_sent(Time(0), u32::try_from(i).unwrap(), o);
+        }
+        // 接收端：到了两片，报进度（新格式）
+        let mut rx = MediaReceiver::new(Time::ZERO, 500_000, Box::new(FakeDecoder::default()));
+        rx.set_probe_ids(true);
+        for (i, o) in key.iter().take(2).enumerate() {
+            rx.on_datagram(
+                Time(5_000),
+                Time(0),
+                u32::try_from(i).unwrap(),
+                o.flags,
+                &o.body,
+            )
+            .unwrap();
+        }
+        let fb = rx.feedback_datagram(Time(6_000));
+        let ((_, _, list), _) = decode_feedback_ids(&fb).unwrap();
+        assert_eq!(
+            list,
+            vec![(1, PROGRESS | 2)],
+            "还没到 10 ms：只有进度，没有重传请求"
+        );
+        // 发送端：进度不是重传请求，不重传；这一帧的存活时间刷新了
+        let again = tx.on_feedback_datagram(Time(300_000), &fb).unwrap();
+        assert!(again.is_empty());
+        assert_eq!(tx.stats().nack_requests, 0);
+        assert_eq!(
+            tx.unacked.front().map(|(id, at, _)| (*id, *at)),
+            Some((1, Time(300_000)))
+        );
+        // 同样的进度再报一次（没有新分片到）：不算进展，不刷新
+        tx.on_feedback_datagram(Time(400_000), &fb).unwrap();
+        assert_eq!(
+            tx.unacked.front().map(|(_, at, _)| *at),
+            Some(Time(300_000))
+        );
+        // 过了 10 ms：进度排在前面，后面是缺的分片（照旧全要）
+        let fb = rx.feedback_datagram(Time(20_000));
+        let ((_, _, list), _) = decode_feedback_ids(&fb).unwrap();
+        assert_eq!(list[0], (1, PROGRESS | 2));
+        assert_eq!(
+            list.len(),
+            1 + key.iter().filter(|o| o.flags & FLAG_PARITY == 0).count() - 2
+        );
+        assert!(list[1..].iter().all(|(_, frag)| frag & PROGRESS == 0));
+        // 对端是老版本：不发进度
+        let mut old = MediaReceiver::new(Time::ZERO, 500_000, Box::new(FakeDecoder::default()));
+        old.on_datagram(Time(5_000), Time(0), 0, key[0].flags, &key[0].body)
+            .unwrap();
+        let (_, _, list) = decode_feedback(&old.feedback_datagram(Time(6_000))).unwrap();
+        assert!(list.is_empty());
     }
 
     #[test]
