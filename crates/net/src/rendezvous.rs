@@ -7,9 +7,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use peerdesk_core::devices::{Enrolled, Refusal, Role};
 use peerdesk_core::paths::{Candidate, Limits, PathKind, NAT_PENALTY_US};
 use peerdesk_core::relay::{parse_notice, unwrap, wrap, SessionId, RELAY_HEADER};
-use peerdesk_core::devices::{Enrolled, Refusal, Role};
 use peerdesk_core::signal::{
     format_code, observe_packet, DeviceRow, Features, PunchInfo, PunchPlan, RelayGrant, SignalMsg,
 };

@@ -7,13 +7,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
+use peerdesk_core::billing::{verify_enroll, EnrollTokenError};
 use peerdesk_core::billing::{AccountId, PUBLIC_ACCOUNT};
+use peerdesk_core::devices::{DeviceInfo, DeviceStore, Refusal, Role, Row};
 use peerdesk_core::paths::Candidate;
 use peerdesk_core::relay::{
     unwrap, FreePolicy, Record, Relay, SessionId, Ticket, Usage, TICKET_LEN, TICKET_MAGIC,
 };
-use peerdesk_core::billing::{verify_enroll, EnrollTokenError};
-use peerdesk_core::devices::{DeviceInfo, DeviceStore, Refusal, Role, Row};
 use peerdesk_core::signal::{
     format_code, parse_observe, Caller, DeviceId, DeviceRow, Features, Registry, SignalMsg,
     MAX_ROWS,
@@ -927,7 +927,184 @@ impl Drop for SignalService {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::indexing_slicing, clippy::unreachable)]
     use super::*;
+
+    /// 设备表的请求：除了入表都要求是账户成员，只能动自己账户里的设备。
+    #[test]
+    fn account_requests_are_answered_for_members_only() {
+        use peerdesk_core::billing::issue_enroll;
+        use peerdesk_core::devices::MemoryStore;
+        let key = b"billing".to_vec();
+        let accounts = Accounts {
+            store: Arc::new(MemoryStore::new()),
+            key: key.clone(),
+        };
+        let ask = |device: u8, msg: SignalMsg, now: u64| {
+            account_reply(Some(&accounts), &[device; 32], &msg, now)
+        };
+        let refused = |why: Refusal| vec![SignalMsg::Refused { code: why.code() }];
+        let enroll = |token: &str, name: &str| SignalMsg::Enroll {
+            token: token.to_owned(),
+            name: name.to_owned(),
+            os: 2,
+            role: Role::Host.id(),
+        };
+        let (a, b) = ([1u8; 8], [2u8; 8]);
+        let token_a = issue_enroll(&key, a, 1_000, 1);
+        let token_b = issue_enroll(&key, b, 1_000, 2);
+        // 入表：令牌不对、过期、名字不合适都拒绝并说明
+        assert_eq!(
+            ask(1, enroll("junk", "mac"), 10),
+            refused(Refusal::BadToken)
+        );
+        assert_eq!(
+            ask(1, enroll(&issue_enroll(b"other", a, 1_000, 1), "mac"), 10),
+            refused(Refusal::BadToken)
+        );
+        assert_eq!(
+            ask(1, enroll(&token_a, "mac"), 1_000),
+            refused(Refusal::ExpiredToken)
+        );
+        assert_eq!(ask(1, enroll(&token_a, ""), 10), refused(Refusal::BadName));
+        // 没入表：列表、改名、移除都拒绝
+        for msg in [
+            SignalMsg::Devices { since: 0 },
+            SignalMsg::Rename {
+                row: 1,
+                name: "x".into(),
+            },
+            SignalMsg::Remove { row: 1 },
+        ] {
+            assert_eq!(ask(1, msg, 10), refused(Refusal::NotMember));
+        }
+        // 三台设备入账户 a，一台入账户 b
+        for (device, name) in [(1u8, "mac-mini"), (2, "办公室 PC"), (3, "linux-box")] {
+            assert_eq!(
+                ask(device, enroll(&token_a, name), 10),
+                vec![SignalMsg::Enrolled {
+                    account: a,
+                    row: u32::from(device),
+                    rev: u64::from(device),
+                }]
+            );
+        }
+        assert_eq!(
+            ask(9, enroll(&token_b, "别人的"), 10),
+            vec![SignalMsg::Enrolled {
+                account: b,
+                row: 1,
+                rev: 1
+            }]
+        );
+        // 已经在别的账户里：拒绝
+        assert_eq!(
+            ask(9, enroll(&token_a, "x"), 10),
+            refused(Refusal::OtherAccount)
+        );
+        // 成员看到自己账户的全部设备，看不到别的账户的
+        let listed = ask(2, SignalMsg::Devices { since: 0 }, 10);
+        assert_eq!(listed.len(), 1);
+        let SignalMsg::DeviceRows {
+            rev,
+            full,
+            more,
+            rows,
+        } = &listed[0]
+        else {
+            unreachable!("应当是设备列表");
+        };
+        assert_eq!((*rev, *full, *more), (3, true, false));
+        assert_eq!(
+            rows.iter()
+                .map(|r| (r.row, r.name.as_str(), r.fingerprint[0]))
+                .collect::<Vec<_>>(),
+            [(1, "mac-mini", 1), (2, "办公室 PC", 2), (3, "linux-box", 3)]
+        );
+        let other = ask(9, SignalMsg::Devices { since: 0 }, 10);
+        assert!(matches!(
+            &other[0],
+            SignalMsg::DeviceRows { rows, .. } if rows.len() == 1 && rows[0].name == "别人的"
+        ));
+        // 改名：只能改自己账户里的；别的账户的编号 1 是另一台设备
+        assert_eq!(
+            ask(
+                2,
+                SignalMsg::Rename {
+                    row: 1,
+                    name: "书房的 Mac".into()
+                },
+                10
+            ),
+            vec![SignalMsg::Changed { rev: 4 }]
+        );
+        assert_eq!(
+            ask(
+                2,
+                SignalMsg::Rename {
+                    row: 7,
+                    name: "x".into()
+                },
+                10
+            ),
+            refused(Refusal::NoSuchDevice)
+        );
+        assert!(matches!(
+            &ask(9, SignalMsg::Devices { since: 0 }, 10)[0],
+            SignalMsg::DeviceRows { rows, .. } if rows[0].name == "别人的"
+        ));
+        // 增量：只有改过的那一行
+        assert!(matches!(
+            &ask(3, SignalMsg::Devices { since: 3 }, 10)[0],
+            SignalMsg::DeviceRows { rev: 4, full: false, rows, .. }
+                if rows.len() == 1 && rows[0].name == "书房的 Mac"
+        ));
+        // 移除别的设备；被移除的那台不再是成员
+        assert_eq!(
+            ask(1, SignalMsg::Remove { row: 3 }, 20),
+            vec![SignalMsg::Changed { rev: 5 }]
+        );
+        assert_eq!(
+            ask(3, SignalMsg::Devices { since: 0 }, 20),
+            refused(Refusal::NotMember)
+        );
+        assert!(matches!(
+            &ask(1, SignalMsg::Devices { since: 4 }, 20)[0],
+            SignalMsg::DeviceRows { rows, .. } if rows.len() == 1 && rows[0].removed
+        ));
+        // 编号 0：自己退出
+        assert_eq!(
+            ask(2, SignalMsg::Remove { row: 0 }, 30),
+            vec![SignalMsg::Changed { rev: 6 }]
+        );
+        assert_eq!(
+            ask(2, SignalMsg::Devices { since: 0 }, 30),
+            refused(Refusal::NotMember)
+        );
+        // 设备多了分页：每条最多 MAX_ROWS 台，最后一条 more 为假
+        for device in 20..50u8 {
+            ask(device, enroll(&token_a, "批量"), 40);
+        }
+        let pages = ask(1, SignalMsg::Devices { since: 0 }, 40);
+        assert_eq!(pages.len(), 3, "31 台分 3 页");
+        let counts: Vec<(usize, bool)> = pages
+            .iter()
+            .map(|p| match p {
+                SignalMsg::DeviceRows { rows, more, .. } => (rows.len(), *more),
+                other => unreachable!("{}", other.name()),
+            })
+            .collect();
+        assert_eq!(counts, [(MAX_ROWS, true), (MAX_ROWS, true), (7, false)]);
+        // 服务器没开设备表：一律“不支持”；不是设备表的消息不回
+        assert_eq!(
+            account_reply(None, &[1; 32], &SignalMsg::Devices { since: 0 }, 1),
+            refused(Refusal::Unsupported)
+        );
+        assert!(ask(1, SignalMsg::Check, 1).is_empty());
+        assert_eq!(features_of(None), Features::NONE);
+        assert_eq!(features_of(Some(&accounts)), Features::DEVICES);
+        assert!(wall_s() > 1_700_000_000);
+    }
 
     #[test]
     fn codes_derive_from_the_fingerprint() {
