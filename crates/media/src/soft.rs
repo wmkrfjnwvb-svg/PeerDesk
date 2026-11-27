@@ -157,7 +157,12 @@ impl EncoderBackend for OpenH264Backend {
             return Err(BackendError::Misuse("还没配置编码尺寸就交帧"));
         };
         let (w, h) = (usize::from(width), usize::from(height));
-        if y.len() < w.saturating_mul(h) || u.len() < w / 2 * (h / 2) || v.len() < w / 2 * (h / 2) {
+        // 必须刚好等于：openh264 的 YUVSlices::new 要求平面长度和尺寸完全一致，不一致会 panic
+        // （C2 体检交一幅比配置大的画面时发现的；以前只拦了太小的）
+        if y.len() != w.saturating_mul(h)
+            || u.len() != w / 2 * (h / 2)
+            || v.len() != w / 2 * (h / 2)
+        {
             self.enc = Some((width, height, enc));
             return Err(BackendError::Misuse("画面的大小和配置的尺寸对不上"));
         }

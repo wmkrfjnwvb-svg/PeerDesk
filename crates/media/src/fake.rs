@@ -1,0 +1,1505 @@
+//! 假编码后端（整体重新设计 C2，见 `docs/research/Q-redesign/design.md` 1.6、3.2 节）：给仿真（L0）和测试用。
+//!
+//! 编出的“码流”不是真 H.264，是确定性的假字节：长度由调用方给的预算和一个可替换的[`ByteModel`]（字节模型）定，
+//! 内容只由（帧编号、QP、是否关键帧、第几帧）决定。**同一配置、同一输入序列，输出逐字节相同。**
+//! 计时用调用方注入的[`Clock`]，从不读系统时间，所以仿真里可以确定地重放；“停了多久”也由调用方拨时钟。
+//!
+//! # 行为只由毛病表决定
+//!
+//! 后端的每一种脾气都是 [`FakeConfig`] 里的一个开关，没有隐式规则。分两张表：
+//! - [`Faults`]：**守约的脾气**。这两周真机上遇到的、契约允许的行为（码率窗口放不下就丢帧、攒帧、静止后第一帧慢……），
+//!   出处见每一项的说明。后端的 [`BackendTraits`] 按它们自动算出来（声明是诚实的）。
+//! - [`Breaches`]：**违约**。契约（`backend.rs` 模块说明九条）不允许的行为，给体检（[`crate::checkup`]）证明它抓得到违约用；
+//!   默认全关，要显式打开。
+//!
+//! 默认配置（[`FakeConfig::default`]）守约、什么毛病也没有：按 QP 编、同步、不攒帧、不丢帧。
+//!
+//! # 字节模型不是真数据
+//!
+//! [`DefaultByteModel`] 按 QP 和“内容复杂度”估字节数，**系数是占位**（形状对：QP 每加 6 字节数减半、关键帧比普通帧大得多、
+//! 变化越多越大），数值不对应任何真实编码器，以后由 M2 的实测数据标定。不要拿它的绝对数字当结论。
+
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use crate::backend::{
+    BackendError, BackendInfo, BackendKind, BackendTraits, DropReason, EncodedOut, EncoderBackend,
+    Finished, Format, FrameAsk, FrameInput, Inputs, RateControl, Rates, Reconfigured, Submitted,
+    Timing,
+};
+
+/// 最小 QP：假后端能编到的最细（和 [`crate::qp::MIN_QP`] 无关，只是模型的范围）。
+pub const MODEL_MIN_QP: u8 = 10;
+/// 最大 QP（H.264 的上限）。
+pub const MODEL_MAX_QP: u8 = 51;
+/// 画面变了这么多（千分之几）以上算整屏突变，[`SceneKeyframes`] 打开时会自己出关键帧。
+pub const SCENE_PERMILLE: u32 = 900;
+/// 抽样步长：每隔这么多个字节取一个亮度点估计“变了多少、有多少细节”（取质数，免得和行宽对齐）。
+const SAMPLE_STEP: usize = 13;
+/// 相邻两点亮度差超过这个值算“有细节”。
+const DETAIL_EDGE: u8 = 24;
+/// [`Faults::first_frame_prime`] 打开时，多编一次初始化花的时间（微秒，占位）。
+pub const PRIME_SETUP_US: u64 = 6_000;
+
+/// 时钟：调用方注入，后端不读系统时间。
+pub trait Clock: Send + Sync + std::fmt::Debug {
+    /// 现在是第几微秒（只有差值有意义）。
+    fn now_us(&self) -> u64;
+}
+
+/// 手拨的时钟：克隆出来的几份共用同一个读数，调用方拨它，假后端读它。
+#[derive(Debug, Clone, Default)]
+pub struct ManualClock(Arc<AtomicU64>);
+
+impl ManualClock {
+    /// 从 0 开始。
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 往前拨若干微秒。
+    pub fn advance_us(&self, us: u64) {
+        let _ = self.0.fetch_add(us, Ordering::Relaxed);
+    }
+
+    /// 往前拨一段时间。
+    pub fn advance(&self, by: Duration) {
+        self.advance_us(u64::try_from(by.as_micros()).unwrap_or(u64::MAX));
+    }
+}
+
+impl Clock for ManualClock {
+    fn now_us(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+/// 字节模型的输入：这一帧的编码条件和内容特征。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelInput {
+    /// 按哪个 QP 编。
+    pub qp: u8,
+    /// 是不是关键帧。
+    pub key: bool,
+    /// 画面像素数。
+    pub pixels: u64,
+    /// 和上一帧比变了多少（千分之几，0 到 1000；第一帧算 1000）。
+    pub changed_permille: u32,
+    /// 画面有多少细节（千分之几：相邻点亮度差大的点占多少）。
+    pub detail_permille: u32,
+}
+
+/// 字节模型：给定编码条件，这一帧大约多少字节。要求：QP 越大不会越大（体检按这个判断“按 QP 编”）。
+pub trait ByteModel: Send + std::fmt::Debug {
+    /// 这一帧的字节数（不为 0）。
+    fn bytes(&self, input: &ModelInput) -> usize;
+}
+
+/// 默认的字节模型（系数是占位，见模块说明）。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DefaultByteModel;
+
+/// QP 每加 1 步长放大的倍数（千分之几），一个周期 6 档，之后翻倍。
+const QP_STEP_X1000: [u64; 6] = [1000, 1122, 1260, 1414, 1587, 1782];
+/// QP 为 0 时每个像素的字节数（占位，千分之一字节）。
+const MILLI_BYTES_PER_PIXEL_QP0: u64 = 1400;
+/// 每帧固定开销（占位）。
+const FRAME_OVERHEAD: u64 = 24;
+/// 关键帧多出来的固定开销（占位）。
+const KEY_OVERHEAD: u64 = 40;
+
+impl ByteModel for DefaultByteModel {
+    fn bytes(&self, input: &ModelInput) -> usize {
+        let qp = u64::from(input.qp.min(MODEL_MAX_QP));
+        let step = QP_STEP_X1000
+            .get(usize::try_from(qp % 6).unwrap_or(0))
+            .copied()
+            .unwrap_or(1000);
+        // 步长 = 周期内的倍数 × 2^(QP / 6)
+        let divisor = u128::from(step) << (qp / 6);
+        let area = if input.key {
+            1000
+        } else {
+            u64::from(input.changed_permille.min(1000))
+        };
+        let detail = 500 + u128::from(input.detail_permille.min(1000));
+        // 千分之一字节 = 像素 × 系数 × 细节 × 面积（后两个各是千分之几）
+        let milli = u128::from(input.pixels)
+            * u128::from(MILLI_BYTES_PER_PIXEL_QP0)
+            * detail
+            * u128::from(area)
+            / 1_000_000;
+        let body = milli * 1000 / divisor / 1000;
+        let overhead = FRAME_OVERHEAD + if input.key { KEY_OVERHEAD } else { 0 };
+        usize::try_from(u128::from(overhead) + body).unwrap_or(usize::MAX)
+    }
+}
+
+/// 整屏突变时会不会自己出关键帧（没要求也出）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SceneKeyframes {
+    /// 不会。
+    #[default]
+    Off,
+    /// 会，并且在 [`BackendTraits::scene_keyframes`] 里声明了（openh264 屏幕内容模式就是这样，守约）。
+    Declared,
+    /// 会，但没声明（违约：调用方没法按“可能是关键帧”算预算）。
+    Undeclared,
+}
+
+/// 静止后第一帧慢：两次交帧隔了至少 `idle_us`，这一帧的计算时间多 `extra_us`
+/// （日志：硬件编码器睡着之后第一帧要醒一下）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlowAfterIdle {
+    /// 静止多久之后算“睡着了”（微秒）。
+    pub idle_us: u64,
+    /// 多出来的计算时间（微秒）。
+    pub extra_us: u64,
+}
+
+/// 卡住：交到第 `after_frames` 帧时（从重新配置算起，从 0 数）编码器卡住，这一帧永远不出；
+/// 之后交帧一律回 `Dropped { NotAccepting }`；卡了 `limit_us` 之后，下一次 `submit` 或 `poll` 报错并复位
+/// （契约第 9 条）。只卡一次。`limit_us = u64::MAX` 表示一直不报错（体检抓“卡住又不吭声”用）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stall {
+    /// 第几帧卡住。
+    pub after_frames: u32,
+    /// 卡多久之后报错（微秒）。
+    pub limit_us: u64,
+}
+
+/// 守约的脾气：契约允许、但各家编码器有的行为。每一项都对应日志里遇到过的情况。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Faults {
+    /// 码率窗口放不下就丢帧，回 `Dropped { Budget }`（VideoToolbox、Media Foundation 的码控）。只对 [`RateControl::Window`] 有意义。
+    pub window_drop: bool,
+    /// 预算放不下时，把要求的关键帧丢掉（回 `Dropped { Budget }`，要求没送到，调用方接着要）
+    /// （VideoToolbox：苹果文档说“不保证都能满足”，2026-11-27 Mac 日志）。只对 Window 有意义。
+    pub drop_requested_keyframe: bool,
+    /// 超发：码控“够不着”预算时（要的比预算大），编出来的字节比预算多这么多（千分之几）。只对 Window 有意义。
+    pub overshoot_permille: u32,
+    /// 攒帧：交了这么多帧之后才出第一个（异步硬件编码器）。声明在 `max_held` 里。
+    pub held_frames: u8,
+    /// 静止后第一帧慢。
+    pub slow_after_idle: Option<SlowAfterIdle>,
+    /// 整屏突变时自己出关键帧。
+    pub scene_keyframes: SceneKeyframes,
+    /// 要了关键帧，晚这么多帧才给（声明在 `keyframe_within` 里）。
+    pub keyframe_delay: u8,
+    /// 运行中改不了码率：`set_rates` 回失败（有的 Media Foundation 编码器），状态不变。
+    pub set_rates_fails: bool,
+    /// 卡住不出帧，然后报错复位（2026-11-27 Windows 日志）。
+    pub stall: Option<Stall>,
+    /// 每隔这么多次交帧有一次不收（`Dropped { NotAccepting }`，Media Foundation 的 `MF_E_NOTACCEPTING`）。
+    pub not_accepting_every: Option<u32>,
+    /// 新开之后第一帧只能按这个 QP 编，别的 QP 要多编一次初始化（openh264）；声明在 `first_frame_qp` 里。
+    pub first_frame_prime: Option<u8>,
+}
+
+/// 违约：契约不允许的行为。默认全关，要显式打开。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Breaches {
+    /// 契约 3：没要求也每隔这么多帧出一个关键帧（固定 GOP，个别厂商的 Media Foundation 编码器）。
+    pub periodic_keyframes: Option<u32>,
+    /// 契约 3：要了关键帧也不给，又不回丢帧（悄悄丢掉要求）。
+    pub ignore_keyframe_requests: bool,
+    /// 契约 1：每隔这么多帧吞掉一帧：回 `Pending`，之后永远没有下落（Media Foundation 被码控丢掉的帧没有通知）。
+    pub lose_frame_every: Option<u32>,
+    /// 契约 4：放不下要丢的时候，交一个空帧冒充编好了（改造前的 VideoToolbox 路径）。
+    pub empty_frame_on_drop: bool,
+    /// 契约 5：改码率时顺带出一个关键帧。
+    pub set_rates_forces_keyframe: bool,
+    /// 契约 6：重新配置时说下一帧一定是关键帧，实际不是。
+    pub first_frame_not_key: bool,
+    /// 契约 6：交的画面尺寸和配置的不一样时，不报用法错，自己悄悄换尺寸（宽度不变，高度按数据量推）。
+    pub resize_silently: bool,
+    /// 契约 7：两次交帧隔了这么久（微秒）就报错。
+    pub error_after_idle_us: Option<u64>,
+    /// 契约 8：不报时间（全是 0）。
+    pub zero_timing: bool,
+    /// 契约 9：出错之后不复位（`size()` 还是 `Some`）。
+    pub keep_state_after_error: bool,
+    /// 契约 2：`flush` 什么也不做，攒着的帧一直没有下落。
+    pub flush_forgets: bool,
+}
+
+/// 假后端的配置。
+#[derive(Debug, Clone)]
+pub struct FakeConfig {
+    /// 名字（日志和体检报告里显示）。
+    pub name: String,
+    /// 每帧大小怎么控制。
+    pub rate_control: RateControl,
+    /// 收哪些形式的画面（显卡画面假后端不收）。
+    pub inputs: Inputs,
+    /// 每帧的基础计算时间（微秒，占位）；关键帧翻倍。
+    pub compute_us: u64,
+    /// 每帧的等待时间（微秒，例如读回）。
+    pub wait_us: u64,
+    /// 守约的脾气。
+    pub faults: Faults,
+    /// 违约。
+    pub breaches: Breaches,
+    /// 谎报的属性：不为 `None` 时，[`EncoderBackend::info`] 给这个，不按上面的脾气算
+    /// （体检抓“声明和实测不符”用）。
+    pub declared: Option<BackendTraits>,
+}
+
+impl Default for FakeConfig {
+    fn default() -> Self {
+        Self {
+            name: "假后端".to_owned(),
+            rate_control: RateControl::PerFrameQp,
+            inputs: Inputs {
+                i420: true,
+                nv12: true,
+                gpu: false,
+            },
+            compute_us: 2_000,
+            wait_us: 0,
+            faults: Faults::default(),
+            breaches: Breaches::default(),
+            declared: None,
+        }
+    }
+}
+
+impl FakeConfig {
+    /// 有自己码控的后端：放不下就丢帧（契约第 4 条允许的做法）。
+    #[must_use]
+    pub fn window() -> Self {
+        Self {
+            name: "假后端（码控窗口）".to_owned(),
+            rate_control: RateControl::Window,
+            faults: Faults {
+                window_drop: true,
+                ..Faults::default()
+            },
+            ..Self::default()
+        }
+    }
+
+    /// 按脾气算出来的诚实声明。
+    #[must_use]
+    pub fn honest_traits(&self) -> BackendTraits {
+        let f = &self.faults;
+        BackendTraits {
+            rate_control: self.rate_control,
+            inputs: self.inputs,
+            // 卡住的那一帧也算攒着的
+            max_held: f.held_frames.max(u8::from(f.stall.is_some())),
+            keyframe_within: f.keyframe_delay.saturating_add(1),
+            first_frame_qp: f.first_frame_prime,
+            scene_keyframes: f.scene_keyframes == SceneKeyframes::Declared,
+        }
+    }
+}
+
+/// 假编码后端。
+#[derive(Debug)]
+pub struct FakeBackend {
+    cfg: FakeConfig,
+    info: BackendInfo,
+    clock: Arc<dyn Clock>,
+    model: Box<dyn ByteModel>,
+    rates: Rates,
+    size: Option<(u16, u16)>,
+    /// 配置之后还没编出过帧。
+    first: bool,
+    /// 配置之后编出了几帧（卡住、吞帧按它数）。
+    index: u32,
+    /// 配置之后收到几次有效的交帧（不收帧按它数）。
+    calls: u32,
+    /// 上一帧抽样的亮度点。
+    prev: Option<Vec<u8>>,
+    /// 上一次交帧的时间。
+    last_submit_us: Option<u64>,
+    /// 欠着的关键帧：还要再过几帧才给。
+    key_countdown: Option<u8>,
+    /// 攒着、还没出的帧。
+    inflight: VecDeque<Finished>,
+    /// 已经出了、等 `poll` 取的帧。
+    ready: VecDeque<Finished>,
+    /// 卡住开始的时间。
+    stalled_since: Option<u64>,
+    /// 卡住已经发生过了（只卡一次）。
+    stall_spent: bool,
+}
+
+impl FakeBackend {
+    /// 创建（还没配置，先 [`EncoderBackend::reconfigure`]）。
+    #[must_use]
+    pub fn new(cfg: FakeConfig, clock: Arc<dyn Clock>, model: Box<dyn ByteModel>) -> Self {
+        let info = BackendInfo {
+            name: cfg.name.clone(),
+            kind: BackendKind::Software,
+            format: Format::H264,
+            traits: cfg.declared.unwrap_or_else(|| cfg.honest_traits()),
+        };
+        Self {
+            cfg,
+            info,
+            clock,
+            model,
+            rates: Rates { bps: 0, fps: 1 },
+            size: None,
+            first: true,
+            index: 0,
+            calls: 0,
+            prev: None,
+            last_submit_us: None,
+            key_countdown: None,
+            inflight: VecDeque::new(),
+            ready: VecDeque::new(),
+            stalled_since: None,
+            stall_spent: false,
+        }
+    }
+
+    /// 用默认字节模型。
+    #[must_use]
+    pub fn with_default_model(cfg: FakeConfig, clock: Arc<dyn Clock>) -> Self {
+        Self::new(cfg, clock, Box::new(DefaultByteModel))
+    }
+
+    /// 最近一次设的码率和帧率。
+    #[must_use]
+    pub const fn rates(&self) -> Rates {
+        self.rates
+    }
+
+    /// 回到“刚配置”的码流状态（不动尺寸）。
+    fn reset_stream(&mut self) {
+        self.first = true;
+        self.index = 0;
+        self.calls = 0;
+        self.prev = None;
+        self.last_submit_us = None;
+        self.key_countdown = None;
+    }
+
+    /// 出错：按契约第 9 条复位（违约的后端不复位），攒着的帧作废。
+    fn fail(&mut self, why: &str) -> BackendError {
+        self.stall_spent = true;
+        self.stalled_since = None;
+        self.inflight.clear();
+        self.ready.clear();
+        self.key_countdown = None;
+        if !self.cfg.breaches.keep_state_after_error {
+            self.size = None;
+            self.reset_stream();
+        }
+        BackendError::Failed(why.to_owned())
+    }
+
+    /// 卡住了的话，到时限没有？到了就出错复位。
+    fn stall_timeout(&mut self, now: u64) -> Option<BackendError> {
+        let since = self.stalled_since?;
+        let limit = self.cfg.faults.stall.map_or(u64::MAX, |s| s.limit_us);
+        (now.saturating_sub(since) >= limit)
+            .then(|| self.fail("编码器卡住了，一直没有出帧（假后端的毛病表）"))
+    }
+
+    /// 检查画面和配置的尺寸对得上；对不上时，违约的后端自己换尺寸，守约的回用法错。返回亮度平面。
+    fn luma<'a>(&mut self, input: FrameInput<'a>) -> Result<(&'a [u8], (u16, u16)), BackendError> {
+        let Some(size) = self.size else {
+            return Err(BackendError::Misuse("还没配置编码尺寸就交帧"));
+        };
+        let (w, h) = (usize::from(size.0), usize::from(size.1));
+        let (luma, total, ok) = match input {
+            FrameInput::I420 { y, u, v } => {
+                if !self.cfg.inputs.i420 {
+                    return Err(BackendError::Misuse("这个后端不收 I420 画面"));
+                }
+                let chroma = w / 2 * (h / 2);
+                (
+                    y,
+                    y.len(),
+                    y.len() == w * h && u.len() == chroma && v.len() == chroma,
+                )
+            }
+            FrameInput::Nv12(data) => {
+                if !self.cfg.inputs.nv12 {
+                    return Err(BackendError::Misuse("这个后端不收 NV12 画面"));
+                }
+                let luma = data.get(..w * h).unwrap_or(data);
+                (luma, data.len() * 2 / 3, data.len() == w * h * 3 / 2)
+            }
+            FrameInput::Gpu(_) => return Err(BackendError::Misuse("这个后端不收显卡画面")),
+        };
+        if ok {
+            return Ok((luma, size));
+        }
+        if !self.cfg.breaches.resize_silently {
+            return Err(BackendError::Misuse("画面的大小和配置的尺寸对不上"));
+        }
+        // 违约：悄悄换尺寸。宽度不变，高度按亮度数据量推，取偶数、至少 2
+        let new_h = u16::try_from(total / w.max(1) / 2 * 2).unwrap_or(2).max(2);
+        self.size = Some((size.0, new_h));
+        self.prev = None;
+        Ok((luma, (size.0, new_h)))
+    }
+}
+
+/// 抽样亮度，算“和上一帧比变了多少、有多少细节”（千分之几）。
+fn features(luma: &[u8], prev: Option<&Vec<u8>>) -> (Vec<u8>, u32, u32) {
+    let sample: Vec<u8> = luma.iter().copied().step_by(SAMPLE_STEP).collect();
+    let n = sample.len().max(1);
+    let changed = match prev {
+        Some(p) if p.len() == sample.len() => {
+            let diff = sample.iter().zip(p).filter(|(a, b)| a != b).count();
+            permille(diff, n)
+        }
+        // 第一帧、尺寸变了：整屏都是新的
+        _ => 1000,
+    };
+    let edges = luma
+        .iter()
+        .zip(luma.iter().skip(1))
+        .step_by(SAMPLE_STEP)
+        .filter(|(a, b)| a.abs_diff(**b) > DETAIL_EDGE)
+        .count();
+    (sample, changed, permille(edges, n))
+}
+
+/// `part` 占 `whole` 的千分之几（不超过 1000）。
+fn permille(part: usize, whole: usize) -> u32 {
+    u32::try_from(part.saturating_mul(1000) / whole.max(1))
+        .unwrap_or(1000)
+        .min(1000)
+}
+
+/// 确定性的假码流：Annex B 起始码 + NAL 头（IDR 或普通片）+ 按种子生成的字节。
+fn fake_stream(len: usize, key: bool, seed: u64) -> Vec<u8> {
+    let mut data = vec![0, 0, 0, 1, if key { 0x65 } else { 0x41 }];
+    let mut x = seed | 1;
+    while data.len() < len {
+        // xorshift64
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        data.extend_from_slice(&x.to_le_bytes());
+    }
+    data.truncate(len.max(5));
+    data
+}
+
+impl EncoderBackend for FakeBackend {
+    fn info(&self) -> &BackendInfo {
+        &self.info
+    }
+
+    fn size(&self) -> Option<(u16, u16)> {
+        self.size
+    }
+
+    fn reconfigure(
+        &mut self,
+        size: (u16, u16),
+        rates: Rates,
+    ) -> Result<Reconfigured, BackendError> {
+        if size.0 == 0 || size.1 == 0 || !size.0.is_multiple_of(2) || !size.1.is_multiple_of(2) {
+            return Err(BackendError::Misuse("尺寸要是偶数，不能为 0"));
+        }
+        self.size = Some(size);
+        self.rates = rates;
+        self.reset_stream();
+        self.inflight.clear();
+        self.ready.clear();
+        // 重建把卡住的编码器也换掉了
+        if self.stalled_since.take().is_some() {
+            self.stall_spent = true;
+        }
+        Ok(Reconfigured {
+            rebuilt: true,
+            keyframe_next: true,
+        })
+    }
+
+    fn set_rates(&mut self, rates: Rates) -> Result<(), BackendError> {
+        if self.cfg.faults.set_rates_fails {
+            return Err(BackendError::Failed(
+                "运行中改不了码率（假后端的毛病表）".to_owned(),
+            ));
+        }
+        self.rates = rates;
+        if self.cfg.breaches.set_rates_forces_keyframe {
+            self.key_countdown = Some(0);
+        }
+        Ok(())
+    }
+
+    fn submit(&mut self, input: FrameInput<'_>, ask: FrameAsk) -> Result<Submitted, BackendError> {
+        let rc = self.cfg.rate_control;
+        if rc == RateControl::PerFrameQp && ask.qp.is_none() {
+            // 先于尺寸检查：用法错不改变状态
+            return Err(BackendError::Misuse("按 QP 编，每帧都要给 QP"));
+        }
+        let (luma, (w, h)) = self.luma(input)?;
+        let now = self.clock.now_us();
+        let gap = self.last_submit_us.map(|t| now.saturating_sub(t));
+        if let (Some(limit), Some(gap)) = (self.cfg.breaches.error_after_idle_us, gap) {
+            if gap >= limit {
+                return Err(self.fail("隔太久再交帧就出错（假后端的违约）"));
+            }
+        }
+        self.last_submit_us = Some(now);
+        if let Some(err) = self.stall_timeout(now) {
+            return Err(err);
+        }
+        if self.stalled_since.is_some() {
+            return Ok(Submitted::Ready(Finished::Dropped {
+                token: ask.token,
+                why: DropReason::NotAccepting,
+            }));
+        }
+        self.calls = self.calls.saturating_add(1);
+        if let Some(n) = self.cfg.faults.not_accepting_every {
+            if n > 0 && self.calls.is_multiple_of(n) {
+                return Ok(Submitted::Ready(Finished::Dropped {
+                    token: ask.token,
+                    why: DropReason::NotAccepting,
+                }));
+            }
+        }
+
+        // 画面特征
+        let (sample, changed, detail) = features(luma, self.prev.as_ref());
+        let pixels = u64::from(w) * u64::from(h);
+
+        // 是不是关键帧：要了（可能晚几帧给）、第一帧、整屏突变、固定 GOP、改码率时顺带
+        let faults = self.cfg.faults;
+        if ask.keyframe
+            && !self.cfg.breaches.ignore_keyframe_requests
+            && self.key_countdown.is_none()
+        {
+            self.key_countdown = Some(faults.keyframe_delay);
+        }
+        let mut key = self.first && !self.cfg.breaches.first_frame_not_key;
+        if self.key_countdown == Some(0) {
+            key = true;
+        }
+        if self.prev.is_some()
+            && faults.scene_keyframes != SceneKeyframes::Off
+            && changed >= SCENE_PERMILLE
+        {
+            key = true;
+        }
+        if let Some(n) = self.cfg.breaches.periodic_keyframes {
+            if n > 0 && self.index > 0 && self.index.is_multiple_of(n) {
+                key = true;
+            }
+        }
+
+        // 多大、按哪个 QP
+        let bytes_at = |qp: u8| {
+            self.model.bytes(&ModelInput {
+                qp,
+                key,
+                pixels,
+                changed_permille: changed,
+                detail_permille: detail,
+            })
+        };
+        let (qp, mut bytes, engaged, fits) = match (rc, ask.qp) {
+            (RateControl::PerFrameQp, Some(qp)) => {
+                let qp = qp.min(MODEL_MAX_QP);
+                (qp, bytes_at(qp), false, true)
+            }
+            // 上面已经排除了 PerFrameQp 不给 QP；Window 不看 QP，自己挑最细的放得下的
+            (RateControl::PerFrameQp | RateControl::Window, _) => {
+                match (MODEL_MIN_QP..=MODEL_MAX_QP).find(|q| bytes_at(*q) <= ask.budget) {
+                    Some(q) => (q, bytes_at(q), bytes_at(MODEL_MIN_QP) > ask.budget, true),
+                    None => (MODEL_MAX_QP, bytes_at(MODEL_MAX_QP), true, false),
+                }
+            }
+        };
+
+        // 放不下：丢（守约的做法），或者不丢、交超预算的帧（违约，体检会抓）
+        if !fits && (faults.window_drop || (key && faults.drop_requested_keyframe)) {
+            if ask.keyframe || key {
+                // 这一帧带的关键帧要求没送到，调用方接着要
+                self.key_countdown = None;
+            }
+            return Ok(Submitted::Ready(if self.cfg.breaches.empty_frame_on_drop {
+                Finished::Frame(EncodedOut {
+                    token: ask.token,
+                    data: Vec::new(),
+                    key: false,
+                    qp: None,
+                    timing: self.timing(false, gap, false),
+                })
+            } else {
+                Finished::Dropped {
+                    token: ask.token,
+                    why: DropReason::Budget,
+                }
+            }));
+        }
+        if fits && engaged && faults.overshoot_permille > 0 {
+            let over = u128::from(1000 + faults.overshoot_permille);
+            bytes = usize::try_from(u128::try_from(ask.budget).unwrap_or(0) * over / 1000)
+                .unwrap_or(usize::MAX);
+        }
+
+        // 编出来了
+        if key {
+            self.key_countdown = None;
+        } else if let Some(c) = self.key_countdown {
+            self.key_countdown = Some(c.saturating_sub(1));
+        }
+        let primed = self.first && faults.first_frame_prime.is_some_and(|p| ask.qp != Some(p));
+        let index = self.index;
+        let timing = self.timing(key, gap, primed);
+        self.prev = Some(sample);
+        self.first = false;
+        self.index = self.index.saturating_add(1);
+        let seed = ask.token.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ u64::from(qp) << 8
+            ^ u64::from(index) << 16
+            ^ u64::from(key);
+        let done = Finished::Frame(EncodedOut {
+            token: ask.token,
+            data: fake_stream(bytes, key, seed),
+            key,
+            qp: Some(qp),
+            timing,
+        });
+
+        // 违约：吞帧、卡住：这一帧永远没有下落
+        if let Some(n) = self.cfg.breaches.lose_frame_every {
+            if n > 0 && self.index.is_multiple_of(n) {
+                return Ok(Submitted::Pending);
+            }
+        }
+        if let Some(stall) = faults.stall {
+            if !self.stall_spent && index == stall.after_frames {
+                self.stalled_since = Some(now);
+                return Ok(Submitted::Pending);
+            }
+        }
+        if faults.held_frames == 0 {
+            return Ok(Submitted::Ready(done));
+        }
+        // 攒帧：超过 held_frames 的最老的那帧才出
+        self.inflight.push_back(done);
+        if self.inflight.len() > usize::from(faults.held_frames) {
+            if let Some(oldest) = self.inflight.pop_front() {
+                self.ready.push_back(oldest);
+            }
+        }
+        Ok(Submitted::Pending)
+    }
+
+    fn poll(&mut self) -> Result<Option<Finished>, BackendError> {
+        if let Some(err) = self.stall_timeout(self.clock.now_us()) {
+            return Err(err);
+        }
+        Ok(self.ready.pop_front())
+    }
+
+    fn flush(&mut self) -> Result<(), BackendError> {
+        if !self.cfg.breaches.flush_forgets {
+            self.ready.append(&mut self.inflight);
+        }
+        Ok(())
+    }
+}
+
+impl FakeBackend {
+    /// 这一帧的各段时间：计算（关键帧翻倍，静止之后第一帧加上额外的）、等待、初始化。
+    fn timing(&self, key: bool, gap: Option<u64>, primed: bool) -> Timing {
+        if self.cfg.breaches.zero_timing {
+            return Timing::default();
+        }
+        let base = self.cfg.compute_us.saturating_mul(if key { 2 } else { 1 });
+        let slow = self
+            .cfg
+            .faults
+            .slow_after_idle
+            .zip(gap)
+            .filter(|(s, gap)| *gap >= s.idle_us)
+            .map_or(0, |(s, _)| s.extra_us);
+        Timing {
+            compute_us: base.saturating_add(slow),
+            wait_us: self.cfg.wait_us,
+            setup_us: if primed { PRIME_SETUP_US } else { 0 },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
+    use super::*;
+
+    const RATES: Rates = Rates {
+        bps: 2_000_000,
+        fps: 30,
+    };
+    const SIZE: (u16, u16) = (64, 64);
+
+    fn planes(patch: u8) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let y = (0..64usize * 64)
+            .map(|i| {
+                if patch != 0 && i % 64 < 8 && i / 64 < 8 {
+                    patch
+                } else {
+                    u8::try_from((i % 64) * 3 % 200).unwrap()
+                }
+            })
+            .collect();
+        (y, vec![128; 32 * 32], vec![128; 32 * 32])
+    }
+
+    fn backend(cfg: FakeConfig) -> (FakeBackend, ManualClock) {
+        let clock = ManualClock::new();
+        let mut b = FakeBackend::with_default_model(cfg, Arc::new(clock.clone()));
+        b.reconfigure(SIZE, RATES).unwrap();
+        (b, clock)
+    }
+
+    fn ask(token: u64, qp: Option<u8>, budget: usize, keyframe: bool) -> FrameAsk {
+        FrameAsk {
+            token,
+            budget,
+            qp,
+            keyframe,
+        }
+    }
+
+    fn ready(got: Result<Submitted, BackendError>) -> Finished {
+        match got.unwrap() {
+            Submitted::Ready(f) => f,
+            Submitted::Pending => panic!("应当当场有结果"),
+        }
+    }
+
+    fn frame(f: Finished) -> EncodedOut {
+        match f {
+            Finished::Frame(out) => out,
+            Finished::Dropped { .. } => panic!("应当编出帧"),
+        }
+    }
+
+    fn i420<'a>(p: &'a (Vec<u8>, Vec<u8>, Vec<u8>)) -> FrameInput<'a> {
+        FrameInput::I420 {
+            y: &p.0,
+            u: &p.1,
+            v: &p.2,
+        }
+    }
+
+    #[test]
+    fn manual_clock_is_shared_between_clones() {
+        let clock = ManualClock::new();
+        let other = clock.clone();
+        clock.advance_us(5);
+        other.advance(Duration::from_millis(2));
+        assert_eq!(clock.now_us(), 2_005);
+    }
+
+    /// 默认模型的形状：QP 每加 6 字节数约减半，关键帧远大于普通帧，变得越多越大，细节越多越大。
+    #[test]
+    fn default_model_has_the_expected_shape() {
+        let m = DefaultByteModel;
+        let base = ModelInput {
+            qp: 20,
+            key: true,
+            pixels: 640 * 360,
+            changed_permille: 1000,
+            detail_permille: 150,
+        };
+        let key20 = m.bytes(&base);
+        let key26 = m.bytes(&ModelInput { qp: 26, ..base });
+        assert!(key26 * 2 <= key20 + key20 / 20 && key26 * 2 >= key20 - key20 / 20);
+        let mut prev = usize::MAX;
+        for qp in 0..=60 {
+            let b = m.bytes(&ModelInput { qp, ..base });
+            assert!(b <= prev, "QP {qp} 的字节数不该比更小的 QP 多");
+            prev = b;
+        }
+        let small = ModelInput {
+            key: false,
+            changed_permille: 5,
+            ..base
+        };
+        assert!(m.bytes(&small) < key20 / 50);
+        assert!(
+            m.bytes(&ModelInput {
+                changed_permille: 500,
+                ..small
+            }) > m.bytes(&small)
+        );
+        assert!(
+            m.bytes(&ModelInput {
+                detail_permille: 900,
+                ..base
+            }) > key20
+        );
+        assert!(m.bytes(&ModelInput { pixels: 0, ..small }) >= 24);
+    }
+
+    /// 同一配置、同一输入序列，输出逐字节相同；数据是 Annex B 的样子；不同的 token 数据不同。
+    #[test]
+    fn same_config_and_inputs_give_identical_bytes() {
+        let run = || {
+            let (mut b, clock) = backend(FakeConfig::default());
+            let mut out = Vec::new();
+            for i in 0..6u64 {
+                clock.advance_us(33_000);
+                let p = planes(u8::try_from(i * 7).unwrap());
+                out.push(frame(ready(
+                    b.submit(i420(&p), ask(i, Some(26), 1 << 20, i == 3)),
+                )));
+            }
+            out
+        };
+        let (a, b) = (run(), run());
+        assert_eq!(a, b);
+        assert!(a[0].key && a[3].key && !a[1].key);
+        assert_eq!(&a[0].data[..5], &[0, 0, 0, 1, 0x65]);
+        assert_eq!(&a[1].data[..5], &[0, 0, 0, 1, 0x41]);
+        assert_ne!(a[1].data, a[2].data);
+        assert!(a.iter().all(|f| f.timing.compute_us > 0));
+    }
+
+    /// 默认假后端守约：属性诚实、按 QP 编（QP 大字节少）、同步、从不丢帧；用法错不改变状态。
+    #[test]
+    fn default_backend_is_contract_abiding() {
+        let (mut b, _) = backend(FakeConfig::default());
+        let traits = b.info().traits;
+        assert_eq!(traits.rate_control, RateControl::PerFrameQp);
+        assert_eq!((traits.max_held, traits.keyframe_within), (0, 1));
+        assert!(!traits.scene_keyframes && traits.first_frame_qp.is_none());
+        assert_eq!(b.info().name, "假后端");
+        assert_eq!(b.size(), Some(SIZE));
+        assert_eq!(b.rates(), RATES);
+        let p = planes(0);
+        // 没给 QP、不收的形式、尺寸不对：用法错
+        assert!(matches!(
+            b.submit(i420(&p), ask(1, None, 1000, false)),
+            Err(BackendError::Misuse(_))
+        ));
+        assert!(matches!(
+            b.submit(FrameInput::Gpu(&gpu_frame()), ask(1, Some(30), 1000, false)),
+            Err(BackendError::Misuse(_))
+        ));
+        let short = FrameInput::I420 {
+            y: &p.0[..100],
+            u: &p.1,
+            v: &p.2,
+        };
+        assert!(matches!(
+            b.submit(short, ask(1, Some(30), 1000, false)),
+            Err(BackendError::Misuse(_))
+        ));
+        assert_eq!(b.size(), Some(SIZE));
+        let fine = frame(ready(b.submit(i420(&p), ask(1, Some(20), 10, false))));
+        let coarse = frame(ready(b.submit(i420(&p), ask(2, Some(44), 10, true))));
+        assert!(fine.key, "第一帧是关键帧");
+        assert!(coarse.key && coarse.data.len() < fine.data.len());
+        assert_eq!((fine.qp, coarse.qp), (Some(20), Some(44)));
+        assert_eq!(b.poll().unwrap(), None);
+        b.flush().unwrap();
+        b.set_rates(Rates { bps: 1, fps: 1 }).unwrap();
+        // 重新配置：奇数、0 不行；正常的话从头来，又是关键帧
+        assert!(matches!(
+            b.reconfigure((63, 64), RATES),
+            Err(BackendError::Misuse(_))
+        ));
+        assert!(matches!(
+            b.reconfigure((0, 64), RATES),
+            Err(BackendError::Misuse(_))
+        ));
+        assert!(matches!(
+            b.reconfigure((64, 0), RATES),
+            Err(BackendError::Misuse(_))
+        ));
+        let r = b.reconfigure(SIZE, RATES).unwrap();
+        assert!(r.rebuilt && r.keyframe_next);
+        assert!(frame(ready(b.submit(i420(&p), ask(3, Some(20), 10, false)))).key);
+        // 没配置就交帧
+        let mut fresh =
+            FakeBackend::with_default_model(FakeConfig::default(), Arc::new(ManualClock::new()));
+        assert_eq!(fresh.size(), None);
+        assert!(matches!(
+            fresh.submit(i420(&p), ask(1, Some(30), 1000, false)),
+            Err(BackendError::Misuse(_))
+        ));
+        assert!(!fresh.accepts(&gpu_frame()));
+    }
+
+    fn gpu_frame() -> peerdesk_core::frame::TestGpuFrame {
+        peerdesk_core::frame::TestGpuFrame::new(
+            peerdesk_core::frame::Nv12::new(64, 64, vec![16; 64 * 64 * 3 / 2]).unwrap(),
+        )
+    }
+
+    /// NV12 收（配置里打开才收）；只收 NV12 时 I420 回用法错。
+    #[test]
+    fn input_forms_follow_the_config() {
+        let p = planes(0);
+        let nv12: Vec<u8> =
+            p.0.iter()
+                .copied()
+                .chain(p.1.iter().zip(&p.2).flat_map(|(a, b)| [*a, *b]))
+                .collect();
+        let (mut b, _) = backend(FakeConfig::default());
+        assert!(
+            frame(ready(b.submit(
+                FrameInput::Nv12(&nv12),
+                ask(1, Some(30), 1000, false)
+            )))
+            .key
+        );
+        assert!(matches!(
+            b.submit(
+                FrameInput::Nv12(&nv12[..100]),
+                ask(2, Some(30), 1000, false)
+            ),
+            Err(BackendError::Misuse(_))
+        ));
+        let (mut only_nv12, _) = backend(FakeConfig {
+            inputs: Inputs {
+                i420: false,
+                nv12: true,
+                gpu: false,
+            },
+            ..FakeConfig::default()
+        });
+        assert!(matches!(
+            only_nv12.submit(i420(&p), ask(1, Some(30), 1000, false)),
+            Err(BackendError::Misuse(_))
+        ));
+        let (mut only_i420, _) = backend(FakeConfig {
+            inputs: Inputs {
+                i420: true,
+                nv12: false,
+                gpu: false,
+            },
+            ..FakeConfig::default()
+        });
+        assert!(matches!(
+            only_i420.submit(FrameInput::Nv12(&nv12), ask(1, Some(30), 1000, false)),
+            Err(BackendError::Misuse(_))
+        ));
+    }
+
+    /// 码控窗口：自己挑 QP 放进预算；放不下按毛病表丢（只丢关键帧 / 全丢），回 Budget。
+    #[test]
+    fn window_mode_fits_the_budget_or_drops() {
+        let (mut b, _) = backend(FakeConfig::window());
+        let p = planes(0);
+        let roomy = frame(ready(b.submit(i420(&p), ask(1, None, 1 << 20, false))));
+        assert!(roomy.qp == Some(MODEL_MIN_QP) && roomy.data.len() <= 1 << 20);
+        let tight = frame(ready(
+            b.submit(i420(&p), ask(2, Some(10), roomy.data.len() / 4, true)),
+        ));
+        assert!(tight.data.len() <= roomy.data.len() / 4 && tight.qp > roomy.qp);
+        let dropped = ready(b.submit(i420(&p), ask(3, None, 1, true)));
+        assert_eq!(
+            dropped,
+            Finished::Dropped {
+                token: 3,
+                why: DropReason::Budget
+            }
+        );
+        // 只丢要求的关键帧：普通帧放不下就交超预算的
+        let (mut vt, _) = backend(FakeConfig {
+            faults: Faults {
+                drop_requested_keyframe: true,
+                ..Faults::default()
+            },
+            ..FakeConfig::window()
+        });
+        let first = frame(ready(vt.submit(i420(&p), ask(1, None, 1 << 20, false))));
+        assert!(first.key);
+        let over = frame(ready(vt.submit(i420(&p), ask(2, None, 1, false))));
+        assert!(over.data.len() > 1 && !over.key);
+        assert_eq!(
+            ready(vt.submit(i420(&p), ask(3, None, 1, true))),
+            Finished::Dropped {
+                token: 3,
+                why: DropReason::Budget
+            }
+        );
+        // 丢了之后接着要：放得下就给
+        assert!(frame(ready(vt.submit(i420(&p), ask(4, None, 1 << 20, true)))).key);
+    }
+
+    /// 超发：码控够不着预算时，字节数是预算的 (1000 + 比例) / 1000。
+    #[test]
+    fn overshoot_only_when_the_rate_control_is_engaged() {
+        let (mut b, _) = backend(FakeConfig {
+            faults: Faults {
+                overshoot_permille: 300,
+                ..Faults::default()
+            },
+            ..FakeConfig::window()
+        });
+        let p = planes(0);
+        let roomy = frame(ready(b.submit(i420(&p), ask(1, None, 1 << 20, false))));
+        assert!(roomy.data.len() < 1 << 20, "放得下、没卡住码控，不超发");
+        let tight = frame(ready(
+            b.submit(i420(&p), ask(2, None, roomy.data.len() / 2, true)),
+        ));
+        assert_eq!(tight.data.len(), roomy.data.len() / 2 * 13 / 10);
+    }
+
+    /// 攒帧：交了 held_frames 帧之后才出第一个；flush 全部交出；顺序按交帧。
+    #[test]
+    fn held_frames_come_out_late_and_flush_releases_them() {
+        let (mut b, _) = backend(FakeConfig {
+            faults: Faults {
+                held_frames: 2,
+                ..Faults::default()
+            },
+            ..FakeConfig::default()
+        });
+        assert_eq!(b.info().traits.max_held, 2);
+        let p = planes(0);
+        for t in 0..2 {
+            assert_eq!(
+                b.submit(i420(&p), ask(t, Some(30), 1000, false)).unwrap(),
+                Submitted::Pending
+            );
+            assert_eq!(b.poll().unwrap(), None);
+        }
+        assert_eq!(
+            b.submit(i420(&p), ask(2, Some(30), 1000, false)).unwrap(),
+            Submitted::Pending
+        );
+        assert_eq!(b.poll().unwrap().map(|f| f.token()), Some(0));
+        assert_eq!(b.poll().unwrap(), None);
+        b.flush().unwrap();
+        assert_eq!(b.poll().unwrap().map(|f| f.token()), Some(1));
+        assert_eq!(b.poll().unwrap().map(|f| f.token()), Some(2));
+        assert_eq!(b.poll().unwrap(), None);
+    }
+
+    /// 静止后第一帧慢：只有隔得够久的那一帧多出额外的计算时间；时间来自注入的时钟。
+    #[test]
+    fn the_first_frame_after_idle_is_slow() {
+        let (mut b, clock) = backend(FakeConfig {
+            faults: Faults {
+                slow_after_idle: Some(SlowAfterIdle {
+                    idle_us: 1_000_000,
+                    extra_us: 30_000,
+                }),
+                ..Faults::default()
+            },
+            wait_us: 700,
+            ..FakeConfig::default()
+        });
+        let p = planes(0);
+        let steady = frame(ready(b.submit(i420(&p), ask(0, Some(30), 1000, false))));
+        clock.advance_us(33_000);
+        let again = frame(ready(b.submit(i420(&p), ask(1, Some(30), 1000, false))));
+        clock.advance(Duration::from_secs(5));
+        let slow = frame(ready(b.submit(i420(&p), ask(2, Some(30), 1000, false))));
+        assert_eq!(again.timing.compute_us, 2_000);
+        assert_eq!(steady.timing.wait_us, 700);
+        assert_eq!(slow.timing.compute_us, 32_000);
+    }
+
+    /// 整屏突变自己出关键帧（声明与否在属性里）；局部变化不出；固定 GOP 是违约，按帧数出。
+    #[test]
+    fn unasked_keyframes_follow_the_table() {
+        let flat = |v: u8| (vec![v; 64 * 64], vec![128; 32 * 32], vec![128; 32 * 32]);
+        for (scene, declared) in [
+            (SceneKeyframes::Declared, true),
+            (SceneKeyframes::Undeclared, false),
+        ] {
+            let (mut b, _) = backend(FakeConfig {
+                faults: Faults {
+                    scene_keyframes: scene,
+                    ..Faults::default()
+                },
+                ..FakeConfig::default()
+            });
+            assert_eq!(b.info().traits.scene_keyframes, declared);
+            assert!(
+                frame(ready(
+                    b.submit(i420(&flat(50)), ask(0, Some(30), 1000, false))
+                ))
+                .key
+            );
+            assert!(
+                !frame(ready(
+                    b.submit(i420(&flat(50)), ask(1, Some(30), 1000, false))
+                ))
+                .key
+            );
+            assert!(
+                frame(ready(
+                    b.submit(i420(&flat(200)), ask(2, Some(30), 1000, false))
+                ))
+                .key
+            );
+        }
+        let (mut gop, _) = backend(FakeConfig {
+            breaches: Breaches {
+                periodic_keyframes: Some(3),
+                ..Breaches::default()
+            },
+            ..FakeConfig::default()
+        });
+        let keys: Vec<bool> = (0..7)
+            .map(|t| {
+                frame(ready(
+                    gop.submit(i420(&planes(0)), ask(t, Some(30), 1000, false)),
+                ))
+                .key
+            })
+            .collect();
+        assert_eq!(keys, [true, false, false, true, false, false, true]);
+    }
+
+    /// 要了关键帧晚几帧给：属性里声明的就是 1 + 延迟。
+    #[test]
+    fn a_requested_keyframe_can_arrive_late() {
+        let (mut b, _) = backend(FakeConfig {
+            faults: Faults {
+                keyframe_delay: 2,
+                ..Faults::default()
+            },
+            ..FakeConfig::default()
+        });
+        assert_eq!(b.info().traits.keyframe_within, 3);
+        let p = planes(0);
+        let keys: Vec<bool> = (0..6)
+            .map(|t| frame(ready(b.submit(i420(&p), ask(t, Some(30), 1000, t == 1)))).key)
+            .collect();
+        assert_eq!(keys, [true, false, false, true, false, false]);
+        // 忽略要求（违约）：永远不给
+        let (mut ignore, _) = backend(FakeConfig {
+            breaches: Breaches {
+                ignore_keyframe_requests: true,
+                ..Breaches::default()
+            },
+            ..FakeConfig::default()
+        });
+        let keys: Vec<bool> = (0..4)
+            .map(|t| {
+                frame(ready(
+                    ignore.submit(i420(&p), ask(t, Some(30), 1000, t == 1)),
+                ))
+                .key
+            })
+            .collect();
+        assert_eq!(keys, [true, false, false, false]);
+    }
+
+    /// 改码率：守约的改了就生效；毛病表里“改不了”的回失败，状态不变；违约的顺带出关键帧。
+    #[test]
+    fn set_rates_follows_the_table() {
+        let p = planes(0);
+        let (mut stuck, _) = backend(FakeConfig {
+            faults: Faults {
+                set_rates_fails: true,
+                ..Faults::default()
+            },
+            ..FakeConfig::default()
+        });
+        assert!(matches!(
+            stuck.set_rates(Rates { bps: 5, fps: 5 }),
+            Err(BackendError::Failed(_))
+        ));
+        assert_eq!((stuck.rates(), stuck.size()), (RATES, Some(SIZE)));
+        let (mut rude, _) = backend(FakeConfig {
+            breaches: Breaches {
+                set_rates_forces_keyframe: true,
+                ..Breaches::default()
+            },
+            ..FakeConfig::default()
+        });
+        assert!(frame(ready(rude.submit(i420(&p), ask(0, Some(30), 1000, false)))).key);
+        assert!(!frame(ready(rude.submit(i420(&p), ask(1, Some(30), 1000, false)))).key);
+        rude.set_rates(Rates { bps: 5, fps: 5 }).unwrap();
+        assert!(frame(ready(rude.submit(i420(&p), ask(2, Some(30), 1000, false)))).key);
+    }
+
+    /// 不收帧：每 N 次有一次，帧没进编码器。
+    #[test]
+    fn not_accepting_drops_every_nth_call() {
+        let (mut b, _) = backend(FakeConfig {
+            faults: Faults {
+                not_accepting_every: Some(3),
+                ..Faults::default()
+            },
+            ..FakeConfig::default()
+        });
+        let p = planes(0);
+        let kinds: Vec<bool> = (0..6)
+            .map(|t| {
+                matches!(
+                    ready(b.submit(i420(&p), ask(t, Some(30), 1000, false))),
+                    Finished::Dropped {
+                        why: DropReason::NotAccepting,
+                        ..
+                    }
+                )
+            })
+            .collect();
+        assert_eq!(kinds, [false, false, true, false, false, true]);
+    }
+
+    /// 卡住：这一帧不出，之后不收帧，过了时限报错并复位（只卡一次）；到时限也可以由 poll 报。
+    #[test]
+    fn a_stalled_encoder_errors_out_and_resets() {
+        let p = planes(0);
+        for via_poll in [false, true] {
+            let (mut b, clock) = backend(FakeConfig {
+                faults: Faults {
+                    stall: Some(Stall {
+                        after_frames: 1,
+                        limit_us: 500_000,
+                    }),
+                    ..Faults::default()
+                },
+                ..FakeConfig::default()
+            });
+            assert_eq!(b.info().traits.max_held, 1);
+            assert!(
+                !frame(ready(b.submit(i420(&p), ask(0, Some(30), 1000, false))))
+                    .data
+                    .is_empty()
+            );
+            assert_eq!(
+                b.submit(i420(&p), ask(1, Some(30), 1000, false)).unwrap(),
+                Submitted::Pending
+            );
+            clock.advance_us(100_000);
+            assert_eq!(b.poll().unwrap(), None);
+            assert!(matches!(
+                ready(b.submit(i420(&p), ask(2, Some(30), 1000, false))),
+                Finished::Dropped {
+                    why: DropReason::NotAccepting,
+                    ..
+                }
+            ));
+            clock.advance_us(400_000);
+            if via_poll {
+                assert!(matches!(b.poll(), Err(BackendError::Failed(_))));
+            } else {
+                assert!(matches!(
+                    b.submit(i420(&p), ask(3, Some(30), 1000, false)),
+                    Err(BackendError::Failed(_))
+                ));
+            }
+            assert_eq!(b.size(), None, "出错之后复位");
+            b.reconfigure(SIZE, RATES).unwrap();
+            for t in 4..8 {
+                assert!(
+                    !frame(ready(b.submit(i420(&p), ask(t, Some(30), 1000, false))))
+                        .data
+                        .is_empty()
+                );
+            }
+        }
+        // 违约：出错不复位
+        let (mut keep, clock) = backend(FakeConfig {
+            faults: Faults {
+                stall: Some(Stall {
+                    after_frames: 0,
+                    limit_us: 10,
+                }),
+                ..Faults::default()
+            },
+            breaches: Breaches {
+                keep_state_after_error: true,
+                ..Breaches::default()
+            },
+            ..FakeConfig::default()
+        });
+        assert_eq!(
+            keep.submit(i420(&p), ask(0, Some(30), 1000, false))
+                .unwrap(),
+            Submitted::Pending
+        );
+        clock.advance_us(10);
+        assert!(keep.poll().is_err());
+        assert_eq!(keep.size(), Some(SIZE));
+        // 重新配置也把卡住的换掉了
+        let (mut re, _) = backend(FakeConfig {
+            faults: Faults {
+                stall: Some(Stall {
+                    after_frames: 0,
+                    limit_us: u64::MAX,
+                }),
+                ..Faults::default()
+            },
+            ..FakeConfig::default()
+        });
+        assert_eq!(
+            re.submit(i420(&p), ask(0, Some(30), 1000, false)).unwrap(),
+            Submitted::Pending
+        );
+        re.reconfigure(SIZE, RATES).unwrap();
+        assert!(
+            !frame(ready(re.submit(i420(&p), ask(1, Some(30), 1000, false))))
+                .data
+                .is_empty()
+        );
+    }
+
+    /// 首帧 QP 限制：要的 QP 不是限制的那个，多花一次初始化（记在 setup）；是的话不花。
+    #[test]
+    fn first_frame_prime_costs_setup_time() {
+        let (mut b, _) = backend(FakeConfig {
+            faults: Faults {
+                first_frame_prime: Some(26),
+                ..Faults::default()
+            },
+            ..FakeConfig::default()
+        });
+        assert_eq!(b.info().traits.first_frame_qp, Some(26));
+        let p = planes(0);
+        let first = frame(ready(b.submit(i420(&p), ask(0, Some(40), 1000, false))));
+        let next = frame(ready(b.submit(i420(&p), ask(1, Some(40), 1000, false))));
+        assert_eq!(
+            (first.timing.setup_us, next.timing.setup_us),
+            (PRIME_SETUP_US, 0)
+        );
+        b.reconfigure(SIZE, RATES).unwrap();
+        assert_eq!(
+            frame(ready(b.submit(i420(&p), ask(2, Some(26), 1000, false))))
+                .timing
+                .setup_us,
+            0
+        );
+    }
+
+    /// 违约一组：吞帧、空帧、第一帧不是关键帧、悄悄换尺寸、隔太久出错、不报时间、flush 不交出、谎报属性。
+    #[test]
+    fn breaches_behave_as_described() {
+        let p = planes(0);
+        // 吞帧：第 N 帧回 Pending 又永远不出
+        let (mut lose, _) = backend(FakeConfig {
+            breaches: Breaches {
+                lose_frame_every: Some(2),
+                ..Breaches::default()
+            },
+            ..FakeConfig::default()
+        });
+        assert!(matches!(
+            lose.submit(i420(&p), ask(0, Some(30), 1000, false))
+                .unwrap(),
+            Submitted::Ready(_)
+        ));
+        assert_eq!(
+            lose.submit(i420(&p), ask(1, Some(30), 1000, false))
+                .unwrap(),
+            Submitted::Pending
+        );
+        lose.flush().unwrap();
+        assert_eq!(lose.poll().unwrap(), None);
+        // 空帧冒充
+        let (mut empty, _) = backend(FakeConfig {
+            breaches: Breaches {
+                empty_frame_on_drop: true,
+                ..Breaches::default()
+            },
+            ..FakeConfig::window()
+        });
+        let e = frame(ready(empty.submit(i420(&p), ask(0, None, 1, false))));
+        assert!(e.data.is_empty() && !e.key);
+        // 第一帧不是关键帧；要了就是
+        let (mut nokey, _) = backend(FakeConfig {
+            breaches: Breaches {
+                first_frame_not_key: true,
+                ..Breaches::default()
+            },
+            ..FakeConfig::default()
+        });
+        assert!(!frame(ready(nokey.submit(i420(&p), ask(0, Some(30), 1000, false)))).key);
+        assert!(frame(ready(nokey.submit(i420(&p), ask(1, Some(30), 1000, true)))).key);
+        // 悄悄换尺寸：I420 和 NV12 都推得出新高度
+        let (mut resize, _) = backend(FakeConfig {
+            breaches: Breaches {
+                resize_silently: true,
+                ..Breaches::default()
+            },
+            ..FakeConfig::default()
+        });
+        let small = (vec![9u8; 64 * 32], vec![128; 32 * 16], vec![128; 32 * 16]);
+        assert!(resize
+            .submit(i420(&small), ask(0, Some(30), 1000, false))
+            .is_ok());
+        assert_eq!(resize.size(), Some((64, 32)));
+        let nv12 = vec![9u8; 64 * 16 * 3 / 2];
+        assert!(resize
+            .submit(FrameInput::Nv12(&nv12), ask(1, Some(30), 1000, false))
+            .is_ok());
+        assert_eq!(resize.size(), Some((64, 16)));
+        assert!(resize
+            .submit(FrameInput::Nv12(&[1, 2]), ask(2, Some(30), 1000, false))
+            .is_ok());
+        assert_eq!(resize.size(), Some((64, 2)));
+        // 隔太久出错
+        let (mut idle, clock) = backend(FakeConfig {
+            breaches: Breaches {
+                error_after_idle_us: Some(1_000_000),
+                ..Breaches::default()
+            },
+            ..FakeConfig::default()
+        });
+        idle.submit(i420(&p), ask(0, Some(30), 1000, false))
+            .unwrap();
+        clock.advance_us(999_999);
+        idle.submit(i420(&p), ask(1, Some(30), 1000, false))
+            .unwrap();
+        clock.advance_us(1_000_000);
+        assert!(matches!(
+            idle.submit(i420(&p), ask(2, Some(30), 1000, false)),
+            Err(BackendError::Failed(_))
+        ));
+        assert_eq!(idle.size(), None);
+        // 不报时间
+        let (mut zero, _) = backend(FakeConfig {
+            breaches: Breaches {
+                zero_timing: true,
+                ..Breaches::default()
+            },
+            ..FakeConfig::default()
+        });
+        assert_eq!(
+            frame(ready(zero.submit(i420(&p), ask(0, Some(30), 1000, false)))).timing,
+            Timing::default()
+        );
+        // flush 不交出
+        let (mut forget, _) = backend(FakeConfig {
+            faults: Faults {
+                held_frames: 1,
+                ..Faults::default()
+            },
+            breaches: Breaches {
+                flush_forgets: true,
+                ..Breaches::default()
+            },
+            ..FakeConfig::default()
+        });
+        forget
+            .submit(i420(&p), ask(0, Some(30), 1000, false))
+            .unwrap();
+        forget.flush().unwrap();
+        assert_eq!(forget.poll().unwrap(), None);
+        // 谎报属性
+        let lie = BackendTraits {
+            max_held: 9,
+            ..FakeConfig::default().honest_traits()
+        };
+        let liar = FakeBackend::with_default_model(
+            FakeConfig {
+                declared: Some(lie),
+                ..FakeConfig::default()
+            },
+            Arc::new(ManualClock::new()),
+        );
+        assert_eq!(liar.info().traits.max_held, 9);
+    }
+}

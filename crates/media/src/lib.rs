@@ -15,7 +15,9 @@ use openh264::formats::YUVSource;
 pub mod annexb;
 pub mod audio;
 pub mod backend;
+pub mod checkup;
 mod color;
+pub mod fake;
 /// Linux 的显卡和 VA-API 能力（检测和给用户的说明）。
 #[cfg(target_os = "linux")]
 pub mod gpu;
