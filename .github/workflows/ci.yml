@@ -1,6 +1,7 @@
 name: CI
 # 省着用：每次推送只在 Linux 上跑 lint、覆盖率门槛（不含端到端仿真）和端到端测试；
-# 端到端测试（仿真、真实二进制闭环、打洞）只在这次推送改了 crates/core、media、net、e2e、Cargo.lock 或本文件时才跑，
+# 端到端测试（仿真、真实二进制闭环、打洞）只在这次推送改了 crates/core、media、net、e2e、server、platform、
+# 闭环和打洞脚本、Cargo.lock 或本文件时才跑（只改客户端界面时跳过），
 # 提交信息里有 [full] 或手动运行时照跑（见 changes 任务）。
 # Windows / macOS 的测试、平台实机测试、界面截图、安装包按需触发：
 # - 提交信息里写 [mac] 或 [win]：只跑那个平台的测试和实机测试；[full]：全部平台加界面截图；
@@ -83,8 +84,8 @@ jobs:
           ./target/release/peerdesk bench-transport --packets 600
 
   # 端到端测试：真实编码器 + 仿真网络 + 接近真实的桌面画面。每次都跑，
-  # 这次推送改没改到会影响端到端结果的代码：传输、编解码、网络（core、media、net）、仿真本身（e2e）、依赖版本
-  # （Cargo.lock）和本工作流。用 git diff 看改动的文件，不用第三方 paths filter action：job 级别没有
+  # 这次推送改没改到会影响端到端结果的代码：传输、编解码、网络（core、media、net）、仿真本身（e2e）、
+  # 真实二进制闭环和打洞要用的服务端（server）、采集和输入（platform）、这两个脚本、依赖版本（Cargo.lock）和本工作流。用 git diff 看改动的文件，不用第三方 paths filter action：job 级别没有
   # 官方的 paths 过滤（on.push.paths 是整个工作流级别的，会把 lint 和覆盖率一起跳过），
   # 多一个 action 就多一个供应链依赖，而判断只是几行 shell。
   # 推送比较“推送前的提交 → 这次的提交”（一次推了好几个提交时都算）；拉取请求比较“目标分支 → 合并结果”。
@@ -117,7 +118,7 @@ jobs:
             changed=$(git diff --name-only "$from" "$GITHUB_SHA")
             echo "改动的文件："
             echo "$changed"
-            if echo "$changed" | grep -Eq '^(crates/(core|media|net|e2e)/|Cargo\.lock$|\.github/workflows/)'; then
+            if echo "$changed" | grep -Eq '^(crates/(core|media|net|e2e|server|platform)/|scripts/(e2e-live|nat-lab)\.sh$|Cargo\.lock$|\.github/workflows/)'; then
               run=true
             else
               run=false
