@@ -17,6 +17,7 @@ use peerdesk_net::rendezvous::Lookup;
 use peerdesk_net::Identity;
 use peerdesk_platform::guide::{guide, mac_settings_names, Action, Guide, Os};
 
+use super::background::{self, Background, Startup};
 use super::form::{parse_pin, parse_port, ConnectForm, Target, DEFAULT_PORT};
 use super::i18n::{effective_lang, save_lang, strings, Lang, Strings};
 use super::netinfo::lan_addresses;
@@ -29,12 +30,9 @@ use super::theme::{
     big_input, card, card_title, icon, icon_button, muted, nav_item, pill, primary_button, toggle,
     Appearance, Palette,
 };
-use super::tray::{self, Tray};
-use super::tray_logic::{self, CloseAction, Lifecycle, TrayCommand, WindowAction};
 use super::viewer::Viewer;
 use super::{fonts, guide_art, password, theme};
 use crate::remote::default_data_dir;
-use crate::{autostart, instance};
 use crate::{EXIT_FAILED, EXIT_OK};
 
 /// 自测模式：启动后自动开启被控、再连接本机。值为 `host` 时只开启被控。CI 用它截图。
@@ -68,27 +66,15 @@ pub fn run() -> u8 {
     let lang = effective_lang(&default_data_dir());
     peerdesk_net::rendezvous::set_prefer_ipv6(lang.prefers_ipv6());
     let s = strings(lang);
-    // 单实例：已经有一个在跑（多半藏在托盘里）时，叫出它的窗口，自己退出（退出码 0，守护不会当成崩溃）
-    let lock = if std::env::var_os(SELFTEST_ENV).is_some() {
-        None
-    } else {
-        match instance::acquire(&default_data_dir()) {
-            Ok(instance::Instance::First(file)) => Some(file),
-            Ok(instance::Instance::Running) => {
-                if let Err(e) = instance::request_show(&default_data_dir()) {
-                    log::warn!("无法通知已在运行的 PeerDesk：{e}");
-                }
-                let _ = writeln!(
-                    std::io::stderr(),
-                    "PeerDesk 已经在运行，已请它显示窗口 / PeerDesk is already running"
-                );
-                return EXIT_OK;
-            }
-            Err(e) => {
-                // 锁文件打不开：照常启动（宁可可能多开，也不能因此不能用），原因写进日志
-                log::warn!("单实例检查失败，继续启动：{e}");
-                None
-            }
+    // 单实例：已经有一个在跑（多半藏在托盘里）时，叫出它的窗口，自己以退出码 0 退出
+    let lock = match background::startup(&default_data_dir()) {
+        Startup::Proceed(lock) => lock,
+        Startup::AlreadyRunning => {
+            let _ = writeln!(
+                std::io::stderr(),
+                "PeerDesk 已经在运行 / PeerDesk is already running"
+            );
+            return EXIT_OK;
         }
     };
     let options = eframe::NativeOptions {
@@ -182,16 +168,8 @@ struct App {
     service_checked: Option<Instant>,
     /// 本机电脑名（首页“本机”卡片上显示）。
     name: String,
-    /// 关闭、退出、首次提示的状态。
-    life: Lifecycle,
-    /// 托盘图标；系统不支持托盘时为 `None`，此时关闭窗口就是退出。
-    tray: Option<Tray>,
-    /// 托盘菜单和“第二次启动”发来的命令。
-    commands: std::sync::mpsc::Receiver<TrayCommand>,
-    /// 开机自启和自动恢复是否开着（设置页的开关）。
-    autostart: bool,
-    /// 单实例锁：拿着直到进程结束，系统在进程消失（包括被杀）时释放。
-    _lock: Option<std::fs::File>,
+    /// 托盘、关闭退到托盘、单实例、开机自启（见 `background.rs`）。
+    bg: Background,
 }
 
 /// 用户手动关闭被控后留下的标记文件。
@@ -247,29 +225,8 @@ impl App {
         let server = ServerSettings::load(&data_dir);
         crate::crashreport::upload_in_background(&data_dir, server.server(s).ok().flatten());
         let ctx2 = ctx.clone();
-        let selftest = std::env::var_os(SELFTEST_ENV).is_some();
-        // 托盘：自测（CI 截图，没有桌面托盘）和 PEERDESK_NO_TRAY 不建。建不了时不静默：告诉用户，
-        // 此时关闭窗口就是退出，否则程序藏起来了用户却找不到。
-        let (tx, commands) = std::sync::mpsc::channel();
-        tray::watch_show_requests(ctx, &data_dir, &tx);
-        let (tray, status) = if selftest || std::env::var_os("PEERDESK_NO_TRAY").is_some() {
-            (None, status)
-        } else {
-            match Tray::create(ctx, s, &tx) {
-                Ok(tray) => (Some(tray), status),
-                Err(why) => {
-                    log::warn!("系统托盘不可用：{why}");
-                    (None, Status::error(s.tray_unavailable))
-                }
-            }
-        };
-        let life = Lifecycle::new(tray.is_some(), tray_logic::hint_seen(&data_dir));
-        // 开机自启和自动恢复：默认开，用户在设置里关过就不再装。开发构建（cargo run）不自动装，
-        // 否则会把 target 目录里的程序注册成开机项。
-        let autostart = !autostart::user_disabled(&data_dir);
-        if autostart && !selftest && !cfg!(debug_assertions) {
-            ensure_autostart();
-        }
+        let (bg, tray_status) = Background::new(ctx, s, &data_dir, lock);
+        let status = tray_status.unwrap_or(status);
         let auto_host = !data_dir.join(HOST_OFF_FILE).exists();
         // PEERDESK_GUI_PREVIEW_MAC=15：在任何系统上预览 macOS 15 的授权引导（截图、设计评审用）
         let preview = std::env::var(PREVIEW_MAC_ENV)
@@ -339,11 +296,7 @@ impl App {
             service: None,
             service_checked: None,
             name: crate::local::device_name(),
-            life,
-            tray,
-            commands,
-            autostart,
-            _lock: lock,
+            bg,
         }
     }
 
@@ -372,90 +325,6 @@ impl App {
         self.phase = HostPhase::Starting;
         self.status = Status::info(s.host_starting);
         self.addrs = lan_addresses();
-    }
-
-    /// 设置页的开关：开启或关闭开机自启和自动恢复，并记住用户的选择。
-    fn set_autostart(&mut self, on: bool) {
-        let s = self.s;
-        let result = autostart::Env::detect().and_then(|env| {
-            if on {
-                autostart::enable(&env, &mut autostart::system_runner).map(Some)
-            } else {
-                autostart::disable(&env, &mut autostart::system_runner).map(|()| None)
-            }
-        });
-        match result {
-            Ok(outcome) => {
-                self.autostart = on;
-                if let Err(e) = autostart::remember_choice(&self.data_dir, on) {
-                    log::warn!("记住开机自启的选择失败：{e}");
-                }
-                self.status = Status::info(match outcome {
-                    None => s.autostart_off,
-                    Some(autostart::Outcome::Fallback) => s.autostart_fallback,
-                    Some(autostart::Outcome::System | autostart::Outcome::Guard) => s.autostart_on,
-                });
-            }
-            Err(why) => {
-                log::warn!("设置开机自启失败：{why}");
-                self.status = Status::error(format!("{}：{why}", s.autostart_failed));
-            }
-        }
-    }
-
-    /// 托盘命令和窗口关闭请求（每帧开头处理）。
-    fn handle_window_events(&mut self, ctx: &egui::Context) {
-        let connected = matches!(
-            self.phase,
-            HostPhase::Busy {
-                established: true,
-                ..
-            }
-        );
-        let commands: Vec<TrayCommand> = self.commands.try_iter().collect();
-        for command in commands {
-            match self.life.on_command(command, connected) {
-                WindowAction::Show => {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                }
-                WindowAction::Kick => {
-                    if let Some(host) = &self.host {
-                        host.kick();
-                    }
-                }
-                // 关闭请求下一帧到来时 `life` 已经是退出状态，会放行
-                WindowAction::Exit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
-                WindowAction::Nothing => {}
-            }
-        }
-        if ctx.input(|i| i.viewport().close_requested()) {
-            let (dir, s) = (&self.data_dir, self.s);
-            let action = self.life.on_close_requested(|| {
-                // 窗口马上隐藏，窗口里的提示没人看得到：发系统通知
-                let delivered = tray::notify("PeerDesk", s.tray_hint);
-                if let Err(e) = tray_logic::mark_hint_seen(dir) {
-                    log::warn!("记录已提示失败：{e}");
-                }
-                delivered
-            });
-            match action {
-                CloseAction::Hide => {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-                }
-                CloseAction::Stay => {
-                    // 通知发不出去（没有通知服务）：这次不隐藏，在窗口里说明，下次关闭才隐藏
-                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                    self.status = Status::info(s.tray_hint);
-                }
-                CloseAction::Quit => {}
-            }
-        }
-        if let Some(tray) = &mut self.tray {
-            tray.set_connected(connected);
-        }
     }
 
     fn stop_hosting(&mut self) {
@@ -1177,16 +1046,8 @@ impl App {
             }
         });
         ui.add_space(12.0);
-
-        let mut autostart = self.autostart;
-        card(ui, p, |ui| {
-            card_title(ui, p, icon::ARROWS_CLOCKWISE, s.autostart_label, |ui| {
-                let _ = toggle(ui, p, &mut autostart, true);
-            });
-            let _ = muted(ui, p, s.autostart_hint);
-        });
-        if autostart != self.autostart {
-            self.set_autostart(autostart);
+        if let Some(status) = self.bg.settings_card(ui, p, s) {
+            self.status = status;
         }
         ui.add_space(12.0);
 
@@ -1603,7 +1464,21 @@ pub(super) fn open_folder(dir: &std::path::Path) -> Result<(), String> {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.handle_window_events(ctx);
+        let connected = matches!(
+            self.phase,
+            HostPhase::Busy {
+                established: true,
+                ..
+            }
+        );
+        let host = self.host.as_ref();
+        if let Some(status) = self.bg.update(ctx, self.s, connected, || {
+            if let Some(host) = host {
+                host.kick();
+            }
+        }) {
+            self.status = status;
+        }
         if self.selftest && self.host.is_none() && self.phase == HostPhase::Off {
             self.start_hosting();
         }
@@ -1726,24 +1601,6 @@ impl eframe::App for App {
             viewer.stop();
         }
         self.stop_hosting();
-    }
-}
-
-/// 后台开启开机自启和自动恢复（每次启动都确认一遍：程序挪了位置、升级后路径变了会跟着更新）。
-/// 要运行系统命令（systemctl、reg），放到线程里，不卡界面启动；结果只写日志，设置页的开关由用户操作。
-fn ensure_autostart() {
-    let spawned = std::thread::Builder::new()
-        .name("autostart".to_owned())
-        .spawn(|| {
-            let result = autostart::Env::detect()
-                .and_then(|env| autostart::enable(&env, &mut autostart::system_runner));
-            match result {
-                Ok(outcome) => log::info!("开机自启已确认：{outcome:?}"),
-                Err(why) => log::warn!("开机自启设置失败：{why}"),
-            }
-        });
-    if let Err(e) = spawned {
-        log::warn!("无法启动自启设置线程：{e}");
     }
 }
 

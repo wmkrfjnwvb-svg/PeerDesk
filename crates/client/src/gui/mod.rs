@@ -6,6 +6,7 @@
 
 mod app;
 pub mod assistant;
+mod background;
 pub mod coords;
 pub mod files;
 pub mod files_window;
