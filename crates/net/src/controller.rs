@@ -719,6 +719,12 @@ pub async fn run(
             },
         }
     };
+    // 对端是因为退出程序而关闭的连接：说清楚，界面显示“对方退出了”，而不是网络错误
+    let end = if link.peer_quit() {
+        crate::node::END_PEER_QUIT.to_owned()
+    } else {
+        end
+    };
     if let Some(t) = &router_task {
         t.abort();
     }

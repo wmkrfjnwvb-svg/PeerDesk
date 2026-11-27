@@ -158,6 +158,8 @@ pub struct Node {
     accepted_tx: mpsc::WeakSender<Result<Link, NetError>>,
     /// 打洞时开的其他端口上的端点，和本端点一起关闭。
     siblings: Mutex<Vec<quinn::Endpoint>>,
+    /// 登记在 [`LIVE`] 里的端点句柄（本端点和打洞端点）；随 Node 释放。
+    live: Mutex<Vec<Arc<quinn::Endpoint>>>,
     /// 与 QUIC 端点共用同一个 UDP 端口的另一份句柄，只用来发打洞包。
     punch: std::net::UdpSocket,
     /// 后台任务完成握手后把连接放进这个队列。
@@ -222,7 +224,9 @@ impl Node {
             recent: Arc::clone(&recent),
         };
         let endpoint = endpoint_on(socket, &server, &client, &shared).map_err(bind_err)?;
+        let live = register_live(identity.fingerprint(), &endpoint);
         Ok(Self {
+            live: Mutex::new(vec![live]),
             endpoint,
             fingerprint: identity.fingerprint(),
             server_config: server,
@@ -263,6 +267,13 @@ impl Node {
         {
             let mut siblings = self.siblings.lock().unwrap_or_else(PoisonError::into_inner);
             siblings.push(endpoint.clone());
+        }
+        {
+            let live = register_live(self.fingerprint, &endpoint);
+            self.live
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(live);
         }
         tokio::time::timeout(timeout, connect_on(&endpoint, addr, pin))
             .await
@@ -382,6 +393,54 @@ impl Node {
     pub async fn wait_idle(&self) {
         self.endpoint.wait_idle().await;
     }
+}
+
+/// 用户退出程序时给对端的 QUIC 应用层关闭码。
+pub const QUIT_CODE: u32 = 3;
+/// 退出时的关闭原因文字（送达对端，对端据此知道不是网络断了，不要重连）。
+pub const QUIT_REASON: &str = "peerdesk-quit";
+/// 对端因为退出而结束会话时，会话报告里的结束原因（界面据此显示“对方退出了 PeerDesk”）。
+pub const END_PEER_QUIT: &str = "对方退出了 PeerDesk";
+
+/// 还活着的端点（按本端指纹分类）：退出时要给所有正在进行的会话发带原因的关闭。
+/// 只放弱引用：端点随 [`Node`] 一起释放，不会因为登记在这里而一直占着端口。
+static LIVE: Mutex<Vec<(Fingerprint, std::sync::Weak<quinn::Endpoint>)>> = Mutex::new(Vec::new());
+
+fn register_live(fingerprint: Fingerprint, endpoint: &quinn::Endpoint) -> Arc<quinn::Endpoint> {
+    let strong = Arc::new(endpoint.clone());
+    let mut live = LIVE.lock().unwrap_or_else(PoisonError::into_inner);
+    live.retain(|(_, weak)| weak.strong_count() > 0);
+    live.push((fingerprint, Arc::downgrade(&strong)));
+    strong
+}
+
+/// 本进程里所有正在进行的会话（被控端、控制端都算）：带着退出原因关闭，最多等 `grace` 让关闭帧发出去。
+/// 用户点“退出”时在退出前调用；对端据此马上知道“对方退出了”，不用等超时。返回关闭了几个有连接的端点。
+pub async fn quit_all(grace: Duration) -> usize {
+    quit_matching(grace, |_| true).await
+}
+
+/// 同 [`quit_all`]，只处理本端指纹满足条件的端点（测试里同一进程有多个身份，只让其中一个退出）。
+pub async fn quit_matching(grace: Duration, mine: impl Fn(&Fingerprint) -> bool) -> usize {
+    let endpoints: Vec<Arc<quinn::Endpoint>> = {
+        let live = LIVE.lock().unwrap_or_else(PoisonError::into_inner);
+        live.iter()
+            .filter(|(fingerprint, _)| mine(fingerprint))
+            .filter_map(|(_, weak)| weak.upgrade())
+            .filter(|endpoint| endpoint.open_connections() > 0)
+            .collect()
+    };
+    for endpoint in &endpoints {
+        endpoint.close(VarInt::from_u32(QUIT_CODE), QUIT_REASON.as_bytes());
+    }
+    // 关闭帧在端点的后台任务里发出；等到所有连接收尾，但最多等 grace，不能拖住退出
+    let _ = tokio::time::timeout(grace, async {
+        for endpoint in &endpoints {
+            endpoint.wait_idle().await;
+        }
+    })
+    .await;
+    endpoints.len()
 }
 
 /// 一条已建立的连接。
@@ -616,6 +675,16 @@ impl Link {
     /// 等待连接关闭，返回原因。
     pub async fn closed(&self) -> String {
         self.conn.closed().await.to_string()
+    }
+
+    /// 对端是不是因为退出程序而关闭了连接（见 [`QUIT_REASON`]）。
+    #[must_use]
+    pub fn peer_quit(&self) -> bool {
+        use quinn::ConnectionError as E;
+        matches!(
+            self.conn.close_reason(),
+            Some(E::ApplicationClosed(close)) if close.reason.as_ref() == QUIT_REASON.as_bytes()
+        )
     }
 
     /// 到目前为止从对端收到的 UDP 包数。

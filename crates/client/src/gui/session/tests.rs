@@ -1,6 +1,7 @@
 //! 会话线程的端到端测试：同一进程里一个被控端、一个或几个控制端，走真实的 QUIC。
 
 use super::*;
+use crate::gui::form::end_text;
 use peerdesk_net::service::{RelayService, SignalService};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -778,6 +779,119 @@ fn server_crash_shows_reconnecting_then_gives_up() {
     for dir in [server_dir, host_dir, ctrl_dir] {
         let _ = std::fs::remove_dir_all(dir);
     }
+}
+
+/// 用户点“退出”：给每个正在进行的会话发带原因的关闭，对端 1 秒内知道“对方退出了”，不用等超时。
+/// 两个方向各测一次（被控端退出、控制端退出）。同一进程里有别的测试在跑，所以只让这一方的身份退出。
+fn quit_test(host_quits: bool) {
+    use crate::gui::i18n::{EN, ZH};
+    let tag = if host_quits { "q-host" } else { "q-ctrl" };
+    let (host_dir, ctrl_dir) = (temp_dir(&format!("{tag}-h")), temp_dir(&format!("{tag}-c")));
+    let (h, port, _) = host(&host_dir, "secret-pw", None);
+    let host_fp = Identity::load_or_create(&host_dir).unwrap().fingerprint();
+    let ctrl_fp = Identity::load_or_create(&ctrl_dir).unwrap().fingerprint();
+    let (repaint, _) = counter();
+    let v = start_view(local(port, Some(host_fp)), "secret-pw", ctrl_dir, repaint);
+    let (mut seen, mut host_seen) = (Log::new(), Log::new());
+    wait_for(
+        || v.poll(),
+        &mut seen,
+        |e| matches!(e, ViewEvent::Connected { .. }),
+    );
+    wait_for(
+        || h.poll(),
+        &mut host_seen,
+        |e| *e == HostEvent::Established,
+    );
+    std::thread::sleep(Duration::from_millis(300));
+
+    let quitter = if host_quits { host_fp } else { ctrl_fp };
+    let started = Instant::now();
+    let told = say_goodbye_where(|fp| *fp == quitter);
+    assert!(told >= 1, "没有通知到任何会话");
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "退出前的通知不能拖：{:?}",
+        started.elapsed()
+    );
+
+    // 另一端 1 秒内收到原因
+    let end = if host_quits {
+        let ended = wait_ended_within(
+            || v.poll(),
+            &mut seen,
+            |e| matches!(e, ViewEvent::Ended(_)),
+            started,
+        );
+        let ViewEvent::Ended(Ok(summary)) = ended else {
+            panic!("控制端该正常结束：{ended:?}")
+        };
+        summary.end
+    } else {
+        let ended = wait_ended_within(
+            || h.poll(),
+            &mut host_seen,
+            |e| matches!(e, HostEvent::SessionEnded(_)),
+            started,
+        );
+        let HostEvent::SessionEnded(Ok(end)) = ended else {
+            panic!("被控端该正常结束：{ended:?}")
+        };
+        end
+    };
+    assert_eq!(end, peerdesk_net::node::END_PEER_QUIT);
+    // 界面上显示人话，不是 closed by peer
+    assert_eq!(end_text(&end, &ZH), "连接已断开：对方退出了 PeerDesk");
+    assert_eq!(
+        end_text(&end, &EN),
+        "Disconnected: the other side quit PeerDesk"
+    );
+    // 握手阶段或别处报成连接错误时也一样
+    let closed = NetError::Closed(format!(
+        "closed by peer: {}",
+        peerdesk_net::node::QUIT_REASON
+    ));
+    assert_eq!(crate::gui::form::explain(&closed, &ZH), ZH.peer_quit);
+    assert!(!ZH.peer_quit.contains("closed by peer"));
+}
+
+/// 在 `started` 之后 1 秒内等到想要的事件。
+fn wait_ended_within<E: Clone + std::fmt::Debug>(
+    poll: impl Fn() -> Vec<E>,
+    log: &mut Log<E>,
+    want: impl Fn(&E) -> bool,
+    started: Instant,
+) -> E {
+    loop {
+        while let Some(e) = log.all.get(log.next).cloned() {
+            log.next += 1;
+            if want(&e) {
+                assert!(
+                    started.elapsed() < Duration::from_secs(1),
+                    "超过 1 秒才收到：{:?}",
+                    started.elapsed()
+                );
+                return e;
+            }
+        }
+        log.all.extend(poll());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "1 秒内没有收到，已收到：{:?}",
+            log.all
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn host_quitting_tells_the_controller_at_once() {
+    quit_test(true);
+}
+
+#[test]
+fn controller_quitting_tells_the_host_at_once() {
+    quit_test(false);
 }
 
 #[test]

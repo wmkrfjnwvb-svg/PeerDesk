@@ -120,10 +120,24 @@ impl ConnectForm {
     }
 }
 
+/// 会话结束时给用户看的一句话：对端退出了就说“连接已断开：对方退出了 PeerDesk”，其他是“会话已结束：原因”。
+#[must_use]
+pub fn end_text(end: &str, s: &Strings) -> String {
+    if end == peerdesk_net::node::END_PEER_QUIT {
+        s.peer_quit.to_owned()
+    } else {
+        format!("{}：{end}", s.session_ended)
+    }
+}
+
 /// 把网络层的错误说成用户看得懂的话，后面附上原始信息便于排查。
 #[must_use]
 pub fn explain(e: &NetError, s: &Strings) -> String {
     let detail = e.to_string();
+    // 对端点了退出：说人话，不显示 closed by peer 这类原文
+    if detail.contains(peerdesk_net::node::QUIT_REASON) {
+        return s.peer_quit.to_owned();
+    }
     let summary = match e {
         NetError::Io(why) if why.contains("绑定") => s.err_port_in_use,
         NetError::Timeout(_) => s.err_timeout,

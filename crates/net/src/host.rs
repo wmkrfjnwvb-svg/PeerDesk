@@ -763,6 +763,12 @@ pub async fn serve(
         }
     };
 
+    // 对端是因为退出程序而关闭的连接：说清楚，界面显示“对方退出了”，而不是网络错误
+    let end = if link.peer_quit() {
+        crate::node::END_PEER_QUIT.to_owned()
+    } else {
+        end
+    };
     // 无论会话怎么结束，都把还按着的键和鼠标按键释放掉。
     for event in keys.release_all() {
         sink.inject(&event);

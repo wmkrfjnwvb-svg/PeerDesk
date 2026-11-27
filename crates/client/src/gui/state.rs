@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 
 use peerdesk_core::signal::format_code;
 
-use super::form::explain;
+use super::form::{end_text, explain};
 use super::i18n::Strings;
 use super::session::{HostEvent, Summary, ViewEvent};
 use peerdesk_net::rendezvous::Path as Route;
@@ -158,10 +158,7 @@ impl HostPhase {
             ),
             // 只拒绝了这一次，仍在等待连接
             HostEvent::Refused(why) => (self.clone(), Some(Status::error(why.clone()))),
-            HostEvent::SessionEnded(Ok(end)) => (
-                listening(),
-                Some(Status::info(format!("{}：{end}", s.session_ended))),
-            ),
+            HostEvent::SessionEnded(Ok(end)) => (listening(), Some(Status::info(end_text(end, s)))),
             HostEvent::SessionEnded(Err(e)) => (listening(), Some(Status::error(explain(e, s)))),
             // 已经关了（例如因为没有权限）：保留之前的说明，不用“已关闭”盖掉它。
             HostEvent::Stopped(None) => (
@@ -264,7 +261,7 @@ impl ViewPhase {
             ViewEvent::Ended(result) => {
                 let status = match result {
                     Ok(summary) if summary.cancelled => Status::info(s.you_disconnected),
-                    Ok(summary) => Status::info(format!("{}：{}", s.session_ended, summary.end)),
+                    Ok(summary) => Status::info(end_text(&summary.end, s)),
                     Err(e) => Status::error(explain(e, s)),
                 };
                 ViewPhase::Ended {

@@ -150,6 +150,8 @@ pub struct Strings {
     pub net_bandwidth_hint: &'static str,
     pub session_ended: &'static str,
     pub you_disconnected: &'static str,
+    /// 对端退出了 PeerDesk（对端点了退出）：不是网络问题，不会重连。
+    pub peer_quit: &'static str,
     pub stats: &'static str,
     /// 详情面板。
     pub d_title: &'static str,
@@ -614,6 +616,7 @@ pub const ZH: Strings = Strings {
     net_bandwidth_hint: "网络带宽不够，画面已自动降低清晰度和帧率。关掉占用网络的下载、视频可以改善。",
     session_ended: "会话已结束",
     you_disconnected: "你断开了连接",
+    peer_quit: "连接已断开：对方退出了 PeerDesk",
     stats: "详情 (F12)",
     d_title: "连接详情",
     d_local: "本机（控制端）",
@@ -895,6 +898,7 @@ pub const EN: Strings = Strings {
     net_bandwidth_hint: "Not enough bandwidth: picture quality and frame rate were lowered automatically. Pausing downloads or videos helps.",
     session_ended: "Session ended",
     you_disconnected: "You disconnected",
+    peer_quit: "Disconnected: the other side quit PeerDesk",
     stats: "Details (F12)",
     d_title: "Connection details",
     d_local: "This computer (controller)",

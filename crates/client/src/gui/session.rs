@@ -90,6 +90,30 @@ async fn stopped(stop: &mut watch::Receiver<bool>) {
     }
 }
 
+/// 退出时最多等多久让关闭帧发出去（用户点了退出，不能拖）。
+const QUIT_GRACE: Duration = Duration::from_millis(300);
+
+/// 用户退出程序之前：给所有正在进行的会话（被控端、控制端都算）发带原因的关闭，对端马上知道
+/// “对方退出了 PeerDesk”，不用等超时。最多等 [`QUIT_GRACE`]。任何线程都能调用，不依赖界面刷新。
+/// 返回通知了几个有连接的端点。
+pub fn say_goodbye() -> usize {
+    say_goodbye_where(|_| true)
+}
+
+/// 同 [`say_goodbye`]，只处理本端指纹满足条件的端点（测试里同一进程有多个身份）。
+pub fn say_goodbye_where(mine: impl Fn(&peerdesk_net::Fingerprint) -> bool) -> usize {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build();
+    match runtime {
+        Ok(rt) => rt.block_on(peerdesk_net::node::quit_matching(QUIT_GRACE, mine)),
+        Err(e) => {
+            log::warn!("退出前通知对端失败：{e}");
+            0
+        }
+    }
+}
+
 /// 先关端点，再等关闭通知发出去（有上限）。
 async fn close_nodes(nodes: &[Arc<Node>]) {
     for node in nodes {
