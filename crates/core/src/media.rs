@@ -10,10 +10,14 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use crate::adaptive::{DelayTracker, DeliveryLog, Feedback, Profile};
+use crate::cc::alr::Alr;
 use crate::cc::probe::ProbeCluster;
 use crate::cc::report::{ArrivalRecorder, ArrivalReport, PacketKind, SendHistory, SentPacket};
 use crate::error::Error;
-use crate::estimator::{EstimatorKind, Extension, Observation, RateEstimator, ReceiverMetrics};
+use crate::estimator::{
+    EstimatorKind, Extension, NetCause, Observation, ProbeAsk, ProbeEnd, ProbeReport, ProbeVerdict,
+    RateEstimator, ReceiverMetrics, SendLimit,
+};
 use crate::frame::{Frame, Picture};
 use crate::governor::FpsGovernor;
 use crate::pacer::FLAG_PADDING;
@@ -23,7 +27,7 @@ use crate::scale::ScalePolicy;
 use crate::screen::Screen;
 use crate::time::Time;
 use crate::transport::{
-    fragment, parity_for, rs_parity_for, Fec, Reassembler, VideoPacket, RS_PARITY_PREFIX,
+    fragment, parity_for, rs_parity_for, Fec, Reassembler, VideoPacket, PROGRESS, RS_PARITY_PREFIX,
     WHOLE_FRAME,
 };
 use crate::video::{Codec, EncodedFrame, FrameHeader, VideoDecoder, VideoEncoder};
@@ -45,6 +49,8 @@ const IN_FLIGHT_RECENT_US: u64 = 100_000;
 
 /// 一条反馈最多带多少个重传请求。
 pub const MAX_NACKS: usize = 48;
+/// 一份反馈里最多带几帧的进度（见 [`crate::transport::PROGRESS`]）。
+const PROGRESS_FRAMES: usize = 4;
 /// 分片缺了多久才请求重传（微秒）：短于这个时间可能只是乱序。
 const NACK_AFTER_US: u64 = 10_000;
 
@@ -62,6 +68,50 @@ pub fn encode_feedback(feedback: &Feedback, ext: &Extension, nacks: &[(u32, u16)
         }
     }
     w.into_vec()
+}
+
+/// 反馈数据报，探测结果带组号的格式（双方都支持 [`crate::proto::Caps::PROBE_ID`] 时用）：和 [`encode_feedback`]
+/// 一样，有探测结果时在最后多 [`ProbeReport::LEN`] 字节。没有探测结果的反馈和老格式逐字节相同——反馈也走瓶颈，
+/// 每份多一两个字节都会让时序和老版本不一样；绝大多数反馈没有探测结果，也省流量。
+/// 有没有探测结果按长度分辨（见 [`decode_feedback_ids`]）。
+#[must_use]
+pub fn encode_feedback_ids(
+    feedback: &Feedback,
+    ext: &Extension,
+    nacks: &[(u32, u16)],
+    probe: Option<&ProbeReport>,
+) -> Vec<u8> {
+    let mut out = encode_feedback(feedback, ext, nacks);
+    if let Some(p) = probe {
+        let mut w = Writer::new();
+        p.encode(&mut w);
+        out.extend(w.into_vec());
+    }
+    out
+}
+
+/// 解析探测结果带组号的反馈数据报（见 [`encode_feedback_ids`]）。
+///
+/// 扩展测量之后剩下的长度：没有重传请求、没有探测结果是 0；只有重传请求是 1 + 6n（除以 6 余 1）；
+/// 只有探测结果是 11（余 5）；两样都有是 12 + 6n（余 0）。三种余数互不相同，所以“余数不是 1”就是带探测结果。
+pub fn decode_feedback_ids(buf: &[u8]) -> Result<(DecodedFeedback, Option<ProbeReport>), Error> {
+    let rest = buf
+        .len()
+        .saturating_sub(Feedback::LEN)
+        .saturating_sub(Extension::LEN);
+    if rest == 0 || rest % 6 == 1 {
+        return Ok((decode_feedback(buf)?, None));
+    }
+    let (head, tail) = buf
+        .split_at_checked(buf.len().saturating_sub(ProbeReport::LEN))
+        .ok_or(Error::Truncated {
+            need: ProbeReport::LEN,
+            have: buf.len(),
+        })?;
+    let mut r = Reader::new(tail);
+    let probe = ProbeReport::decode(&mut r)?;
+    r.finish()?;
+    Ok((decode_feedback(head)?, Some(probe)))
 }
 
 /// 解析出的反馈数据报：基本反馈、扩展测量、重传请求。
@@ -252,6 +302,88 @@ pub struct SenderStats {
     pub resend_capped: u32,
     /// 重传请求里这个分片（原包或上一份重传）还在节奏器里排队、所以没有再排一份的分片数。
     pub resend_unsent: u32,
+    /// 探测的流量和结论。
+    pub probes: ProbeStats,
+}
+
+/// 探测的流量和结论（探测流量是成本：中继按流量计费；每轮探测必有结论）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ProbeStats {
+    /// 发出的探测字节数（含数据报头）：起步探测、静止探测、运行中探测。
+    pub start_bytes: u64,
+    /// 见 [`Self::start_bytes`]。
+    pub idle_bytes: u64,
+    /// 见 [`Self::start_bytes`]。
+    pub run_bytes: u64,
+    /// 运行中探测发出的轮数（待发时就中止的不算），核实和周期各几轮。
+    pub run_sent: u32,
+    /// 见 [`Self::run_sent`]。
+    pub verify_rounds: u32,
+    /// 见 [`Self::run_sent`]。
+    pub periodic_rounds: u32,
+    /// 运行中探测各种结论的次数，下标见 [`ProbeVerdict::index`]（含待发时就中止的）。
+    pub run_verdicts: [u32; 4],
+    /// 静止探测发出的组数和各种结论的次数。
+    pub idle_sent: u32,
+    /// 见 [`Self::idle_sent`]。
+    pub idle_verdicts: [u32; 4],
+}
+
+impl ProbeStats {
+    /// 全部探测字节。
+    #[must_use]
+    pub const fn bytes(&self) -> u64 {
+        self.start_bytes
+            .saturating_add(self.idle_bytes)
+            .saturating_add(self.run_bytes)
+    }
+
+    /// 把另一次运行的计数加进来。
+    pub fn merge(&mut self, o: &Self) {
+        self.start_bytes = self.start_bytes.saturating_add(o.start_bytes);
+        self.idle_bytes = self.idle_bytes.saturating_add(o.idle_bytes);
+        self.run_bytes = self.run_bytes.saturating_add(o.run_bytes);
+        self.run_sent = self.run_sent.saturating_add(o.run_sent);
+        self.verify_rounds = self.verify_rounds.saturating_add(o.verify_rounds);
+        self.periodic_rounds = self.periodic_rounds.saturating_add(o.periodic_rounds);
+        self.idle_sent = self.idle_sent.saturating_add(o.idle_sent);
+        for (a, b) in self.run_verdicts.iter_mut().zip(o.run_verdicts) {
+            *a = a.saturating_add(b);
+        }
+        for (a, b) in self.idle_verdicts.iter_mut().zip(o.idle_verdicts) {
+            *a = a.saturating_add(b);
+        }
+    }
+
+    /// 一行报告。`total_bytes` 是这段时间发出的全部字节（算探测占比）。
+    #[must_use]
+    pub fn line(&self, total_bytes: u64) -> String {
+        let verdicts = |v: &[u32; 4]| {
+            ProbeVerdict::ALL
+                .iter()
+                .zip(v)
+                .map(|(k, n)| format!("{} {n}", k.name()))
+                .collect::<Vec<_>>()
+                .join("、")
+        };
+        let share = self.bytes().saturating_mul(10_000) / total_bytes.max(1);
+        format!(
+            "探测流量 {} B（起步 {}、静止 {}、运行中 {}），占全部流量 {}.{:02}%；运行中探测发出 {} 轮（核实 {}、周期 {}），\
+             结论：{}；静止探测 {} 组，结论：{}",
+            self.bytes(),
+            self.start_bytes,
+            self.idle_bytes,
+            self.run_bytes,
+            share / 100,
+            share % 100,
+            self.run_sent,
+            self.verify_rounds,
+            self.periodic_rounds,
+            verdicts(&self.run_verdicts),
+            self.idle_sent,
+            verdicts(&self.idle_verdicts),
+        )
+    }
 }
 
 /// 交给编码器的一帧任务。编码可以在别的线程上做：任务里带着上次之后发送端判定的丢失和收到的确认，
@@ -331,6 +463,43 @@ const START_PROBE_MAX_US: u64 = 1_000_000;
 /// 起步探测的组号从这里起（和静止探测、网络控制器的探测组号分开）。
 const START_PROBE_ID_BASE: u32 = 0x4000_0000;
 
+/// 等第一个关键帧送到最多等这么久（微秒），到点就不做起步探测、结束“起步”。之后探测本身最多
+/// [`START_PROBE_MAX_US`]，所以“起步”最长 3 秒，每个状态都走得完。
+/// 2 秒的依据：144 次微软轨迹里“起步”实际持续 0.2–0.8 秒（中位 0.2 秒，最长 0.81 秒），大屏 Wi-Fi 场景 0.46 秒；
+/// 2 秒也是“第一幅画面”的门槛。2 秒还没确认的关键帧算下来不可能比起步码率快 2 倍（探测的条件），本来也不会探。
+const START_PROBE_WAIT_MAX_US: u64 = 2_000_000;
+/// 静止探测发出之后这么久（微秒）没有结果算超时（收不齐的组，接收端要等两份没有新包的反馈才结算，
+/// 静止时反馈 1 秒一份，所以最晚约 2 秒多）。
+const IDLE_PROBE_TIMEOUT_US: u64 = 3_000_000;
+/// 运行中探测的组号从这里起（和起步、静止探测的组号分开）。
+const RUN_PROBE_ID_BASE: u32 = 0x2000_0000;
+/// 运行中探测等能探的时机最多等这么久（微秒），到点中止。
+const RUN_PROBE_WAIT_US: u64 = 200_000;
+/// 运行中探测等结果：往返 + 一组的时长 + 这么久（微秒：交给节奏器最多等一个定时周期 25 ms、接收端一次反馈间隔
+/// 20 ms、余量 20 ms）。
+const RUN_PROBE_SLACK_US: u64 = 65_000;
+
+/// 运行中探测在发送端的状态机（要不要探、结论怎么用在估计器，见 [`RateEstimator::probe_wanted`]）。
+/// 每一轮必然以证实、否定、超时、中止之一结束（I4）：待发最多 [`RUN_PROBE_WAIT_US`]，已发最多
+/// 往返 + 一组的时长 + [`RUN_PROBE_SLACK_US`]。
+///
+/// 探测期间照常出帧（和起步探测不同）：反馈里的探测结果带组号，帧的包串混不进来；应用受限时的帧很小，
+/// 而每探一次停 100 多毫秒的画面本身就是卡顿。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunProbe {
+    /// 空闲：每个定时周期问估计器要不要探。
+    Idle,
+    /// 待发：要探，等能探的时机（见 [`MediaSender::probe_blocked`]）。
+    Pending { ask: ProbeAsk, since: Time },
+    /// 已发：等带这个组号的结果。`partial` 是接收端收到一半时先报的结果。
+    Sent {
+        ask: ProbeAsk,
+        id: u32,
+        deadline: Time,
+        partial: Option<u64>,
+    },
+}
+
 /// 起步探测的进度。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct StartProbe {
@@ -346,6 +515,12 @@ struct StartProbe {
     /// 这一组发出之后收到的最高结果（可能混着上一组收尾的结果，到时间再用它下结论）。
     round_bps: u64,
 }
+
+/// 连续这么久（微秒）没有任何网络受限的原因、预算桶也判成受限，才算应用受限（进慢）；一出现网络受限的原因
+/// 马上不算（出快）。500 ms 是预算桶攒满的时间（[`crate::cc::alr`]，WebRTC 同值）。
+const APP_LIMITED_AFTER_US: u64 = 500_000;
+/// 编出的帧达到预算的这么多（千分比）就算编码器被码率卡着。
+const NEAR_BUDGET_PERMILLE: usize = 800;
 
 /// 帧率已经在最低档、帧还一直装不进预算这么久（微秒）就降分辨率（最后手段）。
 const OVERFLOW_DOWN_US: u64 = 2_000_000;
@@ -412,6 +587,19 @@ pub struct MediaSender {
     start_probe: Option<StartProbe>,
     /// 发出的包，等到达报告对账（见 [`crate::cc::report`]）。
     history: SendHistory,
+    /// 发送量受谁限制（见 [`SendLimit`]）：预算桶（发出的量是不是明显少于码率），和最近一次网络受限的原因。
+    alr: Alr,
+    net_limited: Option<(Time, NetCause)>,
+    /// 对端的反馈里探测结果带组号（见 [`Self::set_probe_ids`]）；运行中探测的状态机；会话开始的时刻；
+    /// 静止探测发出的时刻；节奏器里上一帧是不是还没发完（最近一次 [`Self::frame_gate`] 时）。
+    probe_ids: bool,
+    run_probe: RunProbe,
+    started: Option<Time>,
+    probing_at: Time,
+    probing_late: bool,
+    pacer_busy: bool,
+    /// 接收端报告的每一帧到了几个分片（见 [`crate::transport::PROGRESS`]）。
+    progress: BTreeMap<u32, u16>,
 }
 
 impl std::fmt::Debug for MediaSender {
@@ -474,6 +662,15 @@ impl MediaSender {
             pending_probe: None,
             start_probe: None,
             history: SendHistory::new(),
+            alr: Alr::new(cfg.start_bps),
+            net_limited: None,
+            probe_ids: false,
+            run_probe: RunProbe::Idle,
+            started: None,
+            probing_at: Time(0),
+            probing_late: false,
+            pacer_busy: false,
+            progress: BTreeMap::new(),
             scale: if codec == Codec::H264 {
                 ScalePolicy::new()
             } else {
@@ -501,6 +698,23 @@ impl MediaSender {
 
     /// 一个数据报交给了网络（`seq` 是数据报头里的序号）。到达报告据此对账。
     pub fn on_packet_sent(&mut self, now: Time, seq: u32, out: &Outgoing) {
+        // 发出的画面和重传都从“应用受限”的预算桶里扣
+        let size = u64::try_from(out.body.len().saturating_add(HEADER_LEN)).unwrap_or(u64::MAX);
+        // （探测包不算：它不是应用要发的量，算进去的话一组探测就把“应用受限”顶掉、接着的一轮被中止）
+        if !matches!(out.kind, PacketKind::Probe(_)) {
+            self.alr.on_sent(now, size);
+        }
+        if let PacketKind::Probe(id) = out.kind {
+            let p = &mut self.stats.probes;
+            let bytes = if id & IDLE_PROBE_ID_BASE != 0 {
+                &mut p.idle_bytes
+            } else if id & START_PROBE_ID_BASE != 0 {
+                &mut p.start_bytes
+            } else {
+                &mut p.run_bytes
+            };
+            *bytes = bytes.saturating_add(size);
+        }
         match (out.kind, out.fragment) {
             (PacketKind::Retransmit, Some(key)) => {
                 if let Some(state) = self.resent.get_mut(&key) {
@@ -535,8 +749,22 @@ impl MediaSender {
 
     /// 定时调用（约 25 ms）：网络控制器的定时任务（应用受限的预算、定期探测）。
     pub fn on_tick(&mut self, now: Time) {
+        // 没有包发时预算桶照常累积
+        self.alr.set_estimate(self.rate.rate_bps());
+        self.alr.on_tick(now);
         if self.reports {
             self.rate.on_tick(now);
+        }
+        let started = *self.started.get_or_insert(now);
+        if self.start_probe.is_some_and(|p| p.started.is_none())
+            && now.since(started) >= START_PROBE_WAIT_MAX_US
+        {
+            // 兜底：第一个关键帧这么久还没确认，链路不可能比起步码率宽多少，不探了（“起步”有了时间上限）
+            self.start_probe = None;
+            self.rate.set_startup(
+                false,
+                "不做起步探测：第一个关键帧 2 秒还没确认，起步到时限了",
+            );
         }
         if self
             .start_probe
@@ -550,7 +778,24 @@ impl MediaSender {
             // 这一组的结果该回来了、后面再没有新结果：按这一轮收到的判，不干等到 1 秒
             self.start_probe_decide(now);
         }
-        if self.idle_probe && self.next_probe.is_some_and(|t| now >= t) {
+        // 静止探测到时间没有结果：超时（每轮探测必有结论）
+        // （只下结论、写日志；这一组之后迟到的结果照旧认，行为和没有这个时限时完全一样，见不变量 I3）
+        if self.probing.is_some()
+            && !self.probing_late
+            && now.since(self.probing_at) >= IDLE_PROBE_TIMEOUT_US
+        {
+            self.probing_late = true;
+            self.idle_verdict(ProbeVerdict::TimedOut, "到时间没有结果");
+        }
+        self.tick_run_probe(now);
+        // 运行中探测在进行时静止探测先等着（两组探测不同时发）
+        if self.idle_probe
+            && self.next_probe.is_some_and(|t| now >= t)
+            && self.run_probe == RunProbe::Idle
+        {
+            self.stats.probes.idle_sent = self.stats.probes.idle_sent.saturating_add(1);
+            self.probing_at = now;
+            self.probing_late = false;
             self.probes = self.probes.wrapping_add(1);
             let id = IDLE_PROBE_ID_BASE | (self.probes & !IDLE_PROBE_ID_BASE);
             self.pending_probe = Some(ProbeCluster {
@@ -565,6 +810,152 @@ impl MediaSender {
             self.probing = Some(id);
             self.next_probe = Some(now.plus(self.probe_gap));
             self.probe_gap = self.probe_gap.saturating_mul(2).min(IDLE_PROBE_MAX_GAP_US);
+        }
+    }
+
+    /// 记一条静止探测的结论。
+    fn idle_verdict(&mut self, verdict: ProbeVerdict, text: &str) {
+        // 已经按超时下过结论的那一组：迟到的结果、之后的中止只写日志，不再算一次结论
+        if std::mem::take(&mut self.probing_late) && verdict != ProbeVerdict::TimedOut {
+            self.event(format!("静止探测（已按超时下过结论）之后：{text}"));
+            return;
+        }
+        self.probing_late = verdict == ProbeVerdict::TimedOut;
+        if let Some(n) = self.stats.probes.idle_verdicts.get_mut(verdict.index()) {
+            *n = n.saturating_add(1);
+        }
+        self.event(format!("静止探测结论 {}：{text}", verdict.name()));
+    }
+
+    /// 对端的反馈里探测结果带组号（握手时双方都支持 [`crate::proto::Caps::PROBE_ID`]）：反馈按带组号的格式解，
+    /// 并打开运行中探测。对端是老版本时不打开，反馈格式和探测行为都照旧。带到达报告的反馈格式不带组号。
+    pub const fn set_probe_ids(&mut self, on: bool) {
+        self.probe_ids = on;
+    }
+
+    /// 现在为什么不能发运行中探测（能发时为 `None`）。真拥塞时不探：探测是满速的流量，只会添堵。
+    fn probe_blocked(&self, now: Time) -> Option<&'static str> {
+        // （排队平不平静由估计器判：它知道哪些读数是断档的零星小包，不算数）
+        let fb = self.last_obs.map(|o| o.feedback);
+        if self.pending_probe.is_some() || self.probing.is_some() {
+            Some("另一组探测还没完")
+        } else if self.key_pending() {
+            Some("关键帧还没确认")
+        } else if self.in_flight_full(now) {
+            Some("在途数据满了")
+        } else if self.pacer_busy {
+            Some("上一帧还没发完")
+        } else if fb.is_some_and(|f| f.loss_permille >= FEC_FROM_LOSS_PERMILLE) {
+            // 和起步探测一样：有丢包的链路上探测结果不准（ms-02560，8 Mbps、12% 丢包，按探测升码率后卡顿 0 → 3 次）
+            Some("有丢包")
+        } else {
+            None
+        }
+    }
+
+    /// 运行中探测的状态机走一步（每个定时周期）。
+    fn tick_run_probe(&mut self, now: Time) {
+        if self.run_probe == RunProbe::Idle
+            && self.probe_ids
+            && !self.reports
+            && self.start_probe.is_none()
+        {
+            if let Some(ask) = self.rate.probe_wanted(now) {
+                self.run_probe = RunProbe::Pending { ask, since: now };
+            }
+        }
+        match self.run_probe {
+            RunProbe::Idle => {}
+            RunProbe::Pending { ask, since } => match self.probe_blocked(now) {
+                None => {
+                    self.probes = self.probes.wrapping_add(1);
+                    let id = RUN_PROBE_ID_BASE | (self.probes & (RUN_PROBE_ID_BASE - 1));
+                    let packets = crate::estimator::run_probe_packets(ask.target_bps);
+                    self.pending_probe = Some(ProbeCluster {
+                        id,
+                        target_bps: ask.target_bps,
+                        packets,
+                    });
+                    let span = u64::from(packets)
+                        .saturating_mul(u64::from(crate::cc::probe::PROBE_PACKET_BYTES))
+                        .saturating_mul(8_000_000)
+                        / ask.target_bps.max(1);
+                    self.run_probe = RunProbe::Sent {
+                        ask,
+                        id,
+                        deadline: now.plus(self.rtt_us).plus(span).plus(RUN_PROBE_SLACK_US),
+                        partial: None,
+                    };
+                    let p = &mut self.stats.probes;
+                    p.run_sent = p.run_sent.saturating_add(1);
+                    let rounds = match ask.kind {
+                        crate::estimator::ProbeKind::Verify => &mut p.verify_rounds,
+                        crate::estimator::ProbeKind::Periodic => &mut p.periodic_rounds,
+                    };
+                    *rounds = rounds.saturating_add(1);
+                    self.event(format!(
+                        "{}探测：按 {} kbps 发 {packets} 个包（码率 {} kbps）",
+                        ask.kind.name(),
+                        ask.target_bps / 1000,
+                        self.rate.rate_bps() / 1000
+                    ));
+                }
+                Some(why) if now.since(since) >= RUN_PROBE_WAIT_US => {
+                    self.end_run_probe(now, ProbeEnd::Aborted(why));
+                }
+                Some(_) => {}
+            },
+            RunProbe::Sent {
+                deadline, partial, ..
+            } => {
+                if now >= deadline {
+                    // 没等到收完的结果：有收到一半时报的就按它判，没有就是超时
+                    self.end_run_probe(now, partial.map_or(ProbeEnd::TimedOut, ProbeEnd::Result));
+                }
+            }
+        }
+    }
+
+    /// 这一轮运行中探测结束：告诉估计器、记结论，回到空闲。
+    fn end_run_probe(&mut self, now: Time, end: ProbeEnd) {
+        if self.run_probe == RunProbe::Idle {
+            return;
+        }
+        self.run_probe = RunProbe::Idle;
+        let verdict = self.rate.on_probe_end(now, end);
+        if let Some(n) = self.stats.probes.run_verdicts.get_mut(verdict.index()) {
+            *n = n.saturating_add(1);
+        }
+    }
+
+    /// 反馈里带组号的探测结果。
+    fn on_probe_report(&mut self, now: Time, report: ProbeReport) {
+        let RunProbe::Sent {
+            ask,
+            id,
+            deadline,
+            partial,
+        } = self.run_probe
+        else {
+            return;
+        };
+        // 别的组的（上一轮收尾的、起步或静止探测的）不认
+        if report.id != id {
+            return;
+        }
+        let bps = u64::from(report.bytes_per_s).saturating_mul(8);
+        if report.done && bps > 0 {
+            self.end_run_probe(now, ProbeEnd::Result(bps));
+        } else if report.done {
+            // 收完了但测不出（只到了一两个包）：按之前收到一半时报的，没有就是超时
+            self.end_run_probe(now, partial.map_or(ProbeEnd::TimedOut, ProbeEnd::Result));
+        } else {
+            self.run_probe = RunProbe::Sent {
+                ask,
+                id,
+                deadline,
+                partial: Some(bps),
+            };
         }
     }
 
@@ -585,6 +976,10 @@ impl MediaSender {
             best_bps: 0,
             round_bps: 0,
         });
+        if self.start_probe.is_some() {
+            self.rate
+                .set_startup(true, "会话开头，等第一个关键帧送到再决定探不探");
+        }
     }
 
     /// 起步探测还没结束（在等第一个关键帧送到，或者在探）。
@@ -603,6 +998,8 @@ impl MediaSender {
         let rate = self.rate.rate_bps();
         if delivered_bps.saturating_mul(1000) < rate.saturating_mul(START_PROBE_GATE_PERMILLE) {
             self.start_probe = None;
+            self.rate
+                .set_startup(false, "不做起步探测：链路不比起步码率宽多少");
             self.event(format!(
                 "不做起步探测：第一个关键帧 {bytes} 字节送了 {} ms（扣掉往返 {} ms，约 {} kbps），链路不比起步码率 {} kbps 宽多少",
                 took_us / 1000,
@@ -704,6 +1101,14 @@ impl MediaSender {
             return;
         };
         let took = p.started.map_or(0, |t| now.since(t) / 1000);
+        self.rate.set_startup(
+            false,
+            if p.best_bps == 0 {
+                "起步探测没测到结果"
+            } else {
+                "起步探测有结论了"
+            },
+        );
         if p.best_bps == 0 {
             self.event(format!(
                 "起步探测 {took} ms 没测到结果，按起步码率 {} kbps 出画面",
@@ -814,6 +1219,56 @@ impl MediaSender {
             .sum();
         // 最近的关键帧还没确认：之后的帧都依赖它，发了也解不了，先等它送到。
         recent > by_rate.max(floor) || self.key_pending()
+    }
+
+    /// 这一帧现在能不能编：`wanted` 是有东西要编（画面变了，或 [`Self::wants_frame`]），`pacer_busy` 是节奏器里
+    /// 上一帧还没发完。到了该编的时间、却被在途上限或节奏器拦下时，记一次“网络受限”（见 [`SendLimit`]）：
+    /// 发送端有东西要发、是网络不让发，这时不能算应用受限。会话循环每一拍调用一次。
+    pub fn frame_gate(&mut self, now: Time, wanted: bool, pacer_busy: bool) -> bool {
+        self.pacer_busy = pacer_busy;
+        if !wanted || !self.due(now) {
+            return false;
+        }
+        let full = self.in_flight_full(now);
+        if full || pacer_busy {
+            self.net_event(
+                now,
+                if self.key_pending() {
+                    NetCause::KeyPending
+                } else {
+                    NetCause::FrameBlocked
+                },
+            );
+        }
+        !full && !pacer_busy
+    }
+
+    /// 记一次网络受限的原因，马上告诉估计器（应用受限进慢出快，不等下一份反馈）。
+    fn net_event(&mut self, now: Time, cause: NetCause) {
+        self.net_limited = Some((now, cause));
+        self.rate.on_net_limited(cause);
+        // 探测期间出现网络受限的原因：中止，结果不用
+        self.end_run_probe(now, ProbeEnd::Aborted(cause.name()));
+    }
+
+    /// 发送量现在是被谁限制的（每份反馈判一次，交给估计器）。
+    fn send_limit(&mut self, now: Time) -> SendLimit {
+        // 持续性的原因：只要还成立，就一直算网络受限
+        if self.key_pending() {
+            self.net_event(now, NetCause::KeyPending);
+        } else if self.governor.fit_limited() {
+            self.net_event(now, NetCause::FpsReduced);
+        } else if self.scale.permille() < crate::scale::FULL_PERMILLE {
+            self.net_event(now, NetCause::ScaleReduced);
+        }
+        let (at, cause) = *self.net_limited.get_or_insert((now, NetCause::Start));
+        if now.since(at) < APP_LIMITED_AFTER_US {
+            SendLimit::Network(cause)
+        } else if self.alr.in_alr() {
+            SendLimit::App
+        } else {
+            SendLimit::Network(NetCause::UsingRate)
+        }
     }
 
     /// 采集到的画面变了（编码器在别的线程时由会话循环调用；[`Self::on_frame`] 自己会调）。
@@ -1028,7 +1483,9 @@ impl MediaSender {
         // 发了一帧：静止探测从头排（停下 2 秒后第一次），之前那一组的结果不再认（包串速率可能是这一帧的）
         self.next_probe = Some(now.plus(IDLE_PROBE_FIRST_US));
         self.probe_gap = IDLE_PROBE_FIRST_US.saturating_mul(2);
-        self.probing = None;
+        if self.probing.take().is_some() {
+            self.idle_verdict(ProbeVerdict::Aborted, "又开始发帧了，结果不用");
+        }
         self.governor.on_frame(
             now,
             encode_us,
@@ -1036,6 +1493,12 @@ impl MediaSender {
             encoded.payload.len(),
             job.budget,
         );
+        // 这一帧用掉了预算的八成以上：编码器是被码率卡着的（网络受限）
+        if encoded.payload.len().saturating_mul(1000)
+            >= job.budget.saturating_mul(NEAR_BUDGET_PERMILLE)
+        {
+            self.net_event(now, NetCause::FrameNearBudget);
+        }
         if let Some(change) = self.governor.take_change() {
             self.event(change);
         }
@@ -1124,6 +1587,12 @@ impl MediaSender {
         let (feedback, ext, nacks, report) = if self.reports {
             let (f, n, r) = decode_feedback_v2(buf)?;
             (f, Extension::default(), n, r)
+        } else if self.probe_ids {
+            let ((f, e, n), probe) = decode_feedback_ids(buf)?;
+            if let Some(report) = probe {
+                self.on_probe_report(now, report);
+            }
+            (f, e, n, None)
         } else {
             let (f, e, n) = decode_feedback(buf)?;
             (f, e, n, None)
@@ -1150,9 +1619,24 @@ impl MediaSender {
                 one.into_iter().chain(all)
             })
             .collect();
-        // 接收端还在为这些帧要重传：它们在路上、在进展，不能按超时判丢（判丢就要重发关键帧）。
+        // 新反馈格式里的进度标记（不是重传请求）：这一帧到的分片比上次多了，说明它还在路上、在进展
+        type Marks = Vec<(u32, u16)>;
+        let (marks, nacks): (Marks, Marks) = nacks
+            .into_iter()
+            .partition(|(_, frag)| self.probe_ids && *frag != WHOLE_FRAME && frag & PROGRESS != 0);
+        let mut alive: Vec<u32> = Vec::new();
+        for (frame, mark) in marks {
+            let arrived = mark & (PROGRESS - 1);
+            if self.progress.get(&frame).is_none_or(|seen| arrived > *seen) {
+                self.progress.insert(frame, arrived);
+                alive.push(frame);
+            }
+        }
+        self.progress
+            .retain(|frame, _| self.unacked.iter().any(|(id, _, _)| id == frame));
+        // 在进展的帧，和接收端还在要重传的帧：不能按超时判丢（判丢就要重发关键帧），也继续算在途（拦着新帧）。
         for (id, at, _) in &mut self.unacked {
-            if nacks.iter().any(|(frame, _)| frame == id) {
+            if alive.contains(id) || nacks.iter().any(|(frame, _)| frame == id) {
                 *at = now;
             }
         }
@@ -1167,6 +1651,10 @@ impl MediaSender {
             .saturating_add(u32::try_from(nacks.len()).unwrap_or(u32::MAX));
         for (i, (frame, frag)) in nacks.iter().copied().enumerate() {
             if resent_bytes >= allowance.max(1) {
+                // 有要补的分片这一轮发不出去：网络受限。只是“接收端在要重传”不算：要补的马上就发了，发送端没被拦着；
+                // 而且现在的重传请求在一次延迟尖峰里就会发（按第一片到达计时），算上的话尖峰一来就退出应用受限、
+                // 同一份反馈的高读数接着把码率打到底——实测 wifi-light 2 秒后最低 175 kbps（不算是 23.9 Mbps）
+                self.net_event(now, NetCause::ResendCapped);
                 self.stats.resend_capped = self
                     .stats
                     .resend_capped
@@ -1249,6 +1737,12 @@ impl MediaSender {
         self.rate.name()
     }
 
+    /// 码率控制现在处于哪个状态（量尺统计各状态的时间占比用）。
+    #[must_use]
+    pub fn rate_state(&self) -> crate::estimator::RateState {
+        self.rate.state()
+    }
+
     /// 最近一次交给估计器的观测（特征记录用）。
     #[must_use]
     pub const fn last_observation(&self) -> Option<Observation> {
@@ -1299,6 +1793,7 @@ impl MediaSender {
             ext,
             rtt_us: self.rtt_us,
             in_flight: self.in_flight(),
+            limit: self.send_limit(now),
         };
         // 还没开始起步探测就看到明显丢包：不探（有丢包的链路上探测结果不准，码率一下提上去之后在丢包里来回降：
         // 微软轨迹 ms-02560，8 Mbps、12% 随机丢包，卡顿 0 → 3 次）
@@ -1306,6 +1801,7 @@ impl MediaSender {
             && feedback.loss_permille >= FEC_FROM_LOSS_PERMILLE
         {
             self.start_probe = None;
+            self.rate.set_startup(false, "不做起步探测：有丢包");
             self.event(format!(
                 "不做起步探测：有丢包（{}‰），按画面流量慢慢升码率",
                 feedback.loss_permille
@@ -1331,9 +1827,29 @@ impl MediaSender {
                     self.rate.rate_bps() / 1000,
                     capacity / 1000
                 ));
+                self.idle_verdict(ProbeVerdict::Denied, "链路变差了，码率按测得的容量降");
+            } else {
+                self.idle_verdict(
+                    ProbeVerdict::Confirmed,
+                    &format!("测得 {} kbps，链路没有明显变差，码率不变", capacity / 1000),
+                );
             }
         }
         self.rate.on_observation(now, &obs);
+        // 探测期间估计器因为过载降了码率（离开了要探的那个状态）：中止，结果不用（I1）
+        let state = self.rate.state();
+        let moved = match self.run_probe {
+            RunProbe::Idle => false,
+            RunProbe::Pending { ask, .. } | RunProbe::Sent { ask, .. } => match ask.kind {
+                crate::estimator::ProbeKind::Verify => state != crate::estimator::RateState::Verify,
+                crate::estimator::ProbeKind::Periodic => {
+                    state != crate::estimator::RateState::AppLimited
+                }
+            },
+        };
+        if moved {
+            self.end_run_probe(now, ProbeEnd::Aborted("出现过载，降了码率"));
+        }
         let delivered_bps = u64::from(feedback.recv_bytes_per_s).saturating_mul(8);
         if ext.train_bytes_per_s > 0 || delivered_bps.saturating_mul(2) >= self.rate.rate_bps() {
             self.rate_seen = Some(now);
@@ -1514,6 +2030,8 @@ pub struct MediaReceiver {
     /// 发到达报告（双方都支持 [`crate::proto::Caps::TRANSPORT_CC`]）。
     reports: bool,
     arrivals: ArrivalRecorder,
+    /// 反馈里的探测结果带组号（见 [`Self::set_probe_ids`]）。
+    probe_ids: bool,
 }
 
 impl std::fmt::Debug for MediaReceiver {
@@ -1549,6 +2067,7 @@ impl MediaReceiver {
             last_feedback: None,
             reports: false,
             arrivals: ArrivalRecorder::new(),
+            probe_ids: false,
         }
     }
 
@@ -1768,22 +2287,50 @@ impl MediaReceiver {
     /// 有没有缺了一阵子的分片要请求重传。
     #[must_use]
     pub fn wants_nack(&self, now: Time) -> bool {
-        !self.reassembler.missing(now, NACK_AFTER_US, 1).is_empty()
+        !self.nacks(now, 1).is_empty()
+    }
+
+    /// 要请求重传的分片：这一帧第一片到了 10 ms，缺的全要（发送端按“发出之后过了往返加排队”决定真的重传哪些）。
+    /// 按空洞和超时判丢（RFC 9002）试过：虚假重传少了很多，但丢一大片时恢复变慢（drop-while-idle 冻结 1666 ms），
+    /// 先没用，见 docs/research/L-framework.md 6.9。
+    fn nacks(&self, now: Time, limit: usize) -> Vec<(u32, u16)> {
+        self.reassembler.missing(now, NACK_AFTER_US, limit)
     }
 
     /// 生成一个反馈数据报：反馈加上缺失分片的重传请求。
     pub fn feedback_datagram(&mut self, now: Time) -> Vec<u8> {
         let feedback = self.feedback(now);
-        let nacks = self.reassembler.missing(now, NACK_AFTER_US, MAX_NACKS);
+        let mut nacks = self.nacks(now, MAX_NACKS);
         self.stats.nacks_sent = self
             .stats
             .nacks_sent
             .saturating_add(u32::try_from(nacks.len()).unwrap_or(u32::MAX));
+        // 新反馈格式：正在收的帧的进度排在前面（“还活着”和“要重传”是两个信号，见 PROGRESS）
+        if self.probe_ids {
+            let mut list = self.reassembler.progress(PROGRESS_FRAMES);
+            nacks.truncate(MAX_NACKS.saturating_sub(list.len()));
+            list.extend(nacks);
+            nacks = list;
+        }
         if self.reports {
             let report = self.arrivals.report();
             return encode_feedback_v2(&feedback, &nacks, report.as_ref());
         }
-        encode_feedback(&feedback, &self.metrics.report(), &nacks)
+        let ext = self.metrics.report();
+        if self.probe_ids {
+            // 只带运行中探测那个号段的结果：起步、静止探测照旧只看包串速率，它们的反馈和老格式逐字节相同
+            let probe = self.metrics.take_probe_report().filter(|p| {
+                p.id & (RUN_PROBE_ID_BASE | START_PROBE_ID_BASE | IDLE_PROBE_ID_BASE)
+                    == RUN_PROBE_ID_BASE
+            });
+            return encode_feedback_ids(&feedback, &ext, &nacks, probe.as_ref());
+        }
+        encode_feedback(&feedback, &ext, &nacks)
+    }
+
+    /// 反馈里的探测结果带组号（握手时双方都支持 [`crate::proto::Caps::PROBE_ID`]）。带到达报告的反馈格式不带。
+    pub const fn set_probe_ids(&mut self, on: bool) {
+        self.probe_ids = on;
     }
 
     /// 取走这段时间收齐一帧用的最长时间（微秒），清零。
@@ -1884,6 +2431,208 @@ mod tests {
             events.iter().any(|e| e.contains("降分辨率是最后手段")),
             "{events:?}"
         );
+    }
+
+    /// 发送量受谁限制按原因判：有任何网络受限的原因就不算应用受限，500 ms 都没有、发出的量也少才算。
+    #[test]
+    fn the_send_limit_is_judged_by_cause_not_by_ratio() {
+        use crate::estimator::RateState;
+        let screen = Screen::new(64, 64, 1);
+        let acked = |id: u32| Feedback {
+            floor: id,
+            delivered: 1,
+            ..Feedback::default()
+        };
+        let mut tx = MediaSender::new(cfg(), Box::new(FakeEncoder::default()));
+        tx.scale = ScalePolicy::full();
+        assert_eq!(
+            tx.send_limit(Time(0)),
+            SendLimit::Network(NetCause::Start),
+            "会话刚开始：还没观察够"
+        );
+        // 没东西要编、没到时间：不编，也不算被网络拦下
+        assert!(!tx.frame_gate(Time(0), false, false));
+        assert!(tx.frame_gate(Time(0), true, false));
+        let key = tx.on_frame(Time(0), &screen, true, 10_000).unwrap();
+        assert!(!tx.frame_gate(Time(1_000), true, false), "没到下一帧的时间");
+        assert_eq!(tx.net_limited, Some((Time(0), NetCause::FrameNearBudget)));
+        // 关键帧没确认：该编帧时被拦下，记“关键帧还没确认”
+        assert!(!tx.frame_gate(Time(40_000), true, false));
+        assert_eq!(tx.net_limited, Some((Time(40_000), NetCause::KeyPending)));
+        tx.observe(Time(50_000), &acked(1), Extension::default());
+        assert_eq!(
+            tx.last_observation().unwrap().limit,
+            SendLimit::Network(NetCause::KeyPending)
+        );
+        // 之后 500 ms 什么原因都没有、几乎不发（预算桶攒满）：应用受限，估计器进应用受限
+        let mut t = 50_000;
+        while t < 525_000 {
+            t += 25_000;
+            tx.on_tick(Time(t));
+            assert_eq!(
+                tx.send_limit(Time(t)),
+                SendLimit::Network(NetCause::KeyPending),
+                "{t}"
+            );
+        }
+        tx.on_tick(Time(550_000));
+        tx.observe(Time(550_000), &acked(1), Extension::default());
+        assert_eq!(tx.last_observation().unwrap().limit, SendLimit::App);
+        assert_eq!(tx.rate_state(), RateState::AppLimited);
+        // 小帧（远不到预算的八成）照常发：还是应用受限
+        assert!(tx.frame_gate(Time(560_000), true, false));
+        let small = tx.on_frame(Time(560_000), &screen, true, 10_000).unwrap();
+        tx.on_packet_sent(Time(560_000), 1, &small[0]);
+        tx.observe(Time(580_000), &acked(2), Extension::default());
+        assert_eq!(tx.rate_state(), RateState::AppLimited);
+        // 节奏器里上一帧没发完：记一次网络受限，估计器不等反馈马上回跟踪
+        assert!(!tx.frame_gate(Time(600_000), true, true));
+        assert_eq!(
+            tx.net_limited,
+            Some((Time(600_000), NetCause::FrameBlocked))
+        );
+        assert_eq!(tx.rate_state(), RateState::Tracking);
+        let events = tx.take_events().join("\n");
+        assert!(
+            events.contains("码率状态 跟踪 → 应用受限")
+                && events.contains(
+                    "码率状态 应用受限 → 跟踪：网络受限：该编帧时在途数据满了或上一帧没发完"
+                ),
+            "{events}"
+        );
+        // 500 ms 没有原因，但发出的量接近码率（预算桶没判受限）：算网络受限
+        let big = Outgoing {
+            body: vec![0u8; 1_200],
+            ..key[0].clone()
+        };
+        let mut t = 600_000;
+        while t < 1_200_000 {
+            t += 5_000;
+            tx.on_packet_sent(Time(t), 2, &big);
+        }
+        assert_eq!(
+            tx.send_limit(Time(t)),
+            SendLimit::Network(NetCause::UsingRate)
+        );
+        // 编码分辨率低于原尺寸：一直算网络受限
+        tx.scale = ScalePolicy::new();
+        assert_eq!(
+            tx.send_limit(Time(t)),
+            SendLimit::Network(NetCause::ScaleReduced)
+        );
+    }
+
+    /// 内容装不进预算（帧率降档）、重传被额度截断，都是网络受限的原因。
+    #[test]
+    fn overflowing_frames_and_capped_resends_are_network_limits() {
+        let mut tx = MediaSender::new(
+            SenderConfig {
+                start_bps: 200_000,
+                min_bps: 200_000,
+                max_bps: 200_000,
+                ..cfg()
+            },
+            Box::new(HugeEncoder),
+        );
+        tx.scale = ScalePolicy::full();
+        let mut t = Time::ZERO;
+        let mut first = Vec::new();
+        for i in 0..20u32 {
+            t = t.plus(33_334);
+            if tx.frame_gate(t, true, false) {
+                let out = tx
+                    .on_frame(t, &Screen::new(16, 16, i), true, 40_000)
+                    .unwrap();
+                assert_eq!(tx.net_limited, Some((t, NetCause::FrameNearBudget)));
+                if first.is_empty() {
+                    first = out;
+                }
+            }
+        }
+        assert!(tx.fps() < 30, "装不进预算，帧率降档了");
+        assert_eq!(
+            tx.send_limit(t),
+            SendLimit::Network(NetCause::FpsReduced),
+            "降档期间一直算网络受限"
+        );
+        // 第一帧的分片都发出去了，接收端全要重传：额度（码率 × 40 ms = 1000 字节）只够补 3 片，其余截断
+        for (i, o) in first.iter().enumerate() {
+            tx.on_packet_sent(Time(40_000), u32::try_from(i).unwrap(), o);
+        }
+        let nacks: Vec<(u32, u16)> = (0..10).map(|i| (1, i)).collect();
+        let fb = encode_feedback(&Feedback::default(), &Extension::default(), &nacks);
+        let at = t.plus(1_000_000);
+        let again = tx.on_feedback_datagram(at, &fb).unwrap();
+        assert_eq!(again.len(), 3);
+        assert_eq!(tx.stats().resend_capped, 7);
+        assert_eq!(tx.net_limited, Some((at, NetCause::ResendCapped)));
+    }
+
+    /// 起步探测的三种结束（链路不够宽、有丢包、探完）都告诉估计器，状态从起步回到跟踪。
+    #[test]
+    fn the_start_probe_drives_the_startup_state() {
+        use crate::estimator::RateState;
+        let screen = Screen::new(64, 64, 1);
+        let acked = |id: u32, loss: u16| Feedback {
+            floor: id,
+            delivered: 1,
+            loss_permille: loss,
+            ..Feedback::default()
+        };
+        let begin = || {
+            let mut tx = MediaSender::new(cfg(), Box::new(FakeEncoder::default()));
+            tx.set_start_probe(true);
+            assert_eq!(tx.rate_state(), RateState::Startup);
+            tx.on_frame(Time(0), &screen, true, 10_000).unwrap();
+            tx
+        };
+        // 第一个关键帧送得慢：不探
+        let mut tx = begin();
+        tx.observe(Time(900_000), &acked(1, 0), Extension::default());
+        assert_eq!(tx.rate_state(), RateState::Tracking);
+        assert!(tx
+            .take_events()
+            .join("\n")
+            .contains("码率状态 起步 → 跟踪：不做起步探测：链路不比起步码率宽多少"));
+        // 有丢包：不探
+        let mut tx = begin();
+        tx.observe(Time(5_000), &acked(0, 50), Extension::default());
+        assert_eq!(tx.rate_state(), RateState::Tracking);
+        assert!(tx
+            .take_events()
+            .join("\n")
+            .contains("码率状态 起步 → 跟踪：不做起步探测：有丢包"));
+        // 探了，到 1 秒没测到结果
+        let mut tx = begin();
+        tx.observe(Time(10_000), &acked(1, 0), Extension::default());
+        assert_eq!(tx.rate_state(), RateState::Startup, "在探");
+        tx.on_tick(Time(10_000 + START_PROBE_MAX_US));
+        assert_eq!(tx.rate_state(), RateState::Tracking);
+        assert!(tx
+            .take_events()
+            .join("\n")
+            .contains("码率状态 起步 → 跟踪：起步探测没测到结果"));
+        // 探了，有结论
+        let mut tx = begin();
+        tx.observe(Time(10_000), &acked(1, 0), Extension::default());
+        tx.observe(
+            Time(60_000),
+            &Feedback::default(),
+            Extension {
+                train_bytes_per_s: 125_000,
+                ..Extension::default()
+            },
+        );
+        tx.on_tick(Time(10_000 + START_PROBE_MAX_US));
+        assert_eq!(tx.rate_state(), RateState::Tracking);
+        assert!(tx
+            .take_events()
+            .join("\n")
+            .contains("码率状态 起步 → 跟踪：起步探测有结论了"));
+        // 不开起步探测：一直是跟踪
+        let mut tx = MediaSender::new(cfg(), Box::new(FakeEncoder::default()));
+        tx.set_start_probe(false);
+        assert_eq!(tx.rate_state(), RateState::Tracking);
     }
 
     #[test]
@@ -2593,6 +3342,595 @@ mod tests {
         off.on_frame(Time(0), &screen, true, 10_000).unwrap();
         off.on_tick(Time(5_000_000));
         assert!(off.take_probes().is_empty());
+    }
+
+    // ---- 运行中探测的状态机（空闲 → 待发 → 已发 → 判定）----
+
+    use crate::estimator::{ProbeKind, RateState};
+    use std::sync::{Arc, Mutex};
+
+    /// 假估计器：想探一轮 `want`，把每轮怎么结束的记下来。
+    #[derive(Debug)]
+    struct Asker {
+        profile: Profile,
+        want: Option<ProbeAsk>,
+        asked: bool,
+        state: Arc<Mutex<RateState>>,
+        ends: Arc<Mutex<Vec<ProbeEnd>>>,
+    }
+
+    impl RateEstimator for Asker {
+        fn name(&self) -> &'static str {
+            "asker"
+        }
+        fn rate_bps(&self) -> u64 {
+            10_000_000
+        }
+        fn on_observation(&mut self, _now: Time, _obs: &Observation) {}
+        fn profile(&self) -> &Profile {
+            &self.profile
+        }
+        fn set_profile(&mut self, profile: Profile) {
+            self.profile = profile;
+        }
+        fn wants_idle_probe(&self) -> bool {
+            true
+        }
+        fn state(&self) -> RateState {
+            *self.state.lock().unwrap()
+        }
+        fn on_net_limited(&mut self, _cause: NetCause) {
+            *self.state.lock().unwrap() = RateState::Tracking;
+        }
+        fn probe_wanted(&mut self, _now: Time) -> Option<ProbeAsk> {
+            assert!(!self.asked, "上一轮还没回报就又来问");
+            self.asked = self.want.is_some();
+            self.want.take()
+        }
+        fn on_probe_end(&mut self, _now: Time, end: ProbeEnd) -> ProbeVerdict {
+            assert!(self.asked, "没要过探测却来回报");
+            self.asked = false;
+            self.ends.lock().unwrap().push(end);
+            match end {
+                ProbeEnd::Result(bps) if bps >= 14_000_000 => ProbeVerdict::Confirmed,
+                ProbeEnd::Result(_) => ProbeVerdict::Denied,
+                ProbeEnd::TimedOut => ProbeVerdict::TimedOut,
+                ProbeEnd::Aborted(_) => ProbeVerdict::Aborted,
+            }
+        }
+    }
+
+    type Ends = Arc<Mutex<Vec<ProbeEnd>>>;
+
+    /// 一个对端支持探测组号的发送端，估计器想按 20 Mbps 探一轮（`kind`）。
+    fn asking(kind: ProbeKind) -> (MediaSender, Ends, Arc<Mutex<RateState>>) {
+        let mut tx = MediaSender::new(cfg(), Box::new(FakeEncoder::default()));
+        tx.scale = ScalePolicy::full();
+        let ends = Ends::default();
+        let state = Arc::new(Mutex::new(match kind {
+            ProbeKind::Verify => RateState::Verify,
+            ProbeKind::Periodic => RateState::AppLimited,
+        }));
+        tx.rate = Box::new(Asker {
+            profile: Profile::STABLE,
+            want: Some(ProbeAsk {
+                kind,
+                target_bps: 20_000_000,
+            }),
+            asked: false,
+            state: state.clone(),
+            ends: ends.clone(),
+        });
+        tx.set_probe_ids(true);
+        (tx, ends, state)
+    }
+
+    /// 带探测结果的一份反馈。
+    fn probe_feedback(id: u32, bps: u64, done: bool) -> Vec<u8> {
+        encode_feedback_ids(
+            &Feedback::default(),
+            &Extension::default(),
+            &[],
+            Some(&ProbeReport {
+                id,
+                bytes_per_s: u32::try_from(bps / 8).unwrap(),
+                packets: 62,
+                done,
+            }),
+        )
+    }
+
+    #[test]
+    fn a_run_probe_is_sent_when_clear_and_ends_with_the_tagged_result() {
+        let (mut tx, ends, _) = asking(ProbeKind::Periodic);
+        tx.on_tick(Time(1_000_000));
+        // 能探：马上发一组，30 ms 的量（20 Mbps 是 62 个包），组号在运行中探测的号段
+        let cluster = tx.take_probes();
+        assert_eq!(cluster.len(), 1);
+        let id = cluster[0].id;
+        assert_eq!(id & RUN_PROBE_ID_BASE, RUN_PROBE_ID_BASE);
+        assert_eq!(id & (IDLE_PROBE_ID_BASE | START_PROBE_ID_BASE), 0);
+        assert_eq!(
+            (cluster[0].target_bps, cluster[0].packets),
+            (20_000_000, 62)
+        );
+        assert!(tx
+            .take_events()
+            .iter()
+            .any(|e| e == "周期探测：按 20000 kbps 发 62 个包（码率 10000 kbps）"));
+        // 探测期间照常出帧
+        assert!(tx.frame_gate(Time(1_000_000), true, false));
+        // 别的组的结果、没带结果的反馈：不认
+        tx.on_feedback_datagram(Time(1_020_000), &probe_feedback(id ^ 1, 5_000_000, true))
+            .unwrap();
+        tx.on_feedback_datagram(
+            Time(1_030_000),
+            &encode_feedback_ids(&Feedback::default(), &Extension::default(), &[], None),
+        )
+        .unwrap();
+        assert!(ends.lock().unwrap().is_empty());
+        // 这一组收完的结果：结束，结论记一次
+        tx.on_feedback_datagram(Time(1_040_000), &probe_feedback(id, 19_000_000, true))
+            .unwrap();
+        assert_eq!(*ends.lock().unwrap(), [ProbeEnd::Result(19_000_000)]);
+        let p = tx.stats().probes;
+        assert_eq!((p.run_sent, p.periodic_rounds, p.verify_rounds), (1, 1, 0));
+        assert_eq!(p.run_verdicts, [1, 0, 0, 0]);
+        // 之后迟到的结果不再认；估计器不想探就一直空闲
+        tx.on_feedback_datagram(Time(1_060_000), &probe_feedback(id, 1_000_000, true))
+            .unwrap();
+        tx.on_tick(Time(1_100_000));
+        assert!(tx.take_probes().is_empty());
+        assert_eq!(ends.lock().unwrap().len(), 1);
+    }
+
+    /// I4：每一轮探测必然在时限内结束——已发的到 往返 + 一组的时长 + 65 ms 没有结果就是超时（收到过一半的结果
+    /// 就按它判），待发的 200 ms 等不到能探的时机就中止。
+    #[test]
+    fn i4_every_probe_round_ends_within_its_time_limit() {
+        // 没有任何结果：超时。一组 62 个包按 20 Mbps 发 29.76 ms，往返 0，时限 94.76 ms
+        let (mut tx, ends, _) = asking(ProbeKind::Verify);
+        tx.on_tick(Time(1_000_000));
+        assert_eq!(tx.take_probes().len(), 1);
+        tx.on_tick(Time(1_094_000));
+        assert!(ends.lock().unwrap().is_empty(), "还没到时限");
+        tx.on_tick(Time(1_095_000));
+        assert_eq!(*ends.lock().unwrap(), [ProbeEnd::TimedOut]);
+        let p = tx.stats().probes;
+        assert_eq!((p.run_sent, p.verify_rounds), (1, 1));
+        assert_eq!(p.run_verdicts, [0, 0, 1, 0]);
+        // 只收到一半时报的结果：到时限按它判
+        let (mut tx, ends, _) = asking(ProbeKind::Periodic);
+        tx.on_tick(Time(0));
+        let id = tx.take_probes()[0].id;
+        tx.on_feedback_datagram(Time(20_000), &probe_feedback(id, 6_000_000, false))
+            .unwrap();
+        assert!(ends.lock().unwrap().is_empty());
+        tx.on_tick(Time(95_000));
+        assert_eq!(*ends.lock().unwrap(), [ProbeEnd::Result(6_000_000)]);
+        assert_eq!(tx.stats().probes.run_verdicts, [0, 1, 0, 0]);
+        // 收完了但测不出（速率 0）：有一半时的结果按它，没有就是超时
+        let (mut tx, ends, _) = asking(ProbeKind::Periodic);
+        tx.on_tick(Time(0));
+        let id = tx.take_probes()[0].id;
+        tx.on_feedback_datagram(Time(20_000), &probe_feedback(id, 0, true))
+            .unwrap();
+        assert_eq!(*ends.lock().unwrap(), [ProbeEnd::TimedOut]);
+        let (mut tx, ends, _) = asking(ProbeKind::Periodic);
+        tx.on_tick(Time(0));
+        let id = tx.take_probes()[0].id;
+        tx.on_feedback_datagram(Time(20_000), &probe_feedback(id, 16_000_000, false))
+            .unwrap();
+        tx.on_feedback_datagram(Time(40_000), &probe_feedback(id, 0, true))
+            .unwrap();
+        assert_eq!(*ends.lock().unwrap(), [ProbeEnd::Result(16_000_000)]);
+        // 往返长：时限跟着长
+        let (mut tx, ends, _) = asking(ProbeKind::Periodic);
+        tx.rtt_us = 300_000;
+        tx.on_tick(Time(0));
+        tx.take_probes();
+        tx.on_tick(Time(390_000));
+        assert!(ends.lock().unwrap().is_empty());
+        tx.on_tick(Time(395_000));
+        assert_eq!(*ends.lock().unwrap(), [ProbeEnd::TimedOut]);
+        // 待发：关键帧没确认，不探；200 ms 还不能探就中止，一个包都没发
+        let (mut tx, ends, _) = asking(ProbeKind::Verify);
+        tx.on_frame(Time(0), &Screen::new(64, 64, 1), true, 10_000)
+            .unwrap();
+        tx.on_tick(Time(10_000));
+        tx.on_tick(Time(200_000));
+        assert!(tx.take_probes().is_empty());
+        assert!(ends.lock().unwrap().is_empty());
+        tx.on_tick(Time(210_000));
+        assert_eq!(*ends.lock().unwrap(), [ProbeEnd::Aborted("关键帧还没确认")]);
+        assert!(tx.take_probes().is_empty());
+        let p = tx.stats().probes;
+        assert_eq!((p.run_sent, p.run_bytes), (0, 0));
+        assert_eq!(p.run_verdicts, [0, 0, 0, 1]);
+        // 待发时等到了能探的时机（另一组探测发完了）：发
+        let (mut tx, ends, _) = asking(ProbeKind::Verify);
+        tx.probing = Some(1);
+        tx.on_tick(Time(10_000));
+        assert!(tx.take_probes().is_empty());
+        tx.probing = None;
+        tx.on_tick(Time(60_000));
+        assert_eq!(tx.take_probes().len(), 1);
+        assert!(ends.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_run_probe_is_aborted_by_overload_or_a_network_limit() {
+        // 探测期间出现网络受限的原因（这里是节奏器里上一帧没发完）：中止，结果不用
+        let (mut tx, ends, state) = asking(ProbeKind::Periodic);
+        tx.on_tick(Time(0));
+        let id = tx.take_probes()[0].id;
+        assert!(!tx.frame_gate(Time(40_000), true, true));
+        assert_eq!(
+            *ends.lock().unwrap(),
+            [ProbeEnd::Aborted("该编帧时在途数据满了或上一帧没发完")]
+        );
+        assert_eq!(*state.lock().unwrap(), RateState::Tracking);
+        tx.on_feedback_datagram(Time(50_000), &probe_feedback(id, 19_000_000, true))
+            .unwrap();
+        assert_eq!(ends.lock().unwrap().len(), 1, "中止之后到的结果不认");
+        assert_eq!(tx.stats().probes.run_verdicts, [0, 0, 0, 1]);
+        // 探测期间估计器因为过载降了码率、离开了要探的状态：中止（I1）
+        for (kind, moved_to) in [
+            (ProbeKind::Verify, RateState::DrainApp),
+            (ProbeKind::Periodic, RateState::DrainApp),
+        ] {
+            let (mut tx, ends, state) = asking(kind);
+            tx.on_tick(Time(0));
+            assert_eq!(tx.take_probes().len(), 1);
+            tx.observe(Time(20_000), &Feedback::default(), Extension::default());
+            assert!(ends.lock().unwrap().is_empty(), "状态没变，接着等");
+            *state.lock().unwrap() = moved_to;
+            tx.observe(Time(40_000), &Feedback::default(), Extension::default());
+            assert_eq!(
+                *ends.lock().unwrap(),
+                [ProbeEnd::Aborted("出现过载，降了码率")]
+            );
+        }
+        // 不能探的各种原因
+        let (mut tx, _, _) = asking(ProbeKind::Periodic);
+        assert_eq!(tx.probe_blocked(Time(0)), None);
+        tx.pacer_busy = true;
+        assert_eq!(tx.probe_blocked(Time(0)), Some("上一帧还没发完"));
+        tx.pacer_busy = false;
+        let fb = |queue: u32, loss: u16| Feedback {
+            queue_delay_us: queue,
+            loss_permille: loss,
+            ..Feedback::default()
+        };
+        tx.observe(Time(0), &fb(0, 20), Extension::default());
+        assert_eq!(tx.probe_blocked(Time(0)), Some("有丢包"));
+        tx.observe(Time(0), &fb(0, 0), Extension::default());
+        assert_eq!(tx.probe_blocked(Time(0)), None);
+        tx.probing = Some(1);
+        assert_eq!(tx.probe_blocked(Time(0)), Some("另一组探测还没完"));
+        tx.probing = None;
+        // 在途数据满了（不是关键帧）：一个大的增量帧还没确认
+        tx.unacked.push_back((7, Time(0), 10_000_000));
+        tx.last_key = 1;
+        assert_eq!(tx.probe_blocked(Time(0)), Some("在途数据满了"));
+    }
+
+    /// 对端是老版本（反馈里探测结果不带组号）：不做运行中探测，反馈按老格式解，行为和以前一样。
+    #[test]
+    fn no_run_probes_with_an_old_peer_or_during_the_start_probe() {
+        let (mut tx, ends, _) = asking(ProbeKind::Periodic);
+        tx.set_probe_ids(false);
+        for i in 0..400u64 {
+            tx.on_tick(Time(i * 25_000));
+            assert!(tx.take_probes().is_empty());
+        }
+        assert!(ends.lock().unwrap().is_empty());
+        assert_eq!(tx.stats().probes, ProbeStats::default());
+        // 老格式的反馈照常解；带组号格式的（多 11 字节）在老格式下是坏包
+        let old = encode_feedback(&Feedback::default(), &Extension::default(), &[(1, 0)]);
+        assert!(tx.on_feedback_datagram(Time(0), &old).is_ok());
+        assert!(tx
+            .on_feedback_datagram(Time(0), &probe_feedback(1, 1_000_000, true))
+            .is_err());
+        // 用到达报告的会话、起步探测还没结束时：也不问
+        let (mut tx, ends, _) = asking(ProbeKind::Periodic);
+        tx.reports = true;
+        tx.on_tick(Time(0));
+        tx.reports = false;
+        tx.start_probe = Some(StartProbe {
+            started: Some(Time(0)),
+            id: START_PROBE_ID_BASE,
+            target_bps: 0,
+            sent_at: Time(0),
+            prev_target_bps: 0,
+            best_bps: 0,
+            round_bps: 0,
+        });
+        tx.on_tick(Time(25_000));
+        assert!(tx.take_probes().is_empty());
+        assert!(ends.lock().unwrap().is_empty());
+        // 接收端：没协商组号时反馈是老格式；协商了、有探测结果时在最后带上
+        let mut rx = MediaReceiver::new(Time::ZERO, 500_000, Box::new(FakeDecoder::default()));
+        let mut body = vec![0u8; 1200];
+        body[..4].copy_from_slice(&(RUN_PROBE_ID_BASE | 9).to_le_bytes());
+        body[8..12].copy_from_slice(&3u32.to_le_bytes());
+        let feed = |rx: &mut MediaReceiver, from: u64| {
+            for i in 0..3u64 {
+                rx.on_datagram(
+                    Time(from + 10_000 + i * 2_000),
+                    Time(from + i * 2_000),
+                    u32::try_from(i).unwrap(),
+                    FLAG_PADDING,
+                    &body,
+                )
+                .unwrap();
+            }
+        };
+        feed(&mut rx, 0);
+        let plain = rx.feedback_datagram(Time(20_000));
+        assert_eq!(plain.len(), Feedback::LEN + Extension::LEN);
+        rx.set_probe_ids(true);
+        feed(&mut rx, 100_000);
+        let tagged = rx.feedback_datagram(Time(120_000));
+        let (_, probe) = decode_feedback_ids(&tagged).unwrap();
+        let probe = probe.unwrap();
+        assert_eq!(
+            (probe.id, probe.packets, probe.done),
+            (RUN_PROBE_ID_BASE | 9, 3, true)
+        );
+        assert!(probe.bytes_per_s > 0);
+        // 起步、静止探测的号段不带组号结果（反馈和老格式一样长）
+        body[..4].copy_from_slice(&(IDLE_PROBE_ID_BASE | 9).to_le_bytes());
+        for i in 0..3u64 {
+            rx.on_datagram(
+                Time(210_000 + i * 2_000),
+                Time(200_000 + i * 2_000),
+                0,
+                FLAG_PADDING,
+                &body,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            rx.feedback_datagram(Time(220_000)).len(),
+            Feedback::LEN + Extension::LEN
+        );
+        // 没有新的探测结果：和老格式逐字节一样长
+        assert_eq!(
+            rx.feedback_datagram(Time(140_000)).len(),
+            Feedback::LEN + Extension::LEN
+        );
+    }
+
+    /// “这一帧还活着”和“要重传”是两个信号：接收端报进度，发送端按进度增加刷新这一帧的存活时间，
+    /// 进度标记不当成重传请求；对端是老版本时不发进度。
+    #[test]
+    fn progress_marks_keep_a_frame_alive_without_asking_for_retransmits() {
+        let screen = Screen::new(64, 64, 1);
+        let mut tx = MediaSender::new(cfg(), Box::new(FakeEncoder::default()));
+        tx.set_probe_ids(true);
+        let key = tx.on_frame(Time(0), &screen, true, 10_000).unwrap();
+        assert!(key.len() > 3);
+        for (i, o) in key.iter().enumerate() {
+            tx.on_packet_sent(Time(0), u32::try_from(i).unwrap(), o);
+        }
+        // 接收端：到了两片，报进度（新格式）
+        let mut rx = MediaReceiver::new(Time::ZERO, 500_000, Box::new(FakeDecoder::default()));
+        rx.set_probe_ids(true);
+        for (i, o) in key.iter().take(2).enumerate() {
+            rx.on_datagram(
+                Time(5_000),
+                Time(0),
+                u32::try_from(i).unwrap(),
+                o.flags,
+                &o.body,
+            )
+            .unwrap();
+        }
+        let fb = rx.feedback_datagram(Time(6_000));
+        let ((_, _, list), _) = decode_feedback_ids(&fb).unwrap();
+        assert_eq!(
+            list,
+            vec![(1, PROGRESS | 2)],
+            "还没到 10 ms：只有进度，没有重传请求"
+        );
+        // 发送端：进度不是重传请求，不重传；这一帧的存活时间刷新了
+        let again = tx.on_feedback_datagram(Time(300_000), &fb).unwrap();
+        assert!(again.is_empty());
+        assert_eq!(tx.stats().nack_requests, 0);
+        assert_eq!(
+            tx.unacked.front().map(|(id, at, _)| (*id, *at)),
+            Some((1, Time(300_000)))
+        );
+        // 同样的进度再报一次（没有新分片到）：不算进展，不刷新
+        tx.on_feedback_datagram(Time(400_000), &fb).unwrap();
+        assert_eq!(
+            tx.unacked.front().map(|(_, at, _)| *at),
+            Some(Time(300_000))
+        );
+        // 过了 10 ms：进度排在前面，后面是缺的分片（照旧全要）
+        let fb = rx.feedback_datagram(Time(20_000));
+        let ((_, _, list), _) = decode_feedback_ids(&fb).unwrap();
+        assert_eq!(list[0], (1, PROGRESS | 2));
+        assert_eq!(
+            list.len(),
+            1 + key.iter().filter(|o| o.flags & FLAG_PARITY == 0).count() - 2
+        );
+        assert!(list[1..].iter().all(|(_, frag)| frag & PROGRESS == 0));
+        // 对端是老版本：不发进度
+        let mut old = MediaReceiver::new(Time::ZERO, 500_000, Box::new(FakeDecoder::default()));
+        old.on_datagram(Time(5_000), Time(0), 0, key[0].flags, &key[0].body)
+            .unwrap();
+        let (_, _, list) = decode_feedback(&old.feedback_datagram(Time(6_000))).unwrap();
+        assert!(list.is_empty());
+    }
+
+    #[test]
+    fn feedback_with_a_tagged_probe_result_round_trips() {
+        let fb = Feedback {
+            floor: 3,
+            delivered: 5,
+            queue_delay_us: 7,
+            loss_permille: 9,
+            recv_bytes_per_s: 11,
+        };
+        let ext = Extension {
+            trend_tenth_ms: -4,
+            groups: 6,
+            train_bytes_per_s: 8,
+        };
+        let report = ProbeReport {
+            id: RUN_PROBE_ID_BASE | 5,
+            bytes_per_s: 123_456,
+            packets: 62,
+            done: true,
+        };
+        let many: Vec<(u32, u16)> = (0..MAX_NACKS)
+            .map(|i| (9, u16::try_from(i).unwrap()))
+            .collect();
+        for nacks in [&[][..], &[(1, 2)][..], &[(1, 2), (3, 4)][..], &many[..]] {
+            // 没有探测结果：和老格式逐字节相同
+            let plain = encode_feedback_ids(&fb, &ext, nacks, None);
+            assert_eq!(plain, encode_feedback(&fb, &ext, nacks));
+            assert_eq!(
+                decode_feedback_ids(&plain).unwrap(),
+                ((fb, ext, nacks.to_vec()), None)
+            );
+            // 有探测结果：最后多 11 字节
+            let tagged = encode_feedback_ids(&fb, &ext, nacks, Some(&report));
+            assert_eq!(tagged.len(), plain.len() + ProbeReport::LEN);
+            assert_eq!(
+                decode_feedback_ids(&tagged).unwrap(),
+                ((fb, ext, nacks.to_vec()), Some(report))
+            );
+            // 少一个字节就是坏包
+            assert!(decode_feedback_ids(&tagged[..tagged.len() - 1]).is_err());
+        }
+    }
+
+    /// 静止探测也是每组必有结论：证实、否定、超时（3 秒）、中止（又开始发帧）。
+    #[test]
+    fn every_idle_probe_ends_with_a_verdict() {
+        let train = |bps: u64| Extension {
+            train_bytes_per_s: u32::try_from(bps / 8).unwrap(),
+            ..Extension::default()
+        };
+        let screen = Screen::new(64, 64, 1);
+        let mut tx = MediaSender::new(cfg(), Box::new(FakeEncoder::default()));
+        tx.set_idle_probe(true);
+        tx.on_frame(Time(0), &screen, true, 10_000).unwrap();
+        // 第一组（2 秒）：测得的容量够，证实
+        tx.on_tick(Time(2_000_000));
+        assert_eq!(tx.take_probes().len(), 1);
+        tx.observe(Time(2_050_000), &Feedback::default(), train(3_000_000));
+        // 第二组（6 秒）：3 秒没有结果，超时；之后迟到的包串速率不当成探测结果
+        tx.on_tick(Time(6_000_000));
+        assert_eq!(tx.take_probes().len(), 1);
+        tx.on_tick(Time(8_975_000));
+        assert_eq!(tx.stats().probes.idle_verdicts, [1, 0, 0, 0]);
+        tx.on_tick(Time(9_000_000));
+        assert_eq!(tx.stats().probes.idle_verdicts, [1, 0, 1, 0]);
+        // 超时之后才到的结果照旧认（行为和没有时限时一样），但不再算一次结论
+        tx.observe(Time(9_100_000), &Feedback::default(), train(3_000_000));
+        assert_eq!(tx.stats().probes.idle_verdicts, [1, 0, 1, 0]);
+        // 第三组（14 秒）：结果没回来就又开始发帧，中止
+        tx.on_tick(Time(14_000_000));
+        assert_eq!(tx.take_probes().len(), 1);
+        tx.on_frame(Time(14_100_000), &Screen::new(64, 64, 2), true, 10_000)
+            .unwrap();
+        // 第四组：测得的容量不到码率的一半，否定（降）
+        tx.on_tick(Time(16_100_000));
+        assert_eq!(tx.take_probes().len(), 1);
+        tx.observe(Time(16_150_000), &Feedback::default(), train(320_000));
+        assert_eq!(tx.rate_bps(), 288_000);
+        let p = tx.stats().probes;
+        assert_eq!(p.idle_sent, 4);
+        assert_eq!(p.idle_verdicts, [1, 1, 1, 1]);
+        let events = tx.take_events().join("\n");
+        for text in [
+            "静止探测结论 证实：测得 3000 kbps，链路没有明显变差，码率不变",
+            "静止探测结论 超时：到时间没有结果",
+            "静止探测（已按超时下过结论）之后：测得 3000 kbps",
+            "静止探测结论 中止：又开始发帧了，结果不用",
+            "静止探测结论 否定：链路变差了，码率按测得的容量降",
+        ] {
+            assert!(events.contains(text), "{text}\n{events}");
+        }
+        // 运行中探测在进行时，静止探测先等着（两组不同时发）
+        let (mut tx, ends, _) = asking(ProbeKind::Periodic);
+        tx.set_idle_probe(true);
+        tx.next_probe = Some(Time(0));
+        tx.on_tick(Time(0));
+        let first = tx.take_probes();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].id & RUN_PROBE_ID_BASE, RUN_PROBE_ID_BASE);
+        tx.on_tick(Time(95_000));
+        assert_eq!(*ends.lock().unwrap(), [ProbeEnd::TimedOut]);
+        let second = tx.take_probes();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].id & IDLE_PROBE_ID_BASE, IDLE_PROBE_ID_BASE);
+    }
+
+    /// 起步有时间上限：第一个关键帧 2 秒还没确认就不探了，状态回跟踪，写明原因。
+    #[test]
+    fn startup_ends_after_two_seconds_without_the_first_keyframe() {
+        let mut tx = MediaSender::new(cfg(), Box::new(FakeEncoder::default()));
+        tx.set_start_probe(true);
+        tx.on_tick(Time(100_000));
+        tx.on_frame(Time(100_000), &Screen::new(64, 64, 1), true, 10_000)
+            .unwrap();
+        tx.on_tick(Time(2_075_000));
+        assert!(tx.start_probing());
+        assert_eq!(tx.rate_state(), RateState::Startup);
+        tx.on_tick(Time(2_100_000));
+        assert!(!tx.start_probing());
+        assert_eq!(tx.rate_state(), RateState::Tracking);
+        assert!(tx.take_events().join("\n").contains(
+            "码率状态 起步 → 跟踪：不做起步探测：第一个关键帧 2 秒还没确认，起步到时限了"
+        ));
+        assert!(tx.take_probes().is_empty());
+    }
+
+    #[test]
+    fn probe_bytes_are_counted_by_kind() {
+        let mut tx = MediaSender::new(cfg(), Box::new(FakeEncoder::default()));
+        let probe = |id: u32| Outgoing {
+            flags: FLAG_PADDING,
+            body: vec![0u8; 1_000],
+            kind: PacketKind::Probe(id),
+            fragment: None,
+        };
+        let size = u64::try_from(1_000 + HEADER_LEN).unwrap();
+        tx.on_packet_sent(Time(0), 0, &probe(START_PROBE_ID_BASE | 1));
+        tx.on_packet_sent(Time(0), 1, &probe(IDLE_PROBE_ID_BASE | 1));
+        tx.on_packet_sent(Time(0), 2, &probe(IDLE_PROBE_ID_BASE | 2));
+        for seq in 3..6 {
+            tx.on_packet_sent(Time(0), seq, &probe(RUN_PROBE_ID_BASE | 1));
+        }
+        let p = tx.stats().probes;
+        assert_eq!(
+            (p.start_bytes, p.idle_bytes, p.run_bytes),
+            (size, 2 * size, 3 * size)
+        );
+        assert_eq!(p.bytes(), 6 * size);
+        let mut total = p;
+        total.run_sent = 2;
+        total.run_verdicts = [1, 0, 1, 0];
+        total.merge(&total.clone());
+        assert_eq!(total.bytes(), 12 * size);
+        assert_eq!((total.run_sent, total.run_verdicts), (4, [2, 0, 2, 0]));
+        let line = total.line(1_000_000);
+        assert!(
+            line.starts_with(&format!(
+                "探测流量 {} B（起步 {}、静止 {}、运行中 {}），占全部流量 1.22%；运行中探测发出 4 轮（核实 0、周期 0），\
+                 结论：证实 2、否定 0、超时 2、中止 0；静止探测 0 组",
+                12 * size,
+                2 * size,
+                4 * size,
+                6 * size
+            )),
+            "{line}"
+        );
     }
 
     /// 起步探测：第一个关键帧送得够快才探；按 4 倍逐组往上探，探不上去就停，码率定为测得容量的九成。

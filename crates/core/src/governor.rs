@@ -182,6 +182,12 @@ impl FpsGovernor {
         }
     }
 
+    /// 帧率是不是因为内容装不进预算降了档（CPU 跟不上降的不算：那不是网络的原因）。
+    #[must_use]
+    pub const fn fit_limited(&self) -> bool {
+        self.fit_fps < self.max_fps
+    }
+
     /// 帧率是不是已经在最低档。
     #[must_use]
     pub fn at_floor(&self) -> bool {

@@ -423,6 +423,8 @@ pub async fn serve(
     // 环境变量 PEERDESK_START_PROBE=0 关掉起步探测（真实程序平台做对照用，见 scripts/trace-lab.py）
     let start_probe = std::env::var("PEERDESK_START_PROBE").map_or(true, |v| v != "0");
     media.set_start_probe(start_probe && caps.has(Caps::PROBE_TRAIN));
+    // 对端的反馈里探测结果带组号：打开运行中探测（应用受限时降过码率之后核实、码率偏低时往上探）
+    media.set_probe_ids(caps.has(Caps::PROBE_TRAIN) && caps.has(Caps::PROBE_ID));
     // 双方都支持 RS 纠错时用它（老版本只认异或）
     media.set_fec(if caps.has(Caps::FEC_RS) {
         Fec::Rs
@@ -744,7 +746,10 @@ pub async fn serve(
                     source.set_target_size(target);
                 }
                 // 在途数据超过上限：这一帧不编，变化攒着，等确认之后编最新的画面。
-                if encoding || pacer.busy(media.pacing_bps(pacing), 1_000_000 / u64::from(opts.fps.max(1))) || media.in_flight_full(link.now()) || !media.due(link.now()) || (!pending_change && !media.wants_frame()) {
+                // （被在途上限、节奏器拦下时 frame_gate 记一次“网络受限”，码率控制据此判断发送端是不是应用受限）
+                let pacer_busy = pacer.busy(media.pacing_bps(pacing), 1_000_000 / u64::from(opts.fps.max(1)));
+                let wanted = pending_change || media.wants_frame();
+                if encoding || !media.frame_gate(link.now(), wanted, pacer_busy) {
                     continue;
                 }
                 let rtt = u64::try_from(link.rtt().as_micros()).unwrap_or(u64::MAX);
