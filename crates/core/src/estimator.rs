@@ -474,6 +474,8 @@ pub enum NetCause {
     ScaleReduced,
     /// 重传被额度截断：有要补的分片这一轮没发出去。
     ResendCapped,
+    /// 硬件编码器的码控把帧丢了：预算放不下一帧。有东西要发、是码率不让发。
+    EncoderDropped,
     /// 发出的量接近码率（预算桶没有判成受限）。
     UsingRate,
 }
@@ -491,6 +493,7 @@ impl NetCause {
             Self::FpsReduced => "内容装不进预算，帧率在降档",
             Self::ScaleReduced => "编码分辨率低于原尺寸",
             Self::ResendCapped => "重传被额度截断",
+            Self::EncoderDropped => "编码器因为预算放不下把帧丢了",
             Self::UsingRate => "发出的量接近码率",
         }
     }
@@ -2169,6 +2172,7 @@ mod tests {
             NetCause::FpsReduced,
             NetCause::ScaleReduced,
             NetCause::ResendCapped,
+            NetCause::EncoderDropped,
             NetCause::UsingRate,
         ] {
             assert!(!cause.name().is_empty());

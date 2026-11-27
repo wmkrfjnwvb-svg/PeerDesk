@@ -195,8 +195,14 @@ pub struct EncodeTiming {
     pub convert_us: u64,
     /// 编码器本身（交给硬件编码器并取回、或软件编码）的微秒数。
     pub encode_us: u64,
+    /// 其中在等显卡的微秒数（把显卡画面读回内存：等显卡把活干完、等它的锁），已经包含在 `convert_us` 里。
+    /// 这段时间 CPU 是闲的，判断“CPU 跟不上”时要扣掉（2026-11-27 用户日志：读回等锁 200 ms 一帧，
+    /// 被算成“编码占用 94%”，帧率 60 → 30 → 20）。
+    pub wait_us: u64,
     /// 用的是硬件编码器。
     pub hardware: bool,
+    /// 硬件编码器的码控把这一帧丢了（预算放不下）：发送端记成网络受限，不能当成“没东西要发”。
+    pub dropped: bool,
     /// 采集直接交来尺寸正好的 NV12，没有在 CPU 上转换。
     pub nv12_direct: bool,
     /// 编出来的尺寸。
@@ -205,6 +211,15 @@ pub struct EncodeTiming {
     pub height: u16,
     /// 这次出了关键帧的话，为什么（空表示不是关键帧）。
     pub key_reason: &'static str,
+}
+
+impl EncodeTiming {
+    /// 这一帧 CPU 真正在忙的时间：整个任务用了 `took_us`，扣掉等显卡的部分。
+    /// “CPU 跟不上”只按它判断（一个信号只表示一件事：等锁、等读回不是算不过来）。
+    #[must_use]
+    pub const fn busy_us(&self, took_us: u64) -> u64 {
+        took_us.saturating_sub(self.wait_us)
+    }
 }
 
 /// 视频解码器。

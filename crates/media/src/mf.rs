@@ -64,7 +64,7 @@ use windows::Win32::System::Variant::VARIANT;
 
 /// 第一帧等编码器要输入最多这么久（硬件要初始化）。
 const FIRST_WAIT: Duration = Duration::from_secs(3);
-/// 编码器这么久没有任何进展（不要输入、不交帧）才算卡住。
+/// 交了活之后编码器这么久没有任何动静（不要输入、不交帧）才算卡住。静止时没人交活，不计时（见 [`crate::stall`]）。
 const STALL: Duration = Duration::from_secs(2);
 /// 交帧之后等编好的帧最多这么久（等不到下次再取，不算出错）。
 const OUTPUT_WAIT: Duration = Duration::from_millis(20);
@@ -183,8 +183,8 @@ pub struct MfEncoder {
     rejected: bool,
     /// 编码器交出的帧（按顺序；硬件编码器可能攒几帧才交出，交出时可能一次好几帧）。
     ready: std::collections::VecDeque<(Vec<u8>, bool)>,
-    /// 最近一次有进展（编码器要输入或交出帧）的时刻：长时间没有进展才算编码器卡住。
-    progress_at: Instant,
+    /// 交了活之后多久没动静（见 [`crate::stall`]）：超过 [`STALL`] 才算编码器卡住。
+    stall: crate::stall::StallClock,
     bps: u64,
     provides_samples: bool,
     output_size: u32,
@@ -436,7 +436,7 @@ impl MfEncoder {
                 discontinuity: false,
                 rejected: false,
                 ready: std::collections::VecDeque::new(),
-                progress_at: Instant::now(),
+                stall: crate::stall::StallClock::new(STALL, Instant::now()),
                 bps,
                 provides_samples: provides,
                 output_size: info.cbSize.max(width.saturating_mul(height)),
@@ -609,13 +609,13 @@ impl MfEncoder {
             let kind = i32::try_from(kind).unwrap_or(-1);
             if kind == METransformNeedInput.0 {
                 self.need_input = self.need_input.saturating_add(1);
-                self.progress_at = Instant::now();
+                self.stall.progress(Instant::now());
             } else if kind == METransformHaveOutput.0 {
                 // 输出格式变了时这次没有帧：编码器重新协商后会再发 HaveOutput
                 if let Some(frame) = self.output()? {
                     self.ready.push_back(frame);
                 }
-                self.progress_at = Instant::now();
+                self.stall.progress(Instant::now());
             } else if kind == METransformDrainComplete.0 {
                 drained = true;
                 self.resume_after_drain()?;
@@ -630,7 +630,7 @@ impl MfEncoder {
         self.draining = false;
         self.need_input = 0;
         self.discontinuity = true;
-        self.progress_at = Instant::now();
+        self.stall.progress(Instant::now());
         // SAFETY: 对象有效。
         unsafe {
             self.transform
@@ -652,7 +652,7 @@ impl MfEncoder {
             if done(self) || started.elapsed() >= limit {
                 break;
             }
-            if self.progress_at.elapsed() > STALL {
+            if self.stall.stalled(Instant::now()) {
                 return Err(format!(
                     "{} 没有响应（{} 秒没有任何进展）",
                     self.name,
@@ -682,6 +682,8 @@ impl MfEncoder {
             }
         }
         self.rejected = false;
+        // 从现在开始等它：之前画面静止、没人交帧的那段时间不算“没有进展”
+        self.stall.asked(Instant::now());
         // 等编码器要输入（第一帧硬件要初始化，给长一点）；还在排空时先等排空完成
         let limit = if self.frame == 0 { FIRST_WAIT } else { STALL };
         self.pump_until(limit, |e| !e.draining && e.need_input > 0)?;

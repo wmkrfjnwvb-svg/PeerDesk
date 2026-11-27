@@ -107,6 +107,45 @@ fn capture_returns_the_desktop() {
     report(&cap);
 }
 
+/// 回归（2026-11-27 两台 Intel 核显的日志，`docs/research/P-fps-bitrate.md` W2）：屏幕静止时，编码线程把显卡画面
+/// 读回内存不能被采集线程饿住。修之前采集线程等新画面时一直拿着显卡设备的锁，读回一帧 200–390 ms。
+/// 没有显卡通路的机器（CI 的虚拟机交的是 CPU 画面）打印说明后跳过。
+#[cfg(windows)]
+#[test]
+#[ignore = "需要图形界面"]
+fn reading_a_gpu_frame_back_is_not_starved_while_the_screen_is_still() {
+    use peerdesk_core::frame::Frame;
+    let Some(mut cap) = open_capture(60) else {
+        return;
+    };
+    let Some(Frame::Gpu(frame)) = cap.frame() else {
+        println!("跳过：这台机器采集交的不是显卡画面");
+        return;
+    };
+    // 等画面静下来：采集线程这时一直在等新画面
+    std::thread::sleep(Duration::from_millis(500));
+    let mut took: Vec<Duration> = (0..20)
+        .map(|_| {
+            let started = Instant::now();
+            frame.read_nv12().expect("读回显卡画面");
+            let t = started.elapsed();
+            std::thread::sleep(Duration::from_millis(15));
+            t
+        })
+        .collect();
+    took.sort();
+    println!(
+        "读回 20 次：最快 {:?}，中位 {:?}，最慢 {:?}",
+        took[0], took[10], took[19]
+    );
+    report(&cap);
+    assert!(
+        took[10] < Duration::from_millis(60),
+        "屏幕静止时读回显卡画面中位 {:?}（修之前是 200 ms 以上）：采集线程又拿着锁等了？",
+        took[10]
+    );
+}
+
 #[test]
 #[ignore = "需要图形界面"]
 fn input_moves_the_cursor() {
