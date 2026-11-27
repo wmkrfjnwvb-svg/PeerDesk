@@ -37,7 +37,6 @@ Name: "unattended"; Description: "无人值守：注册系统服务，锁屏、�
 
 [Files]
 Source: "{#SourceDir}\peerdesk.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#SourceDir}\peerdesk-server.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\测试说明.txt"; DestDir: "{app}"; Flags: ignoreversion isreadme
 
 [Icons]

@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
-# 打包 macOS 通用（arm64 + x86_64）测试版：PeerDesk.app（本机签名）放进 DMG，
-# 连同服务端和测试说明。用法：scripts/package-macos.sh <输出目录> <名字>
+# 打包 macOS 通用（arm64 + x86_64）测试版：PeerDesk.app（本机签名）和测试说明放进 DMG。
+# 服务端单独打一个压缩包（普通用户用不到服务端，不放进客户端安装包）。
+# 用法：scripts/package-macos.sh <输出目录> <名字> [服务端输出目录，默认 <输出目录>-server]
 set -euo pipefail
 cd "$(dirname "$0")/.."
 out=$(mkdir -p "$1" && cd "$1" && pwd)
 name=$2
+server_out=$(mkdir -p "${3:-$1-server}" && cd "${3:-$1-server}" && pwd)
+server_name=${name/peerdesk-/peerdesk-server-}
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 build=${GITHUB_RUN_NUMBER:-0}
 targets=(aarch64-apple-darwin x86_64-apple-darwin)
@@ -41,11 +44,18 @@ codesign --force --deep -s - --identifier org.peerdesk.client \
   -r='designated => identifier "org.peerdesk.client"' "$app"
 codesign -d -r- "$app"
 codesign --verify --verbose "$app"
-cp "$universal/peerdesk-server" "$stage/peerdesk-server"
-codesign --force -s - "$stage/peerdesk-server"
 cp "packaging/macos/测试说明.txt" "$stage/"
 ln -s /Applications "$stage/Applications"
 
 rm -f "$out/$name.dmg"
 hdiutil create -volname "PeerDesk" -srcfolder "$stage" -ov -format UDZO "$out/$name.dmg"
 ls -l "$out"
+
+# 服务端：通用二进制（本机签名）加说明，单独一个压缩包
+server_stage="target/package/$server_name"
+rm -rf "$server_stage" && mkdir -p "$server_stage"
+cp "$universal/peerdesk-server" "$server_stage/peerdesk-server"
+codesign --force -s - "$server_stage/peerdesk-server"
+cp packaging/server-README.txt "$server_stage/README.txt"
+tar -C target/package -czf "$server_out/$server_name.tar.gz" "$server_name"
+ls -l "$server_out"
