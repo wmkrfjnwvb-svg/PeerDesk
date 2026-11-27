@@ -19,6 +19,7 @@ pub mod checkup;
 mod color;
 pub mod content;
 pub mod fake;
+pub mod fitted;
 /// Linux 的显卡和 VA-API 能力（检测和给用户的说明）。
 #[cfg(target_os = "linux")]
 pub mod gpu;
@@ -108,12 +109,21 @@ fn report_with(
     )]
 }
 
+/// 画面转成 I420（宽高补成偶数）：（宽, 高, 亮度, 色度 U, 色度 V）。和编码器转换画面用的是同一套代码；
+/// M2 的测量工具（`crates/e2e/examples/measure.rs`）用它，保证量的是产品喂给后端的那份数据。
+#[must_use]
+pub fn screen_to_i420(screen: &Screen) -> (usize, usize, Vec<u8>, Vec<u8>, Vec<u8>) {
+    let (w, h, pixels) = even_pixels(screen);
+    let (mut y, mut u, mut v) = (Vec::new(), Vec::new(), Vec::new());
+    color::rgb_to_i420(&pixels, w, &mut y, &mut u, &mut v);
+    (w, h, y, u, v)
+}
+
 /// 画面转成 NV12（宽高补成偶数）：（宽, 高, NV12）。`hw-check` 用它准备硬件编码器的输入。
 #[must_use]
 pub fn screen_to_nv12(screen: &Screen) -> (u32, u32, Vec<u8>) {
-    let (w, h, pixels) = even_pixels(screen);
-    let (mut y, mut u, mut v, mut nv12) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-    color::rgb_to_i420(&pixels, w, &mut y, &mut u, &mut v);
+    let (w, h, y, u, v) = screen_to_i420(screen);
+    let mut nv12 = Vec::new();
     color::i420_to_nv12(&y, &u, &v, &mut nv12);
     (
         u32::try_from(w).unwrap_or(0),
@@ -1691,6 +1701,20 @@ mod tests {
             poll_error: false,
             drop_keys: 0,
         }))
+    }
+
+    /// I420 和 NV12 是同一份数据的两种排法；奇数尺寸补成偶数。
+    #[test]
+    fn i420_and_nv12_hold_the_same_planes() {
+        let screen = picture(321, 193);
+        let (w, h, y, u, v) = screen_to_i420(&screen);
+        assert_eq!((w, h), (322, 194));
+        assert_eq!((y.len(), u.len(), v.len()), (322 * 194, 161 * 97, 161 * 97));
+        let (nw, nh, nv12) = screen_to_nv12(&screen);
+        assert_eq!((usize::try_from(nw), usize::try_from(nh)), (Ok(w), Ok(h)));
+        assert_eq!(nv12.get(..y.len()), Some(&y[..]));
+        let chroma: Vec<u8> = u.iter().zip(&v).flat_map(|(a, b)| [*a, *b]).collect();
+        assert_eq!(nv12.get(y.len()..), Some(&chroma[..]));
     }
 
     #[test]
