@@ -1379,6 +1379,37 @@ impl MediaSender {
         changed: bool,
         rtt_us: u64,
     ) -> Result<Vec<Outgoing>, Error> {
+        self.frame_with(now, changed, rtt_us, |encoder, job| {
+            encoder.encode(job.frame_id, screen, changed, job.budget)
+        })
+    }
+
+    /// 和 [`Self::on_frame`] 一样，交来的是一帧 [`Frame`]（CPU 画面、显卡画面；全模型仿真以后在这里交内容描述）。
+    /// 编码器在发送端里时用（仿真）；产品的编码器在自己的线程上，走 [`Self::start_frame`]、[`encode_job`]、
+    /// [`Self::finish_frame`]。
+    ///
+    /// # Errors
+    /// 同 [`Self::on_frame`]。
+    pub fn on_frame_any(
+        &mut self,
+        now: Time,
+        frame: &Frame,
+        changed: bool,
+        rtt_us: u64,
+    ) -> Result<Vec<Outgoing>, Error> {
+        self.frame_with(now, changed, rtt_us, |encoder, job| {
+            encoder.encode_frame(job.frame_id, frame, changed, job.budget)
+        })
+    }
+
+    /// 一帧的全过程：开始（帧号、预算）→ `encode` 编这一帧 → 切片、纠错。画面是什么形式由 `encode` 决定。
+    fn frame_with(
+        &mut self,
+        now: Time,
+        changed: bool,
+        rtt_us: u64,
+        encode: impl FnOnce(&mut dyn VideoEncoder, &FrameJob) -> Result<Option<EncodedFrame>, Error>,
+    ) -> Result<Vec<Outgoing>, Error> {
         if changed {
             self.screen_changed(now);
         }
@@ -1387,9 +1418,8 @@ impl MediaSender {
             "编码器不在这里：用 start_frame / finish_frame",
         ))?;
         prepare(encoder.as_mut(), &job);
-        let result = encoder
-            .encode(job.frame_id, screen, changed, job.budget)
-            .map(|encoded| (encoded, encoder.wants_refine()));
+        let result =
+            encode(encoder.as_mut(), &job).map(|encoded| (encoded, encoder.wants_refine()));
         self.encoder = Some(encoder);
         let (encoded, refine) = result?;
         self.finish_frame(now, &job, encoded, refine)
@@ -2439,6 +2469,37 @@ mod tests {
             events.iter().any(|e| e.contains("降分辨率是最后手段")),
             "{events:?}"
         );
+    }
+
+    /// 交像素和交 [`Frame`] 是同一条路：同样的画面、同样的时刻，出来的数据报逐字节相同。
+    #[test]
+    fn frames_and_screens_take_the_same_path() {
+        let screen = Screen::new(64, 64, 1);
+        let mut other = screen.clone();
+        other.fill(8, 8, 16, 16, 0x00ff_0000);
+        let mut by_screen = MediaSender::new(cfg(), Box::new(FakeEncoder::default()));
+        let mut by_frame = MediaSender::new(cfg(), Box::new(FakeEncoder::default()));
+        for (i, s) in [&screen, &other, &other].into_iter().enumerate() {
+            let now = Time(u64::try_from(i).unwrap() * 40_000);
+            let changed = i < 2;
+            let a = by_screen.on_frame(now, s, changed, 10_000).unwrap();
+            let b = by_frame
+                .on_frame_any(now, &Frame::rgb(s.clone()), changed, 10_000)
+                .unwrap();
+            assert_eq!(a.len(), b.len());
+            for (x, y) in a.iter().zip(&b) {
+                assert_eq!(
+                    (x.flags, &x.body, x.fragment),
+                    (y.flags, &y.body, y.fragment)
+                );
+            }
+            assert_eq!(by_screen.stats(), by_frame.stats());
+        }
+        // 编码器不在发送端里（产品的用法）：两个入口都说明该走哪条路
+        let mut detached = MediaSender::detached(cfg(), Codec::H264);
+        assert!(detached
+            .on_frame_any(Time(0), &Frame::rgb(screen), true, 10_000)
+            .is_err());
     }
 
     /// 回归（2026-11-27 Mac 日志，`P-fps-bitrate.md` M2）：硬件编码器因为预算放不下把帧丢了，发送端什么都没发出去；
