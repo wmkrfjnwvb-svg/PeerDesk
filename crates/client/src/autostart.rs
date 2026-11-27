@@ -26,7 +26,10 @@ pub const LABEL: &str = "org.peerdesk.client";
 pub const UNIT: &str = "peerdesk.service";
 /// Windows 的 `Run` 项名字。
 pub const RUN_VALUE: &str = "PeerDesk";
-const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+/// 不是真的程序名：[`system_runner`] 看到它就直接调注册表接口，不启动任何外部程序。
+/// 为什么不用 `reg.exe`：它是控制台程序，从没有控制台的图形界面进程里启动，系统会新开一个控制台窗口，
+/// 用户看到启动时“闪了一下”。命令的形式（`@registry set 名字 命令行`、`@registry delete 名字`）让测试仍能检查要写什么。
+pub const REGISTRY_PROGRAM: &str = "@registry";
 /// 用户在设置里关掉开机自启后留下的标记（在数据目录里）：之后启动不再自动装回来。
 pub const OFF_FILE: &str = "autostart-off";
 
@@ -286,16 +289,10 @@ pub fn enable(env: &Env, run: Runner<'_>) -> Result<Outcome, String> {
             must(
                 run,
                 &cmd(&[
-                    "reg",
-                    "add",
-                    RUN_KEY,
-                    "/v",
+                    REGISTRY_PROGRAM,
+                    "set",
                     RUN_VALUE,
-                    "/t",
-                    "REG_SZ",
-                    "/d",
                     &run_command_line(&env.exe),
-                    "/f",
                 ]),
             )?;
             Ok(Outcome::Guard)
@@ -316,8 +313,8 @@ pub fn disable(env: &Env, run: Runner<'_>) -> Result<(), String> {
             Ok(())
         }
         Kind::Windows => {
-            // 项不存在时 reg 返回失败，同样不算错
-            let _ = run(&cmd(&["reg", "delete", RUN_KEY, "/v", RUN_VALUE, "/f"]));
+            // 项不存在不算错（注册表接口对不存在的值返回成功）；真的删不掉才报错
+            must(run, &cmd(&[REGISTRY_PROGRAM, "delete", RUN_VALUE]))?;
             Ok(())
         }
     }
@@ -326,13 +323,31 @@ pub fn disable(env: &Env, run: Runner<'_>) -> Result<(), String> {
 /// 真的运行一条系统命令。
 pub fn system_runner(command: &Command) -> Result<(bool, String), String> {
     let (program, args) = command.split_first().ok_or("空命令")?;
-    let output = std::process::Command::new(program)
-        .args(args)
+    if program == REGISTRY_PROGRAM {
+        return registry(args).map(|()| (true, String::new()));
+    }
+    let output = crate::process::quiet(std::process::Command::new(program).args(args))
         .output()
         .map_err(|e| format!("运行 {program} 失败：{e}"))?;
     let text = String::from_utf8_lossy(&output.stdout).into_owned()
         + &String::from_utf8_lossy(&output.stderr);
     Ok((output.status.success(), text))
+}
+
+/// 执行 [`REGISTRY_PROGRAM`] 命令：只有 Windows 有注册表。
+#[cfg(windows)]
+fn registry(args: &[String]) -> Result<(), String> {
+    use peerdesk_platform::winshell;
+    match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+        ["set", name, value] => winshell::set_run_value(name, value),
+        ["delete", name] => winshell::delete_run_value(name),
+        _ => Err(format!("看不懂的注册表命令：{args:?}")),
+    }
+}
+
+#[cfg(not(windows))]
+fn registry(args: &[String]) -> Result<(), String> {
+    Err(format!("这个系统没有注册表：{args:?}"))
 }
 
 /// 用户是否关掉了开机自启（数据目录里有标记）。
@@ -521,7 +536,7 @@ mod tests {
     }
 
     #[test]
-    fn windows_adds_and_removes_the_run_value() {
+    fn windows_writes_the_registry_directly_and_never_starts_a_program() {
         let env = env(Kind::Windows, "win");
         let mut seen = Vec::new();
         let outcome = enable(&env, &mut |c| {
@@ -530,18 +545,41 @@ mod tests {
         })
         .unwrap();
         assert_eq!(outcome, Outcome::Guard);
-        let add = seen.first().unwrap();
-        assert_eq!(add[..2], ["reg", "add"]);
-        assert!(add.contains(&run_command_line(&env.exe)));
+        // 只有一条命令，而且是注册表的伪命令：不是 reg.exe（它会让启动时闪一个控制台窗口）
+        assert_eq!(seen.len(), 1);
+        let set = seen.first().unwrap();
+        assert_eq!(set[..3], [REGISTRY_PROGRAM, "set", RUN_VALUE]);
+        assert_eq!(set.get(3), Some(&run_command_line(&env.exe)));
         let failed = enable(&env, &mut |_| Ok((false, "拒绝访问".to_owned())));
         assert!(failed.unwrap_err().contains("拒绝访问"));
         let mut deleted = Vec::new();
         disable(&env, &mut |c| {
-            deleted.push(c.join(" "));
-            Ok((false, String::new()))
+            deleted.push(c.clone());
+            Ok((true, String::new()))
         })
         .unwrap();
-        assert!(deleted[0].starts_with("reg delete"));
+        assert_eq!(deleted, [cmd(&[REGISTRY_PROGRAM, "delete", RUN_VALUE])]);
+        assert!(disable(&env, &mut |_| Ok((false, "拒绝访问".to_owned()))).is_err());
+    }
+
+    #[test]
+    fn registry_commands_only_work_on_windows() {
+        let set = cmd(&[REGISTRY_PROGRAM, "set", "X", "y"]);
+        let result = system_runner(&set);
+        if cfg!(windows) {
+            // 真的写了当前用户的注册表：清理掉
+            assert_eq!(result, Ok((true, String::new())));
+            let del = cmd(&[REGISTRY_PROGRAM, "delete", "X"]);
+            assert_eq!(system_runner(&del), Ok((true, String::new())));
+            assert_eq!(
+                system_runner(&del),
+                Ok((true, String::new())),
+                "值不存在不算错"
+            );
+            assert!(system_runner(&cmd(&[REGISTRY_PROGRAM, "bogus"])).is_err());
+        } else {
+            assert!(result.unwrap_err().contains("没有注册表"));
+        }
     }
 
     #[test]

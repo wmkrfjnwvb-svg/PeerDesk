@@ -40,12 +40,15 @@ windows = { version = "0.62", features = [
   "Win32_Security",
   "Win32_Security_Authentication_Identity",
   "Win32_System_DataExchange",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_System_Registry",
   "Win32_System_RemoteDesktop",
   "Win32_System_StationsAndDesktops",
   "Win32_System_Services",
   "Win32_System_Threading",
   "Win32_UI_HiDpi",
   "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_Shell",
   "Win32_UI_WindowsAndMessaging",
 ] }
 
@@ -79,7 +82,7 @@ objc2-screen-capture-kit = { version = "0.3", default-features = false, features
 ] }
 
 # 工作区的检查规则，只有 unsafe_code 从 forbid 放宽到 deny：调用系统接口离不开 unsafe，
-# 只在 x11.rs、windows.rs、macos.rs 三个系统胶水模块里用 #![allow(unsafe_code)] 打开。
+# 只在 x11.rs、windows.rs、macos.rs 和 winshell.rs、macshell.rs 等系统胶水模块里用 #![allow(unsafe_code)] 打开。
 # Cargo 不允许在 `workspace = true` 的基础上单独改一项，所以这里完整抄了一份，改动时两边同步。
 [lints.rust]
 unsafe_code = "deny"

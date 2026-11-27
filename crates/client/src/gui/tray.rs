@@ -21,14 +21,34 @@ use super::tray_logic::{self, IconKind, NotifyOs, TrayCommand};
 
 /// 点“退出”后，如果界面线程一直不响应（窗口隐藏时有的系统不再重绘），多久后强制以退出码 0 结束。
 /// 用户明确点了退出，不能因为界面卡住就退不掉；退出码 0 保证守护不会再把它拉起。
+/// Windows 不靠它：Windows 的退出走窗口消息，立即生效（见 `peerdesk_platform::winshell`）。
+#[cfg(not(windows))]
 const QUIT_WATCHDOG: Duration = Duration::from_secs(5);
 
-/// 唤醒界面线程：窗口隐藏时也要处理托盘命令。
+/// 托盘点击、托盘菜单、第二次启动、`peerdesk window ...` 请求都汇合到这里：唤醒界面处理命令。
+///
+/// Windows：窗口隐藏后 `update` 不再运行（没有 `WM_PAINT`，见 `winshell.rs`），所以“显示”和“退出”
+/// 直接给主窗口发消息，由界面线程的窗口过程立即处理；命令同时进队列，窗口显示、`update` 恢复后
+/// 再按原有的逻辑处理一遍（同步 winit 记的“可见”状态，才能第二次正常隐藏）。
+/// 其他系统：隐藏的窗口 `update` 还在跑，走 eframe 的视口命令。
 fn wake(ctx: &egui::Context, command: TrayCommand) {
+    #[cfg(windows)]
+    {
+        use peerdesk_platform::winshell;
+        // 断开连接要 `update` 里才有会话的句柄：先把窗口显示出来，命令随后被处理
+        let posted = match command {
+            TrayCommand::Open | TrayCommand::Disconnect => winshell::request_show(),
+            TrayCommand::Quit => winshell::request_quit(),
+        };
+        if !posted {
+            log::warn!("主窗口没有登记，托盘命令只能等界面线程处理：{command:?}");
+        }
+    }
     if command == TrayCommand::Open {
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
     }
+    #[cfg(not(windows))]
     if command == TrayCommand::Quit {
         let _ = std::thread::Builder::new()
             .name("quit-watchdog".to_owned())
@@ -41,22 +61,108 @@ fn wake(ctx: &egui::Context, command: TrayCommand) {
     ctx.request_repaint();
 }
 
-/// 第二次启动程序时会留下显示请求（见 `crate::instance`）：后台线程看到就当成“打开主窗口”。
-pub fn watch_show_requests(ctx: &egui::Context, dir: &std::path::Path, tx: &Sender<TrayCommand>) {
+/// 像用户点窗口的关闭按钮一样关窗口（`peerdesk window close`）。
+fn wake_close(ctx: &egui::Context) {
+    #[cfg(windows)]
+    if peerdesk_platform::winshell::request_close() {
+        return;
+    }
+    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    ctx.request_repaint();
+}
+
+/// Windows：在界面创建时调用（界面线程），登记主窗口句柄，之后托盘命令可以不经过 `update` 直接显示、退出。
+/// 其他系统什么也不做。
+pub fn register_window(cc: &eframe::CreationContext<'_>) {
+    #[cfg(windows)]
+    native_window::register(cc);
+    #[cfg(not(windows))]
+    let _ = cc;
+}
+
+/// macOS：接住点程序坞图标的“重新打开”事件，当成“打开”命令。其他系统什么也不做。
+pub fn attach_dock(ctx: &egui::Context, tx: &Sender<TrayCommand>) {
+    #[cfg(target_os = "macos")]
+    dock::attach(ctx, tx);
+    #[cfg(not(target_os = "macos"))]
+    let _ = (ctx, tx);
+}
+
+#[cfg(windows)]
+mod native_window {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    pub fn register(cc: &eframe::CreationContext<'_>) {
+        let hwnd = match cc.window_handle().map(|h| h.as_raw()) {
+            Ok(RawWindowHandle::Win32(handle)) => handle.hwnd.get(),
+            other => {
+                log::warn!("取不到主窗口句柄：{other:?}");
+                return;
+            }
+        };
+        if !peerdesk_platform::winshell::install(hwnd, super::native::quit_now) {
+            log::warn!("登记主窗口失败，托盘命令要等界面刷新才生效");
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod dock {
+    use std::sync::mpsc::Sender;
+    use std::sync::OnceLock;
+
+    use eframe::egui;
+
+    use super::TrayCommand;
+
+    static TARGET: OnceLock<(egui::Context, Sender<TrayCommand>)> = OnceLock::new();
+
+    fn on_reopen() {
+        log::info!("程序坞图标被点击（重新打开），显示窗口");
+        if let Some((ctx, tx)) = TARGET.get() {
+            if tx.send(TrayCommand::Open).is_ok() {
+                super::wake(ctx, TrayCommand::Open);
+            }
+        }
+    }
+
+    pub fn attach(ctx: &egui::Context, tx: &Sender<TrayCommand>) {
+        let _ = TARGET.set((ctx.clone(), tx.clone()));
+        if let Err(why) = peerdesk_platform::macshell::install_reopen_handler(on_reopen) {
+            log::warn!("接不住程序坞图标的点击：{why}");
+        }
+    }
+}
+
+/// 后台线程的轮询间隔。
+const REQUEST_POLL: Duration = Duration::from_millis(200);
+
+/// 其他进程留下的请求（第二次启动、`peerdesk window ...`，见 `crate::instance`）：后台线程看到就照办。
+pub fn watch_requests(ctx: &egui::Context, dir: &std::path::Path, tx: &Sender<TrayCommand>) {
     let (ctx, dir, tx) = (ctx.clone(), dir.to_owned(), tx.clone());
     let spawned = std::thread::Builder::new()
-        .name("show-request".to_owned())
+        .name("window-request".to_owned())
         .spawn(move || loop {
-            std::thread::sleep(Duration::from_millis(400));
-            if crate::instance::take_show_request(&dir) {
-                if tx.send(TrayCommand::Open).is_err() {
-                    return;
+            std::thread::sleep(REQUEST_POLL);
+            let Some(request) = crate::instance::take_request(&dir) else {
+                continue;
+            };
+            log::info!("收到窗口请求：{}", request.word());
+            let command = match request {
+                crate::instance::Request::Show => TrayCommand::Open,
+                crate::instance::Request::Quit => TrayCommand::Quit,
+                crate::instance::Request::Close => {
+                    wake_close(&ctx);
+                    continue;
                 }
-                wake(&ctx, TrayCommand::Open);
+            };
+            if tx.send(command).is_err() {
+                return;
             }
+            wake(&ctx, command);
         });
     if let Err(e) = spawned {
-        log::warn!("无法监听第二次启动的显示请求：{e}");
+        log::warn!("无法监听窗口请求：{e}");
     }
 }
 
@@ -66,6 +172,10 @@ pub fn watch_show_requests(ctx: &egui::Context, dir: &std::path::Path, tx: &Send
 pub fn notify(title: &str, body: &str) -> bool {
     let command = tray_logic::notify_command(NotifyOs::current(), title, body);
     let Some((program, args)) = command.split_first() else {
+        // 没有命令：Windows，直接弹提示框（不起外部程序）
+        #[cfg(windows)]
+        return peerdesk_platform::winshell::message_box_async(title, body);
+        #[cfg(not(windows))]
         return false;
     };
     let mut process = std::process::Command::new(program);
@@ -74,12 +184,7 @@ pub fn notify(title: &str, body: &str) -> bool {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        // CREATE_NO_WINDOW：不闪出 PowerShell 的控制台窗口
-        let _ = process.creation_flags(0x0800_0000);
-    }
+    let _ = crate::process::quiet(&mut process);
     let mut child = match process.spawn() {
         Ok(child) => child,
         Err(e) => {
@@ -111,14 +216,22 @@ pub use sni::Tray;
 
 #[cfg(any(windows, target_os = "macos"))]
 mod native {
+    use std::cell::RefCell;
+
     use tray_icon::menu::{Menu, MenuEvent, MenuItem};
     use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
+    use super::tray_logic::TrayClick;
     use super::{egui, tray_logic, IconKind, Sender, Strings, TrayCommand};
 
-    /// 托盘图标。
+    thread_local! {
+        /// 托盘图标放在创建它的（界面）线程里：退出时要在这个线程把它摘掉，否则 Windows 的通知区域会留下
+        /// 一个死图标，要鼠标划过才消失。
+        static ICON: RefCell<Option<TrayIcon>> = const { RefCell::new(None) };
+    }
+
+    /// 托盘图标的句柄（图标本身在线程局部变量里）。
     pub struct Tray {
-        icon: TrayIcon,
         connected: bool,
         s: &'static Strings,
     }
@@ -129,6 +242,16 @@ mod native {
                 .field("connected", &self.connected)
                 .finish_non_exhaustive()
         }
+    }
+
+    /// 在界面线程里立即退出：摘掉托盘图标，以退出码 0 结束（守护不会拉起）。
+    /// Windows 的“退出”走这里：窗口隐藏时 `update` 不运行，不能等它。代价：不经过 eframe 的正常收尾，
+    /// 正在进行的远程会话由对端按超时发现断开；单实例锁和网络连接由系统回收。
+    #[cfg(windows)]
+    pub fn quit_now() {
+        log::info!("退出（托盘菜单或窗口请求）");
+        ICON.with(|icon| drop(icon.borrow_mut().take()));
+        std::process::exit(i32::from(crate::EXIT_OK));
     }
 
     fn icon_for(kind: IconKind) -> Result<(Icon, bool), String> {
@@ -165,11 +288,12 @@ mod native {
                 .with_tooltip(tray_logic::tooltip(false, s))
                 .with_icon(icon)
                 .with_icon_as_template(template)
-                // Windows：左键直接打开窗口，右键出菜单（Tailscale、RustDesk 一样）。
+                // Windows：左键单击、双击直接打开窗口，右键出菜单（Tailscale、RustDesk 一样）。
                 // macOS：菜单栏图标的习惯是左键出菜单。
                 .with_menu_on_left_click(cfg!(target_os = "macos"))
                 .build()
                 .map_err(|e| e.to_string())?;
+            ICON.with(|icon| *icon.borrow_mut() = Some(tray));
             let (menu_ctx, menu_tx) = (ctx.clone(), tx.clone());
             MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
                 if let Some(command) = TrayCommand::from_id(event.id.as_ref()) {
@@ -180,19 +304,27 @@ mod native {
             }));
             let (click_ctx, click_tx) = (ctx.clone(), tx.clone());
             TrayIconEvent::set_event_handler(Some(move |event: TrayIconEvent| {
-                if let TrayIconEvent::Click {
-                    button: tray_icon::MouseButton::Left,
-                    button_state: tray_icon::MouseButtonState::Up,
-                    ..
-                } = event
-                {
-                    if cfg!(windows) && click_tx.send(TrayCommand::Open).is_ok() {
-                        super::wake(&click_ctx, TrayCommand::Open);
+                // TrayIconEvent 是外部库的非穷尽枚举，必须有通配分支
+                #[allow(clippy::wildcard_enum_match_arm)]
+                let click = match event {
+                    TrayIconEvent::Click {
+                        button: tray_icon::MouseButton::Left,
+                        button_state: tray_icon::MouseButtonState::Up,
+                        ..
+                    } => TrayClick::Left,
+                    TrayIconEvent::DoubleClick {
+                        button: tray_icon::MouseButton::Left,
+                        ..
+                    } => TrayClick::LeftDouble,
+                    _ => TrayClick::Other,
+                };
+                if let Some(command) = tray_logic::click_command(click, cfg!(windows)) {
+                    if click_tx.send(command).is_ok() {
+                        super::wake(&click_ctx, command);
                     }
                 }
             }));
             Ok(Self {
-                icon: tray,
                 connected: false,
                 s,
             })
@@ -204,24 +336,27 @@ mod native {
                 return;
             }
             self.connected = connected;
-            match icon_for(tray_logic::icon_kind(connected)) {
-                Ok((icon, template)) => {
-                    if let Err(e) = self.icon.set_icon_with_as_template(Some(icon), template) {
-                        log::warn!("换托盘图标失败：{e}");
+            ICON.with(|slot| {
+                let slot = slot.borrow();
+                let Some(tray) = slot.as_ref() else {
+                    return;
+                };
+                match icon_for(tray_logic::icon_kind(connected)) {
+                    Ok((icon, template)) => {
+                        if let Err(e) = tray.set_icon_with_as_template(Some(icon), template) {
+                            log::warn!("换托盘图标失败：{e}");
+                        }
                     }
+                    Err(e) => log::warn!("托盘图标解码失败：{e}"),
                 }
-                Err(e) => log::warn!("托盘图标解码失败：{e}"),
-            }
-            if let Err(e) = self
-                .icon
-                .set_tooltip(Some(tray_logic::tooltip(connected, self.s)))
-            {
-                log::warn!("换托盘提示失败：{e}");
-            }
-            match build_menu(connected, self.s) {
-                Ok(menu) => self.icon.set_menu(Some(Box::new(menu))),
-                Err(e) => log::warn!("换托盘菜单失败：{e}"),
-            }
+                if let Err(e) = tray.set_tooltip(Some(tray_logic::tooltip(connected, self.s))) {
+                    log::warn!("换托盘提示失败：{e}");
+                }
+                match build_menu(connected, self.s) {
+                    Ok(menu) => tray.set_menu(Some(Box::new(menu))),
+                    Err(e) => log::warn!("换托盘菜单失败：{e}"),
+                }
+            });
         }
     }
 }

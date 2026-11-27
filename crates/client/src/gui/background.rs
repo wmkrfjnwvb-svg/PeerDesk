@@ -77,7 +77,8 @@ impl Background {
     ) -> (Self, Option<Status>) {
         let selftest = std::env::var_os(SELFTEST_ENV).is_some();
         let (tx, commands) = std::sync::mpsc::channel();
-        tray::watch_show_requests(ctx, data_dir, &tx);
+        tray::watch_requests(ctx, data_dir, &tx);
+        tray::attach_dock(ctx, &tx);
         // 自测（CI 截图，没有桌面托盘）和 PEERDESK_NO_TRAY 不建托盘。建不了时不静默：告诉用户，
         // 此时关闭窗口就是退出，否则程序藏起来了用户却找不到。
         let (tray, status) = if selftest || std::env::var_os("PEERDESK_NO_TRAY").is_some() {
@@ -95,9 +96,19 @@ impl Background {
         // 开机自启和自动恢复：默认开，用户在设置里关过就不再装。开发构建（cargo run）不自动装，
         // 否则会把 target 目录里的程序注册成开机项。
         let autostart = !autostart::user_disabled(data_dir);
-        if autostart && !selftest && !cfg!(debug_assertions) {
+        // PEERDESK_AUTOSTART=force：实机测试用，开发构建也真的写启动项（测试要验证启动时不起外部程序、不闪窗口）
+        let forced = std::env::var_os("PEERDESK_AUTOSTART").is_some_and(|v| v == "force");
+        if autostart && !selftest && (forced || !cfg!(debug_assertions)) {
             ensure_autostart();
         }
+        log::info!(
+            "后台常驻就绪：托盘{}",
+            if tray.is_some() {
+                "已建立"
+            } else {
+                "没有"
+            }
+        );
         let bg = Self {
             life,
             tray,
@@ -123,6 +134,7 @@ impl Background {
         for command in commands {
             match self.life.on_command(command, connected) {
                 WindowAction::Show => {
+                    log::info!("显示主窗口");
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
@@ -145,6 +157,7 @@ impl Background {
             });
             match action {
                 CloseAction::Hide => {
+                    log::info!("窗口已隐藏到托盘，程序继续在后台运行");
                     ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
                 }

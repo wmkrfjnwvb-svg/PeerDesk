@@ -431,8 +431,7 @@ fn run_all(commands: &[Command], out: &mut dyn Write, runner: &mut Runner) -> Re
 /// 真的运行一条系统命令。
 fn system_runner(command: &Command) -> Result<(bool, String), String> {
     let (program, args) = command.split_first().ok_or("空命令")?;
-    let output = std::process::Command::new(program)
-        .args(args)
+    let output = crate::process::quiet(std::process::Command::new(program).args(args))
         .output()
         .map_err(|e| format!("运行 {program} 失败：{e}"))?;
     let text = String::from_utf8_lossy(&output.stdout).into_owned()

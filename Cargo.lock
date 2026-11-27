@@ -3344,6 +3344,7 @@ dependencies = [
  "peerdesk-platform",
  "peerdesk-server",
  "png",
+ "raw-window-handle",
  "sys-locale",
  "tokio",
  "tray-icon",

@@ -109,11 +109,13 @@ fn guard_program(exe: &std::path::Path, args: &[&str], sleep: &mut dyn FnMut(Dur
     supervise(
         &mut || {
             let start = Instant::now();
-            let status = std::process::Command::new(exe)
-                .args(args)
-                .env(GUARDED_ENV, "1")
-                .status()
-                .map_err(|e| format!("{}：{e}", exe.display()))?;
+            let status = crate::process::quiet(
+                std::process::Command::new(exe)
+                    .args(args)
+                    .env(GUARDED_ENV, "1"),
+            )
+            .status()
+            .map_err(|e| format!("{}：{e}", exe.display()))?;
             Ok((status.code(), start.elapsed()))
         },
         sleep,

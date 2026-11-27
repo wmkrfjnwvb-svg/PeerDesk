@@ -261,10 +261,31 @@ pub fn mark_hint_seen(dir: &Path) -> std::io::Result<()> {
     std::fs::write(dir.join(HINT_FILE), b"")
 }
 
+/// 托盘图标上的鼠标操作（和具体托盘库无关）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrayClick {
+    /// 左键单击（松开时）。
+    Left,
+    /// 左键双击。
+    LeftDouble,
+    /// 其他（右键、中键、移动）。
+    Other,
+}
+
+/// 点托盘图标要做什么。Windows：单击、双击都显示窗口（右键出菜单）；
+/// macOS：菜单栏图标的习惯是左键出菜单，不在这里处理。
+#[must_use]
+pub const fn click_command(click: TrayClick, windows: bool) -> Option<TrayCommand> {
+    match (click, windows) {
+        (TrayClick::Left | TrayClick::LeftDouble, true) => Some(TrayCommand::Open),
+        _ => None,
+    }
+}
+
 /// 系统通知要运行的命令（程序名和参数）。
 pub type Command = Vec<String>;
 
-/// 发一条系统通知的命令：Linux 用 `notify-send`，macOS 用 `osascript`，Windows 用 PowerShell 的气泡提示。
+/// 发一条系统通知的命令：Linux 用 `notify-send`，macOS 用 `osascript`；Windows 没有命令（空），由界面进程直接弹提示框。
 /// 不新增依赖，也不碰任何通知服务的私有接口。`title`、`body` 不能含引号（调用的都是我们自己的固定文字）。
 #[must_use]
 pub fn notify_command(os: NotifyOs, title: &str, body: &str) -> Command {
@@ -284,21 +305,9 @@ pub fn notify_command(os: NotifyOs, title: &str, body: &str) -> Command {
             "-e",
             &format!("display notification \"{body}\" with title \"{title}\""),
         ]),
-        NotifyOs::Windows => strs(&[
-            "powershell",
-            "-NoProfile",
-            "-NonInteractive",
-            "-WindowStyle",
-            "Hidden",
-            "-Command",
-            &format!(
-                "Add-Type -AssemblyName System.Windows.Forms,System.Drawing; \
-                 $n = New-Object System.Windows.Forms.NotifyIcon; \
-                 $n.Icon = [System.Drawing.SystemIcons]::Information; $n.Visible = $true; \
-                 $n.ShowBalloonTip(8000, '{title}', '{body}', 'Info'); \
-                 Start-Sleep -Seconds 9; $n.Dispose()"
-            ),
-        ]),
+        // Windows 不起外部程序：用 PowerShell 弹气泡要起一个控制台程序，每次都会闪一下控制台窗口。
+        // 改为在界面进程里直接弹提示框（`tray::notify` 里调平台层）。
+        NotifyOs::Windows => Vec::new(),
     }
 }
 
@@ -477,6 +486,22 @@ mod tests {
     }
 
     #[test]
+    fn clicking_the_tray_icon_opens_the_window_on_windows_only() {
+        assert_eq!(
+            click_command(TrayClick::Left, true),
+            Some(TrayCommand::Open)
+        );
+        assert_eq!(
+            click_command(TrayClick::LeftDouble, true),
+            Some(TrayCommand::Open)
+        );
+        assert_eq!(click_command(TrayClick::Other, true), None);
+        for click in [TrayClick::Left, TrayClick::LeftDouble, TrayClick::Other] {
+            assert_eq!(click_command(click, false), None, "macOS 左键出菜单");
+        }
+    }
+
+    #[test]
     fn notification_commands_for_each_system() {
         let linux = notify_command(NotifyOs::Linux, "标题", "正文");
         assert_eq!(linux.first().map(String::as_str), Some("notify-send"));
@@ -487,12 +512,8 @@ mod tests {
             .last()
             .unwrap()
             .contains("display notification \"B\" with title \"T\""));
-        let win = notify_command(NotifyOs::Windows, "T", "B");
-        assert_eq!(win.first().map(String::as_str), Some("powershell"));
-        assert!(win
-            .last()
-            .unwrap()
-            .contains("ShowBalloonTip(8000, 'T', 'B'"));
+        // Windows 不起任何外部程序（PowerShell 会闪控制台窗口）
+        assert!(notify_command(NotifyOs::Windows, "T", "B").is_empty());
         let _ = NotifyOs::current();
         // 固定文字里不能有会破坏脚本的引号
         for s in [&ZH, &EN] {
