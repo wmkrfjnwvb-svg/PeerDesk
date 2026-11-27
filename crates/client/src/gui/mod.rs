@@ -18,6 +18,7 @@ pub mod home;
 pub mod i18n;
 pub mod input;
 pub mod keys;
+pub mod layout;
 pub mod netinfo;
 pub mod password;
 pub mod recent;

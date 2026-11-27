@@ -25,6 +25,10 @@ use super::home::{
     HostBadge, LineAction, Tab,
 };
 use super::i18n::{effective_lang, save_lang, strings, Lang, Strings};
+use super::layout::{
+    self, code_is_compact, status_beside, table_plan, TablePlan, GROUP_ROW_HEIGHT, HEADER_HEIGHT,
+    PAGE_MARGIN, PAGE_MAX_WIDTH, ROW_HEIGHT, SECTION_GAP, STATUS_MARGIN_Y, STATUS_MIN_HEIGHT,
+};
 use super::netinfo::lan_addresses;
 use super::session::{start_host, start_view, HostConfig, HostEvent, HostHandle, Repaint};
 use super::settings::ServerSettings;
@@ -43,20 +47,6 @@ use crate::{EXIT_FAILED, EXIT_OK};
 
 /// 自测模式：启动后自动开启被控、再连接本机。值为 `host` 时只开启被控。CI 用它截图。
 const SELFTEST_ENV: &str = "PEERDESK_GUI_SELFTEST";
-/// 页面内容最宽这么多（再宽，一行字太长不好读）。
-const PAGE_MAX_WIDTH: f32 = 1060.0;
-/// “这台电脑”的面板里面够这么宽时，状态和设备码、密码排成一行；不够就放到下一行。
-const THIS_PC_WIDE: f32 = 900.0;
-/// 面板里面不到这么宽时，设备码用小一号的字。
-const CODE_WIDE: f32 = 640.0;
-/// 设备表：设备码、上次连接、操作三列的宽度（名称用剩下的）。
-const COL_CODE: f32 = 150.0;
-const COL_LAST: f32 = 110.0;
-const COL_ACTIONS: f32 = 200.0;
-/// 设备表的行高：设备（两行字）、分组（一行字）、表头。
-const ROW_HEIGHT: f32 = 56.0;
-const GROUP_ROW_HEIGHT: f32 = 40.0;
-const HEADER_HEIGHT: f32 = 40.0;
 /// 就地编辑的输入框宽度。
 const EDIT_WIDTH: f32 = 260.0;
 /// “最近”里最多显示这么多台。
@@ -102,8 +92,8 @@ pub fn run() -> u8 {
     let mut viewport = egui::ViewportBuilder::default()
         .with_title(s.app_title)
         .with_app_id("peerdesk")
-        .with_inner_size([1280.0, 800.0])
-        .with_min_inner_size([860.0, 600.0]);
+        .with_inner_size(layout::WINDOW_DEFAULT)
+        .with_min_inner_size(layout::WINDOW_MIN);
     // 窗口图标（品牌标志，见 packaging/icons/README.md）。解码失败时不设图标，记日志
     match eframe::icon_data::from_png_bytes(include_bytes!("../../assets/window-icon.png")) {
         Ok(icon) => viewport = viewport.with_icon(icon),
@@ -675,16 +665,24 @@ impl App {
     }
 
     /// 设备码那一组：标签在上，大号的设备码和复制按钮在下。还没有设备码时说明在等什么。
-    fn code_block(&mut self, ui: &mut egui::Ui, p: &Palette, code: Option<u32>, waiting: bool) {
+    fn code_block(
+        &mut self,
+        ui: &mut egui::Ui,
+        p: &Palette,
+        code: Option<u32>,
+        waiting: bool,
+        compact: bool,
+    ) {
         let s = self.s;
+        let ctl = control_for(compact);
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = space::S6;
             let _ = muted(ui, p, s.device_code);
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = space::S12;
-                ui.set_min_height(size::CONTROL_LARGE);
+                ui.set_min_height(ctl.height());
                 // 窗口窄的时候设备码用小一号的字，不把密码挤到下一行
-                let size = if ui.available_width() < CODE_WIDE {
+                let size = if compact {
                     font::CODE_COMPACT
                 } else {
                     font::CODE
@@ -699,9 +697,7 @@ impl App {
                             font::CODE_TRACKING,
                             p.ink,
                         ));
-                        if icon_button(ui, p, icon::COPY, s.copy_address, ControlSize::Large)
-                            .clicked()
-                        {
+                        if icon_button(ui, p, icon::COPY, s.copy_address, ctl).clicked() {
                             self.copy(ui, &code.to_string());
                         }
                     }
@@ -718,14 +714,15 @@ impl App {
     }
 
     /// 密码那一组：密码、显示或隐藏、复制、换一个。
-    fn password_block(&mut self, ui: &mut egui::Ui, p: &Palette) {
+    fn password_block(&mut self, ui: &mut egui::Ui, p: &Palette, compact: bool) {
         let s = self.s;
+        let ctl = control_for(compact);
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = space::S6;
             let _ = muted(ui, p, s.password);
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = space::S8;
-                ui.set_min_height(size::CONTROL_LARGE);
+                ui.set_min_height(ctl.height());
                 let password = self.password.clone();
                 let shown = if self.show_password {
                     password.clone()
@@ -744,21 +741,13 @@ impl App {
                 } else {
                     (icon::EYE, s.show_password)
                 };
-                if icon_button(ui, p, eye, tip, ControlSize::Large).clicked() {
+                if icon_button(ui, p, eye, tip, ctl).clicked() {
                     self.show_password = !self.show_password;
                 }
-                if icon_button(ui, p, icon::COPY, s.copy_password, ControlSize::Large).clicked() {
+                if icon_button(ui, p, icon::COPY, s.copy_password, ctl).clicked() {
                     self.copy(ui, &password);
                 }
-                if icon_button(
-                    ui,
-                    p,
-                    icon::ARROWS_CLOCKWISE,
-                    s.new_password,
-                    ControlSize::Large,
-                )
-                .clicked()
-                {
+                if icon_button(ui, p, icon::ARROWS_CLOCKWISE, s.new_password, ctl).clicked() {
                     self.renew_password();
                 }
             });
@@ -766,15 +755,33 @@ impl App {
     }
 
     /// 状态那一组：状态标签，下面一句说明（现在是什么情况、怎么办）；正在被控时写明是谁，可以断开。
-    fn host_status_block(&mut self, ui: &mut egui::Ui, p: &Palette, badge: &HostBadge) {
+    fn host_status_block(
+        &mut self,
+        ui: &mut egui::Ui,
+        p: &Palette,
+        badge: &HostBadge,
+        beside: bool,
+    ) {
         let s = self.s;
-        ui.vertical(|ui| {
-            ui.spacing_mut().item_spacing.y = space::S6;
-            let _ = pill(ui, p, badge.label, badge.signal);
+        // 放在下一行时，标签和说明排成一行（说明放不下再换行）；放在旁边时上下排
+        let hint = |ui: &mut egui::Ui| {
             ui.add(
                 egui::Label::new(text(badge.hint, font::SMALL, Weight::Regular).color(p.muted))
                     .wrap(),
             );
+        };
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = space::S6;
+            if beside {
+                let _ = pill(ui, p, badge.label, badge.signal);
+                hint(ui);
+            } else {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = space::S10;
+                    let _ = pill(ui, p, badge.label, badge.signal);
+                    hint(ui);
+                });
+            }
             if !self.server.is_set()
                 && self.service.is_none()
                 && link_button(ui, p, s.go_settings).clicked()
@@ -839,20 +846,22 @@ impl App {
         let code = service.unwrap_or(self.device_code);
         let waiting = service.is_some() || (self.phase.is_on() && self.server.is_set());
         panel(ui, p, |ui| {
-            let wide = ui.available_width() >= THIS_PC_WIDE;
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = space::S48;
-                self.code_block(ui, p, code, waiting);
+            let inner = ui.available_width();
+            let (compact, beside) = (code_is_compact(inner), status_beside(inner));
+            // 窗口很窄时设备码和密码换成两行，不挤在一起
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(layout::BLOCK_GAP, space::S12);
+                self.code_block(ui, p, code, waiting, compact);
                 if service.is_none() {
-                    self.password_block(ui, p);
+                    self.password_block(ui, p, compact);
                 }
-                if wide {
-                    self.host_status_block(ui, p, &badge);
+                if beside {
+                    self.host_status_block(ui, p, &badge, true);
                 }
             });
-            if !wide {
-                ui.add_space(space::S14);
-                self.host_status_block(ui, p, &badge);
+            if !beside {
+                ui.add_space(space::S8);
+                self.host_status_block(ui, p, &badge, false);
             }
         });
     }
@@ -1188,7 +1197,8 @@ impl App {
             rect.bottom(),
             egui::Stroke::new(size::LINE, p.line_soft),
         );
-        let cols = columns(rect);
+        let plan = table_plan(rect.width());
+        let cols = columns(rect, &plan);
         let indent = space::S16 + indent_of(depth);
         // 名称
         let mut cell = ui.new_child(
@@ -1211,7 +1221,13 @@ impl App {
                 title
             };
             let name = egui::Label::new(text(name, font::BODY, Weight::Medium)).truncate();
-            let os = os_name(device.os);
+            // 表窄时没有单独的“上次连接”列：并进这一行（系统 · 5 分钟前）
+            let ago_text = ago(unix_now(), device.last_used, s);
+            let os = match (os_name(device.os), plan.last) {
+                (os, Some(_)) => os.to_owned(),
+                ("", None) => ago_text.clone(),
+                (os, None) => format!("{os} · {ago_text}"),
+            };
             if os.is_empty() {
                 // 只有一行字：直接放，和图标竖直居中
                 cell.add(name);
@@ -1219,24 +1235,28 @@ impl App {
                 cell.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 0.0;
                     ui.add(name);
-                    let _ = muted(ui, p, os);
+                    let _ = muted(ui, p, &os);
                 });
             }
         }
         // 设备码、上次连接
-        let (code, _) = device.code();
-        let mut cell = ui.new_child(
-            egui::UiBuilder::new()
-                .max_rect(cols.code)
-                .layout(Layout::left_to_right(Align::Center)),
-        );
-        cell.add(egui::Label::new(code).truncate());
-        let mut cell = ui.new_child(
-            egui::UiBuilder::new()
-                .max_rect(cols.last)
-                .layout(Layout::left_to_right(Align::Center)),
-        );
-        cell.label(RichText::new(ago(unix_now(), device.last_used, s)).color(p.muted));
+        if let Some(code_rect) = cols.code {
+            let (code, _) = device.code();
+            let mut cell = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(code_rect)
+                    .layout(Layout::left_to_right(Align::Center)),
+            );
+            cell.add(egui::Label::new(code).truncate());
+        }
+        if let Some(last) = cols.last {
+            let mut cell = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(last)
+                    .layout(Layout::left_to_right(Align::Center)),
+            );
+            cell.label(RichText::new(ago(unix_now(), device.last_used, s)).color(p.muted));
+        }
         // 操作
         if active && !editing {
             let mut cell = ui.new_child(
@@ -1381,22 +1401,25 @@ impl App {
             rect.bottom(),
             egui::Stroke::new(size::LINE, p.line),
         );
-        let cols = columns(rect);
+        let cols = columns(rect, &table_plan(rect.width()));
         let name = cols.name.with_min_x(cols.name.left() + space::S16);
         for (rect, label, layout) in [
             (name, s.col_name, Layout::left_to_right(Align::Center)),
-            (
-                cols.code,
-                s.device_code,
-                Layout::left_to_right(Align::Center),
-            ),
-            (cols.last, s.col_last, Layout::left_to_right(Align::Center)),
             (
                 cols.actions,
                 s.col_actions,
                 Layout::right_to_left(Align::Center),
             ),
-        ] {
+        ]
+        .into_iter()
+        .chain(
+            cols.code
+                .map(|code| (code, s.device_code, Layout::left_to_right(Align::Center))),
+        )
+        .chain(
+            cols.last
+                .map(|last| (last, s.col_last, Layout::left_to_right(Align::Center))),
+        ) {
             let mut cell = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(layout));
             cell.label(text(label, font::SMALL, Weight::Medium).color(p.muted));
         }
@@ -1521,9 +1544,9 @@ impl App {
         ui.set_max_width(ui.available_width().min(PAGE_MAX_WIDTH));
         self.permission_guide(ui, p);
         self.this_pc_section(ui, p);
-        ui.add_space(space::S36 - space::S8);
+        ui.add_space(SECTION_GAP);
         self.connect_section(ui, p);
-        ui.add_space(space::S36 - space::S8);
+        ui.add_space(SECTION_GAP);
         self.devices_section(ui, p);
     }
 
@@ -1938,7 +1961,7 @@ impl App {
             }
         }
         ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
-            ui.spacing_mut().item_spacing.y = space::S2;
+            ui.spacing_mut().item_spacing.y = space::S6;
             ui.add_space(space::S14);
             let indent = |ui: &mut egui::Ui, add: &mut dyn FnMut(&mut egui::Ui)| {
                 ui.horizontal(|ui| {
@@ -2080,17 +2103,22 @@ impl eframe::App for App {
             .frame(
                 egui::Frame::new()
                     .fill(p.bg)
-                    .inner_margin(pad(space::S44, space::S8)),
+                    .inner_margin(pad(PAGE_MARGIN[0], STATUS_MARGIN_Y)),
             )
             .show(ctx, |ui| {
-                ui.set_min_height(20.0);
+                ui.set_min_height(STATUS_MIN_HEIGHT);
                 self.status_line(ui, &p);
             });
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
                     .fill(p.bg)
-                    .inner_margin(pad(space::S44, space::S36)),
+                    .inner_margin(egui::epaint::MarginF32 {
+                        left: PAGE_MARGIN[0],
+                        right: PAGE_MARGIN[0],
+                        top: PAGE_MARGIN[1],
+                        bottom: layout::PAGE_MARGIN_BOTTOM,
+                    }),
             )
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| match self.page {
@@ -2167,6 +2195,15 @@ impl eframe::App for App {
     }
 }
 
+/// 设备码、密码旁的按钮大小：窗口紧凑时小一档，省一点高度。
+const fn control_for(compact: bool) -> ControlSize {
+    if compact {
+        ControlSize::Medium
+    } else {
+        ControlSize::Large
+    }
+}
+
 /// 系统的图标：设备列表里一眼分出 Windows、Mac、Linux。
 const fn os_icon(os: PeerOs) -> &'static str {
     match os {
@@ -2180,24 +2217,24 @@ const fn os_icon(os: PeerOs) -> &'static str {
 /// 设备表各列的位置。名称用剩下的宽度，其余几列固定。
 struct Columns {
     name: egui::Rect,
-    code: egui::Rect,
-    last: egui::Rect,
+    code: Option<egui::Rect>,
+    last: Option<egui::Rect>,
     actions: egui::Rect,
 }
 
 /// 把一行切成几列（表头和每一行用同一个切法，才对得齐）。
-fn columns(row: egui::Rect) -> Columns {
+fn columns(row: egui::Rect, plan: &TablePlan) -> Columns {
     let right = row.right() - space::S16;
-    let actions_left = right - COL_ACTIONS;
-    let last_left = actions_left - COL_LAST;
-    let code_left = last_left - COL_CODE;
+    let actions_left = right - plan.actions;
+    let last_left = actions_left - plan.last.unwrap_or(0.0);
+    let code_left = last_left - plan.code.map_or(0.0, |c| c + space::S16);
     let slice = |from: f32, to: f32| {
         egui::Rect::from_min_max(egui::pos2(from, row.top()), egui::pos2(to, row.bottom()))
     };
     Columns {
         name: slice(row.left(), code_left - space::S16),
-        code: slice(code_left, last_left - space::S16),
-        last: slice(last_left, actions_left),
+        code: plan.code.map(|_| slice(code_left, last_left - space::S16)),
+        last: plan.last.map(|_| slice(last_left, actions_left)),
         actions: slice(actions_left, right),
     }
 }

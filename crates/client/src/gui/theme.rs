@@ -129,7 +129,7 @@ pub mod size {
     /// 导航项的高度。
     pub const NAV_ITEM: f32 = 38.0;
     /// 侧边栏的宽度。
-    pub const SIDEBAR: f32 = 220.0;
+    pub const SIDEBAR: f32 = 188.0;
     /// 状态圆点的直径。
     pub const DOT: f32 = 8.0;
     /// 细线、边框。
@@ -541,7 +541,7 @@ pub fn panel<R>(ui: &mut Ui, p: &Palette, add: impl FnOnce(&mut Ui) -> R) -> R {
         .fill(p.surface)
         .stroke(Stroke::new(size::LINE, p.line))
         .corner_radius(radius::PANEL)
-        .inner_margin(pad(space::S28, space::S24))
+        .inner_margin(pad(space::S20, space::S16))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             add(ui)
