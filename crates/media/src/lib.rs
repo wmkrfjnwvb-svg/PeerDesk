@@ -19,6 +19,7 @@ pub mod checkup;
 mod color;
 pub mod content;
 pub mod fake;
+pub mod fitted;
 /// Linux 的显卡和 VA-API 能力（检测和给用户的说明）。
 #[cfg(target_os = "linux")]
 pub mod gpu;
@@ -108,12 +109,21 @@ fn report_with(
     )]
 }
 
+/// 画面转成 I420（宽高补成偶数）：（宽, 高, 亮度, 色度 U, 色度 V）。和编码器转换画面用的是同一套代码；
+/// M2 的测量工具（`crates/e2e/examples/measure.rs`）用它，保证量的是产品喂给后端的那份数据。
+#[must_use]
+pub fn screen_to_i420(screen: &Screen) -> (usize, usize, Vec<u8>, Vec<u8>, Vec<u8>) {
+    let (w, h, pixels) = even_pixels(screen);
+    let (mut y, mut u, mut v) = (Vec::new(), Vec::new(), Vec::new());
+    color::rgb_to_i420(&pixels, w, &mut y, &mut u, &mut v);
+    (w, h, y, u, v)
+}
+
 /// 画面转成 NV12（宽高补成偶数）：（宽, 高, NV12）。`hw-check` 用它准备硬件编码器的输入。
 #[must_use]
 pub fn screen_to_nv12(screen: &Screen) -> (u32, u32, Vec<u8>) {
-    let (w, h, pixels) = even_pixels(screen);
-    let (mut y, mut u, mut v, mut nv12) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-    color::rgb_to_i420(&pixels, w, &mut y, &mut u, &mut v);
+    let (w, h, y, u, v) = screen_to_i420(screen);
+    let mut nv12 = Vec::new();
     color::i420_to_nv12(&y, &u, &v, &mut nv12);
     (
         u32::try_from(w).unwrap_or(0),
@@ -1691,6 +1701,20 @@ mod tests {
             poll_error: false,
             drop_keys: 0,
         }))
+    }
+
+    /// I420 和 NV12 是同一份数据的两种排法；奇数尺寸补成偶数。
+    #[test]
+    fn i420_and_nv12_hold_the_same_planes() {
+        let screen = picture(321, 193);
+        let (w, h, y, u, v) = screen_to_i420(&screen);
+        assert_eq!((w, h), (322, 194));
+        assert_eq!((y.len(), u.len(), v.len()), (322 * 194, 161 * 97, 161 * 97));
+        let (nw, nh, nv12) = screen_to_nv12(&screen);
+        assert_eq!((usize::try_from(nw), usize::try_from(nh)), (Ok(w), Ok(h)));
+        assert_eq!(nv12.get(..y.len()), Some(&y[..]));
+        let chroma: Vec<u8> = u.iter().zip(&v).flat_map(|(a, b)| [*a, *b]).collect();
+        assert_eq!(nv12.get(y.len()..), Some(&chroma[..]));
     }
 
     #[test]
@@ -3335,6 +3359,53 @@ mod tests {
         // Timeout：720p 编码 10 秒没有结束（卡住了）；Disconnected：编码线程 panic 了
         let (took, sizes) = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
         assert!(sizes.iter().all(|s| *s > 0), "{took:?} {sizes:?}");
+    }
+
+    /// 内容描述这条路（L0）：面积、细节从描述里取，交给后端的是描述里这个编码尺寸的亮度抽样。
+    /// 同一串画面，拿像素编（假后端从像素算）和拿描述编，每帧的大小和是不是关键帧都相同。
+    #[test]
+    fn described_content_is_encoded_like_the_same_pixels() {
+        use crate::fake::{FakeBackend, FakeConfig, ManualClock};
+        let make = |described: bool| {
+            let mut cfg = FakeConfig::like_openh264();
+            cfg.inputs.described = described;
+            let backend = FakeBackend::with_default_model(cfg, Arc::new(ManualClock::new()));
+            H264Encoder::with_max_bps(30, 30_000_000)
+                .with_hardware(|_, _, _, _| Err("只测软件".into()))
+                .with_soft_backend(Box::new(backend))
+        };
+        let first = picture(320, 192);
+        let mut second = first.clone();
+        second.fill(40, 100, 120, 60, 0x0020_4060);
+        let mut by_pixels = make(false);
+        let mut by_desc = make(true);
+        // 第一帧（关键帧）、变了的一帧、没变的一帧（往下补清晰）
+        for (version, screen, changed) in [
+            (0u64, &first, true),
+            (1, &second, true),
+            (1, &second, false),
+        ] {
+            let desc = content::describe(screen, version, &[1000]).unwrap();
+            let shape = |f: Option<EncodedFrame>| f.map(|f| (f.payload.len(), f.key));
+            let p = shape(by_pixels.encode(0, screen, changed, 50_000).unwrap());
+            let d = shape(by_desc.encode_described(0, &desc, changed, 50_000).unwrap());
+            assert_eq!(p, d, "第 {version} 版，变了：{changed}");
+            if changed {
+                assert!(p.is_some(), "变了的帧要编出来");
+            }
+        }
+        // 描述里没有编码尺寸的那一份：说清楚，不猜
+        let empty = content::describe(&second, 2, &[]).unwrap();
+        assert!(matches!(
+            by_desc.encode_described(0, &empty, true, 50_000),
+            Err(Error::InvalidArgument(_))
+        ));
+        // 后端不收内容描述却拿到了：后端违约，按编码失败报
+        let desc = content::describe(&second, 2, &[1000]).unwrap();
+        assert!(matches!(
+            by_pixels.encode_described(0, &desc, true, 50_000),
+            Err(Error::Inconsistent(_))
+        ));
     }
 }
 

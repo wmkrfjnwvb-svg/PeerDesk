@@ -1620,6 +1620,22 @@ mod tests {
         assert!(text.contains("契约 1 每一帧都有下落：守约") && text.contains("声明核对：守约"));
     }
 
+    /// 换上实测拟合的字节模型（M2，打开残差扰动和关掉各一次；按 QP 编和按码率窗口编各一次），体检照样全过：
+    /// 模型对 QP 单调、扰动不依赖 QP，所以“按 QP 编”“预算是硬的”这些判断不受影响。
+    #[test]
+    fn the_fitted_byte_model_passes_the_checkup_too() {
+        use crate::fitted::FittedByteModel;
+        for noise in [true, false] {
+            for cfg in [FakeConfig::default(), FakeConfig::window()] {
+                let clock = ManualClock::new();
+                let model = FittedByteModel::openh264_v1().unwrap().with_noise(noise);
+                let mut b = FakeBackend::new(cfg, Arc::new(clock.clone()), Box::new(model));
+                let report = run_with(small(), &mut b, &mut |d| clock.advance(d));
+                assert_clean(&report);
+            }
+        }
+    }
+
     /// 同一配置体检两次，报告逐项相同（确定性）。
     #[test]
     fn the_checkup_is_deterministic() {

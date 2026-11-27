@@ -91,6 +91,12 @@ pub struct ModelInput {
     pub changed_permille: u32,
     /// 画面有多少细节（千分之几：相邻点亮度差大的点占多少）。
     pub detail_permille: u32,
+    /// 上一帧编出来时用的 QP（配置之后还没编出过帧为 `None`）。静止画面补清晰（同一幅画面按更小的 QP 再编一次）
+    /// 要靠它看出来：这时变化面积是 0，字节数却由“从多粗补到多细”决定（M2 实测，见 `data-m2.md`）。
+    pub prev_qp: Option<u8>,
+    /// 配置之后这是第几帧（从 0 数）。字节模型要给帧大小加随机扰动时用它：同一个画面连着编几帧，扰动也该不同；
+    /// 又因为它不依赖 QP，同一帧在不同 QP 下的扰动相同，“QP 越大不会越大”仍然成立。
+    pub serial: u32,
 }
 
 /// 字节模型：给定编码条件，这一帧大约多少字节。要求：QP 越大不会越大（体检按这个判断“按 QP 编”）。
@@ -340,6 +346,8 @@ pub struct FakeBackend {
     calls: u32,
     /// 上一帧抽样的亮度点。
     prev: Option<Vec<u8>>,
+    /// 上一帧编出来时用的 QP。
+    last_qp: Option<u8>,
     /// 上一次交帧的时间。
     last_submit_us: Option<u64>,
     /// 欠着的关键帧：还要再过几帧才给。
@@ -377,6 +385,7 @@ impl FakeBackend {
             index: 0,
             calls: 0,
             prev: None,
+            last_qp: None,
             last_submit_us: None,
             key_countdown: None,
             inflight: VecDeque::new(),
@@ -415,6 +424,7 @@ impl FakeBackend {
         self.index = 0;
         self.calls = 0;
         self.prev = None;
+        self.last_qp = None;
         self.last_submit_us = None;
         self.key_countdown = None;
     }
@@ -686,6 +696,8 @@ impl EncoderBackend for FakeBackend {
                 pixels,
                 changed_permille: changed,
                 detail_permille: detail,
+                prev_qp: self.last_qp,
+                serial: self.index,
             })
         };
         let (qp, mut bytes, engaged, fits) = match (rc, ask.qp) {
@@ -739,6 +751,7 @@ impl EncoderBackend for FakeBackend {
         let index = self.index;
         let timing = self.timing(key, gap, primed);
         self.prev = Some(sample);
+        self.last_qp = Some(qp);
         self.first = false;
         self.index = self.index.saturating_add(1);
         let seed = ask.token.wrapping_mul(0x9E37_79B9_7F4A_7C15)
@@ -998,6 +1011,8 @@ mod tests {
             pixels: 640 * 360,
             changed_permille: 1000,
             detail_permille: 150,
+            prev_qp: None,
+            serial: 0,
         };
         let key20 = m.bytes(&base);
         let key26 = m.bytes(&ModelInput { qp: 26, ..base });
@@ -1027,6 +1042,37 @@ mod tests {
             }) > key20
         );
         assert!(m.bytes(&ModelInput { pixels: 0, ..small }) >= 24);
+    }
+
+    /// 字节模型要的两样上下文由后端给：上一帧编出来的 QP、配置之后的第几帧；重新配置后从头数。
+    #[test]
+    fn the_model_is_told_the_previous_qp_and_the_frame_serial() {
+        type Seen = Arc<std::sync::Mutex<Vec<(Option<u8>, u32)>>>;
+        #[derive(Debug)]
+        struct Recorder(Seen);
+        impl ByteModel for Recorder {
+            fn bytes(&self, input: &ModelInput) -> usize {
+                self.0.lock().unwrap().push((input.prev_qp, input.serial));
+                100
+            }
+        }
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut b = FakeBackend::new(
+            FakeConfig::default(),
+            Arc::new(ManualClock::new()),
+            Box::new(Recorder(Arc::clone(&seen))),
+        );
+        b.reconfigure(SIZE, RATES).unwrap();
+        let p = planes(0);
+        for (i, qp) in [30u8, 20, 20].into_iter().enumerate() {
+            let _ = ready(b.submit(i420(&p), ask(i as u64, Some(qp), 1 << 20, false)));
+        }
+        b.reconfigure(SIZE, RATES).unwrap();
+        let _ = ready(b.submit(i420(&p), ask(9, Some(26), 1 << 20, false)));
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [(None, 0), (Some(30), 1), (Some(20), 2), (None, 0)]
+        );
     }
 
     /// 同一配置、同一输入序列，输出逐字节相同；数据是 Annex B 的样子；不同的 token 数据不同。
