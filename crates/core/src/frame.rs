@@ -15,6 +15,7 @@
 use std::ffi::c_void;
 use std::sync::Arc;
 
+use crate::changes::{Move, Rect};
 use crate::screen::Screen;
 use crate::Error;
 
@@ -105,6 +106,11 @@ pub struct ContentDesc {
     pub area_detail: Arc<[u32]>,
     /// 每种可能的编码尺寸各一份亮度抽样（原尺寸、降分辨率时的尺寸）。
     pub luma: Vec<LumaDesc>,
+    /// 和上一版比新画的区域（原始尺寸上）。采集接口给的就是这个（见 [`crate::changes`]）；合成桌面自己知道自己画了什么。
+    /// 只管这一版相对上一版：编码器从“上一帧编出来”起累计，中间跳过的版本由画面来源推进 [`crate::changes::ChangeFeed`]。
+    pub dirty: Vec<Rect>,
+    /// 和上一版比搬来的区域（原始尺寸上）。
+    pub moves: Vec<Move>,
 }
 
 /// 某个编码尺寸下亮度平面的抽样和细节。
@@ -116,6 +122,9 @@ pub struct LumaDesc {
     pub sample: Arc<[u8]>,
     /// 细节（千分之几）。
     pub detail_permille: u32,
+    /// 每个 16×16 宏块里有细节的抽样点数（`peerdesk_media::content::mb_edges`）：脏区域里的细节要按宏块汇总，
+    /// 只有整幅的千分比算不出一小块的。
+    pub mb_edges: Arc<[u16]>,
 }
 
 impl ContentDesc {

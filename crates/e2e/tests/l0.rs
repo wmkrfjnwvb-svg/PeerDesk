@@ -6,7 +6,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::print_stdout)]
 
 use peerdesk_core::sim::Link;
-use peerdesk_e2e::{behaviour_fingerprint, run, Action, CodecKind, Phase, Scenario};
+use peerdesk_e2e::{behaviour_fingerprint, run_probed, Action, CodecKind, Phase, Scenario};
 
 fn phase(action: Action, frames: u32) -> Phase {
     Phase { action, frames }
@@ -96,16 +96,34 @@ fn scenarios() -> Vec<Scenario> {
 #[test]
 fn l0_sessions_are_identical_to_l05_sessions() {
     for base in scenarios() {
-        let l05 = run(&Scenario {
+        let (l05, inputs05) = run_probed(&Scenario {
             codec: CodecKind::H264L05,
             ..base.clone()
         })
         .unwrap();
-        let l0 = run(&Scenario {
+        let (l0, inputs0) = run_probed(&Scenario {
             codec: CodecKind::H264L0,
             ..base.clone()
         })
         .unwrap();
+        // 区域类输入（脏像素数、移动像素数、整屏移动、脏区域细节、静止宏块的画质差分布、repeat）逐帧相同：
+        // 字节模型现在不看它们，会话一样说明不了什么，要直接比交给假后端的数
+        assert!(inputs05.len() > 10, "{}", base.name);
+        assert_eq!(
+            inputs05, inputs0,
+            "{}：交给假后端的输入有一帧不同",
+            base.name
+        );
+        let any = |f: &dyn Fn(&peerdesk_media::fake::Regions) -> bool| {
+            inputs0.iter().any(|m| f(&m.regions))
+        };
+        assert!(
+            any(&|r| r.dirty_px > 0 && r.dirty_px < 100_000),
+            "有小块的脏区域"
+        );
+        assert!(any(&|r| r.moved_px > 0), "有移动区域（滚动、拖窗口）");
+        assert!(any(&|r| r.static_gap.iter().any(|g| *g > 0)), "有补清晰");
+        assert!(any(&|r| r.dirty_detail_permille > 0), "脏区域里有细节");
         println!(
             "{}：帧 {} / {}，关键帧 {} / {}，字节 {} / {}，反馈 {} / {}",
             base.name,

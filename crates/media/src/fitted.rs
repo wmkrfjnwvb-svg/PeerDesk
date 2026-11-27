@@ -403,6 +403,7 @@ mod tests {
             detail_permille: 120,
             prev_qp: Some(28),
             serial: 5,
+            regions: crate::fake::Regions::default(),
         }
     }
 

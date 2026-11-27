@@ -170,6 +170,7 @@ pub fn describe(screen: &Screen, version: u64, scales: &[u16]) -> Result<Content
             size: coded,
             sample: sample_luma(&y).into(),
             detail_permille: detail_permille(&y),
+            mb_edges: mb_edges(&y, coded).into(),
         });
     }
     Ok(ContentDesc {
@@ -178,6 +179,9 @@ pub fn describe(screen: &Screen, version: u64, scales: &[u16]) -> Result<Content
         area_pixels: area.pixels.into(),
         area_detail: area.detail.into(),
         luma,
+        // 区域不是从像素里算出来的：画面的来源（合成桌面、采集接口）知道哪里变了，由它填
+        dirty: Vec::new(),
+        moves: Vec::new(),
     })
 }
 
@@ -223,6 +227,61 @@ pub fn detail_permille(luma: &[u8]) -> u32 {
         .filter(|(a, b)| a.abs_diff(**b) > DETAIL_EDGE)
         .count();
     permille(edges, n)
+}
+
+/// 宏块边长（像素）。H.264 的宏块是 16×16；宏块画质表、脏区域的细节都按它汇总。
+pub const MB_SIZE: usize = 16;
+
+/// 编码尺寸为 `size` 时宏块的列数和行数（边上不满 16 的也算一个）。
+#[must_use]
+pub fn mb_dims(size: (u16, u16)) -> (usize, usize) {
+    (
+        usize::from(size.0).div_ceil(MB_SIZE),
+        usize::from(size.1).div_ceil(MB_SIZE),
+    )
+}
+
+/// 抽样点（亮度平面里每隔 [`LUMA_SAMPLE_STEP`] 个字节的那些，和 [`detail_permille`] 的点一样）所在的宏块下标。
+fn sample_mbs(len: usize, size: (u16, u16)) -> impl Iterator<Item = usize> {
+    let (cols, _) = mb_dims(size);
+    let w = usize::from(size.0).max(1);
+    (0..len.div_ceil(LUMA_SAMPLE_STEP)).map(move |k| {
+        let i = k * LUMA_SAMPLE_STEP;
+        i / w / MB_SIZE * cols + i % w / MB_SIZE
+    })
+}
+
+/// 每个宏块里有几个抽样点（只和编码尺寸有关）。
+#[must_use]
+pub fn mb_points(size: (u16, u16)) -> Vec<u16> {
+    let (cols, rows) = mb_dims(size);
+    let mut out = vec![0u16; cols * rows];
+    for mb in sample_mbs(usize::from(size.0) * usize::from(size.1), size) {
+        if let Some(n) = out.get_mut(mb) {
+            *n = n.saturating_add(1);
+        }
+    }
+    out
+}
+
+/// 每个宏块里有细节的抽样点数（和 [`detail_permille`] 同一个判断：该点和后一个字节的亮度差超过 [`DETAIL_EDGE`]）。
+/// 所有宏块加起来除以抽样点总数，就是整幅的 [`detail_permille`]。
+#[must_use]
+pub fn mb_edges(luma: &[u8], size: (u16, u16)) -> Vec<u16> {
+    let (cols, rows) = mb_dims(size);
+    let mut out = vec![0u16; cols * rows];
+    let pairs = luma
+        .iter()
+        .zip(luma.iter().skip(1))
+        .step_by(LUMA_SAMPLE_STEP);
+    for (mb, (a, b)) in sample_mbs(luma.len(), size).zip(pairs) {
+        if a.abs_diff(*b) > DETAIL_EDGE {
+            if let Some(n) = out.get_mut(mb) {
+                *n = n.saturating_add(1);
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -314,5 +373,43 @@ mod tests {
         other[0] ^= 1;
         assert!(luma_changed_permille(&sample, Some(&other)) > 0);
         assert_eq!(permille(5, 0), 1000);
+    }
+    /// 宏块汇总和整幅的定义对得上：每个宏块的抽样点数加起来是抽样点总数，有细节的点数加起来除以总数就是 `detail_permille`；
+    /// 细节落在哪个宏块，就记在哪个宏块里。
+    #[test]
+    fn per_macroblock_detail_adds_up_to_the_whole_plane() {
+        let size = (100u16, 50u16);
+        assert_eq!(mb_dims(size), (7, 4));
+        let (w, h) = (usize::from(size.0), usize::from(size.1));
+        let pts = mb_points(size);
+        assert_eq!(pts.len(), 28);
+        let n = (w * h).div_ceil(LUMA_SAMPLE_STEP);
+        assert_eq!(pts.iter().map(|p| usize::from(*p)).sum::<usize>(), n);
+        // 一块 20×20 的亮块放在 (32, 16)：只有它边上的点有细节
+        let mut luma = vec![10u8; w * h];
+        for y in 16..36 {
+            for x in 32..52 {
+                luma[y * w + x] = 200;
+            }
+        }
+        let edges = mb_edges(&luma, size);
+        let total: usize = edges.iter().map(|e| usize::from(*e)).sum();
+        assert!(total > 0);
+        assert_eq!(
+            u32::try_from(total * 1000 / n).unwrap(),
+            detail_permille(&luma)
+        );
+        // 抽样点比的是它和右边一个字节：左边缘的点在块外一格（宏块列 1），右边缘的点在块里（列 3）；
+        // 块占宏块行 1..=2。其余宏块为 0
+        for (i, e) in edges.iter().enumerate() {
+            let (col, row) = (i % 7, i / 7);
+            if !(1..=3).contains(&col) || !(1..=2).contains(&row) {
+                assert_eq!(*e, 0, "宏块 ({col}, {row}) 不该有细节");
+            }
+            assert!(e <= &pts[i]);
+        }
+        // 平面比尺寸短（后面没有了）：不越界，多出来的宏块没有点
+        assert_eq!(mb_edges(&luma[..40], size).len(), 28);
+        assert_eq!(mb_points((16, 16)), vec![20]);
     }
 }

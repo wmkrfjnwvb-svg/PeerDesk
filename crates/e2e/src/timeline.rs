@@ -54,14 +54,18 @@ impl Timeline {
                 if moved {
                     version = version.saturating_add(1);
                 }
-                // 画面没变就沿用上一拍的描述（同一份，不拷贝）
+                // 画面没变就沿用上一拍的描述（同一份，不拷贝；它的区域是那一版的，这一拍没有新的变化）
                 let content = match ticks.last() {
                     Some(last) if !moved => Arc::clone(&last.content),
-                    Some(_) | None => Arc::new(peerdesk_media::content::describe(
-                        desk.screen(),
-                        version,
-                        &SCALES,
-                    )?),
+                    Some(_) | None => {
+                        let mut desc =
+                            peerdesk_media::content::describe(desk.screen(), version, &SCALES)?;
+                        // 这一版相对上一版画了哪里、搬了哪里：合成桌面自己交的
+                        let changes = desk.changes();
+                        desc.dirty = changes.dirty.clone();
+                        desc.moves = changes.moves.clone();
+                        Arc::new(desc)
+                    }
                 };
                 ticks.push(Tick { moved, content });
             }
@@ -160,6 +164,11 @@ mod tests {
             assert_eq!(content.size, (320, 240));
             assert!(content.luma_at((320, 240)).is_some() && content.luma_at((160, 120)).is_some());
             assert!(content.luma_at((2, 2)).is_none());
+            // 区域是这一版相对上一版的，和像素桌面这一步交出的一样；没变的拍沿用上一版的描述，不重复推进
+            if moved {
+                assert_eq!(content.dirty, desk.changes().dirty, "第 {i} 拍");
+                assert_eq!(content.moves, desk.changes().moves, "第 {i} 拍");
+            }
             if let Some(p) = prev.as_ref().filter(|_| !moved) {
                 assert!(Arc::ptr_eq(p, content), "没变的拍沿用同一份");
             }

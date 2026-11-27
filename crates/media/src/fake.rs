@@ -30,6 +30,7 @@ use crate::backend::{
     Timing,
 };
 use crate::content;
+use peerdesk_core::changes::{union_area, ChangeFeed, Rect};
 use peerdesk_core::error::Error;
 use peerdesk_core::frame::{Described, Picture};
 use peerdesk_core::screen::Screen;
@@ -87,7 +88,8 @@ pub struct ModelInput {
     pub key: bool,
     /// 画面像素数。
     pub pixels: u64,
-    /// 和上一帧比变了多少（千分之几，0 到 1000；第一帧算 1000）。
+    /// 和上一帧比变了多少（千分之几，0 到 1000；第一帧算 1000）。抽样比出来的，小变化（指针、打字）量成 0；
+    /// 新的字节模型该看 [`Self::regions`]，这个只用来判场景切换。
     pub changed_permille: u32,
     /// 画面有多少细节（千分之几：相邻点亮度差大的点占多少）。
     pub detail_permille: u32,
@@ -97,6 +99,48 @@ pub struct ModelInput {
     /// 配置之后这是第几帧（从 0 数）。字节模型要给帧大小加随机扰动时用它：同一个画面连着编几帧，扰动也该不同；
     /// 又因为它不依赖 QP，同一帧在不同 QP 下的扰动相同，“QP 越大不会越大”仍然成立。
     pub serial: u32,
+    /// 区域类的输入：从上一帧编出来起，画面哪里变了、静止的部分画质怎么样（见 [`Regions`]）。
+    /// 现有的字节模型（占位模型、`FittedByteModel`）都不看它；`changed_permille` 也不再用来算字节，只用来判场景切换。
+    pub regions: Regions,
+}
+
+/// [`Regions`] 里静止宏块画质差分布的格数：画质差 1 到 51。
+pub const GAP_BINS: usize = MODEL_MAX_QP as usize;
+
+/// 区域类的输入（`docs/research/Q-redesign/m2b-plan.md` 第 1 节）。像素数都是编码尺寸上的。
+///
+/// 来源：画面的来源每变一版推进脏区域和移动区域（[`peerdesk_core::changes`]），后端从上一帧编出来起累计；
+/// 再加上它自己维护的 16×16 宏块“现在画质”表：每个宏块记它最后一次被编时的 QP。
+/// 脏区域、移动区域碰到的宏块是“编码的”，其余是“静止的”。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Regions {
+    /// 脏区域（新画的）的像素数。刚配置之后的第一帧整屏都算新的。
+    pub dirty_px: u64,
+    /// 移动区域（搬来的）的像素数：各次移动目的地的并集，减去脏区域。
+    pub moved_px: u64,
+    /// 累计的变化里，有一次移动的目的地占整帧 [`peerdesk_core::changes::FULL_MOVE_PERMILLE`]‰ 以上（整屏滚动）。
+    pub full_move: bool,
+    /// 脏区域里的细节（千分之几）：脏区域碰到的宏块里，有细节的抽样点占全部抽样点的比例。没有脏区域为 0。
+    pub dirty_detail_permille: u32,
+    /// 静止宏块的画质差分布：`static_gap[g - 1]` 是“现在画质比这一帧的 QP 粗 g 档”的静止宏块个数（g = 1…51）。
+    /// 这些宏块这一帧会被补清晰；画质不比这一帧粗的不计（它们保持原样）。
+    pub static_gap: [u32; GAP_BINS],
+    /// 静止宏块在这一帧的 QP 上已经连着编了几帧（现在画质恰好等于这一帧的 QP 的静止宏块里，连续次数最大的；没有为 0，最多 255）。
+    /// 只有低 QP 地板的实验（`data-m2b.md` 第 1 节）证明需要时才用；那个实验的结论是不需要。
+    pub repeat: u32,
+}
+
+impl Default for Regions {
+    fn default() -> Self {
+        Self {
+            dirty_px: 0,
+            moved_px: 0,
+            full_move: false,
+            dirty_detail_permille: 0,
+            static_gap: [0; GAP_BINS],
+            repeat: 0,
+        }
+    }
 }
 
 /// 字节模型：给定编码条件，这一帧大约多少字节。要求：QP 越大不会越大（体检按这个判断“按 QP 编”）。
@@ -362,6 +406,10 @@ pub struct FakeBackend {
     stall_spent: bool,
     /// 画面内容的版本，由外面（仿真的画面来源）拨；每一帧的码流里写着交帧时的读数。
     version: Option<Arc<AtomicU64>>,
+    /// 画面哪里变了，由外面（仿真的画面来源）每变一版推进来；没接的话区域类输入只有“刚配置的第一帧整屏都是新的”。
+    feed: Option<ChangeFeed>,
+    /// 宏块的“现在画质”表。
+    mbs: MbTable,
 }
 
 impl FakeBackend {
@@ -393,7 +441,20 @@ impl FakeBackend {
             stalled_since: None,
             stall_spent: false,
             version: None,
+            feed: None,
+            mbs: MbTable::default(),
         }
+    }
+
+    /// 画面哪里变了从 `feed` 读（每交一帧读一次累计，编出来之后清零）。
+    ///
+    /// 为什么用旁路而不是跟着画面一起交（和 [`Self::with_version_tag`] 同一个理由）：吃真像素的路径（L0.5）像素里没有
+    /// “哪里变了”，产品里的编码器接口（`VideoEncoder::encode`）也没有这个参数；吃内容描述的路径（L0）里，发送端在途满了
+    /// 跳过的那些版本，后端根本看不到，只能由画面来源每变一版推进一次。两条路都由来源推进，交给后端的累计就相同。
+    #[must_use]
+    pub fn with_change_feed(mut self, feed: ChangeFeed) -> Self {
+        self.feed = Some(feed);
+        self
     }
 
     /// 画面内容的版本从 `tag` 读（每交一帧读一次，写进这一帧的码流）。
@@ -427,6 +488,7 @@ impl FakeBackend {
         self.last_qp = None;
         self.last_submit_us = None;
         self.key_countdown = None;
+        self.mbs = MbTable::default();
     }
 
     /// 出错：按契约第 9 条复位（违约的后端不复位），攒着的帧作废。
@@ -501,6 +563,142 @@ fn features(luma: &[u8], prev: Option<&Vec<u8>>) -> (Vec<u8>, u32, u32) {
     let sample = content::sample_luma(luma);
     let changed = content::luma_changed_permille(&sample, prev);
     (sample, changed, content::detail_permille(luma))
+}
+
+/// 宏块还没编过。
+const MB_UNSET: u8 = u8::MAX;
+/// 按 QP 分格的格数（0 到 [`MODEL_MAX_QP`]）。
+const QP_BINS: usize = MODEL_MAX_QP as usize + 1;
+
+/// 宏块（16×16）的“现在画质”表：每个宏块记它最后一次被编时的 QP，和这个 QP 上已经连着编了几帧。
+///
+/// 规则（`m2b-plan.md` 第 1 节）：脏区域和移动区域碰到的宏块，编完后设成这一帧的 QP；静止的宏块补清晰时取较小值
+/// （画质只会变好，比这一帧细的保持不变）；关键帧整帧设成这一帧的 QP；重新配置之后整张表作废。
+#[derive(Debug, Default)]
+struct MbTable {
+    size: (u16, u16),
+    qp: Vec<u8>,
+    run: Vec<u8>,
+    /// 每个宏块里有几个抽样点（只和尺寸有关）。
+    points: Vec<u16>,
+}
+
+/// 一帧编之前对宏块的盘点。
+struct Survey {
+    /// 脏区域或移动区域碰到的宏块。
+    touched: Vec<bool>,
+    dirty_px: u64,
+    moved_px: u64,
+    full_move: bool,
+    detail_permille: u32,
+    /// 静止宏块按现在画质（QP）分的个数、连续次数的最大值。
+    count: [u32; QP_BINS],
+    run_max: [u8; QP_BINS],
+}
+
+impl MbTable {
+    /// 尺寸变了（或第一次）：重建，宏块都没编过。
+    fn ensure(&mut self, size: (u16, u16)) {
+        if self.size == size {
+            return;
+        }
+        let (cols, rows) = content::mb_dims(size);
+        self.size = size;
+        self.qp = vec![MB_UNSET; cols * rows];
+        self.run = vec![0; cols * rows];
+        self.points = content::mb_points(size);
+    }
+
+    /// 把 `rects` 碰到的宏块标出来。
+    fn mark(&self, rects: &[Rect], out: &mut [bool]) {
+        let (cols, rows) = content::mb_dims(self.size);
+        let mb = u32::try_from(content::MB_SIZE).unwrap_or(16);
+        for r in rects.iter().filter(|r| !r.is_empty()) {
+            let (c0, c1) = (usize::from(r.x) / content::MB_SIZE, (r.right() - 1) / mb);
+            let (r0, r1) = (usize::from(r.y) / content::MB_SIZE, (r.bottom() - 1) / mb);
+            for row in r0..=usize::try_from(r1).unwrap_or(0).min(rows.saturating_sub(1)) {
+                for col in c0..=usize::try_from(c1).unwrap_or(0).min(cols.saturating_sub(1)) {
+                    if let Some(t) = out.get_mut(row * cols + col) {
+                        *t = true;
+                    }
+                }
+            }
+        }
+    }
+
+    fn survey(&self, dirty: &[Rect], moved: &[Rect], edges: &[u16], full_move: bool) -> Survey {
+        let n = self.qp.len();
+        let mut by_dirty = vec![false; n];
+        self.mark(dirty, &mut by_dirty);
+        let mut touched = by_dirty.clone();
+        self.mark(moved, &mut touched);
+        // 脏区域里的细节：碰到的宏块里有细节的抽样点 ÷ 全部抽样点
+        let (mut hit, mut all) = (0u64, 0u64);
+        for (i, _) in by_dirty.iter().enumerate().filter(|(_, d)| **d) {
+            hit += u64::from(edges.get(i).copied().unwrap_or(0));
+            all += u64::from(self.points.get(i).copied().unwrap_or(0));
+        }
+        let mut count = [0u32; QP_BINS];
+        let mut run_max = [0u8; QP_BINS];
+        for (i, _) in touched.iter().enumerate().filter(|(_, t)| !**t) {
+            let q = self.qp.get(i).copied().unwrap_or(MB_UNSET);
+            if q == MB_UNSET {
+                continue;
+            }
+            let bin = usize::from(q).min(QP_BINS - 1);
+            if let Some(c) = count.get_mut(bin) {
+                *c += 1;
+            }
+            if let (Some(m), Some(r)) = (run_max.get_mut(bin), self.run.get(i)) {
+                *m = (*m).max(*r);
+            }
+        }
+        let dirty_px = union_area(dirty);
+        let both: Vec<Rect> = dirty.iter().chain(moved).copied().collect();
+        Survey {
+            touched,
+            dirty_px,
+            moved_px: union_area(&both) - dirty_px,
+            full_move,
+            detail_permille: content::permille(
+                usize::try_from(hit).unwrap_or(usize::MAX),
+                usize::try_from(all).unwrap_or(usize::MAX),
+            ),
+            count,
+            run_max,
+        }
+    }
+
+    /// 这一帧编出来了：按 QP `qp` 更新表。
+    fn commit(&mut self, touched: &[bool], qp: u8, key: bool) {
+        for (i, (q, run)) in self.qp.iter_mut().zip(self.run.iter_mut()).enumerate() {
+            if key || touched.get(i).copied().unwrap_or(false) || *q > qp {
+                *q = qp;
+                *run = 1;
+            } else if *q == qp {
+                *run = run.saturating_add(1);
+            }
+        }
+    }
+}
+
+impl Survey {
+    /// 按这一帧的 QP 算区域类输入。
+    fn regions(&self, qp: u8) -> Regions {
+        let q = usize::from(qp.min(MODEL_MAX_QP));
+        let mut static_gap = [0u32; GAP_BINS];
+        for (g, slot) in static_gap.iter_mut().enumerate() {
+            *slot = self.count.get(q + g + 1).copied().unwrap_or(0);
+        }
+        Regions {
+            dirty_px: self.dirty_px,
+            moved_px: self.moved_px,
+            full_move: self.full_move,
+            dirty_detail_permille: self.detail_permille,
+            static_gap,
+            repeat: u32::from(self.run_max.get(q).copied().unwrap_or(0)),
+        }
+    }
 }
 
 /// 假码流开头的固定部分的长度：起始码 4 字节 + NAL 头 1 字节 + 内容版本 8 + 帧序号 4 + QP 1。
@@ -609,11 +807,12 @@ impl EncoderBackend for FakeBackend {
                 version,
                 sample,
                 detail_permille,
+                mb_edges,
             } => {
                 if !self.cfg.inputs.described {
                     return Err(BackendError::Misuse("这个后端不收内容描述"));
                 }
-                Some((version, sample, detail_permille))
+                Some((version, sample, detail_permille, mb_edges))
             }
             FrameInput::I420 { .. } | FrameInput::Nv12(_) | FrameInput::Gpu(_) => None,
         };
@@ -655,7 +854,7 @@ impl EncoderBackend for FakeBackend {
 
         // 画面特征
         let (sample, changed, detail) = match described {
-            Some((_, sample, detail)) => (
+            Some((_, sample, detail, _)) => (
                 sample.to_vec(),
                 content::luma_changed_permille(sample, self.prev.as_ref()),
                 detail,
@@ -663,6 +862,27 @@ impl EncoderBackend for FakeBackend {
             None => features(luma, self.prev.as_ref()),
         };
         let pixels = u64::from(w) * u64::from(h);
+
+        // 区域类输入：累计的变化换算到编码尺寸，和宏块画质表一起盘点
+        self.mbs.ensure((w, h));
+        let acc = self.feed.as_ref().map(ChangeFeed::peek);
+        let (dirty, moved, full_move) = if self.prev.is_none() {
+            (vec![Rect::whole((w, h))], Vec::new(), false)
+        } else if let Some(acc) = &acc {
+            let (d, m) = acc.rects((w, h));
+            (d, m, acc.full_move())
+        } else {
+            (Vec::new(), Vec::new(), false)
+        };
+        let edges_owned;
+        let edges: &[u16] = match described {
+            Some((_, _, _, e)) => e,
+            None => {
+                edges_owned = content::mb_edges(luma, (w, h));
+                &edges_owned
+            }
+        };
+        let survey = self.mbs.survey(&dirty, &moved, edges, full_move);
 
         // 是不是关键帧：要了（可能晚几帧给）、第一帧、整屏突变、固定 GOP、改码率时顺带
         let faults = self.cfg.faults;
@@ -698,6 +918,7 @@ impl EncoderBackend for FakeBackend {
                 detail_permille: detail,
                 prev_qp: self.last_qp,
                 serial: self.index,
+                regions: survey.regions(qp),
             })
         };
         let (qp, mut bytes, engaged, fits) = match (rc, ask.qp) {
@@ -751,6 +972,10 @@ impl EncoderBackend for FakeBackend {
         let index = self.index;
         let timing = self.timing(key, gap, primed);
         self.prev = Some(sample);
+        self.mbs.commit(&survey.touched, qp, key);
+        if let Some(feed) = &self.feed {
+            feed.clear();
+        }
         self.last_qp = Some(qp);
         self.first = false;
         self.index = self.index.saturating_add(1);
@@ -767,7 +992,7 @@ impl EncoderBackend for FakeBackend {
                         .as_ref()
                         .map_or(0, |v| v.load(Ordering::Relaxed))
                 },
-                |(version, _, _)| version,
+                |(version, _, _, _)| version,
             ),
             serial: index,
             qp,
@@ -1013,6 +1238,7 @@ mod tests {
             detail_permille: 150,
             prev_qp: None,
             serial: 0,
+            regions: Regions::default(),
         };
         let key20 = m.bytes(&base);
         let key26 = m.bytes(&ModelInput { qp: 26, ..base });
@@ -1114,6 +1340,7 @@ mod tests {
                 version: 0,
                 sample: &sample,
                 detail_permille: content::detail_permille(&p.0),
+                mb_edges: &content::mb_edges(&p.0, SIZE),
             };
             let a = frame(ready(
                 by_pixels.submit(i420(&p), ask(i, Some(30), 1 << 20, i == 4)),
@@ -1130,6 +1357,7 @@ mod tests {
             version: 42,
             sample: &sample,
             detail_permille: 100,
+            mb_edges: &[],
         };
         assert_eq!(format!("{tagged:?}"), "内容描述");
         let out = frame(ready(
@@ -1934,5 +2162,217 @@ mod tests {
         );
         let real = crate::soft::OpenH264Backend::new();
         assert_eq!(fake.info().traits, real.info().traits);
+    }
+    type Seen = Arc<std::sync::Mutex<Vec<ModelInput>>>;
+
+    /// 把每一帧的模型输入记下来，字节数固定。
+    #[derive(Debug)]
+    struct Probe(Seen);
+    impl ByteModel for Probe {
+        fn bytes(&self, input: &ModelInput) -> usize {
+            self.0.lock().unwrap().push(*input);
+            100
+        }
+    }
+
+    fn probed(cfg: FakeConfig, feed: Option<&ChangeFeed>) -> (FakeBackend, Seen) {
+        let seen = Seen::default();
+        let mut b = FakeBackend::new(
+            cfg,
+            Arc::new(ManualClock::new()),
+            Box::new(Probe(Arc::clone(&seen))),
+        );
+        if let Some(f) = feed {
+            b = b.with_change_feed(f.clone());
+        }
+        b.reconfigure(SIZE, RATES).unwrap();
+        (b, seen)
+    }
+
+    fn last(seen: &Seen) -> ModelInput {
+        *seen.lock().unwrap().last().unwrap()
+    }
+
+    fn changes(
+        dirty: &[Rect],
+        moves: &[peerdesk_core::changes::Move],
+    ) -> peerdesk_core::changes::Changes {
+        peerdesk_core::changes::Changes {
+            size: SIZE,
+            dirty: dirty.to_vec(),
+            moves: moves.to_vec(),
+        }
+    }
+
+    /// 区域类输入的全过程（64×64 = 4×4 个宏块）：刚配置整屏是新的；画质表按“编码的设成这一帧的 QP、静止的只会变细”走；
+    /// 画质差分布和连续次数；跳过的版本累计；关键帧整屏重设；重新配置作废。
+    #[test]
+    fn region_inputs_follow_the_change_feed_and_the_quality_table() {
+        use peerdesk_core::changes::Move;
+        let feed = ChangeFeed::default();
+        let (mut b, seen) = probed(FakeConfig::default(), Some(&feed));
+        let p = planes(0);
+        let go = |b: &mut FakeBackend, i: u64, qp: u8, key: bool| {
+            frame(ready(b.submit(i420(&p), ask(i, Some(qp), 1 << 20, key))));
+            last(&seen).regions
+        };
+        // 第一帧：整屏都是新的，没有静止宏块
+        let r = go(&mut b, 0, 30, false);
+        assert_eq!((r.dirty_px, r.moved_px, r.full_move), (64 * 64, 0, false));
+        assert_eq!(r.static_gap, [0; GAP_BINS]);
+        // 补清晰：什么都没变，16 个静止宏块都是 QP 30，比这一帧（20）粗 10 档
+        let r = go(&mut b, 1, 20, false);
+        assert_eq!((r.dirty_px, r.moved_px, r.dirty_detail_permille), (0, 0, 0));
+        assert_eq!(r.static_gap.iter().sum::<u32>(), 16);
+        assert_eq!(r.static_gap[9], 16);
+        assert_eq!(r.repeat, 0, "没有静止宏块已经在 QP 20 上");
+        // 再按 20 编：都补到 20 了，连着编了 1 帧；比 20 更粗的没有
+        let r = go(&mut b, 2, 20, false);
+        assert_eq!(r.static_gap, [0; GAP_BINS]);
+        assert_eq!(r.repeat, 1);
+        assert_eq!(go(&mut b, 3, 20, false).repeat, 2);
+        // 变化：脏区域（碰到宏块 (0,0) 和 (1,0)）和移动（目的地 (16,16)–(48,32)，碰到 2×1 个宏块，和脏区域不重叠）
+        feed.push(&changes(
+            &[Rect::new(10, 2, 10, 4)],
+            &[Move {
+                from: (0, 0),
+                to: Rect::new(16, 16, 32, 16),
+            }],
+        ));
+        let r = go(&mut b, 4, 28, false);
+        assert_eq!((r.dirty_px, r.moved_px), (40, 512));
+        assert!(!r.full_move);
+        // 静止宏块都是 20，比这一帧（28）细：不计入画质差
+        assert_eq!(r.static_gap, [0; GAP_BINS]);
+        // 编码的那些宏块现在是 28：补到 20 时，碰到的宏块（脏 2 个 + 移动 2 个）比 20 粗 8 档
+        let r = go(&mut b, 5, 20, false);
+        assert_eq!(r.static_gap[7], 4);
+        assert_eq!(r.static_gap.iter().sum::<u32>(), 4);
+        assert_eq!(
+            r.repeat, 3,
+            "另外 12 个宏块一直在 QP 20 上，QP 28 那一帧它们没动"
+        );
+        // 画面来源每变一版推进一次，发送端跳过的版本也累计：两版合起来
+        feed.push(&changes(&[Rect::new(0, 0, 8, 8)], &[]));
+        feed.push(&changes(&[Rect::new(4, 4, 8, 8)], &[]));
+        let r = go(&mut b, 6, 20, false);
+        assert_eq!(r.dirty_px, 64 + 64 - 16);
+        // 整屏移动一次就记着
+        feed.push(&changes(
+            &[Rect::new(0, 60, 64, 4)],
+            &[Move {
+                from: (0, 4),
+                to: Rect::new(0, 0, 64, 60),
+            }],
+        ));
+        let r = go(&mut b, 7, 20, false);
+        assert!(r.full_move);
+        assert_eq!((r.dirty_px, r.moved_px), (256, 64 * 60));
+        // 关键帧：整屏设成这一帧的 QP；之后补清晰按它算
+        let _ = go(&mut b, 8, 40, true);
+        assert_eq!(go(&mut b, 9, 30, false).static_gap[9], 16);
+        // 帧编出来之前累计不清零：放不下被丢的帧，变化还欠着
+        feed.push(&changes(&[Rect::new(0, 0, 4, 4)], &[]));
+        let mut win = FakeBackend::new(
+            FakeConfig::window(),
+            Arc::new(ManualClock::new()),
+            Box::new(Probe(Arc::default())),
+        )
+        .with_change_feed(feed.clone());
+        win.reconfigure(SIZE, RATES).unwrap();
+        assert!(matches!(
+            ready(win.submit(i420(&p), ask(0, None, 1, false))),
+            Finished::Dropped { .. }
+        ));
+        assert!(!feed.peek().is_empty(), "丢了的帧不消耗累计");
+        // 编出来的帧清零
+        let _ = go(&mut b, 10, 30, false);
+        assert!(feed.peek().is_empty());
+        // 重新配置：表作废，第一帧又是整屏新的
+        b.reconfigure(SIZE, RATES).unwrap();
+        assert_eq!(go(&mut b, 11, 30, false).dirty_px, 64 * 64);
+        // 画质表按编码尺寸建：换尺寸之后宏块数跟着变
+        let (mut small, seen2) = probed(FakeConfig::default(), None);
+        small.reconfigure((32, 32), RATES).unwrap();
+        let q = (vec![9u8; 32 * 32], vec![128; 16 * 16], vec![128; 16 * 16]);
+        frame(ready(
+            small.submit(i420(&q), ask(0, Some(30), 1 << 20, false)),
+        ));
+        frame(ready(
+            small.submit(i420(&q), ask(1, Some(20), 1 << 20, false)),
+        ));
+        assert_eq!(last(&seen2).regions.static_gap[9], 4);
+        // 没接信道：只有第一帧整屏是新的，之后没有区域
+        assert_eq!(last(&seen2).regions.dirty_px, 0);
+    }
+
+    /// 脏区域里的细节按宏块汇总：细节在哪个宏块，就只算碰到那个宏块的脏区域。
+    #[test]
+    fn dirty_detail_counts_only_the_macroblocks_the_dirty_region_touches() {
+        let feed = ChangeFeed::default();
+        let (mut b, seen) = probed(FakeConfig::default(), Some(&feed));
+        // 左上 16×16 满是细节（条纹），其余是平的
+        let y: Vec<u8> = (0..64usize * 64)
+            .map(|i| {
+                if i % 64 < 16 && i / 64 < 16 && i % 2 == 0 {
+                    255
+                } else {
+                    0
+                }
+            })
+            .collect();
+        let p = (y, vec![128u8; 32 * 32], vec![128u8; 32 * 32]);
+        frame(ready(b.submit(i420(&p), ask(0, Some(30), 1 << 20, false))));
+        let whole = last(&seen).regions.dirty_detail_permille;
+        assert_eq!(
+            whole,
+            content::detail_permille(&p.0),
+            "整屏都是脏的就是整幅的细节"
+        );
+        feed.push(&changes(&[Rect::new(2, 2, 4, 4)], &[]));
+        frame(ready(b.submit(i420(&p), ask(1, Some(30), 1 << 20, false))));
+        let inside = last(&seen).regions.dirty_detail_permille;
+        feed.push(&changes(&[Rect::new(40, 40, 4, 4)], &[]));
+        frame(ready(b.submit(i420(&p), ask(2, Some(30), 1 << 20, false))));
+        let outside = last(&seen).regions.dirty_detail_permille;
+        assert!(inside > 400, "{inside}");
+        assert_eq!(outside, 0);
+    }
+
+    /// 同一幅画面，交像素和交内容描述，区域类输入逐帧相同；描述里的宏块细节是从同一个算法来的。
+    #[test]
+    fn described_and_pixel_frames_give_the_same_region_inputs() {
+        let mut cfg = FakeConfig::default();
+        cfg.inputs.described = true;
+        let (fa, fb) = (ChangeFeed::default(), ChangeFeed::default());
+        let (mut by_pixels, seen_a) = probed(cfg.clone(), Some(&fa));
+        let (mut by_desc, seen_b) = probed(cfg, Some(&fb));
+        for i in 0..6u64 {
+            let p = planes(u8::try_from(i / 2 * 9).unwrap());
+            let sample = content::sample_luma(&p.0);
+            let edges = content::mb_edges(&p.0, SIZE);
+            if i > 0 {
+                let c = changes(&[Rect::new(0, 0, 8, 8)], &[]);
+                fa.push(&c);
+                fb.push(&c);
+            }
+            let described = FrameInput::Described {
+                version: 0,
+                sample: &sample,
+                detail_permille: content::detail_permille(&p.0),
+                mb_edges: &edges,
+            };
+            let qp = if i == 3 { 20 } else { 30 };
+            frame(ready(
+                by_pixels.submit(i420(&p), ask(i, Some(qp), 1 << 20, false)),
+            ));
+            frame(ready(
+                by_desc.submit(described, ask(i, Some(qp), 1 << 20, false)),
+            ));
+        }
+        let (a, b) = (seen_a.lock().unwrap(), seen_b.lock().unwrap());
+        assert_eq!(a.len(), 6);
+        assert_eq!(*a, *b);
+        assert!(a.iter().skip(1).any(|m| m.regions.dirty_px == 64));
     }
 }
