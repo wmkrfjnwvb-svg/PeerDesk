@@ -258,6 +258,7 @@ impl Default for FakeConfig {
                 i420: true,
                 nv12: true,
                 gpu: false,
+                described: false,
             },
             compute_us: 2_000,
             wait_us: 0,
@@ -294,6 +295,7 @@ impl FakeConfig {
                 i420: true,
                 nv12: false,
                 gpu: false,
+                described: false,
             },
             compute_us: 0,
             faults: Faults {
@@ -465,6 +467,10 @@ impl FakeBackend {
                 (luma, data.len() * 2 / 3, data.len() == w * h * 3 / 2)
             }
             FrameInput::Gpu(_) => return Err(BackendError::Misuse("这个后端不收显卡画面")),
+            // 内容描述在 submit 里单独处理，到不了这里
+            FrameInput::Described { .. } => {
+                return Err(BackendError::Misuse("内容描述没有亮度平面"))
+            }
         };
         if ok {
             return Ok((luma, size));
@@ -587,7 +593,29 @@ impl EncoderBackend for FakeBackend {
             // 先于尺寸检查：用法错不改变状态
             return Err(BackendError::Misuse("按 QP 编，每帧都要给 QP"));
         }
-        let (luma, (w, h)) = self.luma(input)?;
+        // 内容描述：没有像素，面积抽样、细节、版本都在描述里；其余形式从亮度平面算
+        let described = match input {
+            FrameInput::Described {
+                version,
+                sample,
+                detail_permille,
+            } => {
+                if !self.cfg.inputs.described {
+                    return Err(BackendError::Misuse("这个后端不收内容描述"));
+                }
+                Some((version, sample, detail_permille))
+            }
+            FrameInput::I420 { .. } | FrameInput::Nv12(_) | FrameInput::Gpu(_) => None,
+        };
+        let (luma, (w, h)) = match described {
+            Some(_) => {
+                let Some(size) = self.size else {
+                    return Err(BackendError::Misuse("还没配置编码尺寸就交帧"));
+                };
+                (&[][..], size)
+            }
+            None => self.luma(input)?,
+        };
         let now = self.clock.now_us();
         let gap = self.last_submit_us.map(|t| now.saturating_sub(t));
         if let (Some(limit), Some(gap)) = (self.cfg.breaches.error_after_idle_us, gap) {
@@ -616,7 +644,14 @@ impl EncoderBackend for FakeBackend {
         }
 
         // 画面特征
-        let (sample, changed, detail) = features(luma, self.prev.as_ref());
+        let (sample, changed, detail) = match described {
+            Some((_, sample, detail)) => (
+                sample.to_vec(),
+                content::luma_changed_permille(sample, self.prev.as_ref()),
+                detail,
+            ),
+            None => features(luma, self.prev.as_ref()),
+        };
         let pixels = u64::from(w) * u64::from(h);
 
         // 是不是关键帧：要了（可能晚几帧给）、第一帧、整屏突变、固定 GOP、改码率时顺带
@@ -712,10 +747,15 @@ impl EncoderBackend for FakeBackend {
             ^ u64::from(key);
         let head = StreamHead {
             key,
-            version: self
-                .version
-                .as_ref()
-                .map_or(0, |v| v.load(Ordering::Relaxed)),
+            // 内容描述自带版本；像素输入时读调用方拨的版本（没拨就是 0）
+            version: described.map_or_else(
+                || {
+                    self.version
+                        .as_ref()
+                        .map_or(0, |v| v.load(Ordering::Relaxed))
+                },
+                |(version, _, _)| version,
+            ),
             serial: index,
             qp,
         };
@@ -1013,6 +1053,62 @@ mod tests {
         assert!(a.iter().all(|f| f.timing.compute_us > 0));
     }
 
+    /// 内容描述和像素是同一幅画面的两种交法：抽样、细节取自同一个算法时，编出来的字节逐帧相同，
+    /// 版本号从描述里来。没声明收内容描述的后端拒收，状态不变；还没配置时也拒收。
+    #[test]
+    fn a_described_frame_encodes_exactly_like_its_pixels() {
+        let mut cfg = FakeConfig::default();
+        cfg.inputs.described = true;
+        let (mut by_pixels, _) = backend(cfg.clone());
+        let (mut by_desc, _) = backend(cfg.clone());
+        for i in 0..6u64 {
+            let p = planes(u8::try_from(i / 2 * 9).unwrap());
+            let sample = content::sample_luma(&p.0);
+            let described = FrameInput::Described {
+                version: 0,
+                sample: &sample,
+                detail_permille: content::detail_permille(&p.0),
+            };
+            let a = frame(ready(
+                by_pixels.submit(i420(&p), ask(i, Some(30), 1 << 20, i == 4)),
+            ));
+            let b = frame(ready(
+                by_desc.submit(described, ask(i, Some(30), 1 << 20, i == 4)),
+            ));
+            assert_eq!(a, b, "第 {i} 帧");
+        }
+        // 版本号写进码流，假解码器读得回
+        let p = planes(77);
+        let sample = content::sample_luma(&p.0);
+        let tagged = FrameInput::Described {
+            version: 42,
+            sample: &sample,
+            detail_permille: 100,
+        };
+        assert_eq!(format!("{tagged:?}"), "内容描述");
+        let out = frame(ready(
+            by_desc.submit(tagged, ask(9, Some(30), 1 << 20, true)),
+        ));
+        assert_eq!(parse_head(&out.data).map(|h| h.version), Some(42));
+        // 没声明的后端不收；没配置尺寸的也不收
+        let (mut plain, _) = backend(FakeConfig::default());
+        assert!(matches!(
+            plain.submit(tagged, ask(1, Some(30), 1 << 20, false)),
+            Err(BackendError::Misuse(_))
+        ));
+        assert!(
+            frame(ready(
+                plain.submit(i420(&p), ask(2, Some(30), 1 << 20, false))
+            ))
+            .key
+        );
+        let mut unset = FakeBackend::with_default_model(cfg, Arc::new(ManualClock::new()));
+        assert!(matches!(
+            unset.submit(tagged, ask(1, Some(30), 1 << 20, false)),
+            Err(BackendError::Misuse(_))
+        ));
+    }
+
     /// 默认假后端守约：属性诚实、按 QP 编（QP 大字节少）、同步、从不丢帧；用法错不改变状态。
     #[test]
     fn default_backend_is_contract_abiding() {
@@ -1114,6 +1210,7 @@ mod tests {
                 i420: false,
                 nv12: true,
                 gpu: false,
+                described: false,
             },
             ..FakeConfig::default()
         });
@@ -1126,6 +1223,7 @@ mod tests {
                 i420: true,
                 nv12: false,
                 gpu: false,
+                described: false,
             },
             ..FakeConfig::default()
         });

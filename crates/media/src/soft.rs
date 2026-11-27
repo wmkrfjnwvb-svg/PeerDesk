@@ -72,6 +72,7 @@ impl OpenH264Backend {
                         i420: true,
                         nv12: false,
                         gpu: false,
+                        described: false,
                     },
                     max_held: 0,
                     keyframe_within: 1,

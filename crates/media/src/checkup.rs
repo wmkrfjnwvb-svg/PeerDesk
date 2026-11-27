@@ -1949,6 +1949,7 @@ mod tests {
                     i420: false,
                     nv12: true,
                     gpu: false,
+                    described: false,
                 },
                 ..FakeConfig::default()
             },
@@ -2017,6 +2018,7 @@ mod tests {
                 i420: false,
                 nv12: false,
                 gpu: true,
+                described: false,
             },
             ..FakeConfig::default()
         });
@@ -2213,6 +2215,7 @@ mod tests {
                 i420: false,
                 nv12: true,
                 gpu: false,
+                described: false,
             },
             ..FakeConfig::default()
         });

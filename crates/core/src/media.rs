@@ -18,7 +18,7 @@ use crate::estimator::{
     EstimatorKind, Extension, NetCause, Observation, ProbeAsk, ProbeEnd, ProbeReport, ProbeVerdict,
     RateEstimator, ReceiverMetrics, SendLimit,
 };
-use crate::frame::{Frame, Picture};
+use crate::frame::{ContentDesc, Frame, Picture};
 use crate::governor::FpsGovernor;
 use crate::pacer::FLAG_PADDING;
 use crate::policy::ContentPolicy;
@@ -1402,6 +1402,22 @@ impl MediaSender {
         })
     }
 
+    /// 和 [`Self::on_frame`] 一样，交来的是内容描述（没有像素，全模型仿真用，见 [`ContentDesc`]）。
+    ///
+    /// # Errors
+    /// 编码器不收内容描述；其余同 [`Self::on_frame`]。
+    pub fn on_described(
+        &mut self,
+        now: Time,
+        content: &ContentDesc,
+        changed: bool,
+        rtt_us: u64,
+    ) -> Result<Vec<Outgoing>, Error> {
+        self.frame_with(now, changed, rtt_us, |encoder, job| {
+            encoder.encode_described(job.frame_id, content, changed, job.budget)
+        })
+    }
+
     /// 一帧的全过程：开始（帧号、预算）→ `encode` 编这一帧 → 切片、纠错。画面是什么形式由 `encode` 决定。
     fn frame_with(
         &mut self,
@@ -2495,6 +2511,18 @@ mod tests {
             }
             assert_eq!(by_screen.stats(), by_frame.stats());
         }
+        // 内容描述：不收它的编码器（这里的测试编码器、块编码、真 H.264 后端）如实拒绝
+        let content = ContentDesc {
+            version: 1,
+            size: (64, 64),
+            area_pixels: Arc::from(Vec::new()),
+            area_detail: Arc::from(Vec::new()),
+            luma: Vec::new(),
+        };
+        assert!(content.luma_at((64, 64)).is_none());
+        assert!(by_frame
+            .on_described(Time(200_000), &content, true, 10_000)
+            .is_err());
         // 编码器不在发送端里（产品的用法）：两个入口都说明该走哪条路
         let mut detached = MediaSender::detached(cfg(), Codec::H264);
         assert!(detached

@@ -9,7 +9,7 @@
 
 use crate::codec;
 use crate::error::Error;
-use crate::frame::{Frame, Picture};
+use crate::frame::{ContentDesc, Frame, Picture};
 use crate::screen::Screen;
 use crate::wire::{Reader, Writer};
 
@@ -152,6 +152,20 @@ pub trait VideoEncoder: Send {
 
     /// 发送端判定这一帧丢了。
     fn on_lost(&mut self, frame_id: u32);
+
+    /// 编一帧**内容描述**（没有像素，全模型仿真用，见 [`ContentDesc`]）。只有后端是模型的编码器收它。
+    ///
+    /// # Errors
+    /// 这个编码器不收内容描述（默认）；或者同 [`Self::encode`]。
+    fn encode_described(
+        &mut self,
+        _frame_id: u32,
+        _content: &ContentDesc,
+        _changed: bool,
+        _budget: usize,
+    ) -> Result<Option<EncodedFrame>, Error> {
+        Err(Error::InvalidArgument("这个编码器不收内容描述"))
+    }
 
     /// 画面静止之后是否还要继续编（补清晰度）。为真时即使画面没变，发送端也要按时调用 [`Self::encode`]。
     fn wants_refine(&self) -> bool;

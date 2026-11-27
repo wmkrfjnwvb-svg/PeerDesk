@@ -94,6 +94,8 @@ pub struct Inputs {
     pub nv12: bool,
     /// 显卡画面，不拷贝（具体认不认某一帧还要问 [`EncoderBackend::accepts`]：可能不在同一块显卡上）。
     pub gpu: bool,
+    /// 内容描述（没有像素，只有模型后端收）。
+    pub described: bool,
 }
 
 /// 后端的属性：能力和毛病。事先说明的才算数，体检（C2）核对它们是不是真的。
@@ -151,6 +153,16 @@ pub enum FrameInput<'a> {
     Nv12(&'a [u8]),
     /// 显卡画面。
     Gpu(&'a dyn GpuFrame),
+    /// 内容描述（没有像素）：这一帧在当前编码尺寸下的亮度抽样和细节，以及源画面的版本。
+    /// 只有模型后端（假后端）收：它本来就不看像素，只看这几样（见 `peerdesk_core::frame::ContentDesc`）。
+    Described {
+        /// 源画面的第几版。
+        version: u64,
+        /// 亮度平面的抽样（和 `content::sample_luma` 对同一幅画面的结果相同）。
+        sample: &'a [u8],
+        /// 细节（千分之几）。
+        detail_permille: u32,
+    },
 }
 
 impl std::fmt::Debug for FrameInput<'_> {
@@ -159,6 +171,7 @@ impl std::fmt::Debug for FrameInput<'_> {
             Self::I420 { .. } => "I420",
             Self::Nv12(_) => "NV12",
             Self::Gpu(_) => "显卡画面",
+            Self::Described { .. } => "内容描述",
         })
     }
 }
