@@ -440,6 +440,7 @@ async fn host_main(
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
         let opts = HostOptions {
+            record: crate::diag_record::setup(&config.data_dir),
             limiter: Arc::clone(&limiter),
             clipboard: system_clipboard(Box::new(|_| {})),
             audio: SYSTEM_AUDIO.0(),
@@ -965,6 +966,8 @@ async fn watch_remote(
     let started = Instant::now();
     let mut attempt = 0u32;
     let mut upgraded: Option<Box<Dialed>> = None;
+    // 一次访问（从点连接到最终断开）：升级直连和断线重连换了连接，记录靠它串起来
+    let visit = Mutex::new(crate::diag_record::Visit::new());
     let result = loop {
         let (tx, rx) = tokio::sync::mpsc::channel(256);
         *current.lock().unwrap_or_else(PoisonError::into_inner) = Some(tx);
@@ -979,12 +982,19 @@ async fn watch_remote(
             ev,
             data_dir,
             upgraded.take(),
+            &visit,
         )
         .await;
         match outcome {
             Ok(Outcome::Done(summary)) => break Ok(summary),
             // 换到直连：不算重连次数
-            Ok(Outcome::Upgrade(dialed)) => upgraded = Some(dialed),
+            Ok(Outcome::Upgrade(dialed)) => {
+                visit
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .note_upgrade();
+                upgraded = Some(dialed);
+            }
             Ok(Outcome::Notice(text)) => {
                 ev.send(ViewEvent::Notice(text.clone()));
                 break Ok(Summary {
@@ -995,6 +1005,10 @@ async fn watch_remote(
             }
             Ok(Outcome::Lost(why)) if attempt < RECONNECT_TRIES => {
                 attempt += 1;
+                visit
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .note_lost();
                 peerdesk_net::note!(warn, "控制：网络断开（{why}），第 {attempt} 次重连");
                 ev.send(ViewEvent::Reconnecting { attempt, why });
                 tokio::time::sleep(RECONNECT_GAP).await;
@@ -1029,6 +1043,7 @@ async fn one_session(
     ev: &Emitter<ViewEvent>,
     data_dir: &std::path::Path,
     upgraded: Option<Box<Dialed>>,
+    visit: &Mutex<crate::diag_record::Visit>,
 ) -> Result<Outcome, NetError> {
     // 走中继时，会话中在后台试直连（用户没要求只走中继时）
     let mut direct_search = None;
@@ -1090,9 +1105,15 @@ async fn one_session(
         detail,
     });
     let started = Instant::now();
+    // 会话记录：会话号在 link 交给会话之前取
+    let record = visit
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .begin(link.session_id().ok(), data_dir);
     let session = controller::run(
         link,
         ControllerOptions {
+            record,
             session: session(identity, policy, auth.clone()),
             deadline_us: FRAME_DEADLINE_US,
             duration: None,

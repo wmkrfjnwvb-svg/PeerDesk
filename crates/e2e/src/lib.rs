@@ -17,9 +17,10 @@ use peerdesk_core::error::Error;
 pub use peerdesk_core::estimator::EstimatorKind;
 pub use peerdesk_core::estimator::RateState;
 pub use peerdesk_core::media::ProbeStats;
-use peerdesk_core::media::{MediaReceiver, MediaSender, SenderConfig};
+use peerdesk_core::media::{MediaReceiver, MediaSender, SenderConfig, SenderStats};
 pub use peerdesk_core::policy::ContentPolicy;
 use peerdesk_core::proto::{decode_datagram, encode_datagram, Channel, Header};
+use peerdesk_core::record::{self, Meta, Record, Role, Sink};
 use peerdesk_core::screen::Screen;
 use peerdesk_core::sim::{Link, Net, NetStats};
 use peerdesk_core::time::Time;
@@ -226,6 +227,8 @@ pub struct Outcome {
     pub codec: CodecKind,
     /// 每个阶段。
     pub phases: Vec<PhaseResult>,
+    /// 发出的帧数。
+    pub frames: u32,
     /// 发出的关键帧数。
     pub keyframes: u32,
     /// 判定丢失、让编码器恢复的次数。
@@ -507,6 +510,125 @@ fn send_ready(
 const CC_TICK_US: u64 = 25_000;
 
 pub fn run(s: &Scenario) -> Result<Outcome, Error> {
+    run_inner(s, false).map(|(outcome, _)| outcome)
+}
+
+/// 运行一个场景，同时把被控端的会话记录（`peerdesk_core::record` 的格式）写进内存，一起交回。
+/// 记录只读发送端的状态，不改变会话：结果和 [`run`] 逐字节相同（`tests/record.rs` 证明）。
+pub fn run_recorded(s: &Scenario) -> Result<(Outcome, Vec<u8>), Error> {
+    run_inner(s, true).map(|(outcome, bytes)| (outcome, bytes.unwrap_or_default()))
+}
+
+/// 被控端的会话记录（仿真的内存模式）：没有队列和写盘线程，直接写进内存，所以没有缺口，结果也是确定的。
+/// 记录点和产品的被控端循环（`peerdesk_net::host::serve`）里不用改核心库的那几处对应；产品里取得到、
+/// 仿真里取不到的字段（预算、各段耗时、编码尺寸）写“不知道”，由 R5 补。
+#[derive(Debug)]
+struct Journal {
+    sink: Sink,
+    out: Vec<u8>,
+    /// 下一次每秒汇总的时间（微秒）。
+    next_second: u64,
+    /// 上一次汇总时的发送端计数。
+    last: SenderStats,
+}
+
+impl Journal {
+    fn new(s: &Scenario, estimator: &str) -> Self {
+        let mut meta = Meta::new(Role::Host, 0);
+        meta.codec = Some(s.codec.name().to_owned());
+        meta.estimator = Some(estimator.to_owned());
+        meta.policy = Some(s.policy.name.to_owned());
+        meta.fps = Some(s.fps);
+        meta.start_bps = Some(s.start_bps);
+        meta.max_bps = Some(s.max_bps);
+        Self {
+            sink: Sink::new(),
+            out: record::encode_header(&meta),
+            next_second: 1_000_000,
+            last: SenderStats::default(),
+        }
+    }
+
+    fn push(&mut self, now: Time, record: &Record) {
+        self.sink.push(now.micros(), record, || None, &mut self.out);
+    }
+
+    /// 处理完一份反馈：发送端看到的和算出的。
+    fn feedback(
+        &mut self,
+        now: Time,
+        tx: &MediaSender,
+        obs: &peerdesk_core::estimator::Observation,
+    ) {
+        let f = record::Feedback::from_observation(obs, tx.rate_bps(), tx.rate_state());
+        self.push(now, &Record::Feedback(f));
+    }
+
+    /// 一个编码任务结束。`before` 是调用 `on_frame` 之前的计数。
+    fn frame(&mut self, now: Time, tx: &MediaSender, before: SenderStats, changed: bool) {
+        let after = tx.stats();
+        let key = after.keyframes != before.keyframes;
+        // 出了帧就是出了帧；没出帧时仿真取不到编码器的内部状态（是被预算丢了，还是没东西要发），
+        // 如实写“不知道”，不猜
+        let outcome = if after.frames == before.frames {
+            record::FrameOutcome::NoFrameUnknown
+        } else {
+            record::FrameOutcome::Sent {
+                bytes: u32::try_from(after.video_bytes.saturating_sub(before.video_bytes))
+                    .unwrap_or(u32::MAX),
+            }
+        };
+        let f = record::Frame {
+            frame_id: before.frames.saturating_add(1),
+            captured_ago_us: Some(0),
+            class: record::FrameClass::of(key, changed),
+            key_reason: std::borrow::Cow::Borrowed(""),
+            budget_bytes: None,
+            outcome,
+            scale_permille: None,
+            size: None,
+            timing: None,
+            hardware: false,
+        };
+        self.push(now, &Record::Frame(f));
+    }
+
+    /// 每秒汇总：到点了就写重传记录。
+    fn second(&mut self, now: Time, stats: SenderStats) {
+        if now.micros() >= self.next_second {
+            self.retransmit(now, stats);
+            while self.next_second <= now.micros() {
+                self.next_second += 1_000_000;
+            }
+        }
+    }
+
+    fn retransmit(&mut self, now: Time, stats: SenderStats) {
+        let last = std::mem::replace(&mut self.last, stats);
+        let r = record::Retransmit {
+            requested: stats.nack_requests.saturating_sub(last.nack_requests),
+            resent: stats.retransmitted.saturating_sub(last.retransmitted),
+            capped: stats.resend_capped.saturating_sub(last.resend_capped),
+            lost_frames: stats.lost.saturating_sub(last.lost),
+        };
+        self.push(now, &Record::Retransmit(r));
+    }
+
+    /// 会话结束：最后不足一秒的汇总，结束记录。
+    fn finish(mut self, now: Time, stats: SenderStats) -> Vec<u8> {
+        self.retransmit(now, stats);
+        self.sink.finish(
+            now.micros(),
+            record::EndReason::Normal,
+            now.micros(),
+            None,
+            &mut self.out,
+        );
+        self.out
+    }
+}
+
+fn run_inner(s: &Scenario, record: bool) -> Result<(Outcome, Option<Vec<u8>>), Error> {
     if s.fps == 0 || s.phases.is_empty() {
         return Err(Error::InvalidArgument("帧率和阶段都不能为空"));
     }
@@ -561,6 +683,7 @@ pub fn run(s: &Scenario) -> Result<Outcome, Error> {
     let mut pending = false;
     let mut overall_freezes = 0u32;
     let mut states = StateShare::default();
+    let mut journal = record.then(|| Journal::new(s, tx.estimator()));
 
     let mut now = Time::ZERO;
     let mut next_feedback = Time(FEEDBACK_US);
@@ -618,8 +741,13 @@ pub fn run(s: &Scenario) -> Result<Outcome, Error> {
             let pacer_busy = pacer.busy(tx.pacing_bps(pacing), 1_000_000 / u64::from(s.fps.max(1)));
             if tx.frame_gate(now, wanted, pacer_busy) {
                 let rtt = link.delay_us.saturating_mul(2).saturating_add(1_000);
-                let before = tx.stats().frames;
-                let out = tx.on_frame(now, desk.screen(), std::mem::take(&mut pending), rtt)?;
+                let before = tx.stats();
+                let changed = std::mem::take(&mut pending);
+                let out = tx.on_frame(now, desk.screen(), changed, rtt)?;
+                if let Some(j) = journal.as_mut() {
+                    j.frame(now, &tx, before, changed);
+                }
+                let before = before.frames;
                 if tx.stats().frames != before {
                     captured.push(now);
                     if trace_events {
@@ -755,6 +883,9 @@ pub fn run(s: &Scenario) -> Result<Outcome, Error> {
                             }
                         }
                         if let Some(obs) = tx.last_observation() {
+                            if let Some(j) = journal.as_mut() {
+                                j.feedback(now, &tx, &obs);
+                            }
                             features.push(FeatureRow {
                                 t_ms: now.micros() / 1000,
                                 rate_bps: tx.rate_bps(),
@@ -817,6 +948,9 @@ pub fn run(s: &Scenario) -> Result<Outcome, Error> {
             );
             net.advance_to(tick_end);
             now = tick_end;
+            if let Some(j) = journal.as_mut() {
+                j.second(now, tx.stats());
+            }
         }
         // 阶段结束时还在等（第一幅画面已经出来之后）：等到现在的时间也算进去。
         if let Some(since) = waiting_since.filter(|_| first_picture.is_some()) {
@@ -852,10 +986,12 @@ pub fn run(s: &Scenario) -> Result<Outcome, Error> {
     }
     let (tx_stats, rx_stats) = (tx.stats(), rx.stats());
     let sent_bytes = results.iter().map(|p| p.bytes).sum();
-    Ok(Outcome {
+    let recorded = journal.map(|j| j.finish(now, tx_stats));
+    let outcome = Outcome {
         name: s.name.clone(),
         codec: s.codec,
         phases: results,
+        frames: tx_stats.frames,
         keyframes: tx_stats.keyframes,
         recoveries: tx_stats.lost,
         skipped: rx_stats.skipped,
@@ -871,7 +1007,8 @@ pub fn run(s: &Scenario) -> Result<Outcome, Error> {
         estimator: tx.estimator(),
         features,
         trace,
-    })
+    };
+    Ok((outcome, recorded))
 }
 
 #[cfg(test)]

@@ -88,6 +88,7 @@ async fn session_with_capture(
     let ctrl = tokio::spawn(controller::run(
         ctrl_link,
         ControllerOptions {
+            record: None,
             session: session(&ctrl_id, Caps::AUDIO),
             deadline_us: 200_000,
             duration: None,

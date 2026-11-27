@@ -15,6 +15,8 @@ blake3 = { version = "1", default-features = false, features = ["pure"] }
 spake2 = "0.4"
 hmac = "0.12"
 sha2 = "0.10"
+# 会话记录文件的块校验（已在依赖树里：flate2、png 等用它）
+crc32fast = "1"
 
 [lints]
 workspace = true

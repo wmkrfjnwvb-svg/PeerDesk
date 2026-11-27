@@ -42,6 +42,8 @@ pub mod fs_store;
 pub mod gateway;
 #[cfg(feature = "media")]
 pub mod host;
+#[cfg(feature = "media")]
+mod host_record;
 pub mod ice;
 pub mod identity;
 pub mod netcheck;
@@ -49,6 +51,7 @@ pub mod node;
 #[cfg(feature = "portmap")]
 pub mod portmap;
 pub mod punch;
+pub mod recorder;
 pub mod rendezvous;
 pub mod safety;
 pub mod service;
@@ -56,6 +59,8 @@ pub mod sidechannel;
 pub mod stream;
 mod tls;
 mod tls_verifier;
+#[cfg(feature = "media")]
+mod view_record;
 
 pub use error::NetError;
 pub use identity::{Fingerprint, Identity};

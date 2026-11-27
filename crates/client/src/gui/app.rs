@@ -230,6 +230,8 @@ struct App {
     appearance: Appearance,
     /// 打开程序后自动开启被控（默认开；用户手动关过就记住，下次不自动开）。权限齐了才真正开启。
     auto_host: bool,
+    /// 诊断记录开关（见 `crate::diag_record`）。
+    diag_records: bool,
     /// 无人值守服务的状态（每 2 秒读一次；没装为 `None`）。
     service: Option<crate::unattended::Status>,
     service_checked: Option<Instant>,
@@ -297,6 +299,7 @@ impl App {
         let (bg, tray_status) = Background::new(ctx, s, &data_dir, lock);
         let status = tray_status.unwrap_or(status);
         let auto_host = !data_dir.join(HOST_OFF_FILE).exists();
+        let diag_records = crate::diag_record::enabled(&data_dir);
         // PEERDESK_GUI_PREVIEW_MAC=15：在任何系统上预览 macOS 15 的授权引导（截图、设计评审用）
         let preview = std::env::var(PREVIEW_MAC_ENV)
             .ok()
@@ -375,6 +378,7 @@ impl App {
             preview_mac,
             appearance,
             auto_host,
+            diag_records,
             service: None,
             service_checked: None,
             name: crate::local::device_name(),
@@ -1686,6 +1690,17 @@ impl App {
                     Ok(()) => Status::info(self.data_dir.join("logs").display().to_string()),
                     Err(e) => Status::error(e),
                 };
+            }
+            let mut records = self.diag_records;
+            if ui
+                .checkbox(&mut records, s.diag_records)
+                .on_hover_text(s.diag_records_hint)
+                .changed()
+            {
+                match crate::diag_record::set_enabled(&self.data_dir, records) {
+                    Ok(()) => self.diag_records = records,
+                    Err(e) => self.status = Status::error(e.to_string()),
+                }
             }
         });
         ui.add_space(space::S12);

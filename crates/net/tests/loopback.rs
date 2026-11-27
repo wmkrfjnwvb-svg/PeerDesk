@@ -167,6 +167,7 @@ async fn full_session_video_input_and_files() {
     let report = controller::run(
         ctrl_link,
         ControllerOptions {
+            record: None,
             session: session_h264(&p.ctrl_id, &policy),
             deadline_us: 200_000,
             duration: Some(Duration::from_millis(1500)),
@@ -297,6 +298,7 @@ async fn interrupted_upload_resumes_from_partial_file() {
     let report = controller::run(
         ctrl_link,
         ControllerOptions {
+            record: None,
             session: session(&p.ctrl_id, &policy),
             deadline_us: 200_000,
             duration: Some(Duration::from_millis(50)),
@@ -339,6 +341,7 @@ async fn host_ending_first_is_reported_to_controller() {
     let report = controller::run(
         ctrl_link,
         ControllerOptions {
+            record: None,
             session: session(&p.ctrl_id, &policy),
             deadline_us: 100_000,
             duration: None,
@@ -390,6 +393,7 @@ async fn paced_session_delivers_frames() {
     let report = controller::run(
         ctrl_link,
         ControllerOptions {
+            record: None,
             session: session_h264(&p.ctrl_id, &policy),
             deadline_us: 100_000,
             duration: Some(Duration::from_secs(4)),
@@ -557,6 +561,7 @@ async fn controller_reports_rejection() {
     let result = controller::run(
         ctrl_link,
         ControllerOptions {
+            record: None,
             session: session(&p.ctrl_id, &only_chacha),
             deadline_us: 1,
             duration: None,
@@ -649,6 +654,7 @@ async fn idle_screen_costs_almost_nothing_on_the_wire() {
         let report = controller::run(
             ctrl_link,
             ControllerOptions {
+                record: None,
                 session: session(&p.ctrl_id, &policy),
                 deadline_us: 200_000,
                 duration: Some(Duration::from_secs(seconds)),
@@ -737,6 +743,7 @@ async fn sources_with_a_change_counter_are_encoded_only_when_it_moves() {
     let report = controller::run(
         ctrl_link,
         ControllerOptions {
+            record: None,
             session: session(&p.ctrl_id, &policy),
             deadline_us: 100_000,
             duration: None,
@@ -788,6 +795,7 @@ async fn host_encodes_native_size_even_in_a_small_window() {
     let report = controller::run(
         ctrl_link,
         ControllerOptions {
+            record: None,
             session: with_view(&p.ctrl_id),
             deadline_us: 200_000,
             duration: Some(Duration::from_millis(1500)),
@@ -872,6 +880,7 @@ async fn gpu_frames_are_captured_at_the_encode_size() {
     let report = controller::run(
         ctrl_link,
         ControllerOptions {
+            record: None,
             session: session_h264(&p.ctrl_id, &policy),
             deadline_us: 200_000,
             duration: Some(Duration::from_millis(1500)),
@@ -902,4 +911,233 @@ async fn gpu_frames_are_captured_at_the_encode_size() {
     );
     let seen = report.screen.unwrap();
     assert_eq!((seen.width(), seen.height()), (640, 360));
+}
+
+/// 被控端会话记录：真实的会话循环（QUIC 回环、H.264 编码线程、控制端的反馈）写出一份记录，
+/// 能完整读回，条数和被控端自己报告的次数对得上；写的过程中是 `.part`，结束后改成正式文件名。
+#[tokio::test(flavor = "multi_thread")]
+async fn the_host_session_writes_a_recording_that_matches_its_report() {
+    use peerdesk_core::record::{EndReason, FileState, Kind, Recording, Role};
+    use peerdesk_core::record::{Previous, PreviousReason, ViewResult};
+    use peerdesk_net::recorder::{RecordSetup, Retention, ViewRecordSetup};
+    let policy = Policy::recommended();
+    let p = pair(&policy, &policy);
+    let (host_link, ctrl_link) = links(&p).await;
+    let dir = temp_dir("record");
+    let records = dir.join("records");
+    let desktop = DemoDesktop::new(640, 360, 1).with_script(vec![(Workload::Typing, 1000)]);
+    let host_task = tokio::spawn(host::serve(
+        host_link,
+        HostOptions {
+            record: Some(RecordSetup {
+                dir: records.clone(),
+                retention: Retention::default(),
+                program_version: Some("0.0.0-test".into()),
+                commit: Some("abc1234".into()),
+            }),
+            ..HostOptions::new(
+                session_h264(&p.host_id, &policy),
+                30,
+                temp_dir("record-recv"),
+            )
+        },
+        Box::new(desktop),
+        Box::new(Recorder::default()),
+    ));
+    let (_tx, rx) = mpsc::channel(1);
+    let visit_id = [0x5a; 16];
+    let ctrl_records = dir.join("ctrl-records");
+    let creport = controller::run(
+        ctrl_link,
+        ControllerOptions {
+            record: Some(ViewRecordSetup {
+                setup: RecordSetup {
+                    dir: ctrl_records.clone(),
+                    retention: Retention::default(),
+                    program_version: Some("0.0.0-test".into()),
+                    commit: Some("abc1234".into()),
+                },
+                visit_id,
+                previous: Some(Previous {
+                    session_id: [7; 16],
+                    reason: PreviousReason::Upgraded,
+                }),
+            }),
+            session: session_h264(&p.ctrl_id, &policy),
+            deadline_us: 200_000,
+            duration: Some(Duration::from_millis(2500)),
+            clipboard: None,
+            on_established: None,
+            on_link: None,
+            view: None,
+            on_quality: None,
+            audio: None,
+        },
+        Box::new(CountSink::new()),
+        rx,
+        None,
+    )
+    .await
+    .unwrap();
+    let report = host_task.await.unwrap().unwrap();
+    // 记录线程在会话结束后自己收尾（改名、清理）：等它
+    let mut finished = Vec::new();
+    for _ in 0..200 {
+        finished = std::fs::read_dir(&records)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        if finished
+            .iter()
+            .any(|n| peerdesk_core::record::classify(n) == Some(FileState::Finished))
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        finished.len(),
+        1,
+        "只有一份正式文件，没有遗留的 .part：{finished:?}"
+    );
+    let bytes = std::fs::read(records.join(&finished[0])).unwrap();
+    let rec = Recording::parse(&bytes).unwrap();
+    assert_eq!(rec.meta.role, Role::Host);
+    assert_eq!(rec.meta.codec.as_deref(), Some("h264"));
+    assert_eq!(rec.meta.commit.as_deref(), Some("abc1234"));
+    assert_eq!(rec.meta.fps, Some(30));
+    assert!(rec.meta.caps.is_some() && rec.meta.os.is_some());
+    let st = rec.stats;
+    assert_eq!(
+        (
+            st.bad_blocks,
+            st.bad_records,
+            st.unknown_records,
+            st.skipped_bytes
+        ),
+        (0, 0, 0, 0)
+    );
+    assert!(!st.truncated_tail && rec.count(Kind::Gap) == 0);
+    let end = rec.end().expect("正常收尾应当有结束记录");
+    assert!(
+        matches!(end.reason, EndReason::Normal | EndReason::PeerQuit),
+        "{:?}",
+        end.reason
+    );
+    // 帧：出了帧的任务数等于被控端报告的帧数；每帧带着预算、尺寸和耗时
+    let sent: Vec<_> = rec
+        .frames()
+        .map(|(_, f)| f)
+        .filter(|f| f.sent_bytes().is_some())
+        .collect();
+    assert_eq!(sent.len(), usize::try_from(report.frames_sent).unwrap());
+    assert!(sent.len() > 10, "{}", sent.len());
+    // 第一帧是开始的半分辨率阶段（见上面的测试），之后按原尺寸
+    assert_eq!(
+        (sent[0].size, sent[0].scale_permille),
+        (Some((320, 180)), Some(500))
+    );
+    assert!(sent[1..]
+        .iter()
+        .all(|f| f.size == Some((640, 360)) && f.scale_permille == Some(1000)));
+    assert!(sent
+        .iter()
+        .all(|f| f.budget_bytes.is_some() && f.timing.is_some()));
+    assert_eq!(
+        sent.iter()
+            .filter_map(|f| f.sent_bytes())
+            .map(u64::from)
+            .sum::<u64>(),
+        report.video_bytes
+    );
+    for (i, f) in sent.iter().enumerate() {
+        assert_eq!(usize::try_from(f.frame_id).unwrap(), i + 1);
+    }
+    // 反馈：控制端一直在发，被控端处理的每一份都记了
+    assert!(
+        rec.count(Kind::Feedback) > 10,
+        "{}",
+        rec.count(Kind::Feedback)
+    );
+    // 每秒汇总：重传汇总里的判定丢帧数和报告一致；每秒一条加结束时一条
+    let lost: u64 = rec
+        .retransmits()
+        .map(|(_, r)| u64::from(r.lost_frames))
+        .sum();
+    assert_eq!(lost, u64::from(report.frames_repaired));
+    assert!(rec.count(Kind::Retransmit) >= 2);
+    assert_eq!(rec.count(Kind::Retransmit), rec.count(Kind::Transport));
+    assert_eq!(rec.count(Kind::Retransmit), rec.count(Kind::Input));
+    // 真实会话的记录大小（对照设计 1.6 节的估计）
+    eprintln!(
+        "真实会话 {:.1} 秒：{} 字节，每秒 {:.0} 字节；反馈 {}、帧 {}、汇总各 {}",
+        end.duration_us as f64 / 1e6,
+        bytes.len(),
+        bytes.len() as f64 / (end.duration_us as f64 / 1e6),
+        rec.count(Kind::Feedback),
+        rec.count(Kind::Frame),
+        rec.count(Kind::Retransmit)
+    );
+    let tally = |kind: Kind| {
+        end.tallies
+            .iter()
+            .find(|t| t.kind == kind.code())
+            .map(|t| (t.written, t.dropped))
+    };
+    assert_eq!(
+        tally(Kind::Frame),
+        Some((u64::try_from(rec.count(Kind::Frame)).unwrap(), 0))
+    );
+    // 控制端的记录：会话号和被控端的相同，访问号和上一份在文件头里；每帧的解码和交给界面都有记录
+    let ctrl_file = loop {
+        let names: Vec<String> = std::fs::read_dir(&ctrl_records)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        if let Some(n) = names
+            .iter()
+            .find(|n| peerdesk_core::record::classify(n) == Some(FileState::Finished))
+        {
+            break n.clone();
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let crec = Recording::parse(&std::fs::read(ctrl_records.join(ctrl_file)).unwrap()).unwrap();
+    assert_eq!(crec.meta.role, Role::Controller);
+    assert!(crec.meta.session_id.is_some());
+    assert_eq!(
+        crec.meta.session_id, rec.meta.session_id,
+        "两端的会话号相同"
+    );
+    assert_eq!(crec.meta.visit_id, Some(visit_id));
+    assert_eq!(rec.meta.visit_id, None, "被控端不知道访问号");
+    assert_eq!(
+        crec.meta.previous,
+        Some(Previous {
+            session_id: [7; 16],
+            reason: PreviousReason::Upgraded
+        })
+    );
+    let cend = crec.end().expect("控制端正常收尾应当有结束记录");
+    assert!(matches!(
+        cend.reason,
+        EndReason::Normal | EndReason::PeerQuit
+    ));
+    let shown = crec
+        .view_frames()
+        .filter(|(_, v)| v.result == ViewResult::Shown)
+        .count();
+    assert_eq!(u64::try_from(shown).unwrap(), creport.frames_delivered);
+    assert!(shown > 10);
+    // 控制端看到的每个帧号，被控端都发过
+    let host_ids: std::collections::HashSet<u32> = sent.iter().map(|f| f.frame_id).collect();
+    assert!(crec
+        .view_frames()
+        .all(|(_, v)| host_ids.contains(&v.frame_id)));
+    assert!(crec
+        .view_frames()
+        .all(|(_, v)| v.decode_us > 0 || v.result != ViewResult::Shown));
+    assert!(crec.count(Kind::Transport) >= 2 && crec.count(Kind::Input) >= 2);
+    assert_eq!(crec.stats.bad_blocks + crec.stats.bad_records, 0);
+    let _ = std::fs::remove_dir_all(&dir);
 }

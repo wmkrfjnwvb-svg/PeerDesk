@@ -122,6 +122,7 @@ async fn attempt(
     let result = controller::run(
         ctrl_link,
         ControllerOptions {
+            record: None,
             session: cfg(&w.ctrl_id, ctrl_auth),
             deadline_us: 100_000,
             duration: Some(Duration::from_millis(200)),

@@ -391,6 +391,7 @@ async fn host_async(args: HostArgs, out: &mut dyn Write) -> Result<u8, NetError>
         let result = host::serve(
             link,
             HostOptions {
+                record: crate::diag_record::setup(&args.data_dir),
                 trusted: args.trusted.clone(),
                 permissions: args.permissions,
                 limiter: Arc::clone(&limiter),
@@ -728,9 +729,12 @@ async fn connect_session(
             input_tx
         })
     });
+    // 命令行连接只有一份会话，一次访问就是它
+    let record = crate::diag_record::Visit::new().begin(link.session_id().ok(), &args.data_dir);
     let report = controller::run(
         link,
         ControllerOptions {
+            record,
             session: session(identity, policy, args.auth.clone()),
             deadline_us: 100_000,
             duration: Some(Duration::from_secs(args.seconds)),
@@ -1059,6 +1063,32 @@ mod tests {
                 .len(),
             200_000
         );
+
+        // 诊断记录默认开：两端都在自己数据目录的 records/ 里写了一份，会话号相同、都有结束记录
+        let read = |dir: &Path| {
+            for _ in 0..200 {
+                let files: Vec<_> = std::fs::read_dir(dir.join("records"))
+                    .map(|d| d.filter_map(Result::ok).collect())
+                    .unwrap_or_default();
+                if let [file] = files.as_slice() {
+                    if file.file_name().to_string_lossy().ends_with(".pdsr") {
+                        return peerdesk_core::record::Recording::parse(
+                            &std::fs::read(file.path()).unwrap(),
+                        )
+                        .unwrap();
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            panic!("{} 里没有写完的记录", dir.display());
+        };
+        let (host_rec, ctrl_rec) = (read(&host_dir), read(&ctrl_dir));
+        assert!(host_rec.end().is_some() && ctrl_rec.end().is_some());
+        assert!(host_rec.meta.session_id.is_some());
+        assert_eq!(host_rec.meta.session_id, ctrl_rec.meta.session_id);
+        assert!(ctrl_rec.meta.visit_id.is_some() && ctrl_rec.meta.previous.is_none());
+        assert!(host_rec.count(peerdesk_core::record::Kind::Frame) > 0);
+        assert!(ctrl_rec.view_frames().count() > 0);
 
         // 身份是持久的：重启被控端后指纹不变
         let again = Identity::load_or_create(&host_dir).unwrap();
