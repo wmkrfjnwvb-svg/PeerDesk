@@ -202,7 +202,7 @@ fn the_recording_reads_back_and_matches_what_happened() {
 
         // 帧：出了帧的任务数等于发出的帧数，帧号 1.. 连续；关键帧数对得上
         let frames: Vec<_> = rec.frames().map(|(_, f)| f).collect();
-        let sent: Vec<_> = frames.iter().filter(|f| f.bytes > 0).collect();
+        let sent: Vec<_> = frames.iter().filter(|f| f.sent_bytes().is_some()).collect();
         assert_eq!(
             sent.len(),
             usize::try_from(o.frames).unwrap(),
@@ -222,7 +222,7 @@ fn the_recording_reads_back_and_matches_what_happened() {
         // 没出帧的任务不是关键帧
         assert!(frames
             .iter()
-            .filter(|f| f.bytes == 0)
+            .filter(|f| f.sent_bytes().is_none())
             .all(|f| f.class != FrameClass::Key));
 
         // 重传：每秒汇总加起来等于全程的计数

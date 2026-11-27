@@ -662,10 +662,38 @@ pub struct Timing {
     pub encode_us: u64,
 }
 
+/// 一个编码任务的结果。每个任务恰好是其中一种，互不重叠。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameOutcome {
+    /// 编出了一帧：码流字节数（带帧头的整帧载荷，不含分片头和纠错分片，大于 0）。
+    Sent {
+        /// 码流字节数。
+        bytes: u32,
+    },
+    /// 编码器因为预算放不下，把这一帧丢了（硬件编码器的码控）。有东西要发、是码率不让发。
+    DroppedByEncoder,
+    /// 编码器没给东西、也没说丢了：画面没变、清晰度也已经补完，这个任务没有要发的。
+    NoOutput,
+    /// 没出帧，但记录的一方分不出是上面哪一种（例如仿真里取不到编码器的内部状态）。
+    NoFrameUnknown,
+}
+
+impl FrameOutcome {
+    const fn code(self) -> u8 {
+        match self {
+            Self::Sent { .. } => 0,
+            Self::DroppedByEncoder => 1,
+            Self::NoOutput => 2,
+            Self::NoFrameUnknown => 3,
+        }
+    }
+}
+
 /// 帧记录：一个编码任务结束。时间是任务结束（结果交回会话循环）的时刻。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
-    /// 帧号。没出帧时（`bytes` 为 0）是这个任务占用、下一个任务还会用的编号。
+    /// 这个任务被分配的帧号，对所有结果含义一致。出了帧（[`FrameOutcome::Sent`]）就是这一帧的号；
+    /// 没出帧时编号没有被用掉，下一个任务会再用同一个号。
     pub frame_id: u32,
     /// 采集时间在记录时间之前多少微秒；不知道时为 `None`。
     pub captured_ago_us: Option<u64>,
@@ -675,8 +703,8 @@ pub struct Frame {
     pub key_reason: Cow<'static, str>,
     /// 这一帧的字节预算；不知道时为 `None`。
     pub budget_bytes: Option<u32>,
-    /// 编出的字节数（码流，不含分片头和纠错分片）；0 表示这个任务没出帧。
-    pub bytes: u32,
+    /// 这个任务的结果。
+    pub outcome: FrameOutcome,
     /// 编码尺寸占源画面的比例（千分比）；不知道时为 `None`。
     pub scale_permille: Option<u16>,
     /// 编码尺寸（宽，高，像素）；不知道时为 `None`。
@@ -685,8 +713,19 @@ pub struct Frame {
     pub timing: Option<Timing>,
     /// 用的是硬件编码器。
     pub hardware: bool,
-    /// 编码器因为预算放不下把这一帧丢了。
-    pub dropped: bool,
+}
+
+impl Frame {
+    /// 出了帧时的码流字节数。
+    #[must_use]
+    pub const fn sent_bytes(&self) -> Option<u32> {
+        match self.outcome {
+            FrameOutcome::Sent { bytes } => Some(bytes),
+            FrameOutcome::DroppedByEncoder
+            | FrameOutcome::NoOutput
+            | FrameOutcome::NoFrameUnknown => None,
+        }
+    }
 }
 
 /// 重传记录：每秒一条，这一秒（或最后不足一秒）里的计数。
@@ -918,7 +957,10 @@ impl Record {
                 out.push(f.class.code());
                 put_text(out, clip(&f.key_reason, KEY_REASON_MAX));
                 put_opt(out, f.budget_bytes.map(u64::from));
-                put_varint(out, u64::from(f.bytes));
+                out.push(f.outcome.code());
+                if let FrameOutcome::Sent { bytes } = f.outcome {
+                    put_varint(out, u64::from(bytes));
+                }
                 put_opt(out, f.scale_permille.map(u64::from));
                 put_opt(out, f.size.map(|(w, _)| u64::from(w)));
                 put_opt(out, f.size.map(|(_, h)| u64::from(h)));
@@ -931,7 +973,7 @@ impl Record {
                     }
                     None => out.push(0),
                 }
-                out.push(u8::from(f.hardware) | (u8::from(f.dropped) << 1));
+                out.push(u8::from(f.hardware));
             }
             Self::Retransmit(r) => {
                 for v in [r.requested, r.resent, r.capped, r.lost_frames] {
@@ -995,7 +1037,13 @@ impl Record {
                 let class = FrameClass::from_code(cur.u8()?)?;
                 let key_reason = Cow::Owned(cur.text()?);
                 let budget_bytes = cur.opt()?.map(u32::try_from).transpose().ok()?;
-                let bytes = cur.u32()?;
+                let outcome = match cur.u8()? {
+                    0 => FrameOutcome::Sent { bytes: cur.u32()? },
+                    1 => FrameOutcome::DroppedByEncoder,
+                    2 => FrameOutcome::NoOutput,
+                    3 => FrameOutcome::NoFrameUnknown,
+                    _ => return None,
+                };
                 let scale_permille = cur.opt()?.map(u16::try_from).transpose().ok()?;
                 let width = cur.opt()?.map(u16::try_from).transpose().ok()?;
                 let height = cur.opt()?.map(u16::try_from).transpose().ok()?;
@@ -1022,12 +1070,11 @@ impl Record {
                     class,
                     key_reason,
                     budget_bytes,
-                    bytes,
+                    outcome,
                     scale_permille,
                     size,
                     timing,
                     hardware: flags & 1 != 0,
-                    dropped: flags & 2 != 0,
                 })
             }
             Kind::Retransmit => Self::Retransmit(Retransmit {
@@ -1696,7 +1743,7 @@ mod tests {
             class: FrameClass::Key,
             key_reason: Cow::Borrowed("有帧丢了（接收端解不了后面的帧）"),
             budget_bytes: Some(40_000),
-            bytes: 38_123,
+            outcome: FrameOutcome::Sent { bytes: 38_123 },
             scale_permille: Some(750),
             size: Some((1920, 1080)),
             timing: Some(Timing {
@@ -1707,7 +1754,6 @@ mod tests {
                 encode_us: 9_000,
             }),
             hardware: true,
-            dropped: false,
         })
     }
 
@@ -1722,12 +1768,11 @@ mod tests {
             class: FrameClass::Refine,
             key_reason: Cow::Borrowed(""),
             budget_bytes: None,
-            bytes: 0,
+            outcome: FrameOutcome::DroppedByEncoder,
             scale_permille: None,
             size: None,
             timing: None,
             hardware: false,
-            dropped: true,
         }
     }
 
@@ -2486,6 +2531,39 @@ mod tests {
     }
 
     #[test]
+    fn every_frame_outcome_round_trips_and_means_one_thing() {
+        let outcomes = [
+            FrameOutcome::Sent { bytes: 5 },
+            FrameOutcome::DroppedByEncoder,
+            FrameOutcome::NoOutput,
+            FrameOutcome::NoFrameUnknown,
+        ];
+        let records: Vec<(u64, Record)> = outcomes
+            .iter()
+            .enumerate()
+            .map(|(i, o)| {
+                let mut f = bare(7);
+                f.outcome = *o;
+                (u64::try_from(i).unwrap(), Record::Frame(f))
+            })
+            .collect();
+        let rec = Recording::parse(&write_all(&meta(), &records)).unwrap();
+        let got: Vec<_> = rec
+            .frames()
+            .map(|(_, f)| (f.frame_id, f.outcome, f.sent_bytes()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (7, outcomes[0], Some(5)),
+                (7, outcomes[1], None),
+                (7, outcomes[2], None),
+                (7, outcomes[3], None)
+            ]
+        );
+    }
+
+    #[test]
     fn controller_files_and_every_os_round_trip() {
         for os in [PeerOs::Unknown, PeerOs::Windows, PeerOs::Mac, PeerOs::Linux] {
             let mut m = Meta::new(Role::Controller, 5);
@@ -2507,6 +2585,7 @@ mod tests {
             c.push(0); // 类别
             put_text(&mut c, "");
             put_opt(&mut c, None); // 预算
+            c.push(0); // 结果：出了帧
             put_varint(&mut c, 10); // 字节
             put_opt(&mut c, None); // 缩放
             tail(&mut c);

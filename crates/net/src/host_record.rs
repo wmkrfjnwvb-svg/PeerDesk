@@ -10,8 +10,8 @@ use std::borrow::Cow;
 use peerdesk_core::media::{FrameJob, MediaSender, SenderStats};
 use peerdesk_core::proto::PeerOs;
 use peerdesk_core::record::{
-    EndReason, Feedback, Frame, FrameClass, InputLevel, Meta, Record, Retransmit, Role, Timing,
-    Transport,
+    EndReason, Feedback, Frame, FrameClass, FrameOutcome, InputLevel, Meta, Record, Retransmit,
+    Role, Timing, Transport,
 };
 use peerdesk_core::time::Time;
 use peerdesk_core::video::{EncodeTiming, EncodedFrame};
@@ -185,14 +185,23 @@ pub(crate) fn frame_record(
     changed: bool,
     captured_ago_us: u64,
 ) -> Frame {
-    let (bytes, key) = encoded.unwrap_or((0, false));
+    let (outcome, key) = match encoded {
+        Some((bytes, key)) => (
+            FrameOutcome::Sent {
+                bytes: u32::try_from(bytes).unwrap_or(u32::MAX),
+            },
+            key,
+        ),
+        None if timing.dropped => (FrameOutcome::DroppedByEncoder, false),
+        None => (FrameOutcome::NoOutput, false),
+    };
     Frame {
         frame_id: job.frame_id,
         captured_ago_us: Some(captured_ago_us),
         class: FrameClass::of(key, changed),
         key_reason: Cow::Borrowed(timing.key_reason),
         budget_bytes: u32::try_from(job.budget).ok(),
-        bytes: u32::try_from(bytes).unwrap_or(u32::MAX),
+        outcome,
         scale_permille: Some(job.scale_permille),
         size: (timing.width > 0 && timing.height > 0).then_some((timing.width, timing.height)),
         timing: Some(Timing {
@@ -203,7 +212,6 @@ pub(crate) fn frame_record(
             encode_us: timing.encode_us,
         }),
         hardware: timing.hardware,
-        dropped: timing.dropped,
     }
 }
 
@@ -301,14 +309,16 @@ mod tests {
             encode_us: 9_000,
             wait_us: 500,
             hardware: true,
-            dropped: false,
             width: 1280,
             height: 720,
             key_reason: "有帧丢了（接收端解不了后面的帧）",
             ..EncodeTiming::default()
         };
         let f = frame_record(&job(), 14_000, &timing, Some((38_000, true)), true, 4_200);
-        assert_eq!((f.frame_id, f.bytes, f.class), (7, 38_000, FrameClass::Key));
+        assert_eq!(
+            (f.frame_id, f.sent_bytes(), f.class),
+            (7, Some(38_000), FrameClass::Key)
+        );
         assert_eq!(f.key_reason, "有帧丢了（接收端解不了后面的帧）");
         assert_eq!(
             (f.budget_bytes, f.scale_permille),
@@ -319,13 +329,21 @@ mod tests {
             (Some((1280, 720)), Some(4_200))
         );
         assert_eq!(f.timing.unwrap().wait_us, 500);
-        assert!(f.hardware && !f.dropped);
-        // 没出帧：字节为 0；没变化也没出关键帧是补清晰；尺寸不知道
+        assert!(f.hardware);
+        // 没出帧：没有字节；没变化也没出关键帧是补清晰；尺寸不知道
         let none = frame_record(&job(), 1_000, &EncodeTiming::default(), None, false, 0);
         assert_eq!(
-            (none.bytes, none.class, none.size),
-            (0, FrameClass::Refine, None)
+            (none.outcome, none.class, none.size),
+            (FrameOutcome::NoOutput, FrameClass::Refine, None)
         );
+        // 硬件编码器的码控把帧丢了：和“没东西要发”分开
+        let dropped = EncodeTiming {
+            dropped: true,
+            ..EncodeTiming::default()
+        };
+        let lost = frame_record(&job(), 1_000, &dropped, None, true, 0);
+        assert_eq!(lost.outcome, FrameOutcome::DroppedByEncoder);
+        assert_eq!(lost.sent_bytes(), None);
         let content = frame_record(
             &job(),
             1,

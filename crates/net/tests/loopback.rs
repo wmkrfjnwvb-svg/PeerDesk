@@ -1003,7 +1003,7 @@ async fn the_host_session_writes_a_recording_that_matches_its_report() {
     let sent: Vec<_> = rec
         .frames()
         .map(|(_, f)| f)
-        .filter(|f| f.bytes > 0)
+        .filter(|f| f.sent_bytes().is_some())
         .collect();
     assert_eq!(sent.len(), usize::try_from(report.frames_sent).unwrap());
     assert!(sent.len() > 10, "{}", sent.len());
@@ -1019,7 +1019,10 @@ async fn the_host_session_writes_a_recording_that_matches_its_report() {
         .iter()
         .all(|f| f.budget_bytes.is_some() && f.timing.is_some()));
     assert_eq!(
-        sent.iter().map(|f| u64::from(f.bytes)).sum::<u64>(),
+        sent.iter()
+            .filter_map(|f| f.sent_bytes())
+            .map(u64::from)
+            .sum::<u64>(),
         report.video_bytes
     );
     for (i, f) in sent.iter().enumerate() {

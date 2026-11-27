@@ -568,19 +568,27 @@ impl Journal {
     fn frame(&mut self, now: Time, tx: &MediaSender, before: SenderStats, changed: bool) {
         let after = tx.stats();
         let key = after.keyframes != before.keyframes;
+        // 出了帧就是出了帧；没出帧时仿真取不到编码器的内部状态（是被预算丢了，还是没东西要发），
+        // 如实写“不知道”，不猜
+        let outcome = if after.frames == before.frames {
+            record::FrameOutcome::NoFrameUnknown
+        } else {
+            record::FrameOutcome::Sent {
+                bytes: u32::try_from(after.video_bytes.saturating_sub(before.video_bytes))
+                    .unwrap_or(u32::MAX),
+            }
+        };
         let f = record::Frame {
             frame_id: before.frames.saturating_add(1),
             captured_ago_us: Some(0),
             class: record::FrameClass::of(key, changed),
             key_reason: std::borrow::Cow::Borrowed(""),
             budget_bytes: None,
-            bytes: u32::try_from(after.video_bytes.saturating_sub(before.video_bytes))
-                .unwrap_or(u32::MAX),
+            outcome,
             scale_permille: None,
             size: None,
             timing: None,
             hardware: false,
-            dropped: false,
         };
         self.push(now, &Record::Frame(f));
     }
