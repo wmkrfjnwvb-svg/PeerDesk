@@ -225,15 +225,42 @@ FROM, OUT OF THE USE OR INABILITY TO USE THE FONT SOFTWARE OR FROM
 OTHER DEALINGS IN THE FONT SOFTWARE.
 ```
 
-## Microsoft MMSys 2024 带宽估计挑战赛数据集（CC BY 4.0）
+## Microsoft MMSys 2024 带宽估计挑战赛数据（仓库自带的 24 通评测通话）
 
-`crates/e2e/traces/ms-*.csv` 是从该数据集的仿真通话中摘取的真实带宽和丢包轨迹（由 `scripts/ms-traces.py` 转换，
-只保留变化最多的 40 秒、只记变化时刻）。来源：Microsoft，
-https://github.com/microsoft/RL4BandwidthEstimationChallenge ，
-数据集说明 https://www.microsoft.com/en-us/research/academic-program/bandwidth-estimation-challenge/data/ ，
-许可 Creative Commons Attribution 4.0（https://creativecommons.org/licenses/by/4.0/）。
-论文：Khairy et al., "ACM MMSys 2024 Bandwidth Estimation in Real Time Communications Challenge", arXiv:2403.06324。
-已做的改动：截取窗口、百分数换成千分比、缺失值沿用上一步。
+`crates/e2e/traces/ms-*.csv` 是从该挑战赛仓库自带的 `data/` 目录（24 通仿真评测通话，带真实带宽和丢包）中摘取的轨迹，
+由 `scripts/ms-traces.py` 转换：只保留变化最多的 40 秒、只记变化时刻、百分数换成千分比、缺失值沿用上一步。
+
+- 来源：Microsoft，https://github.com/microsoft/RL4BandwidthEstimationChallenge （`data/` 目录）。
+- 论文：Khairy et al., "ACM MMSys 2024 Bandwidth Estimation in Real Time Communications Challenge", arXiv:2403.06324。
+- 许可：两种说法都照办。
+  - 该仓库的 LICENSE 文件是 MIT，原文见下。
+  - 仓库 README 写明仓库里的文档和其他内容按 Creative Commons Attribution 4.0 授权（https://creativecommons.org/licenses/by/4.0/）。
+- 不在此列：挑战赛另外放在 Azure 上、用脚本下载的仿真数据集（约 8 GB）和测试床数据集（约 35 GB）不在该仓库里。
+  README 的 “Dataset licenses” 一节对它们只有免责声明，没有写明授权。PeerDesk 仓库不收录这两份数据的任何内容。
+
+```
+MIT License
+
+Copyright (c) Microsoft Corporation.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE
+```
 
 ## cros-codecs、cros-libva（Linux 硬件编解码，编译进客户端）
 

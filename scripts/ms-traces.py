@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """把微软 MMSys 2024 带宽估计挑战赛的仿真通话（带真实带宽和丢包）转成端到端测试用的网络轨迹。
 
-数据：https://github.com/microsoft/RL4BandwidthEstimationChallenge（数据 CC BY 4.0，见 THIRD_PARTY_NOTICES.md）
+数据：https://github.com/microsoft/RL4BandwidthEstimationChallenge 仓库自带的 data/ 目录（24 通评测通话；许可见 THIRD_PARTY_NOTICES.md）。
+不要用它转换 Azure 上另外下载的大数据集：那两份没有写明授权，转出来的轨迹不能提交进仓库。
 用法：python3 -I scripts/ms-traces.py <数据目录> <输出目录> <通话号>...
 每一步 60 ms（挑战赛说明里观测和带宽估计的间隔）。取每通里带宽和丢包变化最多的 WINDOW_S 秒，
 只写变化的时刻：`毫秒,带宽 bps,丢包千分比`。缺失值（nan）沿用上一步。
