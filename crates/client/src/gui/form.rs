@@ -134,6 +134,8 @@ pub fn explain(e: &NetError, s: &Strings) -> String {
         NetError::Connect(_) => s.err_refused,
         NetError::PinMismatch { .. } => s.err_pin_mismatch,
         NetError::Closed(_) => s.err_closed,
+        // 账户设备表的拒绝自带原因和解决办法，原样给用户
+        NetError::Refused(_) => return detail,
         NetError::Io(_) | NetError::Core(_) | NetError::Tls(_) | NetError::Protocol(_) => {
             s.err_other
         }
