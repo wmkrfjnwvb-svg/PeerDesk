@@ -16,8 +16,9 @@ use peerdesk_core::adaptive::Profile;
 use peerdesk_core::error::Error;
 pub use peerdesk_core::estimator::EstimatorKind;
 pub use peerdesk_core::estimator::RateState;
+use peerdesk_core::frame::{Described, Picture};
 pub use peerdesk_core::media::ProbeStats;
-use peerdesk_core::media::{MediaReceiver, MediaSender, SenderConfig, SenderStats};
+use peerdesk_core::media::{DecodeWorker, MediaReceiver, MediaSender, SenderConfig, SenderStats};
 pub use peerdesk_core::policy::ContentPolicy;
 use peerdesk_core::proto::{decode_datagram, encode_datagram, Channel, Header};
 use peerdesk_core::record::{self, Meta, Record, Role, Sink};
@@ -25,7 +26,10 @@ use peerdesk_core::screen::Screen;
 use peerdesk_core::sim::{Link, Net, NetStats};
 use peerdesk_core::time::Time;
 use peerdesk_core::video::{TileDecoder, TileEncoder, VideoDecoder, VideoEncoder};
+use peerdesk_media::fake::{FakeBackend, FakeConfig, FakeDecoder, ManualClock};
 use peerdesk_media::{H264Decoder, H264Encoder};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 pub use content::{Action, RealisticDesktop};
 
@@ -63,7 +67,14 @@ pub enum CodecKind {
     Tile,
     /// H.264（OpenH264）。
     H264,
+    /// L0.5（见 `docs/research/Q-redesign/a1-plan.md` 第 4 节）：画面是真像素，编码用假后端（面积、细节从像素算，字节由字节模型定，
+    /// 字节模型现在是占位），解码用假解码器；接收端走控制端用的“延后解码”那条路。显示端量尺按内容版本号和 QP 判清晰，
+    /// 没有像素可比：[`PhaseResult::end_psnr`] 是 NaN（没量）。和 L1（[`Self::H264`]）比，只差“字节模型准不准”。
+    H264L05,
 }
+
+/// L0.5 里 QP 不超过这个值算“清晰”。**占位**：M3 出数之前没有依据，结果只报告、不当门槛。
+pub const L05_QP_SHARP: u8 = 28;
 
 impl CodecKind {
     /// 名字。
@@ -72,11 +83,47 @@ impl CodecKind {
         match self {
             CodecKind::Tile => "tile",
             CodecKind::H264 => "h264",
+            CodecKind::H264L05 => "h264-l05",
         }
     }
 
-    fn make(self, fps: u32, max_bps: u64, policy: &ContentPolicy) -> Result<Codecs, Error> {
+    /// 是不是 H.264 一类（接收端要开关键帧宽限）。
+    #[must_use]
+    pub const fn is_h264(self) -> bool {
+        matches!(self, CodecKind::H264 | CodecKind::H264L05)
+    }
+
+    /// 解码器交出的是描述、不是像素（接收端走延后解码，量尺按版本号和 QP 判）。
+    const fn described(self) -> bool {
+        matches!(self, CodecKind::H264L05)
+    }
+
+    /// 造一对编码器和解码器。`tag` 是源画面的内容版本，只有 L0.5 用（假后端每交一帧读一次）。
+    fn make(
+        self,
+        fps: u32,
+        max_bps: u64,
+        policy: &ContentPolicy,
+        tag: &Arc<AtomicU64>,
+    ) -> Result<Codecs, Error> {
         Ok(match self {
+            CodecKind::H264L05 => {
+                // 假后端的时钟不拨：A1 里编码耗时按 0 算（和 L1 一样）
+                let backend = FakeBackend::with_default_model(
+                    FakeConfig::like_openh264(),
+                    Arc::new(ManualClock::new()),
+                )
+                .with_version_tag(Arc::clone(tag));
+                (
+                    Box::new(
+                        H264Encoder::with_max_bps(fps, max_bps)
+                            .with_policy(policy)
+                            .with_hardware(software_only)
+                            .with_soft_backend(Box::new(backend)),
+                    ),
+                    Box::new(FakeDecoder::new()),
+                )
+            }
             CodecKind::Tile => (Box::new(TileEncoder::new()), Box::new(TileDecoder::new())),
             CodecKind::H264 => (
                 Box::new(
@@ -106,6 +153,15 @@ fn fec_from(value: Option<&std::ffi::OsStr>) -> peerdesk_core::transport::Fec {
         peerdesk_core::transport::Fec::Xor
     } else {
         peerdesk_core::transport::Fec::Rs
+    }
+}
+
+/// 默认的编码器：环境变量 `PEERDESK_E2E_CODEC=h264-l05` 把所有默认场景换成 L0.5（对账用），其他是 H.264（L1）。
+fn default_codec(value: Option<&std::ffi::OsStr>) -> CodecKind {
+    if value.is_some_and(|v| v == "h264-l05") {
+        CodecKind::H264L05
+    } else {
+        CodecKind::H264
     }
 }
 
@@ -171,7 +227,7 @@ impl Scenario {
             width,
             height,
             fps: 30,
-            codec: CodecKind::H264,
+            codec: default_codec(std::env::var_os("PEERDESK_E2E_CODEC").as_deref()),
             phases,
             network: vec![(0, Link::lan())],
             profile: Profile::STABLE,
@@ -564,6 +620,83 @@ impl Stage for PixelStage {
     }
 }
 
+/// L0.5 版：合成桌面出真像素，编码是假后端、解码是假解码器；清晰度按内容版本号和 QP 判。
+///
+/// 源画面每变一次版本加一，同时拨给假后端（[`FakeBackend::with_version_tag`]），后端把它写进码流；假解码器从码流里读出来
+/// 交回，所以“显示的是第几版”是从传输、重组、解码这一整条链上走过来的，不是量尺自己猜的。
+struct DescribedStage {
+    desk: RealisticDesktop,
+    /// 源画面现在是第几版。
+    version: u64,
+    tag: Arc<AtomicU64>,
+    /// 解码器放在这里（和产品控制端的解码线程里一样，用 [`DecodeWorker`]；仿真是单线程，当场执行）。
+    worker: DecodeWorker,
+    /// 控制端现在显示的是什么。
+    shown: Option<Described>,
+}
+
+impl Stage for DescribedStage {
+    fn step(&mut self, action: Action) -> Result<bool, Error> {
+        let moved = self.desk.step(action)?;
+        if moved {
+            self.version = self.version.saturating_add(1);
+            self.tag.store(self.version, Ordering::Relaxed);
+        }
+        Ok(moved)
+    }
+
+    fn encode(
+        &self,
+        tx: &mut MediaSender,
+        now: Time,
+        changed: bool,
+        rtt_us: u64,
+    ) -> Result<Vec<peerdesk_core::media::Outgoing>, Error> {
+        tx.on_frame(now, self.desk.screen(), changed, rtt_us)
+    }
+
+    fn receive(
+        &mut self,
+        rx: &mut MediaReceiver,
+        now: Time,
+        header: &Header,
+        body: &[u8],
+    ) -> Option<u32> {
+        let jobs = rx
+            .on_datagram_deferred(now, header.send_time, header.seq, header.flags, body)
+            .ok()?;
+        // 和控制端一样：每个任务一个结果，成功了报给接收端，失败了让接收端等关键帧
+        let mut shown = None;
+        for job in &jobs {
+            match self.worker.decode(job) {
+                Ok(Some(Picture::Described(d))) => {
+                    rx.decode_succeeded();
+                    self.shown = Some(d);
+                    shown = Some(job.frame_id);
+                }
+                Ok(Some(Picture::Rgb(_) | Picture::Nv12(_)) | None) => {}
+                Err(_) => {
+                    rx.decode_failed();
+                    shown = None;
+                }
+            }
+        }
+        shown
+    }
+
+    fn sharp(&self) -> bool {
+        self.shown
+            .is_some_and(|d| d.version == self.version && d.qp <= L05_QP_SHARP)
+    }
+
+    /// 没有显示的像素：信噪比是 NaN（没量），截图的显示那一半是黑的。
+    fn snapshot(&self) -> (f64, (Screen, Screen)) {
+        let source = self.desk.screen();
+        let blank = Screen::new(source.width(), source.height(), 0);
+        (f64::NAN, (source.clone(), blank))
+    }
+}
+
 /// 一次会话的墙上时间花在哪（测量用）：环境变量 `PEERDESK_E2E_PROFILE` 打开，会话结束时往标准错误打一行。
 /// 只读时钟，不影响会话。用来回答“去掉像素之后仿真能多快”（`a1-plan.md` 第 3 节）。
 #[derive(Debug, Default)]
@@ -764,6 +897,63 @@ fn note_fingerprint(s: &Scenario, o: &Outcome) {
     }
 }
 
+/// 环境变量 `PEERDESK_E2E_SUMMARY` 给出文件路径时，每次运行往里追加一行关键数字（用来比 L1 和 L0.5 在同一批场景上的差别，
+/// 见 `scripts/e2e-tiers.sh`）：场景的身份（和指纹文件一样，不含编码器）、编码、帧数、关键帧数、冻结次数、最长等待、没解的帧、解码失败（花屏）、
+/// 发出的字节、停下阶段变清晰用的时间（毫秒，没清晰写 -）、仿真秒数、墙上毫秒。
+/// 墙上时间在并行的测试里会被抢占，量速度要单线程跑（`-- --test-threads=1`）。
+fn note_summary(s: &Scenario, o: &Outcome, wall: std::time::Duration, sim: Time) {
+    use std::io::Write as _;
+    let Some(path) = std::env::var_os("PEERDESK_E2E_SUMMARY") else {
+        return;
+    };
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = file.write_all(summary_line(s, o, wall, sim).as_bytes());
+    }
+}
+
+/// 摘要文件里的一行（见 [`note_summary`]）。
+fn summary_line(s: &Scenario, o: &Outcome, wall: std::time::Duration, sim: Time) -> String {
+    let sharp: Vec<String> = o
+        .phases
+        .iter()
+        .filter_map(|p| p.sharp_ms.map(|ms| format!("{ms:.0}")))
+        .collect();
+    format!(
+        "{} {}x{} fps{} {} seed{} max{} start{} pace{} probe{}{} {:?}|{}|frames {}|keys {}|freezes {}|maxwait {:.0}|skipped {}|bad {}|bytes {}|sharp {}|sim {:.1}|wall {:.0}\n",
+        s.name,
+        s.width,
+        s.height,
+        s.fps,
+        o.estimator,
+        s.seed,
+        s.max_bps,
+        s.start_bps,
+        u8::from(s.pacing),
+        u8::from(s.start_probe),
+        u8::from(s.probe_ids),
+        s.fec,
+        o.codec.name(),
+        o.frames,
+        o.keyframes,
+        o.freezes,
+        o.max_wait_ms,
+        o.skipped,
+        o.bad,
+        o.sent_bytes,
+        if sharp.is_empty() {
+            "-".to_owned()
+        } else {
+            sharp.join(",")
+        },
+        ms(sim.micros()) / 1000.0,
+        wall.as_secs_f64() * 1000.0
+    )
+}
+
 /// 指纹文件里的一行：场景的身份（名字、尺寸、帧率、编码、估计器、种子、码率、开关）和结果的指纹。
 fn fingerprint_line(s: &Scenario, o: &Outcome) -> String {
     format!(
@@ -907,11 +1097,25 @@ fn run_inner(s: &Scenario, record: bool) -> Result<(Outcome, Option<Vec<u8>>), E
     let interval = 1_000_000 / u64::from(s.fps);
     let mut profile = Stopwatch::from_env();
     let wall = std::time::Instant::now();
-    let mut stage = PixelStage {
-        desk: RealisticDesktop::new(s.width, s.height, s.seed)?,
-        shown: None,
-    };
-    let (encoder, decoder) = s.codec.make(s.fps, s.max_bps, &s.policy)?;
+    let desk = RealisticDesktop::new(s.width, s.height, s.seed)?;
+    let tag = Arc::new(AtomicU64::new(0));
+    let (encoder, decoder) = s.codec.make(s.fps, s.max_bps, &s.policy, &tag)?;
+    // L1 在收包的当场解码；L0.5 走控制端用的延后解码（解码器交给量尺里的 DecodeWorker）
+    let (mut stage, inline): (Box<dyn Stage>, Option<Box<dyn VideoDecoder>>) =
+        if s.codec.described() {
+            (
+                Box::new(DescribedStage {
+                    desk,
+                    version: 0,
+                    tag,
+                    worker: DecodeWorker::new(decoder),
+                    shown: None,
+                }),
+                None,
+            )
+        } else {
+            (Box::new(PixelStage { desk, shown: None }), Some(decoder))
+        };
     let cfg = SenderConfig {
         fps: s.fps,
         start_bps: s.start_bps,
@@ -922,8 +1126,11 @@ fn run_inner(s: &Scenario, record: bool) -> Result<(Outcome, Option<Vec<u8>>), E
         ..SenderConfig::default()
     };
     let mut tx = MediaSender::new(cfg, encoder);
-    let mut rx = MediaReceiver::new(Time::ZERO, cfg.deadline_us, decoder);
-    rx.set_keyframe_grace(s.codec == CodecKind::H264);
+    let mut rx = match inline {
+        Some(decoder) => MediaReceiver::new(Time::ZERO, cfg.deadline_us, decoder),
+        None => MediaReceiver::detached(Time::ZERO, cfg.deadline_us),
+    };
+    rx.set_keyframe_grace(s.codec.is_h264());
     rx.set_fec(s.fec);
     tx.set_fec(s.fec);
     // 网络控制器要到达报告时两端都打开（产品里由握手的 TRANSPORT_CC 决定）
@@ -1330,6 +1537,7 @@ fn run_inner(s: &Scenario, record: bool) -> Result<(Outcome, Option<Vec<u8>>), E
         let _ = writeln!(std::io::stderr().lock(), "{line}");
     }
     note_fingerprint(s, &outcome);
+    note_summary(s, &outcome, wall.elapsed(), now);
     Ok((outcome, recorded))
 }
 
@@ -1348,6 +1556,72 @@ mod tests {
             }],
         ))
         .unwrap()
+    }
+
+    #[test]
+    fn l05_runs_the_real_session_code_with_a_fake_codec_and_no_corrupt_frames() {
+        let mut s = Scenario::new(
+            "l05",
+            vec![
+                Phase {
+                    action: Action::Typing,
+                    frames: 30,
+                },
+                Phase {
+                    action: Action::Idle,
+                    frames: 60,
+                },
+            ],
+        );
+        s.codec = CodecKind::H264L05;
+        let o = run(&s).unwrap();
+        assert_eq!(o.codec.name(), "h264-l05");
+        assert!(o.frames > 10 && o.keyframes >= 1, "{o:?}");
+        // 假解码器和真解码器一样严：接不上的帧会算解码失败。没有丢包的局域网上一帧也不该有
+        assert_eq!((o.bad, o.skipped), (0, 0));
+        assert!(o.first_picture_ms.is_some());
+        // 停下之后补清晰到 QP 够低；没有像素可比，信噪比是 NaN
+        assert!(o.phases[1].sharp_ms.is_some(), "{:?}", o.phases[1]);
+        assert!(o.phases[1].end_psnr.is_nan());
+        // 同一个场景再跑一遍，结果相同
+        assert_eq!(fingerprint(&o), fingerprint(&run(&s).unwrap()));
+        // 摘要行
+        let line = summary_line(
+            &s,
+            &o,
+            std::time::Duration::from_millis(50),
+            Time(2_000_000),
+        );
+        assert!(
+            line.contains(" seed1 ") && line.contains("|h264-l05|frames "),
+            "{line}"
+        );
+        assert!(line.contains("|sim 2.0|wall 50\n"), "{line}");
+        let plain = summary_line(
+            &s,
+            &Outcome {
+                phases: vec![],
+                ..o
+            },
+            std::time::Duration::ZERO,
+            Time::ZERO,
+        );
+        assert!(plain.contains("|sharp -|"), "{plain}");
+    }
+
+    #[test]
+    fn codec_kinds_and_the_environment_choice() {
+        assert!(CodecKind::H264.is_h264() && CodecKind::H264L05.is_h264());
+        assert!(!CodecKind::Tile.is_h264());
+        assert_eq!(default_codec(None), CodecKind::H264);
+        assert_eq!(
+            default_codec(Some(std::ffi::OsStr::new("h264-l05"))),
+            CodecKind::H264L05
+        );
+        assert_eq!(
+            default_codec(Some(std::ffi::OsStr::new("x"))),
+            CodecKind::H264
+        );
     }
 
     #[test]

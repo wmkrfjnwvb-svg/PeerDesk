@@ -15,6 +15,8 @@ fast-ramp 1280x720 fps30 h264 gcc-v1 seed1 max30000000 start500000 pace0 probe11
 fast-ramp 1280x720 fps30 h264 legacy seed1 max30000000 start500000 pace0 probe11 Rs 978c8ae2a398eaf4
 fp 1280x720 fps30 h264 classic-v1 seed1 max30000000 start1000000 pace0 probe11 Rs 0f6c5de4ddaf274b
 fp 1280x720 fps30 h264 classic-v1 seed1 max30000000 start1000000 pace0 probe11 Rs 0f6c5de4ddaf274b
+l05 1280x720 fps30 h264-l05 classic-v1 seed1 max30000000 start1000000 pace0 probe11 Rs b562818146508595
+l05 1280x720 fps30 h264-l05 classic-v1 seed1 max30000000 start1000000 pace0 probe11 Rs b562818146508595
 light-minute 1280x720 fps30 h264 classic-v1 seed1 max30000000 start1000000 pace0 probe01 Rs 2b1d5d9ebc4721ca
 light-old-peer 1280x720 fps30 h264 classic-v1 seed1 max30000000 start1000000 pace0 probe00 Rs c2781e9162bf22cc
 lossy-stable 1280x720 fps30 h264 classic-v1 seed1 max30000000 start1000000 pace0 probe11 Rs 4675dec1373821f1
