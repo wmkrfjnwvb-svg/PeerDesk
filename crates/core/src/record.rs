@@ -1199,6 +1199,136 @@ impl BlockWriter {
 }
 
 // ---------------------------------------------------------------------------
+// 缺口和结束：写入器之上的一层
+// ---------------------------------------------------------------------------
+
+/// 队列满过：记录线程取走的这一段时间里被丢的记录。下标是 [`Kind::slot`]。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GapInfo {
+    /// 最早一条被丢的记录的时间（微秒）。
+    pub first_us: u64,
+    /// 最后一条被丢的记录的时间（微秒）。
+    pub last_us: u64,
+    /// 各种类丢了几条。
+    pub dropped: [u64; Kind::ALL.len()],
+}
+
+/// 在 [`BlockWriter`] 之上管“缺口”和“结束”两种记录：
+/// 队列满过的话，下一个块开头写一条缺口记录；结束时写结束记录（带各种类写了多少、丢了多少）。
+/// 内存里的仿真和写文件的记录线程用同一份逻辑，区别只是缺口从哪来（仿真没有队列，永远没有缺口）。
+#[derive(Debug, Default)]
+pub struct Sink {
+    writer: BlockWriter,
+    /// 已经写进缺口记录的丢失条数，下标是 [`Kind::slot`]。
+    dropped: [u64; Kind::ALL.len()],
+}
+
+impl Sink {
+    /// 新的写入层。
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            writer: BlockWriter::new(),
+            dropped: [0; Kind::ALL.len()],
+        }
+    }
+
+    /// 写一条记录。要开新块时调用 `take_gap` 取队列满过的情况（取走即清零，所以只在真的要写缺口记录时才调用）。
+    pub fn push(
+        &mut self,
+        at_us: u64,
+        record: &Record,
+        take_gap: impl FnOnce() -> Option<GapInfo>,
+        out: &mut Vec<u8>,
+    ) {
+        self.writer.seal_if_due(at_us, out);
+        if !self.writer.is_open() {
+            if let Some(gap) = take_gap() {
+                self.write_gap(at_us, &gap, out);
+            }
+        }
+        self.writer.push(at_us, record, out);
+    }
+
+    fn write_gap(&mut self, at_us: u64, gap: &GapInfo, out: &mut Vec<u8>) {
+        // 块的起始时间取这一段里最早的：缺口记录的时间（最后一条被丢的）和后面的记录都不早于它
+        self.writer.open(at_us.min(gap.first_us));
+        let dropped = Kind::ALL
+            .iter()
+            .zip(gap.dropped)
+            .filter(|(_, n)| *n > 0)
+            .map(|(kind, n)| (kind.code(), n))
+            .collect();
+        for (total, n) in self.dropped.iter_mut().zip(gap.dropped) {
+            *total = total.saturating_add(n);
+        }
+        let record = Record::Gap(Gap {
+            span_us: gap.last_us.saturating_sub(gap.first_us),
+            dropped,
+        });
+        self.writer.push(gap.last_us, &record, out);
+    }
+
+    /// 封掉当前块。
+    pub fn flush(&mut self, out: &mut Vec<u8>) {
+        self.writer.flush(out);
+    }
+
+    /// 会话结束：先写还没写的缺口，再写结束记录，封块。`at_us` 是结束的时间，`duration_us` 是会话时长。
+    pub fn finish(
+        &mut self,
+        at_us: u64,
+        reason: EndReason,
+        duration_us: u64,
+        last_gap: Option<GapInfo>,
+        out: &mut Vec<u8>,
+    ) {
+        self.writer.seal_if_due(at_us, out);
+        if let Some(gap) = last_gap {
+            self.write_gap(at_us, &gap, out);
+        }
+        let tallies = Kind::ALL
+            .iter()
+            .zip(self.writer.written())
+            .zip(self.dropped)
+            .filter(|((kind, written), dropped)| {
+                **kind != Kind::End && (**written > 0 || *dropped > 0)
+            })
+            .map(|((kind, written), dropped)| KindTally {
+                kind: kind.code(),
+                written: *written,
+                dropped,
+            })
+            .collect();
+        let end = Record::End(End {
+            reason,
+            duration_us,
+            tallies,
+        });
+        self.writer.push(at_us, &end, out);
+        self.writer.flush(out);
+    }
+
+    /// 各种类交给写入器的条数，下标是 [`Kind::slot`]。
+    #[must_use]
+    pub const fn written(&self) -> &[u64; Kind::ALL.len()] {
+        self.writer.written()
+    }
+
+    /// 各种类已经写进缺口记录的丢失条数，下标是 [`Kind::slot`]。
+    #[must_use]
+    pub const fn dropped(&self) -> &[u64; Kind::ALL.len()] {
+        &self.dropped
+    }
+
+    /// 已经封好的块数。
+    #[must_use]
+    pub const fn blocks(&self) -> u64 {
+        self.writer.blocks()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 读
 // ---------------------------------------------------------------------------
 
@@ -1400,6 +1530,19 @@ impl Recording {
             | Record::Transport(_)
             | Record::Input(_)
             | Record::Gap(_) => None,
+        })
+    }
+
+    /// 缺口记录（队列满过的地方）：时间和内容。
+    pub fn gaps(&self) -> impl Iterator<Item = (u64, &Gap)> {
+        self.entries.iter().filter_map(|e| match &e.record {
+            Record::Gap(gap) => Some((e.at_us, gap)),
+            Record::Feedback(_)
+            | Record::Frame(_)
+            | Record::Retransmit(_)
+            | Record::Transport(_)
+            | Record::Input(_)
+            | Record::End(_) => None,
         })
     }
 
@@ -2179,6 +2322,112 @@ mod tests {
             &rec.entries[0].record,
             Record::Frame(f) if f.key_reason.len() <= KEY_REASON_MAX && !f.key_reason.is_empty()
         ));
+    }
+
+    #[test]
+    fn a_gap_opens_the_next_block_and_the_end_record_adds_everything_up() {
+        let mut out = encode_header(&meta());
+        let mut sink = Sink::new();
+        let mut asked = 0;
+        let gap = GapInfo {
+            first_us: 900,
+            last_us: 1_400,
+            dropped: [3, 0, 0, 0, 0, 0, 0],
+        };
+        sink.push(
+            1_000,
+            &feedback(1),
+            || {
+                asked += 1;
+                Some(gap)
+            },
+            &mut out,
+        );
+        // 块已经开着：不再问缺口（问了就会把计数取走）
+        sink.push(
+            1_100,
+            &feedback(2),
+            || {
+                asked += 1;
+                None
+            },
+            &mut out,
+        );
+        assert_eq!(asked, 1);
+        // 超过 1 秒开新块，这次没有缺口
+        sink.push(
+            2_500_000,
+            &Record::Input(InputLevel::Few),
+            || None,
+            &mut out,
+        );
+        let last = GapInfo {
+            first_us: 2_600_000,
+            last_us: 2_700_000,
+            dropped: [0, 2, 0, 0, 0, 0, 0],
+        };
+        sink.finish(
+            3_000_000,
+            EndReason::LinkLost,
+            3_000_000,
+            Some(last),
+            &mut out,
+        );
+        let rec = Recording::parse(&out).unwrap();
+        let got: Vec<(u64, Record)> = read_pairs(&rec);
+        assert_eq!(
+            got[0],
+            (
+                1_400,
+                Record::Gap(Gap {
+                    span_us: 500,
+                    dropped: vec![(1, 3)]
+                })
+            )
+        );
+        assert_eq!(got[1].0, 1_000);
+        assert_eq!(got[3].0, 2_500_000);
+        assert_eq!(
+            got[4],
+            (
+                2_700_000,
+                Record::Gap(Gap {
+                    span_us: 100_000,
+                    dropped: vec![(2, 2)]
+                })
+            )
+        );
+        let Record::End(end) = &got[5].1 else {
+            assert_eq!(got[5].1.kind(), Kind::End, "最后一条应当是结束记录");
+            return;
+        };
+        assert_eq!(
+            (end.reason, end.duration_us),
+            (EndReason::LinkLost, 3_000_000)
+        );
+        let tally = |kind: Kind| end.tallies.iter().find(|t| t.kind == kind.code()).copied();
+        assert_eq!(
+            tally(Kind::Feedback),
+            Some(KindTally {
+                kind: 1,
+                written: 2,
+                dropped: 3
+            })
+        );
+        assert_eq!(
+            tally(Kind::Frame),
+            Some(KindTally {
+                kind: 2,
+                written: 0,
+                dropped: 2
+            })
+        );
+        assert_eq!(tally(Kind::Gap).map(|t| t.written), Some(2));
+        assert_eq!(tally(Kind::End), None, "结束记录不数自己");
+        assert_eq!(tally(Kind::Transport), None, "没写过也没丢过的不列");
+        assert_eq!(sink.written()[Kind::End.slot()], 1);
+        assert_eq!(sink.dropped(), &[3, 2, 0, 0, 0, 0, 0]);
+        assert_eq!(sink.blocks(), rec.stats.blocks);
     }
 
     #[test]
