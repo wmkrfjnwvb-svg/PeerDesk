@@ -43,6 +43,7 @@ pub mod paths;
 pub mod policy;
 pub mod probe;
 pub mod proto;
+pub mod record;
 pub mod region;
 pub mod relay;
 pub mod rs;
