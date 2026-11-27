@@ -137,6 +137,11 @@ fn show_now(hwnd: HWND) {
     }
 }
 
+/// 主窗口的子类化窗口过程（下面用 `SetWindowSubclass` 挂上）。
+///
+/// # Safety
+///
+/// 只能由系统在主窗口的界面线程上调用，参数是这个窗口收到的消息。
 unsafe extern "system" fn main_window_proc(
     hwnd: HWND,
     msg: u32,
@@ -250,6 +255,11 @@ struct Collect {
     found: Vec<WindowInfo>,
 }
 
+/// `EnumWindows` 的回调：收集属于某个进程的顶层窗口。
+///
+/// # Safety
+///
+/// 只能由 `EnumWindows` 调用，`lparam` 必须是 `top_windows_of_process` 传入的 `Collect` 的地址。
 unsafe extern "system" fn collect_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
     // SAFETY: lparam 是 `top_windows_of_process` 传进来的 `Collect` 的地址，枚举期间一直有效。
     let collect = unsafe { &mut *(lparam.0 as *mut Collect) };

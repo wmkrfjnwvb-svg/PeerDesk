@@ -564,12 +564,12 @@ mod tests {
 
     #[test]
     fn registry_commands_only_work_on_windows() {
-        let set = cmd(&[REGISTRY_PROGRAM, "set", "X", "y"]);
+        let set = cmd(&[REGISTRY_PROGRAM, "set", "PeerDesk-test-delete-me", "y"]);
         let result = system_runner(&set);
         if cfg!(windows) {
             // 真的写了当前用户的注册表：清理掉
             assert_eq!(result, Ok((true, String::new())));
-            let del = cmd(&[REGISTRY_PROGRAM, "delete", "X"]);
+            let del = cmd(&[REGISTRY_PROGRAM, "delete", "PeerDesk-test-delete-me"]);
             assert_eq!(system_runner(&del), Ok((true, String::new())));
             assert_eq!(
                 system_runner(&del),
