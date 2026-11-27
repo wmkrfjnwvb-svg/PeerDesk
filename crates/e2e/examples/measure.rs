@@ -14,6 +14,9 @@
 //! - `scene <集> <种子> <宽> <高> <QP> <面积千分比,…>`：整屏换窗口的门槛：前一帧是桌面，后一帧把其中一块（占这么多千分比）换成另一个桌面的内容；
 //!   `scenev` 同上，换进来的是视频噪声（变化面积能到 100%）。
 //!
+//! 另有一个子命令 `measure floor <输出目录> <第几份> <共几份>`：低 QP 地板的根因实验（`docs/research/Q-redesign/m2b-plan.md` 第 2 节），
+//! 不读清单，任务（12 个种子）写死在代码里，每帧多记解码后对原图的亮度 PSNR。
+//!
 //! 固定：单线程；每个（序列, QP）新开一个后端；每个任务的第一个 QP 编两遍，字节数必须相同（自检，不同就报错退出）。
 
 use std::fs::{self, File};
@@ -22,11 +25,14 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::time::Instant;
 
+use peerdesk_core::frame::Picture;
 use peerdesk_core::screen::Screen;
+use peerdesk_core::video::{Codec, FrameHeader, VideoDecoder};
 use peerdesk_e2e::content::{Action, RealisticDesktop};
 use peerdesk_media::backend::{EncoderBackend, Finished, FrameAsk, FrameInput, Rates, Submitted};
 use peerdesk_media::content::{detail_permille, luma_changed_permille, sample_luma};
 use peerdesk_media::soft::OpenH264Backend;
+use peerdesk_media::H264Decoder;
 
 type Res<T> = Result<T, String>;
 
@@ -620,8 +626,142 @@ fn run_job(job: &Job, out: &mut BufWriter<File>) -> Res<()> {
     }
 }
 
+/// 低 QP 地板实验的 CSV 表头。`chain` 是 `hold` 或 `desc`；`idx` 0 是先按 QP 30 编的那一帧。
+const FLOOR_HEADER: &str = "seed,w,h,chain,q,idx,qp,bytes,got_key,psnr";
+
+/// 解码后的亮度和原图亮度比，PSNR（分贝）；完全相同记 99。
+fn luma_psnr(orig: &[u8], decoded: &[u8]) -> Option<f64> {
+    if orig.len() != decoded.len() || orig.is_empty() {
+        return None;
+    }
+    let sum: f64 = orig
+        .iter()
+        .zip(decoded)
+        .map(|(a, b)| {
+            let d = i32::from(*a) - i32::from(*b);
+            f64::from(d * d)
+        })
+        .sum();
+    let n = f64::from(u32::try_from(orig.len()).ok()?);
+    let mse = sum / n;
+    Some(if mse <= 0.0 {
+        99.0
+    } else {
+        10.0 * (255.0f64 * 255.0 / mse).log10()
+    })
+}
+
+/// 同一幅画面依次按 `qps` 编，每帧解码后量亮度 PSNR。返回（字节数, 是不是关键帧, PSNR）。
+fn floor_chain(
+    frame: &Frame,
+    size: (u16, u16),
+    qps: &[u8],
+) -> Res<Vec<(usize, bool, Option<f64>)>> {
+    let mut backend = OpenH264Backend::new();
+    let rates = Rates {
+        bps: 8_000_000,
+        fps: 30,
+    };
+    let _ = backend
+        .reconfigure(size, rates)
+        .map_err(|e| format!("配置后端失败：{e:?}"))?;
+    let mut dec = H264Decoder::new().map_err(|e| e.to_string())?;
+    let mut out = Vec::with_capacity(qps.len());
+    for (i, qp) in qps.iter().enumerate() {
+        let ask = FrameAsk {
+            token: u64::try_from(i).unwrap_or(0),
+            budget: usize::MAX / 2,
+            qp: Some(*qp),
+            keyframe: false,
+        };
+        let input = FrameInput::I420 {
+            y: &frame.y,
+            u: &frame.u,
+            v: &frame.v,
+        };
+        let Submitted::Ready(Finished::Frame(f)) = backend
+            .submit(input, ask)
+            .map_err(|e| format!("第 {i} 帧编码失败：{e:?}"))?
+        else {
+            return Err(format!("第 {i} 帧没有立刻编出来"));
+        };
+        let header = FrameHeader {
+            codec: Codec::H264,
+            key: f.key,
+            width: size.0,
+            height: size.1,
+        };
+        let psnr = match dec
+            .decode_picture(&header, &f.data)
+            .map_err(|e| e.to_string())?
+        {
+            Some(Picture::Nv12(nv)) => {
+                let n = usize::from(size.0) * usize::from(size.1);
+                nv.data().get(..n).and_then(|y| luma_psnr(&frame.y, y))
+            }
+            _ => None,
+        };
+        out.push((f.data.len(), f.key, psnr));
+    }
+    Ok(out)
+}
+
+/// `measure floor`：每个种子一幅 1080p 画面（和 refine 同一套摆法）。
+/// 链 1（`hold`）：先按 QP 30 编一帧，再按同一个 q 连编 20 帧，q = 12…20；链 2（`desc`）：从 30 每帧降 1 到 12。
+fn run_floor(args: &[String]) -> Res<()> {
+    let arg = |i: usize| {
+        args.get(i)
+            .ok_or("用法：measure floor <输出目录> <第几份> <共几份>")
+    };
+    let dir = Path::new(arg(2)?);
+    let (shard, shards): (u64, u64) = (num(arg(3)?, "第几份")?, num(arg(4)?, "共几份")?);
+    fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let file = File::create(dir.join(format!("floor-{shard}.csv"))).map_err(|e| e.to_string())?;
+    let mut w = BufWriter::new(file);
+    writeln!(w, "{FLOOR_HEADER}").map_err(|e| e.to_string())?;
+    let size = (1920u16, 1080u16);
+    for seed in 0..12u64 {
+        if seed % shards.max(1) != shard {
+            continue;
+        }
+        let mut desk = RealisticDesktop::new(size.0, size.1, seed).map_err(|e| e.to_string())?;
+        warm(&mut desk, seed, "refine")?;
+        for _ in 0..(seed % 3) * 30 {
+            let _ = desk.step(Action::Scrolling).map_err(|e| e.to_string())?;
+        }
+        let frame = to_frame(desk.screen(), style_of(seed), &mut None)?;
+        let mut chains: Vec<(&str, u8, Vec<u8>)> = (12..=20u8)
+            .map(|q| {
+                let mut v = vec![30u8];
+                v.extend(std::iter::repeat_n(q, 20));
+                ("hold", q, v)
+            })
+            .collect();
+        chains.push(("desc", 0, (12..=30u8).rev().collect()));
+        for (name, q, qps) in chains {
+            let rows = floor_chain(&frame, size, &qps)?;
+            for (i, ((bytes, key, psnr), qp)) in rows.iter().zip(&qps).enumerate() {
+                let p = psnr.map_or_else(|| "-".to_owned(), |p| format!("{p:.3}"));
+                writeln!(
+                    w,
+                    "{seed},{},{},{name},{q},{i},{qp},{bytes},{},{p}",
+                    size.0,
+                    size.1,
+                    u8::from(*key)
+                )
+                .map_err(|e| e.to_string())?;
+            }
+        }
+        w.flush().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 fn run() -> Res<()> {
     let args: Vec<String> = std::env::args().collect();
+    if args.get(1).is_some_and(|a| a == "floor") {
+        return run_floor(&args);
+    }
     let arg = |i: usize| {
         args.get(i)
             .ok_or("用法：measure <清单> <输出目录> <第几份> <共几份>")
