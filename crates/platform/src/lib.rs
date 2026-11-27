@@ -31,6 +31,8 @@ pub mod session;
 
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "macos")]
+pub mod macshell;
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 mod unsupported;
 #[cfg(windows)]
@@ -42,6 +44,8 @@ pub mod winservice;
 /// Windows 系统服务用到的会话和进程操作（无人值守）。
 #[cfg(windows)]
 pub mod winsession;
+#[cfg(windows)]
+pub mod winshell;
 #[cfg(target_os = "linux")]
 mod x11;
 

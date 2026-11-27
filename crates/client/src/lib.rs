@@ -13,6 +13,7 @@ pub mod instance;
 pub mod keychain;
 pub mod libcheck;
 pub mod logfile;
+pub mod process;
 
 /// 默认的数据目录（身份、设置、日志都在这里）。
 #[must_use]
@@ -67,6 +68,7 @@ const USAGE: &str = "\
                           Windows 无人值守：注册系统服务，锁屏和登录界面也能远程（需管理员）
   guard                   守护模式：运行图形界面，被杀或崩溃（退出码非 0）就重启，用户从托盘退出（退出码 0）则不重启
   autostart on|off        开启/关闭开机自启和崩溃自动恢复
+  window show|close|quit  对正在运行的界面：显示窗口、关窗口（有托盘时隐藏）、退出（安装程序、更新脚本用）
   help                    显示本帮助
 
 host 的选项：
@@ -319,6 +321,7 @@ pub fn run(args: &[String], out: &mut dyn Write) -> u8 {
             return report(out, result);
         }
         "guard" => return guard::cmd_guard(out),
+        "window" => return instance::cmd_window(rest, out, &data_dir()),
         "autostart" => return autostart::cmd_autostart(rest, out),
         "agent" => {
             let result = unattended::cmd_agent(rest, out);

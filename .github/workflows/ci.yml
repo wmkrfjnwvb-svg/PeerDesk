@@ -228,6 +228,12 @@ jobs:
           sleep 2
       - name: Live tests
         run: cargo test -p peerdesk-platform --test live -- --ignored --test-threads 1 --nocapture
+      # 图形界面常驻后台的回归测试（真机反馈：启动闪一下、关闭后托盘点不开、退出慢、程序坞点不开）：
+      # 真的启动 peerdesk，Windows 发 WM_CLOSE、第二次启动、window show/quit 请求并看窗口状态和退出码，
+      # macOS 装一个最小的 .app，关窗口后再 open -a（等同点程序坞图标）并看日志。只发窗口消息和请求，不动键鼠。
+      - name: GUI background lifecycle (close to tray, show, quit, dock reopen)
+        if: runner.os != 'Linux'
+        run: cargo test -p peerdesk --test gui_live -- --ignored --test-threads 1 --nocapture
       - name: screen-check (release build)
         shell: bash
         run: |

@@ -117,7 +117,11 @@ pub fn run() -> u8 {
     let result = eframe::run_native(
         s.app_title,
         options,
-        Box::new(move |cc| Ok(Box::new(App::new(&cc.egui_ctx, s, lock)))),
+        Box::new(move |cc| {
+            // Windows：登记主窗口句柄，托盘命令才能在窗口隐藏时直接显示窗口、退出
+            super::tray::register_window(cc);
+            Ok(Box::new(App::new(&cc.egui_ctx, s, lock)))
+        }),
     );
     match result {
         Ok(()) => EXIT_OK,
