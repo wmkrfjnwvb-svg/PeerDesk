@@ -296,3 +296,43 @@ TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
 SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 /
 ```
+
+## 系统托盘（关闭退到托盘，编进客户端）
+
+这些是依赖库，没有拷贝它们的代码。按各自许可证随二进制发布，这里写明来源和许可：
+
+| 库 | 用在 | 许可证 | 版权 |
+|---|---|---|---|
+| `tray-icon` 0.24 及其依赖 `muda` 0.19 | Windows、macOS 的托盘（菜单栏）图标和右键菜单 | MIT OR Apache-2.0（我们按 MIT 使用） | Copyright (c) 2022-2022 Tauri Programme within The Commons Conservancy |
+| `ksni` 0.3 | Linux 的托盘图标（StatusNotifierItem，纯 Rust 的 D-Bus） | Unlicense（公有领域） | 无 |
+
+Linux 不用 `tray-icon`，所以不依赖 GTK3 和 libayatana-appindicator（LGPL 系统库）：`ksni` 不需要任何系统库，
+运行时只要桌面有 StatusNotifierWatcher（KDE、XFCE、Cinnamon、MATE 自带；GNOME 要 AppIndicator 扩展）。
+`Cargo.lock` 里会出现 `tray-icon` 在 Linux 上的可选依赖（gtk、libappindicator 等，MIT）和 `dirs-sys` 用到的 `option-ext`（MPL-2.0），
+它们只在 `tray-icon` 的 Linux 实现里用到，我们的构建不编译、不分发。
+
+`tray-icon` 的 MIT 许可证原文：
+
+```
+MIT License
+
+Copyright (c) 2022-2022 Tauri Programme within The Commons Conservancy
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```

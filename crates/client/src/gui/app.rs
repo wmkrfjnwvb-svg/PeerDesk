@@ -17,6 +17,7 @@ use peerdesk_net::rendezvous::Lookup;
 use peerdesk_net::Identity;
 use peerdesk_platform::guide::{guide, mac_settings_names, Action, Guide, Os};
 
+use super::background::{self, Background, Startup};
 use super::book::{Book, Device, Id, Row};
 use super::form::{parse_pin, parse_port, ConnectForm, Target, DEFAULT_PORT};
 use super::home::{
@@ -81,11 +82,23 @@ pub fn run() -> u8 {
     if let Some(why) = crate::libcheck::check() {
         log::error!("{why}");
         let _ = writeln!(std::io::stderr(), "{why}");
-        return EXIT_FAILED;
+        // 缺系统库重试也没用：让进程守护停手，不要每几秒重启一次
+        return crate::EXIT_NO_RETRY;
     }
     let lang = effective_lang(&default_data_dir());
     peerdesk_net::rendezvous::set_prefer_ipv6(lang.prefers_ipv6());
     let s = strings(lang);
+    // 单实例：已经有一个在跑（多半藏在托盘里）时，叫出它的窗口，自己以退出码 0 退出
+    let lock = match background::startup(&default_data_dir()) {
+        Startup::Proceed(lock) => lock,
+        Startup::AlreadyRunning => {
+            let _ = writeln!(
+                std::io::stderr(),
+                "PeerDesk 已经在运行 / PeerDesk is already running"
+            );
+            return EXIT_OK;
+        }
+    };
     let mut viewport = egui::ViewportBuilder::default()
         .with_title(s.app_title)
         .with_app_id("peerdesk")
@@ -104,7 +117,7 @@ pub fn run() -> u8 {
     let result = eframe::run_native(
         s.app_title,
         options,
-        Box::new(move |cc| Ok(Box::new(App::new(&cc.egui_ctx, s)))),
+        Box::new(move |cc| Ok(Box::new(App::new(&cc.egui_ctx, s, lock)))),
     );
     match result {
         Ok(()) => EXIT_OK,
@@ -220,6 +233,8 @@ struct App {
     name: String,
     /// 没找到兜底用的系统中文字体（生僻字会显示成方框）：设置页里一直提示。
     font_fallback_missing: bool,
+    /// 托盘、关闭退到托盘、单实例、开机自启（见 `background.rs`）。
+    bg: Background,
 }
 
 /// 用户手动关闭被控后留下的标记文件。
@@ -259,7 +274,7 @@ impl App {
         }
     }
 
-    fn new(ctx: &egui::Context, s: &'static Strings) -> Self {
+    fn new(ctx: &egui::Context, s: &'static Strings, lock: Option<std::fs::File>) -> Self {
         let fonts = theme::install(ctx);
         let appearance = Appearance::load(&default_data_dir());
         appearance.apply(ctx);
@@ -275,6 +290,8 @@ impl App {
         let server = ServerSettings::load(&data_dir);
         crate::crashreport::upload_in_background(&data_dir, server.server(s).ok().flatten());
         let ctx2 = ctx.clone();
+        let (bg, tray_status) = Background::new(ctx, s, &data_dir, lock);
+        let status = tray_status.unwrap_or(status);
         let auto_host = !data_dir.join(HOST_OFF_FILE).exists();
         // PEERDESK_GUI_PREVIEW_MAC=15：在任何系统上预览 macOS 15 的授权引导（截图、设计评审用）
         let preview = std::env::var(PREVIEW_MAC_ENV)
@@ -358,6 +375,7 @@ impl App {
             service_checked: None,
             name: crate::local::device_name(),
             font_fallback_missing: fonts.system_cjk.is_none(),
+            bg,
         }
     }
 
@@ -1557,6 +1575,10 @@ impl App {
             }
         });
         ui.add_space(space::S12);
+        if let Some(status) = self.bg.settings_card(ui, p, s) {
+            self.status = status;
+        }
+        ui.add_space(space::S12);
 
         panel(ui, p, |ui| {
             section_title(ui, s.section_network, |ui| {
@@ -2001,6 +2023,21 @@ pub(super) fn open_folder(dir: &std::path::Path) -> Result<(), String> {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let connected = matches!(
+            self.phase,
+            HostPhase::Busy {
+                established: true,
+                ..
+            }
+        );
+        let host = self.host.as_ref();
+        if let Some(status) = self.bg.update(ctx, self.s, connected, || {
+            if let Some(host) = host {
+                host.kick();
+            }
+        }) {
+            self.status = status;
+        }
         if self.selftest && self.host.is_none() && self.phase == HostPhase::Off {
             self.start_hosting();
         }

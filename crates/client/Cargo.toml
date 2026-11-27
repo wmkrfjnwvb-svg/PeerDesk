@@ -33,19 +33,29 @@ egui-phosphor = "=0.10.0"
 ab_glyph = "0.2.32"
 # 保存的连接密码加密（XChaCha20-Poly1305，见 src/vault.rs）
 chacha20poly1305 = "0.10"
+# 托盘图标是 PNG（packaging/icons/tray-*.png），解码成 RGBA 交给系统托盘。png 已被 eframe 间接依赖。
+png = { version = "0.18", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 # 图形界面的 exe 没有控制台；命令行子命令运行时挂到启动它的终端上（AttachConsole 的安全封装）。
 win32console = "0.1"
 # 系统钥匙串（存保存密码的加密密钥，见 src/keychain.rs）：Windows 凭据管理器
 keyring = { version = "3.6", features = ["windows-native"] }
+# 系统托盘（MIT OR Apache-2.0）。Windows 通知区域图标，不依赖任何系统库。
+tray-icon = { version = "0.24", default-features = false }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3.6", features = ["apple-native"] }
+# 系统菜单栏图标（MIT OR Apache-2.0）。macOS 用 NSStatusItem，模板图由系统按深浅色着色。
+tray-icon = { version = "0.24", default-features = false }
 
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 # Linux：Secret Service（纯 Rust 的 D-Bus，不依赖 libdbus）
 keyring = { version = "3.6", features = ["async-secret-service", "tokio", "crypto-rust"] }
+# 系统托盘：StatusNotifierItem（纯 Rust 的 D-Bus，Unlicense 即公有领域，和 keyring 一样不依赖 libdbus）。
+# 不用 tray-icon 的 Linux 实现：它要 GTK3 和 libayatana-appindicator（LGPL 系统库），
+# 还要在另一个线程里跑 GTK 主循环，和 winit 打架；ksni 不需要任何系统库。
+ksni = { version = "0.3", features = ["blocking"] }
 
 [dev-dependencies]
 peerdesk-server = { path = "../server" }
