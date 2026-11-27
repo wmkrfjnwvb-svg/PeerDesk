@@ -42,6 +42,10 @@ const CHANGE_OF_KEY_PERMILLE: u64 = 800;
 pub const LARGE_CHANGE_PERMILLE: u64 = 500;
 /// 整屏变化编出来超过大帧时限这么多倍就重编（见 [`QpControl::overshoot_qp`]）。
 const OVERSHOOT_TIMES: u64 = 2;
+/// 画面一直在变时，变化面积比上一帧大出这么多（上一帧的 [`RENEWAL_TIMES`] 倍再加这么多千分比），算“突然换了一块”
+/// （打字、拖小块之后切换窗口、打开对话框），按面积估计装进大帧时限，不封顶在 [`KEY_MIN_QP`]。
+const RENEWAL_MIN_PERMILLE: u64 = 100;
+const RENEWAL_TIMES: u64 = 4;
 /// 补清晰时一帧的补充量最多是预算的几倍：1 倍，补清晰正好用满链路；再多会占满在途上限，画面一动新帧就得排在补清晰的帧后面。
 const REFINE_BUDGET_FACTOR: u64 = 1;
 /// 补清晰降一个 QP 的估计补充量超过大帧时限的这么多倍就不再降（停在当前清晰度）。
@@ -71,6 +75,8 @@ pub struct QpControl {
     key_density: u64,
     /// 上一次画面在变时用的 QP。
     change_qp: Option<u8>,
+    /// 上一帧在变的增量帧变了多少（加权千分比，不知道为 `None`）：判断这一帧是不是“突然换了一块”。
+    change_area: Option<u64>,
     max_qp: u8,
 }
 
@@ -104,6 +110,7 @@ impl QpControl {
             last: None,
             key_density: KEY_BYTES_PER_MEGAPIXEL,
             change_qp: None,
+            change_area: None,
             max_qp: max_qp.clamp(MIN_QP, MAX_QP),
         }
     }
@@ -200,10 +207,23 @@ impl QpControl {
                         let q = i32::from(q) + delta;
                         let q = u8::try_from(q.clamp(i32::from(MIN_QP), i32::from(self.max_qp)))
                             .unwrap_or(self.max_qp);
+                        // 变化面积比上一帧突然大很多（打字之后切换窗口、打开对话框）：这块区域是整个换成新内容，
+                        // 上一帧的大小推算不出它，按面积估计装进大帧时限，和静止后第一帧变化一样不封顶。
+                        // 2026-11-27：打字时码率 13 Mbps、QP 12，静止中链路降到 2 Mbps，切换窗口（加权面积 38%）
+                        // 按下面封顶的规则只提到 QP 22，编出 146 KB（大帧时限 9 KB 的 16 倍），2 Mbps 上传了 600 ms。
                         // 降到 KEY_MIN_QP 以下时：这块区域突然整个换掉（拖动窗口之后马上切换窗口）也要装得进
                         // 大帧时限，最多提到 KEY_MIN_QP。不按面积估计一直在变的帧：滚动、视频靠运动补偿，
                         // 比按面积估计的小得多（实测窄带上逐帧按面积估计，视频和拖动之后的画面明显更糊）
                         match changed_permille {
+                            Some(area) if self.renewal(area) => q.max(self.fit(
+                                if area >= LARGE_CHANGE_PERMILLE {
+                                    KEY_MIN_QP
+                                } else {
+                                    MIN_QP
+                                },
+                                key_allowed,
+                                |x| renewed(area, x),
+                            )),
                             Some(area) if q < KEY_MIN_QP => q.max(
                                 self.fit(MIN_QP, key_allowed, |x| renewed(area, x))
                                     .min(KEY_MIN_QP),
@@ -254,8 +274,18 @@ impl QpControl {
         )
     }
 
-    /// 编完一帧：`bytes` 字节、用的 QP `qp`、`pixels` 个像素。
-    pub fn on_frame(&mut self, kind: Kind, bytes: u64, qp: u8, pixels: u64) {
+    /// 画面一直在变时，这一帧变化的面积 `area`（加权千分比）比上一帧大很多：这块区域是突然整个换掉的。
+    /// 上一帧的面积不知道时不算（按原来的规则）。
+    fn renewal(&self, area: u64) -> bool {
+        self.change_area.is_some_and(|last| {
+            area >= last
+                .saturating_mul(RENEWAL_TIMES)
+                .saturating_add(RENEWAL_MIN_PERMILLE)
+        })
+    }
+
+    /// 编完一帧：`bytes` 字节、用的 QP `qp`、`pixels` 个像素，画面变了多少 `area`（加权千分比，不知道为 `None`）。
+    pub fn on_frame(&mut self, kind: Kind, bytes: u64, qp: u8, pixels: u64, area: Option<u64>) {
         if kind == Kind::Key {
             // 换算回 QP 34 的“每百万像素多少字节”，下一个关键帧按它估计
             let density = bytes.saturating_mul(1_000_000) / pixels.max(1);
@@ -268,6 +298,7 @@ impl QpControl {
         });
         if kind == Kind::Change {
             self.change_qp = Some(qp);
+            self.change_area = area;
         }
         self.last = Some((bytes, qp, kind));
     }
@@ -299,29 +330,29 @@ mod tests {
     fn changing_frames_track_the_target_and_learn_keyframe_size() {
         let mut c = QpControl::new(MAX_QP);
         // 关键帧实际只有估计的一半：下一次估计跟着变小
-        c.on_frame(Kind::Key, 46_000, BASE_QP, P720);
+        c.on_frame(Kind::Key, 46_000, BASE_QP, P720, None);
         assert!(c.key_bytes(P720, BASE_QP) < 60_000);
         // 刚出过关键帧：沿用它的 QP
         assert_eq!(c.next(Kind::Change, 2_000, 0, P720, None), BASE_QP);
         // 一帧大了 8 倍：QP 加约 21，但每帧最多 +10
-        c.on_frame(Kind::Change, 16_000, 30, P720);
+        c.on_frame(Kind::Change, 16_000, 30, P720, None);
         assert_eq!(c.next(Kind::Change, 2_000, 0, P720, None), 40);
         // 一帧比目标小很多：每帧最多 −2；但比当前画面的 QP 低就等于补清晰，只能低到预算补得动的程度（这里 1）
-        c.on_frame(Kind::Change, 100, 40, P720);
+        c.on_frame(Kind::Change, 100, 40, P720, None);
         assert_eq!(c.next(Kind::Change, 2_000, 0, P720, None), 39);
         assert_eq!(c.next(Kind::Change, 1_000_000, 0, P720, None), 38);
         // 正好：不动
-        c.on_frame(Kind::Change, 2_000, 39, P720);
+        c.on_frame(Kind::Change, 2_000, 39, P720, None);
         assert_eq!(c.next(Kind::Change, 2_000, 0, P720, None), 39);
         // 夹在范围里
-        c.on_frame(Kind::Change, 1, MIN_QP, P720);
+        c.on_frame(Kind::Change, 1, MIN_QP, P720, None);
         assert_eq!(c.next(Kind::Change, 2_000, 0, P720, None), MIN_QP);
     }
 
     #[test]
     fn refine_steps_down_within_budget_until_converged() {
         let mut c = QpControl::new(MAX_QP);
-        c.on_frame(Kind::Key, 14_000, 51, P720);
+        c.on_frame(Kind::Key, 14_000, 51, P720, None);
         assert!(!c.converged());
         // 预算很小：每帧至少降 1；预算大：一次降很多
         let small = c.next(Kind::Refine, 500, u64::MAX, P720, None);
@@ -333,7 +364,7 @@ mod tests {
         for _ in 0..200 {
             let q = c.next(Kind::Refine, 2_000, u64::MAX, P720, None);
             assert!(q <= last);
-            c.on_frame(Kind::Refine, 2_000, q, P720);
+            c.on_frame(Kind::Refine, 2_000, q, P720, None);
             last = q;
             if c.converged() {
                 break;
@@ -341,7 +372,7 @@ mod tests {
         }
         assert!(c.converged());
         // 补清晰的帧不会让画面“变糊”：用了更高的 QP 也记更好的那个
-        c.on_frame(Kind::Refine, 10, 30, P720);
+        c.on_frame(Kind::Refine, 10, 30, P720, None);
         assert_eq!(c.qp(), Some(MIN_QP));
         // 补完之后画面突然整屏变化：按面积估计、装进大帧时限，不按补到的 QP 12 编
         let whole = c.next(Kind::Change, 1_000, 10_000, P720, Some(1000));
@@ -350,8 +381,8 @@ mod tests {
         assert_eq!(c.next(Kind::Change, 1_000, 10_000, P720, Some(2)), MIN_QP);
         // 不知道面积：用上一次在变时的 QP（这里还没有过，用当前的）
         assert_eq!(c.next(Kind::Change, 1_000, 10_000, P720, None), MIN_QP);
-        c.on_frame(Kind::Change, 1_000, 33, P720);
-        c.on_frame(Kind::Refine, 10, 20, P720);
+        c.on_frame(Kind::Change, 1_000, 33, P720, None);
+        c.on_frame(Kind::Refine, 10, 20, P720, None);
         assert_eq!(c.next(Kind::Change, 1_000, 10_000, P720, None), 33);
         assert_eq!(QpControl::default().qp(), None);
     }
@@ -359,7 +390,7 @@ mod tests {
     #[test]
     fn refine_stops_where_one_step_would_take_the_link_too_long() {
         let mut c = QpControl::new(MAX_QP);
-        c.on_frame(Kind::Key, 14_000, 40, P720);
+        c.on_frame(Kind::Key, 14_000, 40, P720, None);
         // 窄带（大帧时限 500 字节，约 40 kbps）：降一步要多出约 1.5 KB，链路一次装不下，停在 40
         let step = c.key_bytes(P720, 39) - c.key_bytes(P720, 40);
         assert!(step > 500 * REFINE_STEP_KEY_TIMES, "{step}");
@@ -369,7 +400,7 @@ mod tests {
         // 宽带：一直补到最小 QP
         for _ in 0..100 {
             let q = c.next(Kind::Refine, 20_000, 1_000_000, P720, None);
-            c.on_frame(Kind::Refine, 20_000, q, P720);
+            c.on_frame(Kind::Refine, 20_000, q, P720, None);
         }
         assert!(c.converged());
     }
@@ -379,7 +410,7 @@ mod tests {
         // 拖动窗口：变化 20%，帧很小，按上一帧推算要降到 12
         let drag = |allowed, area| {
             let mut c = QpControl::new(MAX_QP);
-            c.on_frame(Kind::Change, 500, 14, P720);
+            c.on_frame(Kind::Change, 500, 14, P720, None);
             c.next(Kind::Change, 15_000, allowed, P720, area)
         };
         let drag = |allowed| drag(allowed, Some(200));
@@ -387,7 +418,7 @@ mod tests {
         assert_eq!(drag(46_000), KEY_MIN_QP);
         // 宽的链路（时限 1 MB）：装得下，和不看面积一样往下降
         let mut c = QpControl::new(MAX_QP);
-        c.on_frame(Kind::Change, 500, 14, P720);
+        c.on_frame(Kind::Change, 500, 14, P720, None);
         let free = c.next(Kind::Change, 15_000, 1_000_000, P720, None);
         assert!(free < 14);
         assert_eq!(drag(1_000_000), free);
@@ -396,8 +427,35 @@ mod tests {
         assert!(mid > MIN_QP && mid < KEY_MIN_QP, "{mid}");
         // QP 本来就不低于 KEY_MIN_QP（窄带）：不管面积，按上一帧推算
         let mut c = QpControl::new(MAX_QP);
-        c.on_frame(Kind::Change, 15_000, 26, P720);
+        c.on_frame(Kind::Change, 15_000, 26, P720, None);
         assert_eq!(c.next(Kind::Change, 20_000, 1_000, P720, Some(1000)), 25);
+    }
+
+    #[test]
+    fn a_region_suddenly_renewed_while_changing_fits_the_limit_without_the_cap() {
+        // 2026-11-27 drop-while-idle：打字（变化不到 1‰、QP 12、1.5 KB）之后切换窗口（加权面积 381‰），
+        // 时限 9 KB。以前按上一帧推算到 12、面积保护最多提到 KEY_MIN_QP，编出 146 KB
+        let after = |last_area| {
+            let mut c = QpControl::new(MAX_QP);
+            c.on_frame(Kind::Key, 147_000, 26, P720, None);
+            c.on_frame(Kind::Change, 1_500, MIN_QP, P720, last_area);
+            c.next(Kind::Change, 3_000, 9_000, P720, Some(381))
+        };
+        let renewed = after(Some(0));
+        assert!(renewed > KEY_MIN_QP + 10, "{renewed}");
+        // 估计装得进时限
+        let mut c = QpControl::new(MAX_QP);
+        c.on_frame(Kind::Key, 147_000, 26, P720, None);
+        let est = c.key_bytes(P720, renewed) * 381 * CHANGE_OF_KEY_PERMILLE / 1_000_000;
+        assert!(est <= 9_000, "{est}");
+        // 上一帧面积不知道：按原来的规则（封顶 KEY_MIN_QP）
+        assert_eq!(after(None), KEY_MIN_QP);
+        // 一直在变、面积差不多（拖动、滚动）：不算突然换了一块，按原来的规则
+        assert_eq!(after(Some(300)), KEY_MIN_QP);
+        // 整屏换掉（面积过半）：下限按关键帧
+        let mut c = QpControl::new(MAX_QP);
+        c.on_frame(Kind::Change, 1_500, MIN_QP, P720, Some(0));
+        assert!(c.next(Kind::Change, 3_000, 10_000_000, P720, Some(900)) >= KEY_MIN_QP);
     }
 
     #[test]

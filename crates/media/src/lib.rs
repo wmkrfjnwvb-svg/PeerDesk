@@ -1164,6 +1164,7 @@ impl H264Encoder {
             u64::try_from(data.len()).unwrap_or(u64::MAX),
             qp,
             pixels,
+            area.map(|(_, weighted)| weighted),
         );
         self.soft_converged = Some(self.qp.converged());
         self.inner = Some((size.0, size.1, enc));
