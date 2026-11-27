@@ -454,6 +454,8 @@ enum Sent {
     Rec(usize),
     /// 后端回了用法错。
     Misuse(&'static str),
+    /// 后端回了“不接受”：这个信号只该来自 set_rates（契约 5），交帧时回它是用错了信号（已经记录，这一帧按没进后端退回）。
+    Rejected,
     /// 后端出错（已经记录、等着复位）。
     Failed,
     /// 前面复位失败，这一步没法继续。
@@ -807,6 +809,13 @@ impl<'a> Run<'a> {
                     .push(format!("{}：意外的用法错：{m}", self.step));
                 return;
             }
+            // “不接受”只能来自 set_rates（契约 5）；别处回它说明后端用错了信号
+            BackendError::Rejected(m) => {
+                self.measured
+                    .errors
+                    .push(format!("{}：不该在这里回“不接受”：{m}", self.step));
+                return;
+            }
             BackendError::Failed(m) => m,
         };
         self.measured.errors.push(format!("{}：{msg}", self.step));
@@ -976,18 +985,13 @@ impl<'a> Run<'a> {
                 return Sent::Failed;
             }
             Err(BackendError::Misuse(m)) => {
-                // 这一帧没进后端：记录退回去，下一帧要带的标记还给下一帧
-                self.pending.retain(|i| *i != idx);
-                let (reconfig, rates_mark, asked) = self
-                    .recs
-                    .get(idx)
-                    .map(|r| (r.reconfig, r.after_set_rates, r.ask.keyframe))
-                    .unwrap_or_default();
-                self.recs.truncate(idx);
-                self.reconfig_mark = reconfig;
-                self.set_rates_mark = rates_mark;
-                self.reask = self.reask || (asked && !req.keyframe);
+                self.unsend(idx, req);
                 return Sent::Misuse(m);
+            }
+            Err(e @ BackendError::Rejected(_)) => {
+                self.on_error(e);
+                self.unsend(idx, req);
+                return Sent::Rejected;
             }
         }
         self.after_recover = false;
@@ -1007,8 +1011,22 @@ impl<'a> Run<'a> {
                 ));
                 None
             }
-            Sent::Failed | Sent::Skipped => None,
+            Sent::Rejected | Sent::Failed | Sent::Skipped => None,
         }
+    }
+
+    /// 这一帧没进后端：记录退回去，下一帧要带的标记还给下一帧。
+    fn unsend(&mut self, idx: usize, req: Req) {
+        self.pending.retain(|i| *i != idx);
+        let (reconfig, rates_mark, asked) = self
+            .recs
+            .get(idx)
+            .map(|r| (r.reconfig, r.after_set_rates, r.ask.keyframe))
+            .unwrap_or_default();
+        self.recs.truncate(idx);
+        self.reconfig_mark = reconfig;
+        self.set_rates_mark = rates_mark;
+        self.reask = self.reask || (asked && !req.keyframe);
     }
 
     /// 交一帧，再等一个帧间隔。
@@ -1171,6 +1189,7 @@ impl<'a> Run<'a> {
         self.type_frames(4);
         for bps in [400_000, 4_000_000] {
             let rates = Rates { bps, fps: 30 };
+            let mut reset = false;
             match self.b.set_rates(rates) {
                 Ok(()) => {
                     self.measured.set_rates_accepted =
@@ -1179,10 +1198,17 @@ impl<'a> Run<'a> {
                     self.budget = budget_of(rates);
                     self.set_rates_mark = true;
                 }
-                // 如实回失败是允许的（契约 5）：状态不能变，接着用旧的码率编
-                Err(_) => self.measured.set_rates_accepted = Some(false),
+                // 如实回“不接受”是允许的（契约 5）：状态不能变，接着用旧的码率编
+                Err(BackendError::Rejected(_)) => self.measured.set_rates_accepted = Some(false),
+                // 用法错只记下来，状态不该变，下面照常核对尺寸
+                Err(e @ BackendError::Misuse(_)) => self.on_error(e),
+                // 改码率时出错：后端应已复位（契约 9 由 on_error 核对），下一帧前重新配置
+                Err(e @ BackendError::Failed(_)) => {
+                    self.on_error(e);
+                    reset = true;
+                }
             }
-            if self.b.size() != Some(self.cur_size) {
+            if !reset && self.b.size() != Some(self.cur_size) {
                 let got = self.b.size();
                 let size = self.cur_size;
                 self.note(
@@ -1292,6 +1318,7 @@ impl<'a> Run<'a> {
             let outcome = match got {
                 Sent::Rec(_) => "收下了",
                 Sent::Misuse(_) => "回了用法错",
+                Sent::Rejected => "回了“不接受”",
                 Sent::Failed | Sent::Skipped => "出错了",
             };
             if after != Some(other) && !self.needs_recover {
@@ -2010,6 +2037,8 @@ mod tests {
         fail_reconfig_from: Option<u32>,
         fail_after_reconfig: bool,
         size_lie: Option<(u16, u16)>,
+        set_rates_error: Option<BackendError>,
+        submit_rejects_once: bool,
         reconfigs: u32,
         just_reconfigured: bool,
         flush_fails: bool,
@@ -2026,6 +2055,8 @@ mod tests {
                 fail_reconfig_from: None,
                 fail_after_reconfig: false,
                 size_lie: None,
+                set_rates_error: None,
+                submit_rejects_once: false,
                 reconfigs: 0,
                 just_reconfigured: false,
                 flush_fails: false,
@@ -2058,6 +2089,9 @@ mod tests {
             self.inner.reconfigure(size, rates)
         }
         fn set_rates(&mut self, rates: Rates) -> Result<(), BackendError> {
+            if let Some(e) = self.set_rates_error.take() {
+                return Err(e);
+            }
             self.inner.set_rates(rates)
         }
         fn submit(
@@ -2065,6 +2099,9 @@ mod tests {
             input: FrameInput<'_>,
             ask: FrameAsk,
         ) -> Result<Submitted, BackendError> {
+            if std::mem::take(&mut self.submit_rejects_once) {
+                return Err(BackendError::Rejected("交帧时不该回这个".to_owned()));
+            }
             if self.fail_after_reconfig
                 && self.reconfigs >= 2
                 && std::mem::take(&mut self.just_reconfigured)
@@ -2121,6 +2158,39 @@ mod tests {
         odd.shift_tokens = true;
         let text = evidence(&odd.check(&clock), 1);
         assert!(text.contains("没交过") && text.contains("没有下落"));
+    }
+
+    #[test]
+    fn rejected_failed_and_misuse_from_set_rates_mean_different_things() {
+        // 出错：按契约 9 核对复位（这层包装不复位，所以记违约），之后重新配置接着编
+        let (mut odd, clock) = Odd::new(FakeConfig::default());
+        odd.set_rates_error = Some(BackendError::Failed("改码率时坏了".to_owned()));
+        let report = odd.check(&clock);
+        assert!(report
+            .measured
+            .errors
+            .iter()
+            .any(|e| e.contains("改码率时坏了")));
+        assert!(evidence(&report, 9).contains("没有复位"));
+        // 用法错：只记下来，状态不变，不算违约
+        let (mut odd, clock) = Odd::new(FakeConfig::default());
+        odd.set_rates_error = Some(BackendError::Misuse("码率是 0"));
+        let report = odd.check(&clock);
+        assert!(report
+            .measured
+            .errors
+            .iter()
+            .any(|e| e.contains("意外的用法错：码率是 0")));
+        assert!(report.is_clean());
+        // 交帧时回“不接受”：用错了信号，记下来
+        let (mut odd, clock) = Odd::new(FakeConfig::default());
+        odd.submit_rejects_once = true;
+        let report = odd.check(&clock);
+        assert!(report
+            .measured
+            .errors
+            .iter()
+            .any(|e| e.contains("不该在这里回“不接受”：交帧时不该回这个")));
     }
 
     #[test]

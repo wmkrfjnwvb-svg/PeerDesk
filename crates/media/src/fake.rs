@@ -521,7 +521,7 @@ impl EncoderBackend for FakeBackend {
 
     fn set_rates(&mut self, rates: Rates) -> Result<(), BackendError> {
         if self.cfg.faults.set_rates_fails {
-            return Err(BackendError::Failed(
+            return Err(BackendError::Rejected(
                 "运行中改不了码率（假后端的毛病表）".to_owned(),
             ));
         }
@@ -1207,7 +1207,7 @@ mod tests {
         });
         assert!(matches!(
             stuck.set_rates(Rates { bps: 5, fps: 5 }),
-            Err(BackendError::Failed(_))
+            Err(BackendError::Rejected(_))
         ));
         assert_eq!((stuck.rates(), stuck.size()), (RATES, Some(SIZE)));
         let (mut rude, _) = backend(FakeConfig {

@@ -28,6 +28,8 @@
 //!    后端按 QP 编（[`RateControl::PerFrameQp`]）时字节数由调用方的 QP 决定，超不超由调用方负责；
 //!    后端自己有码控（[`RateControl::Window`]）时放不下可以丢帧（回 `Dropped`），不许交一个空帧冒充编好了。
 //! 5. **改码率、帧率不重建。** [`EncoderBackend::set_rates`] 立即返回、下一帧生效、不出关键帧。
+//!    运行中改不了的后端回 [`BackendError::Rejected`]：状态不变、不复位，接着按旧的值编；
+//!    调用方改用 [`EncoderBackend::reconfigure`]（代价是一个关键帧）或者换后端。
 //! 6. **改分辨率可以重建，但要说代价。** 只有 [`EncoderBackend::reconfigure`] 会改尺寸；它返回
 //!    [`Reconfigured`]，写明下一帧是不是一定是关键帧。`submit` 不会因为尺寸对不上而自己重建，尺寸不对是调用方的错。
 //! 7. **停多久再交帧都不能出错。** 两次 `submit` 之间隔多久都一样；后端内部的“卡住”判定只能从交了活之后算起
@@ -268,6 +270,9 @@ pub struct Reconfigured {
 pub enum BackendError {
     /// 这次调用失败了。后端已经复位（契约第 9 条），调用方可以重新配置再试，或者换后端。
     Failed(String),
+    /// 后端不接受这组值（例如运行中改不了码率），状态没有变、没有复位，接着按旧的值编（契约第 5 条）。
+    /// 和 [`Self::Failed`] 分开：一个信号只表示一件事，“拒绝”不等于“出错复位”。
+    Rejected(String),
     /// 调用方用错了（给了后端不收的画面形式、该给 QP 没给、尺寸不对、还没配置就交帧）。后端的状态没有变。
     Misuse(&'static str),
 }
@@ -276,6 +281,7 @@ impl std::fmt::Display for BackendError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Failed(why) => write!(f, "编码器出错：{why}"),
+            Self::Rejected(why) => write!(f, "编码器不接受：{why}"),
             Self::Misuse(why) => write!(f, "编码器用法不对：{why}"),
         }
     }
@@ -301,7 +307,7 @@ pub trait EncoderBackend: Send + std::fmt::Debug {
     /// 改码率、帧率：不重建、不出关键帧，下一帧生效（契约第 5 条）。
     ///
     /// # Errors
-    /// 后端拒绝这组值。
+    /// 后端不接受这组值（[`BackendError::Rejected`]，状态不变）；或者编码器出错（[`BackendError::Failed`]，已复位）。
     fn set_rates(&mut self, rates: Rates) -> Result<(), BackendError>;
 
     /// 认不认这一帧显卡画面（[`Inputs::gpu`] 为真的后端才可能认；例如要在同一块显卡上）。
@@ -357,6 +363,10 @@ mod tests {
         assert_eq!(
             BackendError::Failed("显卡丢了".into()).to_string(),
             "编码器出错：显卡丢了"
+        );
+        assert_eq!(
+            BackendError::Rejected("运行中改不了码率".into()).to_string(),
+            "编码器不接受：运行中改不了码率"
         );
         assert_eq!(
             BackendError::Misuse("没给 QP").to_string(),
