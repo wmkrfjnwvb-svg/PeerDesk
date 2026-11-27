@@ -15,9 +15,10 @@ use peerdesk_core::media::{encode_job, FrameJob, MediaSender, SenderConfig};
 use peerdesk_core::policy::ContentPolicy;
 use peerdesk_core::proto::{Caps, Channel, Control, RejectReason};
 use peerdesk_core::session::{Session, SessionConfig, State};
+use peerdesk_core::time::Time;
 use peerdesk_core::trace::{Stage, TraceId, Tracer};
 use peerdesk_core::transport::Fec;
-use peerdesk_core::video::{EncodedFrame, TileEncoder, VideoEncoder};
+use peerdesk_core::video::{Codec, EncodedFrame, TileEncoder, VideoEncoder};
 use peerdesk_media::H264Encoder;
 use tokio::sync::mpsc;
 
@@ -27,6 +28,10 @@ use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
 use crate::files::{receive_files, FileResult};
+use crate::host_record::{
+    encoded_info, end_reason, frame_record, wall_now_us, HostJournal, Params as RecordParams,
+};
+use crate::recorder::RecordSetup;
 use crate::stream::{read_control, read_kind, write_control, write_file_msg, StreamKind};
 use crate::{Fingerprint, Link, NetError};
 
@@ -135,6 +140,8 @@ pub struct HostOptions {
     pub pacing: bool,
     /// 内容策略（帧率档位、QP 上限、大帧时限等，见 [`peerdesk_core::policy`]）。现在只有办公。
     pub policy: ContentPolicy,
+    /// 会话记录（见 [`crate::recorder`]）：`None` 表示不记录。打不开时写日志说明原因，会话照常进行。
+    pub record: Option<RecordSetup>,
 }
 
 impl HostOptions {
@@ -155,6 +162,7 @@ impl HostOptions {
             name: String::new(),
             pacing: peerdesk_core::pacer::enabled(),
             policy: ContentPolicy::OFFICE,
+            record: None,
         }
     }
 }
@@ -220,15 +228,18 @@ pub(crate) fn control_reader(mut recv: quinn::RecvStream) -> mpsc::Receiver<Cont
     rx
 }
 
-/// 编码线程的任务：一帧任务、画面、画面是否变了。
-type EncodeJob = (FrameJob, Frame, bool);
-/// 编码线程交回的结果。
+/// 编码线程的任务：一帧任务、画面、画面是否变了、采集时间（会话的单调时钟，记录用）。
+type EncodeJob = (FrameJob, Frame, bool, Time);
+/// 编码线程交回的结果：任务、编码结果、整个任务的耗时、颜色转换耗时、分段计时，
+/// 以及任务里带来的“画面是否变了”和采集时间（原样带回，记录用）。
 type EncodeDone = (
     FrameJob,
     Result<(Option<EncodedFrame>, bool), peerdesk_core::Error>,
     u64,
     u64,
     peerdesk_core::video::EncodeTiming,
+    bool,
+    Time,
 );
 
 /// 启动编码线程。编码要好几毫秒到几十毫秒，放在会话循环里会让输入和反馈排队等它。
@@ -243,7 +254,7 @@ fn spawn_encoder(
     let (jobs, job_rx) = std::sync::mpsc::channel::<EncodeJob>();
     let (done_tx, done_rx) = mpsc::unbounded_channel();
     std::thread::spawn(move || {
-        while let Ok((job, frame, changed)) = job_rx.recv() {
+        while let Ok((job, frame, changed, captured)) = job_rx.recv() {
             let started = std::time::Instant::now();
             let result = encode_job(encoder.as_mut(), &job, &frame, changed);
             let took = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
@@ -256,7 +267,10 @@ fn spawn_encoder(
             }
             let convert = encoder.convert_micros();
             let timing = encoder.timing();
-            if done_tx.send((job, result, took, convert, timing)).is_err() {
+            if done_tx
+                .send((job, result, took, convert, timing, changed, captured))
+                .is_err()
+            {
                 break;
             }
         }
@@ -458,6 +472,21 @@ pub async fn serve(
     let mut last_quic = link.quic_stats();
     // 这一秒里编码和颜色转换的总耗时、帧数（统计行用平均值，单帧的值跳得厉害）
     let mut window = (0u64, 0u64, 0u64);
+    // 会话记录：握手完成、循环开始时打开（见 crate::host_record）。本端自己出的错记在 `failed` 里，决定结束原因。
+    let mut journal = opts.record.as_ref().and_then(|setup| {
+        let params = RecordParams {
+            caps: caps.0,
+            codec: if codec == Codec::H264 { "h264" } else { "tile" },
+            estimator: media.estimator(),
+            policy: opts.policy.name,
+            fps: opts.fps,
+            start_bps: opts.start_bps,
+            max_bps: opts.max_bps,
+            wall_start_us: wall_now_us(),
+        };
+        HostJournal::open(setup, &params, link.now(), last_quic)
+    });
+    let mut failed = false;
 
     let end = loop {
         tokio::select! {
@@ -487,6 +516,9 @@ pub async fn serve(
                     // 控制通道的数据报是观看端的反馈：哪些帧到了、链路有没有积压。
                     Channel::Control => match media.on_feedback_datagram(link.now(), &payload) {
                         Ok(again) => {
+                            if let Some(j) = &journal {
+                                j.feedback(link.now(), &media);
+                            }
                             // 已经有定论的帧（送到了、或接收端放弃了）的包不再发
                             pacer.retain(|o| media.wanted(o));
                             pacer.push_front(again);
@@ -586,9 +618,12 @@ pub async fn serve(
             // 编码线程交回一帧：切片发出。
             done = encoded_rx.recv() => {
                 encoding = false;
-                let (job, result, took, convert, timing) = match done {
+                let (job, result, took, convert, timing, changed, captured_at) = match done {
                     Some(done) => done,
-                    None => break "编码线程结束".to_owned(),
+                    None => {
+                        failed = true;
+                        break "编码线程结束".to_owned();
+                    }
                 };
                 // CPU 跟不上的判断只算在算的时间：等显卡读回（和它的锁）的时间扣掉
                 media.set_encode_time(timing.busy_us(took), timing.hardware);
@@ -600,10 +635,18 @@ pub async fn serve(
                 encode_window.add(took, &timing, result.as_ref().ok().and_then(|(e, _)| e.as_ref()).map(|e| e.payload.len()));
                 last_budget = job.budget;
                 media.set_max_payload(link.max_payload());
+                let info = encoded_info(&result);
                 let out = match result.and_then(|(encoded, refine)| media.finish_frame(link.now(), &job, encoded, refine)) {
                     Ok(out) => out,
-                    Err(e) => break e.to_string(),
+                    Err(e) => {
+                        failed = true;
+                        break e.to_string();
+                    }
                 };
+                if let Some(j) = &journal {
+                    let now = link.now();
+                    j.frame(now, frame_record(&job, took, &timing, info, changed, now.since(captured_at)));
+                }
                 if out.is_empty() {
                     continue;
                 }
@@ -682,6 +725,9 @@ pub async fn serve(
                 let quic = link.quic_stats();
                 crate::note!(info, target: "peerdesk::stats", "{}", crate::diag::quic_line(&last_quic, &quic));
                 last_quic = quic;
+                if let Some(j) = journal.as_mut() {
+                    j.second(link.now(), now, quic, input_events.saturating_add(input_denied));
+                }
                 for event in media.take_events() {
                     crate::note!(info, target: "peerdesk::stats", "决定 {event}");
                 }
@@ -711,7 +757,11 @@ pub async fn serve(
                 let Some(frame) = source.frame() else {
                     // 画面来源结束：正在编的那一帧编完发出去再结束。
                     let last = if encoding { encoded_rx.recv().await } else { None };
-                    let last = last.and_then(|(job, r, _, _, _)| r.ok().map(|(e, f)| (job, e, f)));
+                    if let (Some(j), Some((job, r, took, _, timing, changed, captured_at))) = (&journal, &last) {
+                        let now = link.now();
+                        j.frame(now, frame_record(job, *took, timing, encoded_info(r), *changed, now.since(*captured_at)));
+                    }
+                    let last = last.and_then(|(job, r, _, _, _, _, _)| r.ok().map(|(e, f)| (job, e, f)));
                     media.set_max_payload(link.max_payload());
                     let out = last.map(|(job, e, f)| media.finish_frame(link.now(), &job, e, f).unwrap_or_default());
                     out.unwrap_or_default().iter().for_each(|o| drop(link.send_flags(Channel::Video, o.flags, &o.body)));
@@ -719,6 +769,7 @@ pub async fn serve(
                 };
                 screen_size = frame.size();
                 let captured = crate::framelog::unix_us();
+                let captured_at = link.now();
                 let changed = match seq {
                     Some(seq) => last_seq.replace(seq) != Some(seq),
                     None => {
@@ -759,7 +810,8 @@ pub async fn serve(
                 let rtt = u64::try_from(link.rtt().as_micros()).unwrap_or(u64::MAX);
                 let job = media.start_frame(link.now(), rtt);
                 frame_log.encoded(job.frame_id, captured);
-                if jobs.send((job, frame, std::mem::take(&mut pending_change))).is_err() {
+                if jobs.send((job, frame, std::mem::take(&mut pending_change), captured_at)).is_err() {
+                    failed = true;
                     break "编码线程结束".to_owned();
                 }
                 encoding = true;
@@ -773,6 +825,17 @@ pub async fn serve(
     } else {
         end
     };
+    // 会话记录收尾：最后不足一秒的汇总和结束记录；不等记录线程写完（它自己收尾、改名、清理）。
+    if let Some(j) = journal.take() {
+        let reason = end_reason(failed, link.peer_quit(), link.lost_reason().is_some());
+        drop(j.finish(
+            link.now(),
+            media.stats(),
+            link.quic_stats(),
+            input_events.saturating_add(input_denied),
+            reason,
+        ));
+    }
     // 无论会话怎么结束，都把还按着的键和鼠标按键释放掉。
     for event in keys.release_all() {
         sink.inject(&event);

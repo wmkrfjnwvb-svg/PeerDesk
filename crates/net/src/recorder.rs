@@ -48,6 +48,19 @@ impl Default for Retention {
     }
 }
 
+/// 记录设置：客户端传进会话选项。没有这一项（`None`）就不记录。
+#[derive(Debug, Clone)]
+pub struct RecordSetup {
+    /// 记录放在哪个目录（数据目录下的 `records/`）。
+    pub dir: PathBuf,
+    /// 本机保留策略。
+    pub retention: Retention,
+    /// 程序版本号，写进文件头。
+    pub program_version: Option<String>,
+    /// 程序提交号，写进文件头。net 包里拿不到（它是客户端编译时定的），所以由客户端传进来。
+    pub commit: Option<String>,
+}
+
 /// 一次清理的结果。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RetentionReport {
@@ -248,12 +261,6 @@ impl Report {
     #[must_use]
     pub fn lost_to_write_error_total(&self) -> u64 {
         Self::total(&self.lost_to_write_error)
-    }
-
-    /// 写进写入器的总条数。
-    #[must_use]
-    pub fn written_total(&self) -> u64 {
-        Self::total(&self.written)
     }
 
     fn log(&self) {

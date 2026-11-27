@@ -42,6 +42,8 @@ pub mod fs_store;
 pub mod gateway;
 #[cfg(feature = "media")]
 pub mod host;
+#[cfg(feature = "media")]
+mod host_record;
 pub mod ice;
 pub mod identity;
 pub mod netcheck;

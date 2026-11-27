@@ -1546,6 +1546,45 @@ impl Recording {
         })
     }
 
+    /// 反馈记录：时间和内容。
+    pub fn feedbacks(&self) -> impl Iterator<Item = (u64, &Feedback)> {
+        self.entries.iter().filter_map(|e| match &e.record {
+            Record::Feedback(f) => Some((e.at_us, f)),
+            Record::Frame(_)
+            | Record::Retransmit(_)
+            | Record::Transport(_)
+            | Record::Input(_)
+            | Record::Gap(_)
+            | Record::End(_) => None,
+        })
+    }
+
+    /// 帧记录：时间和内容。
+    pub fn frames(&self) -> impl Iterator<Item = (u64, &Frame)> {
+        self.entries.iter().filter_map(|e| match &e.record {
+            Record::Frame(f) => Some((e.at_us, f)),
+            Record::Feedback(_)
+            | Record::Retransmit(_)
+            | Record::Transport(_)
+            | Record::Input(_)
+            | Record::Gap(_)
+            | Record::End(_) => None,
+        })
+    }
+
+    /// 重传记录：时间和内容。
+    pub fn retransmits(&self) -> impl Iterator<Item = (u64, &Retransmit)> {
+        self.entries.iter().filter_map(|e| match &e.record {
+            Record::Retransmit(r) => Some((e.at_us, r)),
+            Record::Feedback(_)
+            | Record::Frame(_)
+            | Record::Transport(_)
+            | Record::Input(_)
+            | Record::Gap(_)
+            | Record::End(_) => None,
+        })
+    }
+
     /// 某个种类读出来多少条。
     #[must_use]
     pub fn count(&self, kind: Kind) -> usize {
@@ -1814,6 +1853,22 @@ mod tests {
         assert_eq!(rec.end().unwrap().reason, EndReason::PeerQuit);
         assert_eq!(rec.count(Kind::Feedback), 1);
         assert_eq!(rec.count(Kind::Frame), 2);
+        assert_eq!(
+            rec.feedbacks().map(|(at, _)| at).collect::<Vec<_>>(),
+            vec![1_000]
+        );
+        assert_eq!(
+            rec.frames().map(|(at, _)| at).collect::<Vec<_>>(),
+            vec![1_500, 2_000]
+        );
+        assert_eq!(
+            rec.retransmits().map(|(at, _)| at).collect::<Vec<_>>(),
+            vec![10_000]
+        );
+        assert_eq!(
+            rec.gaps().map(|(at, _)| at).collect::<Vec<_>>(),
+            vec![20_000]
+        );
     }
 
     #[test]
@@ -2428,6 +2483,76 @@ mod tests {
         assert_eq!(sink.written()[Kind::End.slot()], 1);
         assert_eq!(sink.dropped(), &[3, 2, 0, 0, 0, 0, 0]);
         assert_eq!(sink.blocks(), rec.stats.blocks);
+    }
+
+    #[test]
+    fn controller_files_and_every_os_round_trip() {
+        for os in [PeerOs::Unknown, PeerOs::Windows, PeerOs::Mac, PeerOs::Linux] {
+            let mut m = Meta::new(Role::Controller, 5);
+            m.os = Some(os);
+            let back = Recording::parse(&encode_header(&m)).unwrap().meta;
+            assert_eq!(back, m);
+        }
+    }
+
+    #[test]
+    fn frames_with_inconsistent_fields_are_counted_as_bad() {
+        // 只有宽没有高；耗时标志不是 0 或 1；字段值装不进目标类型
+        let mut file = encode_header(&meta());
+        let base = |tail: &dyn Fn(&mut Vec<u8>)| {
+            let mut c = Vec::new();
+            put_varint(&mut c, 0); // 时间差
+            put_signed(&mut c, 1); // 帧号差
+            put_opt(&mut c, None); // 采集时间
+            c.push(0); // 类别
+            put_text(&mut c, "");
+            put_opt(&mut c, None); // 预算
+            put_varint(&mut c, 10); // 字节
+            put_opt(&mut c, None); // 缩放
+            tail(&mut c);
+            c
+        };
+        let half_size = base(&|c| {
+            put_opt(c, Some(640));
+            put_opt(c, None);
+            c.extend_from_slice(&[0, 0]);
+        });
+        let bad_timing_flag = base(&|c| {
+            put_opt(c, None);
+            put_opt(c, None);
+            c.push(2);
+        });
+        let too_wide = base(&|c| {
+            put_opt(c, Some(70_000));
+            put_opt(c, Some(1));
+            c.extend_from_slice(&[0, 0]);
+        });
+        for body in [half_size, bad_timing_flag, too_wide] {
+            file.extend_from_slice(&raw_block(0, &[(Kind::Frame.code(), body)]));
+        }
+        let rec = Recording::parse(&file).unwrap();
+        assert_eq!((rec.stats.bad_records, rec.entries.len()), (3, 0));
+    }
+
+    #[test]
+    fn nonsense_block_lengths_are_skipped() {
+        // 块长度 0、长度超过上限、块内容的起始时间读不出来：都当坏块，后面的好块照读
+        let mut file = encode_header(&meta());
+        file.extend_from_slice(&[0; 8]);
+        let mut huge = Vec::new();
+        huge.extend_from_slice(&u32::try_from(MAX_BLOCK_BYTES + 1).unwrap().to_be_bytes());
+        huge.extend_from_slice(&[0; 4]);
+        file.extend_from_slice(&huge);
+        file.extend_from_slice(&raw_block(
+            3,
+            &[(
+                Kind::Input.code(),
+                content_of(&Record::Input(InputLevel::Few)),
+            )],
+        ));
+        let rec = Recording::parse(&file).unwrap();
+        assert_eq!(rec.entries.len(), 1);
+        assert_eq!((rec.stats.bad_blocks, rec.stats.truncated_tail), (1, false));
     }
 
     #[test]
