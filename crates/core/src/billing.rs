@@ -112,6 +112,93 @@ pub fn verify(secret: &[u8], token: &str) -> Result<Account, Error> {
     })
 }
 
+/// 入表令牌的前缀（和账户令牌 [`PREFIX`] 不同，两种令牌互不通用）。
+const ENROLL_PREFIX: &str = "pde1";
+/// 入表令牌默认和最长的有效期（天）。
+pub const ENROLL_DEFAULT_DAYS: u64 = 7;
+/// 见 [`ENROLL_DEFAULT_DAYS`]。
+pub const ENROLL_MAX_DAYS: u64 = 90;
+
+/// 入表令牌为什么不能用。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnrollTokenError {
+    /// 格式不对，或者不是这个服务器签发的。
+    Invalid,
+    /// 过期了。
+    Expired,
+}
+
+/// 签发一枚入表令牌：拿着它可以把设备加进 `account` 这个账户，到 `expires_s`（Unix 秒）为止，可以用多次。
+/// `pde1-<账户号 16 位十六进制>-<过期时间>-<随机数 8 位十六进制>-<签名>`。
+///
+/// 为什么不直接用账户令牌入表：账户令牌没有有效期、不能单独作废、还带着中继额度，而入表令牌要发到每一台被控机上
+/// （批量部署时写进脚本）。入表令牌只能“加设备”，加完设备的身份就是它自己的证书指纹，令牌过期或泄漏都不影响
+/// 已经入表的设备——Tailscale 的 auth key 也是这样（“Revoking a key does not deauthorize nodes using the key”）。
+#[must_use]
+pub fn issue_enroll(secret: &[u8], account: AccountId, expires_s: u64, nonce: u32) -> String {
+    let body = format!(
+        "{ENROLL_PREFIX}-{}-{expires_s}-{}",
+        hex(&account),
+        hex(&nonce.to_be_bytes())
+    );
+    format!("{body}-{}", hex(&signature(secret, &body)))
+}
+
+/// 验证入表令牌，返回它能加设备的账户。
+pub fn verify_enroll(
+    secret: &[u8],
+    token: &str,
+    now_s: u64,
+) -> Result<AccountId, EnrollTokenError> {
+    let token = token.trim();
+    let Some((body, sig)) = token.rsplit_once('-') else {
+        return Err(EnrollTokenError::Invalid);
+    };
+    let mut parts = body.split('-');
+    let (Some(ENROLL_PREFIX), Some(id), Some(expires), Some(nonce), None) = (
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    ) else {
+        return Err(EnrollTokenError::Invalid);
+    };
+    let (Some(id), Ok(expires_s), Some(_), Some(sig)) = (
+        unhex::<8>(id),
+        expires.parse::<u64>(),
+        unhex::<4>(nonce),
+        unhex::<SIG_LEN>(sig),
+    ) else {
+        return Err(EnrollTokenError::Invalid);
+    };
+    // 逐字节比较全部签名，不在第一个不同处提前返回。
+    let expected = signature(secret, body);
+    let diff = expected
+        .iter()
+        .zip(sig.iter())
+        .fold(0u8, |acc, (a, b)| acc | (a ^ b));
+    if diff != 0 {
+        return Err(EnrollTokenError::Invalid);
+    }
+    if now_s >= expires_s {
+        return Err(EnrollTokenError::Expired);
+    }
+    Ok(id)
+}
+
+/// 账户号的十六进制写法（16 位）。
+#[must_use]
+pub fn account_hex(id: &AccountId) -> String {
+    hex(id)
+}
+
+/// 从十六进制写法读账户号。
+#[must_use]
+pub fn parse_account(text: &str) -> Option<AccountId> {
+    unhex::<8>(text.trim())
+}
+
 /// 公历月份（例如 202611），用 Unix 毫秒时间算（UTC）。
 #[must_use]
 pub fn month_of(unix_ms: u64) -> u32 {
@@ -447,5 +534,71 @@ mod tests {
         let bytes = encode_totals(202_611, &totals);
         assert_eq!(decode_totals(&bytes).unwrap(), (202_611, totals));
         assert!(decode_totals(&bytes[..bytes.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn enroll_tokens_expire_and_cannot_be_forged_or_swapped_with_account_tokens() {
+        let secret = b"billing secret";
+        let account = [1, 2, 3, 4, 5, 6, 7, 8];
+        let token = issue_enroll(secret, account, 1_000, 0xdead_beef);
+        assert_eq!(
+            token.get(..36),
+            Some("pde1-0102030405060708-1000-deadbeef-"),
+            "{token}"
+        );
+        assert_eq!(verify_enroll(secret, &token, 999), Ok(account));
+        assert_eq!(
+            verify_enroll(secret, &format!(" {token}\n"), 0),
+            Ok(account)
+        );
+        // 到点就过期
+        assert_eq!(
+            verify_enroll(secret, &token, 1_000),
+            Err(EnrollTokenError::Expired)
+        );
+        // 别的密钥签的、改了账户号、改了过期时间：都不认
+        assert_eq!(
+            verify_enroll(b"other", &token, 0),
+            Err(EnrollTokenError::Invalid)
+        );
+        let moved = token.replace("0102030405060708", "0102030405060709");
+        assert_eq!(
+            verify_enroll(secret, &moved, 0),
+            Err(EnrollTokenError::Invalid)
+        );
+        let longer = token.replace("-1000-", "-9000-");
+        assert_eq!(
+            verify_enroll(secret, &longer, 0),
+            Err(EnrollTokenError::Invalid)
+        );
+        // 格式不对
+        for bad in [
+            "",
+            "pde1",
+            "pde1-xx-1-00000000-00",
+            "pde1-0102030405060708-x-deadbeef-00",
+        ] {
+            assert_eq!(
+                verify_enroll(secret, bad, 0),
+                Err(EnrollTokenError::Invalid),
+                "{bad}"
+            );
+        }
+        let extra = token.replacen("pde1-", "pde1-00-", 1);
+        assert_eq!(
+            verify_enroll(secret, &extra, 0),
+            Err(EnrollTokenError::Invalid)
+        );
+        // 两种令牌互不通用
+        let member = issue(secret, account, 5);
+        assert_eq!(
+            verify_enroll(secret, &member, 0),
+            Err(EnrollTokenError::Invalid)
+        );
+        assert!(verify(secret, &token).is_err());
+        // 账户号的写法
+        assert_eq!(account_hex(&account), "0102030405060708");
+        assert_eq!(parse_account(" 0102030405060708 "), Some(account));
+        assert_eq!(parse_account("xyz"), None);
     }
 }

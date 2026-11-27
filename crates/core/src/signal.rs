@@ -33,8 +33,9 @@ impl Features {
     pub const WATCH: Features = Features(1 << 1);
     /// 设备自报状态（S3）。
     pub const STATUS: Features = Features(1 << 2);
-    /// 这个版本的服务器会的全部功能。每做完一步，把那一步的位加进来。
-    pub const SERVER: Features = Features::NONE;
+    /// 这个版本的服务器代码会的全部功能。每做完一步，把那一步的位加进来。服务器实际报告哪些还要看配置
+    /// （例如没配账户设备表的存储就不报 [`Features::DEVICES`]）。
+    pub const SERVER: Features = Features::DEVICES;
 
     /// 是否包含 `other` 的全部功能。
     #[must_use]
@@ -54,6 +55,52 @@ impl Features {
             return Ok(Features::NONE);
         }
         Ok(Features(r.u32()?))
+    }
+}
+
+/// 一条 [`SignalMsg::DeviceRows`] 里最多带几台设备。一条信令消息最长 4096 字节，一台设备最多约 310 字节
+/// （名字 64 个字、每个字最多 4 字节）。
+pub const MAX_ROWS: usize = 12;
+
+/// 线上的一台设备（账户设备表里的一行，见 [`crate::devices::Row`]）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceRow {
+    /// 账户内的编号。
+    pub row: u32,
+    /// 证书指纹（控制端按它连接）。
+    pub fingerprint: DeviceId,
+    /// 名字。
+    pub name: String,
+    /// 系统。
+    pub os: u8,
+    /// 角色。
+    pub role: u8,
+    /// 上次在线的时间（Unix 秒，0 表示不知道）。
+    pub last_seen_s: u64,
+    /// 已经移出账户（增量里才会出现）。
+    pub removed: bool,
+}
+
+impl DeviceRow {
+    fn put(&self, w: &mut Writer) {
+        w.u32(self.row).bytes(&self.fingerprint);
+        put_text(w, &self.name);
+        w.u8(self.os)
+            .u8(self.role)
+            .u64(self.last_seen_s)
+            .u8(u8::from(self.removed));
+    }
+
+    fn get(r: &mut Reader<'_>) -> Result<Self, Error> {
+        Ok(Self {
+            row: r.u32()?,
+            fingerprint: get_id(r)?,
+            name: get_text(r)?,
+            os: r.u8()?,
+            role: r.u8()?,
+            last_seen_s: r.u64()?,
+            removed: r.u8()? != 0,
+        })
     }
 }
 
@@ -155,6 +202,71 @@ pub enum SignalMsg {
     },
     /// 设备 → 服务器：网络体检，问服务器看到的本机地址。
     Check,
+    /// 客户端 → 服务器：只问服务器会哪些功能（回 [`SignalMsg::Checked`]），**不动 NAT 探测的结果**。
+    /// 线上就是 [`SignalMsg::Check`] 末尾多一个字节 1。普通的体检会让服务器忘掉这台设备上一次探测看到的地址
+    /// （下一次体检要看新的），要是拿它来问功能，夹在“探测”和“发起连接”之间就把打洞用的 NAT 判断弄丢了。
+    /// 老服务器不看末尾，当成普通体检处理——它本来也不会任何新功能，客户端问完就不会再发新消息。
+    CheckQuiet,
+    /// 设备 → 服务器：用入表令牌把这台设备加进账户（见 [`crate::devices`]）。只在服务器有
+    /// [`Features::DEVICES`] 时发。回 [`SignalMsg::Enrolled`] 或 [`SignalMsg::Refused`]。
+    Enroll {
+        /// 入表令牌。
+        token: String,
+        /// 电脑名。
+        name: String,
+        /// 系统（[`crate::proto::PeerOs`] 的数值）。
+        os: u8,
+        /// 角色（[`crate::devices::Role::id`]）。
+        role: u8,
+    },
+    /// 服务器 → 设备：入表了。
+    Enrolled {
+        /// 账户号。
+        account: [u8; 8],
+        /// 这台设备在账户里的编号。
+        row: u32,
+        /// 账户现在的修订号。
+        rev: u64,
+    },
+    /// 服务器 → 客户端：拒绝，原因见 [`crate::devices::Refusal::from_code`]。
+    Refused {
+        /// 原因码。
+        code: u8,
+    },
+    /// 账户成员 → 服务器：账户里 `since` 之后的改动（0 表示要全量）。回若干条 [`SignalMsg::DeviceRows`]。
+    Devices {
+        /// 客户端见过的修订号。
+        since: u64,
+    },
+    /// 服务器 → 账户成员：一批设备。一次查询的结果分成若干条（每条最多 [`MAX_ROWS`] 台），最后一条 `more` 为假。
+    DeviceRows {
+        /// 账户现在的修订号。
+        rev: u64,
+        /// 这是全量（客户端把手上的表换掉）还是增量（按编号合并）。
+        full: bool,
+        /// 后面还有。
+        more: bool,
+        /// 设备。
+        rows: Vec<DeviceRow>,
+    },
+    /// 账户成员 → 服务器：给设备改名。回 [`SignalMsg::Changed`] 或 [`SignalMsg::Refused`]。
+    Rename {
+        /// 编号。
+        row: u32,
+        /// 新名字。
+        name: String,
+    },
+    /// 账户成员 → 服务器：把设备移出账户（编号 0 表示自己退出）。回 [`SignalMsg::Changed`] 或
+    /// [`SignalMsg::Refused`]。
+    Remove {
+        /// 编号；0 是发消息的这台设备自己。
+        row: u32,
+    },
+    /// 服务器 → 账户成员：改好了。
+    Changed {
+        /// 改动后的修订号。
+        rev: u64,
+    },
     /// 服务器 → 设备：体检结果。
     Checked {
         /// 服务器在信令端口看到的本机地址。
@@ -454,9 +566,18 @@ impl SignalMsg {
             | SignalMsg::ConnectCode { .. }
             | SignalMsg::NotFound
             | SignalMsg::Check
+            | SignalMsg::CheckQuiet
             | SignalMsg::Nodes
             | SignalMsg::NodeList { .. }
-            | SignalMsg::Checked { .. } => None,
+            | SignalMsg::Checked { .. }
+            | SignalMsg::Enroll { .. }
+            | SignalMsg::Enrolled { .. }
+            | SignalMsg::Refused { .. }
+            | SignalMsg::Devices { .. }
+            | SignalMsg::DeviceRows { .. }
+            | SignalMsg::Rename { .. }
+            | SignalMsg::Remove { .. }
+            | SignalMsg::Changed { .. } => None,
         }
     }
 
@@ -473,6 +594,15 @@ impl SignalMsg {
             SignalMsg::Probe { .. } => "Probe",
             SignalMsg::NotFound => "NotFound",
             SignalMsg::Check => "Check",
+            SignalMsg::CheckQuiet => "CheckQuiet",
+            SignalMsg::Enroll { .. } => "Enroll",
+            SignalMsg::Enrolled { .. } => "Enrolled",
+            SignalMsg::Refused { .. } => "Refused",
+            SignalMsg::Devices { .. } => "Devices",
+            SignalMsg::DeviceRows { .. } => "DeviceRows",
+            SignalMsg::Rename { .. } => "Rename",
+            SignalMsg::Remove { .. } => "Remove",
+            SignalMsg::Changed { .. } => "Changed",
             SignalMsg::Nodes => "Nodes",
             SignalMsg::NodeList { .. } => "NodeList",
             SignalMsg::Checked { .. } => "Checked",
@@ -560,6 +690,55 @@ impl SignalMsg {
             SignalMsg::Check => {
                 w.u8(9);
             }
+            SignalMsg::CheckQuiet => {
+                w.u8(9).u8(1);
+            }
+            SignalMsg::Enroll {
+                token,
+                name,
+                os,
+                role,
+            } => {
+                w.u8(13);
+                put_text(&mut w, token);
+                put_text(&mut w, name);
+                w.u8(*os).u8(*role);
+            }
+            SignalMsg::Enrolled { account, row, rev } => {
+                w.u8(14).bytes(account).u32(*row).u64(*rev);
+            }
+            SignalMsg::Refused { code } => {
+                w.u8(15).u8(*code);
+            }
+            SignalMsg::Devices { since } => {
+                w.u8(16).u64(*since);
+            }
+            SignalMsg::DeviceRows {
+                rev,
+                full,
+                more,
+                rows,
+            } => {
+                let rows = rows.get(..rows.len().min(MAX_ROWS)).unwrap_or_default();
+                w.u8(17)
+                    .u64(*rev)
+                    .u8(u8::from(*full))
+                    .u8(u8::from(*more))
+                    .u8(u8::try_from(rows.len()).unwrap_or(0));
+                for row in rows {
+                    row.put(&mut w);
+                }
+            }
+            SignalMsg::Rename { row, name } => {
+                w.u8(18).u32(*row);
+                put_text(&mut w, name);
+            }
+            SignalMsg::Remove { row } => {
+                w.u8(19).u32(*row);
+            }
+            SignalMsg::Changed { rev } => {
+                w.u8(20).u64(*rev);
+            }
             SignalMsg::Checked {
                 observed,
                 probe,
@@ -637,7 +816,55 @@ impl SignalMsg {
                 relay: get_grant(&mut r)?,
             },
             6 => SignalMsg::NotFound,
-            9 => SignalMsg::Check,
+            9 => {
+                if r.remaining() >= 1 && r.u8()? == 1 {
+                    SignalMsg::CheckQuiet
+                } else {
+                    SignalMsg::Check
+                }
+            }
+            13 => SignalMsg::Enroll {
+                token: get_text(&mut r)?,
+                name: get_text(&mut r)?,
+                os: r.u8()?,
+                role: r.u8()?,
+            },
+            14 => {
+                let mut account = [0u8; 8];
+                account.copy_from_slice(r.take(8)?);
+                SignalMsg::Enrolled {
+                    account,
+                    row: r.u32()?,
+                    rev: r.u64()?,
+                }
+            }
+            15 => SignalMsg::Refused { code: r.u8()? },
+            16 => SignalMsg::Devices { since: r.u64()? },
+            17 => {
+                let rev = r.u64()?;
+                let full = r.u8()? != 0;
+                let more = r.u8()? != 0;
+                let n = usize::from(r.u8()?);
+                if n > MAX_ROWS {
+                    return Err(Error::Inconsistent("一条消息里设备太多"));
+                }
+                let mut rows = Vec::with_capacity(n);
+                for _ in 0..n {
+                    rows.push(DeviceRow::get(&mut r)?);
+                }
+                SignalMsg::DeviceRows {
+                    rev,
+                    full,
+                    more,
+                    rows,
+                }
+            }
+            18 => SignalMsg::Rename {
+                row: r.u32()?,
+                name: get_text(&mut r)?,
+            },
+            19 => SignalMsg::Remove { row: r.u32()? },
+            20 => SignalMsg::Changed { rev: r.u64()? },
             10 => SignalMsg::Checked {
                 observed: get_addr(&mut r)?,
                 probe: get_opt_addr(&mut r)?,
@@ -1460,8 +1687,8 @@ mod tests {
         assert!(!Features::DEVICES.has(Features::WATCH));
         assert!(Features::NONE.has(Features::NONE) && !Features::NONE.has(Features::DEVICES));
         assert_eq!(Features::default(), Features::NONE);
-        // 这个版本的服务器还没有做任何一步：不许谎报
-        assert_eq!(Features::SERVER, Features::NONE);
+        // 这个版本的服务器只做了账户设备表：不许谎报别的
+        assert_eq!(Features::SERVER, Features::DEVICES);
 
         let registered = |features| SignalMsg::Registered {
             observed: addr("203.0.113.9:40000"),
@@ -1511,5 +1738,92 @@ mod tests {
             done.reply,
             SignalMsg::Registered { features, .. } if features == Features::SERVER
         ));
+    }
+
+    #[test]
+    fn device_table_messages_roundtrip() {
+        let row = |n: u32, name: &str, removed| DeviceRow {
+            row: n,
+            fingerprint: [u8::try_from(n).unwrap(); 32],
+            name: name.to_owned(),
+            os: 2,
+            role: 1,
+            last_seen_s: 1_700_000_000 + u64::from(n),
+            removed,
+        };
+        let all = [
+            SignalMsg::CheckQuiet,
+            SignalMsg::Enroll {
+                token: "pde1-0102030405060708-1000-deadbeef-00".into(),
+                name: "书房的 Mac mini".into(),
+                os: 2,
+                role: 1,
+            },
+            SignalMsg::Enrolled {
+                account: [1, 2, 3, 4, 5, 6, 7, 8],
+                row: 7,
+                rev: 42,
+            },
+            SignalMsg::Refused { code: 3 },
+            SignalMsg::Devices { since: 0 },
+            SignalMsg::Devices { since: u64::MAX },
+            SignalMsg::DeviceRows {
+                rev: 9,
+                full: true,
+                more: true,
+                rows: vec![row(1, "mac-mini", false), row(2, "办公室 PC", true)],
+            },
+            SignalMsg::DeviceRows {
+                rev: 0,
+                full: false,
+                more: false,
+                rows: vec![],
+            },
+            SignalMsg::Rename {
+                row: 3,
+                name: "新名字".into(),
+            },
+            SignalMsg::Remove { row: 0 },
+            SignalMsg::Changed { rev: 10 },
+        ];
+        for msg in &all {
+            let bytes = msg.encode();
+            assert_eq!(&SignalMsg::decode(&bytes).unwrap(), msg, "{}", msg.name());
+            assert!(msg.punch().is_none());
+            // 截断的都读不出来（体检的两种写法除外：少了末尾那个字节就是普通体检）
+            for cut in 1..bytes.len() {
+                let short = SignalMsg::decode(&bytes[..cut]);
+                if *msg == SignalMsg::CheckQuiet {
+                    assert_eq!(short, Ok(SignalMsg::Check));
+                } else {
+                    assert!(short.is_err(), "{} 截到 {cut}", msg.name());
+                }
+            }
+        }
+        // 只问功能的体检就是普通体检多一个字节 1：老服务器不看末尾，当成普通体检
+        assert_eq!(SignalMsg::Check.encode(), [9]);
+        assert_eq!(SignalMsg::CheckQuiet.encode(), [9, 1]);
+        assert_eq!(SignalMsg::decode(&[9, 0]).unwrap(), SignalMsg::Check);
+        // 一条消息最多 MAX_ROWS 台：多的不发，超了的不收；装满时不超过信令消息的长度上限
+        let many: Vec<DeviceRow> = (0..20).map(|n| row(n, &"字".repeat(64), false)).collect();
+        let full = SignalMsg::DeviceRows {
+            rev: 1,
+            full: true,
+            more: false,
+            rows: many.clone(),
+        }
+        .encode();
+        assert!(full.len() <= 4096, "{}", full.len());
+        let decoded = SignalMsg::decode(&full).unwrap();
+        assert!(matches!(
+            &decoded,
+            SignalMsg::DeviceRows { rows, .. } if rows[..] == many[..MAX_ROWS]
+        ));
+        let mut too_many = full.clone();
+        too_many[11] = u8::try_from(MAX_ROWS).unwrap() + 1;
+        assert_eq!(
+            SignalMsg::decode(&too_many),
+            Err(Error::Inconsistent("一条消息里设备太多"))
+        );
     }
 }

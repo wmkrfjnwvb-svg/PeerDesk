@@ -33,6 +33,7 @@ pub mod cpu;
 pub mod crash;
 pub mod crypto;
 pub mod desktop_sim;
+pub mod devices;
 pub mod error;
 pub mod estimator;
 pub mod file;
