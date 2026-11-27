@@ -227,21 +227,13 @@ pub fn decode_rgba(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
     let mut buf = vec![0; size];
     let info = reader.next_frame(&mut buf).map_err(|e| e.to_string())?;
     buf.truncate(info.buffer_size());
+    // 托盘图标都是带透明度的 RGBA（make-icons.py 生成）；别的格式说明图标文件被换错了，明说
     let rgba = match info.color_type {
         png::ColorType::Rgba => buf,
-        png::ColorType::Rgb => buf
-            .chunks_exact(3)
-            .flat_map(|p| p.iter().copied().chain(std::iter::once(255)))
-            .collect(),
-        png::ColorType::Grayscale => buf.iter().flat_map(|g| [*g, *g, *g, 255]).collect(),
-        png::ColorType::GrayscaleAlpha => buf
-            .chunks_exact(2)
-            .flat_map(|p| {
-                let g = p.first().copied().unwrap_or(0);
-                [g, g, g, p.get(1).copied().unwrap_or(255)]
-            })
-            .collect(),
-        png::ColorType::Indexed => return Err("不支持索引色图标".to_owned()),
+        png::ColorType::Rgb
+        | png::ColorType::Grayscale
+        | png::ColorType::GrayscaleAlpha
+        | png::ColorType::Indexed => return Err("托盘图标必须是 RGBA 的 PNG".to_owned()),
     };
     Ok((rgba, info.width, info.height))
 }
@@ -325,13 +317,12 @@ impl NotifyOs {
     /// 当前系统。
     #[must_use]
     pub const fn current() -> Self {
-        if cfg!(target_os = "macos") {
-            Self::MacOs
-        } else if cfg!(windows) {
-            Self::Windows
-        } else {
-            Self::Linux
-        }
+        #[cfg(target_os = "macos")]
+        return Self::MacOs;
+        #[cfg(windows)]
+        return Self::Windows;
+        #[cfg(all(not(windows), not(target_os = "macos")))]
+        return Self::Linux;
     }
 }
 
@@ -352,10 +343,7 @@ mod tests {
         });
         assert_eq!(first, CloseAction::Hide);
         assert!(!life.hint_pending());
-        let second = life.on_close_requested(|| {
-            hinted += 1;
-            true
-        });
+        let second = life.on_close_requested(|| panic!("不该再提示"));
         assert_eq!(second, CloseAction::Hide);
         assert_eq!(hinted, 1, "提示只发一次");
         assert!(!life.quitting());

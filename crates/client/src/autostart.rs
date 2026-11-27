@@ -45,13 +45,12 @@ impl Kind {
     /// 当前系统。
     #[must_use]
     pub const fn current() -> Self {
-        if cfg!(target_os = "macos") {
-            Self::MacOs
-        } else if cfg!(windows) {
-            Self::Windows
-        } else {
-            Self::Linux
-        }
+        #[cfg(target_os = "macos")]
+        return Self::MacOs;
+        #[cfg(windows)]
+        return Self::Windows;
+        #[cfg(all(not(windows), not(target_os = "macos")))]
+        return Self::Linux;
     }
 }
 
@@ -462,14 +461,8 @@ mod tests {
     #[test]
     fn macos_writes_the_plist_without_running_anything() {
         let env = env(Kind::MacOs, "mac");
-        let mut ran = 0;
-        let outcome = enable(&env, &mut |_| {
-            ran += 1;
-            Ok((true, String::new()))
-        })
-        .unwrap();
+        let outcome = enable(&env, &mut |_| panic!("macOS 不运行命令")).unwrap();
         assert_eq!(outcome, Outcome::System);
-        assert_eq!(ran, 0);
         let path = env
             .home
             .join("Library/LaunchAgents/org.peerdesk.client.plist");
@@ -619,6 +612,14 @@ mod tests {
         assert!(text.contains("由系统自动恢复"));
         let _ = std::fs::remove_dir_all(&mac.home);
         let _ = std::fs::remove_dir_all(&linux.home);
+    }
+
+    #[test]
+    fn removing_a_directory_as_a_file_is_an_error() {
+        let dir = std::env::temp_dir().join(format!("peerdesk-auto-rmdir-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(remove_file(&dir).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

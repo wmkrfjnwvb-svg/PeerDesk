@@ -77,11 +77,8 @@ pub fn supervise(
                 return exit;
             }
             Decision::Restart(wait) => {
-                log::warn!(
-                    "守护：PeerDesk 异常结束（退出码 {code:?}，运行了 {} 秒），{} 秒后重启",
-                    ran.as_secs(),
-                    wait.as_secs()
-                );
+                let (ran, wait_s) = (ran.as_secs(), wait.as_secs());
+                log::warn!("守护：PeerDesk 异常结束（退出码 {code:?}，运行了 {ran} 秒），{wait_s} 秒后重启");
                 sleep(wait);
             }
         }
@@ -90,8 +87,16 @@ pub fn supervise(
 
 /// `peerdesk guard`。
 pub fn cmd_guard(out: &mut dyn Write) -> u8 {
-    match std::env::current_exe() {
-        Ok(exe) => guard_program(&exe, &[], &mut std::thread::sleep),
+    guard_self(std::env::current_exe(), out, &mut std::thread::sleep)
+}
+
+fn guard_self(
+    exe: std::io::Result<std::path::PathBuf>,
+    out: &mut dyn Write,
+    sleep: &mut dyn FnMut(Duration),
+) -> u8 {
+    match exe {
+        Ok(exe) => guard_program(&exe, &[], sleep),
         Err(e) => {
             let _ = writeln!(out, "错误：找不到自己的路径：{e}");
             EXIT_FAILED
@@ -186,7 +191,7 @@ mod tests {
     fn supervise_keeps_the_no_retry_code() {
         let code = supervise(
             &mut || Ok((Some(i32::from(EXIT_NO_RETRY)), SHORT)),
-            &mut |_| {},
+            &mut |_| (),
         );
         assert_eq!(code, EXIT_NO_RETRY);
     }
@@ -226,6 +231,17 @@ mod tests {
             guard_program(sh, &["-c", "exit 78"], &mut |_| {}),
             EXIT_NO_RETRY
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guard_self_runs_the_program_and_reports_a_missing_path() {
+        let mut out = Vec::new();
+        let true_exe = std::path::PathBuf::from("/bin/true");
+        assert_eq!(guard_self(Ok(true_exe), &mut out, &mut |_| ()), 0);
+        let broken = Err(std::io::Error::other("没有路径"));
+        assert_eq!(guard_self(broken, &mut out, &mut |_| ()), EXIT_FAILED);
+        assert!(String::from_utf8(out).unwrap().contains("没有路径"));
     }
 
     #[test]
