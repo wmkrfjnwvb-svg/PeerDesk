@@ -971,6 +971,8 @@ struct Jitter {
     recent: VecDeque<bool>,
     /// 现在按抖动链路的门限。
     on: bool,
+    /// 一段超过稳定链路 high 的读数从什么时候开始、还没有定论（是尖峰还是队列，要看它多久回落）。
+    spike_since: Option<Time>,
 }
 
 /// 看最近多少份“没在用链路”的排队读数。
@@ -983,6 +985,41 @@ impl Jitter {
         Self {
             recent: VecDeque::new(),
             on: false,
+            spike_since: None,
+        }
+    }
+
+    /// 一份“没在用链路”的排队读数；返回门限是否换了。尖峰和队列按持续多久分（一个信号只表示一件事）：
+    /// - 高读数在一个窗口（`window_us`，和常驻队列同一个窗口）之内回落：尖峰，是链路自己的抖动（Wi-Fi 的信道争用、
+    ///   接收端批量读包）；
+    /// - 高读数持续满一个窗口：是队列（例如家里有人在上传，或者我们自己一阵大帧还没排完），不算抖动，交给常驻队列判断；
+    /// - 断档的读数（零星的包）：每一份都是孤立的，看不出持续多久，按读数本身算（Wi-Fi 省电下每份都是醒过来的延迟，
+    ///   这本身就是链路的抖动）。
+    fn reading(&mut self, now: Time, queue_us: u32, contiguous: bool, window_us: u64) -> bool {
+        let over = queue_us > Profile::STABLE.high_delay_us;
+        if !contiguous {
+            self.spike_since = None;
+            return self.add(over);
+        }
+        match (over, self.spike_since) {
+            (true, None) => {
+                self.spike_since = Some(now);
+                false
+            }
+            (true, Some(t)) => {
+                if now.since(t) >= window_us {
+                    // 满一个窗口还高：是队列，这一段了结（不算抖动），下一份高读数重新开始
+                    self.spike_since = None;
+                    self.add(false)
+                } else {
+                    false
+                }
+            }
+            (false, Some(t)) => {
+                self.spike_since = None;
+                self.add(now.since(t) < window_us)
+            }
+            (false, None) => self.add(false),
         }
     }
 
@@ -1809,7 +1846,13 @@ impl RateEstimator for ClassicV1 {
         self.probing.rtt_us = obs.rtt_us;
         // 这份反馈里的送达速率是不是链路的能力；不是的话，它的排队读数记进“链路自己的抖动”
         let link_limited = self.link_limited(now, using, obs);
-        if !link_limited && self.jitter.add(fb.queue_delay_us > Profile::STABLE.high_delay_us) {
+        // 抖动只认“很快回落的高读数”，持续一个窗口的是队列（见 `Jitter::reading`）
+        let window_us = STANDING_US.max(obs.rtt_us);
+        if !link_limited
+            && self
+                .jitter
+                .reading(now, fb.queue_delay_us, contiguous, window_us)
+        {
             let (low, high) = self.delay_limits();
             self.note(format!(
                 "延迟门限换成 low {} ms、high {} ms：{}",
@@ -1843,7 +1886,13 @@ impl RateEstimator for ClassicV1 {
         } else {
             fb.queue_delay_us
         };
-        let queue_high = queue_us > high_us && contiguous;
+        // 常驻队列（一个窗口里的最小值）已经把尖峰滤掉了，和画像本身的门限比；单份读数才按链路的抖动放宽
+        let (low_cmp, high_cmp) = if relaxed {
+            (p.low_delay_us, p.high_delay_us)
+        } else {
+            (low_us, high_us)
+        };
+        let queue_high = queue_us > high_cmp && contiguous;
         // 固有丢包慢慢跟（每份反馈 1/128，反馈 20 ms 一次时约 2.5 秒）
         let loss = u64::from(fb.loss_permille).saturating_mul(1000);
         self.inherent_loss = self.inherent_loss - self.inherent_loss / 128 + loss / 128;
@@ -1851,7 +1900,7 @@ impl RateEstimator for ClassicV1 {
         // 丢包也按上面的读数：应用受限时一份反馈里只有几个包，丢一个就是几百‰（用户日志：2 个包丢 1 个，500‰），
         // 没有常驻队列就不算
         let lossy_and_queued = fb.loss_permille > p.loss_permille.saturating_add(inherent)
-            && queue_us > low_us
+            && queue_us > low_cmp
             && contiguous;
         let congested = self.usage == Usage::Over || queue_high || lossy_and_queued;
         // 一个往返（至少 100 ms）之内只降一次：同一次拥塞的反馈会连着来好几条。
@@ -2076,6 +2125,16 @@ mod tests {
             };
             self.v.on_observation(Time(self.t), &o);
         }
+        /// 同 [`Self::put`]，但发送端这一刻有积压（有东西等着发、被网络挡着）。
+        fn put_busy(&mut self, queue: u32, loss: u16, recv: u32, ext: Extension, limit: SendLimit) {
+            self.t += 20_000;
+            let o = Observation {
+                limit,
+                backlog: true,
+                ..obs(fb(queue, loss, recv), ext)
+            };
+            self.v.on_observation(Time(self.t), &o);
+        }
         /// 进入应用受限（先喂一份平静的反馈）。
         fn app_limited(profile: Profile, start_bps: u64) -> Self {
             let mut f = Self::new(profile, start_bps);
@@ -2294,9 +2353,22 @@ mod tests {
         assert!(g
             .notes()
             .contains("应用受限 → 跟踪：网络受限：该编帧时在途数据满了或上一帧没发完"));
-        // 回到跟踪以后一份高读数就降，按送达速率，不再“最多一半”
+        // 回到跟踪以后：送达只有码率的一成（静止时要发的量），单独一份高读数不按它降——2026-11-27 Mac 日志里
+        // 这样降了 496 次、317 次降到 1 Mbps 以下（`docs/research/P-fps-bitrate.md` M1）
         g.put(20_000, 0, 250_000, FLAT, NET);
-        assert_eq!(g.v.rate_bps(), 1_700_000);
+        assert_eq!(
+            g.v.rate_bps(),
+            30_000_000,
+            "没证明链路一直忙，不按送达速率降"
+        );
+        // 发送端连着一个窗口都有积压（链路一直忙着）：这时的送达速率是链路的能力，高读数按它降，不再“最多一半”
+        let mut h = Feed::app_limited(Profile::STABLE, 30_000_000);
+        h.v.on_net_limited(NetCause::FrameBlocked);
+        for _ in 0..6 {
+            h.put_busy(1_000, 0, 250_000, FLAT, NET);
+        }
+        h.put_busy(20_000, 0, 250_000, FLAT, NET);
+        assert_eq!(h.v.rate_bps(), 1_700_000);
         // 每个原因都有说明
         for cause in [
             NetCause::Unknown,
@@ -2373,9 +2445,17 @@ mod tests {
     fn cut(f: &mut Feed, times: u32) {
         for _ in 0..times {
             let before = f.v.rate_bps();
-            while f.v.rate_bps() == before {
+            for _ in 0..500 {
+                if f.v.rate_bps() != before {
+                    break;
+                }
                 f.put(30_000, 0, 25_000, FLAT, SendLimit::App);
             }
+            assert_ne!(
+                f.v.rate_bps(),
+                before,
+                "常驻队列 30 ms 持续 10 秒，应用受限时也该降（最多一半）"
+            );
         }
         assert_eq!(f.v.state(), RateState::DrainApp);
         assert_eq!(f.v.probe_wanted(Time(f.t)), None, "排空里不探");
@@ -2520,28 +2600,22 @@ mod tests {
         assert_eq!(g.v.rate_bps(), 900_000);
     }
 
-    /// 跟踪里降了码率、但当时发送端没用满码率（一阵流量刚收尾，送达速率只是要发的量），紧接着进了应用受限：
-    /// 没有流量把码率带回去，要马上核实。用满了码率时降的不核实。跟踪怎么降不变（I3）。
+    /// 跟踪里一阵流量刚收尾（发送端没用满码率，送达速率只是要发的量），一份高读数不降（#71 第 2 步：
+    /// 以前按它降到 9.52 Mbps，再靠核实拉回来；wifi-light 实测大屏开头 30 → 9.5 Mbps，之后 5 秒停在那里）。
+    /// 用满了码率时降的是真凭实据，照降，也不核实。
     #[test]
-    fn t1_a_tracking_cut_on_a_tapering_flow_is_verified_once_app_limited() {
+    fn t1_a_tapering_flow_is_not_cut_and_a_cut_while_using_the_rate_is_not_verified() {
         let mut f = Feed::new(Profile::STABLE, 30_000_000);
         f.v.capacity = Some((30_000_000, Time(0)));
         f.put(1_000, 0, 3_500_000, FLAT, NET);
         let before = f.v.rate_bps();
-        // 送达 11.2 Mbps（不到码率的六成），一份排队 18 ms：按跟踪的规则降到 9.52 Mbps
+        // 送达 11.2 Mbps（不到码率的六成），一份排队 18 ms：流量收尾，不降
         f.put(18_000, 0, 1_400_000, FLAT, NET);
-        assert_eq!((f.v.state(), f.v.rate_bps()), (RateState::Drain, 9_520_000));
+        assert_eq!((f.v.state(), f.v.rate_bps()), (RateState::Tracking, before));
         f.put(1_000, 0, 25_000, FLAT, NET);
-        assert_eq!(f.v.probe_wanted(Time(f.t)), None, "跟踪里不探");
         f.put(1_000, 0, 25_000, FLAT, SendLimit::App);
         assert_eq!(f.v.state(), RateState::AppLimited);
-        let ask = f.v.probe_wanted(Time(f.t)).unwrap();
-        assert_eq!(
-            (ask.kind, ask.target_bps),
-            (ProbeKind::Verify, before * 85 / 100)
-        );
-        f.v.on_probe_end(Time(f.t), ProbeEnd::Result(ask.target_bps));
-        assert_eq!(f.v.rate_bps(), ask.target_bps);
+        assert_eq!(f.v.probe_wanted(Time(f.t)), None, "没降过，不用核实");
         // 用满了码率时降的（送达 20 Mbps ≥ 码率的六成）：是真凭实据，不核实
         let mut g = Feed::new(Profile::STABLE, 30_000_000);
         g.v.capacity = Some((30_000_000, Time(0)));
@@ -2656,7 +2730,10 @@ mod tests {
         }
         // 降得不多（没到降前的 66% 以下）：不核实
         let mut g = probing(30_000_000, Some(30_000_000));
-        while g.v.rate_bps() == 30_000_000 {
+        for _ in 0..500 {
+            if g.v.rate_bps() != 30_000_000 {
+                break;
+            }
             // 送达 24 Mbps：降到它的 85% = 20.4 Mbps（降前的 68%）
             g.put(30_000, 0, 3_000_000, FLAT, SendLimit::App);
         }
@@ -3752,8 +3829,9 @@ mod tests {
         }
         assert_eq!(f.v.rate_bps(), 850_000, "降到送达速率（1 Mbps）的 85%");
         // 说明满了以后再来一次更严重的拥塞：码率照降
+        // （发送端一直有积压：送达速率是链路的能力，可以按它降到底线）
         for _ in 0..10 {
-            f.put(20_000, 0, 12_500, FLAT, NET);
+            f.put_busy(20_000, 0, 12_500, FLAT, NET);
         }
         assert_eq!(f.v.rate_bps(), 100_000, "说明满了不影响降码率");
         let notes = f.v.take_notes();
