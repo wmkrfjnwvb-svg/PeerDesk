@@ -96,6 +96,9 @@ fn header() -> String {
             // A2-3 加的：随机数布局，读进来的文件的哈希（换档之前）
             "rng_layout",
             "source_hash",
+            // 分段路径每段正向排队（毫秒，A → B 五段，分号隔开；不是分段路径为 -）
+            "seg_mean_queue_ms",
+            "seg_max_queue_ms",
             "error",
         ]
         .map(str::to_owned),
@@ -133,6 +136,18 @@ fn rate_percentiles(o: &Outcome) -> (u64, u64) {
             .unwrap_or(0)
     };
     (at(500), at(50))
+}
+
+/// 每段一个数，分号隔开；没有分段时为 `-`。
+fn segment_column(o: &Outcome, f: impl Fn(&peerdesk_e2e::SegmentTruth) -> f64) -> String {
+    if o.segments.is_empty() {
+        return "-".to_owned();
+    }
+    o.segments
+        .iter()
+        .map(|s| format!("{:.1}", f(s)))
+        .collect::<Vec<_>>()
+        .join(";")
 }
 
 fn row(world: &World, o: &Outcome, wall_ms: f64, source: &str) -> String {
@@ -212,6 +227,8 @@ fn row(world: &World, o: &Outcome, wall_ms: f64, source: &str) -> String {
         format!("{:016x}", fingerprint(o)),
         world.scenario.network.layout().to_string(),
         source.to_owned(),
+        segment_column(o, |s| s.mean_queue_ms),
+        segment_column(o, |s| s.max_queue_ms),
         String::new(),
     ]);
     cols.join(",")

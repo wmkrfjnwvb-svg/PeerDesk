@@ -10,6 +10,7 @@
 //! 同一个场景同一个种子，结果逐字节相同，可以放进 CI 当回归门槛。
 
 pub mod content;
+pub mod homes;
 pub mod report;
 pub mod timeline;
 pub mod world;
@@ -22,6 +23,7 @@ pub use peerdesk_core::estimator::RateState;
 use peerdesk_core::frame::{Described, Picture};
 pub use peerdesk_core::media::ProbeStats;
 use peerdesk_core::media::{DecodeWorker, MediaReceiver, MediaSender, SenderConfig, SenderStats};
+use peerdesk_core::path::segments::{Segment, SegmentRoute, Segmented, SegmentedConfig};
 use peerdesk_core::path::{
     CrossSpec, CrossStats, Dir, DirConfig, Path, PathConfig, PathStats, RouteChange,
 };
@@ -439,6 +441,9 @@ pub enum NetworkPlan {
     Layout1(Vec<(u64, Link)>),
     /// 布局 2：分层的路径模型 [`Path`]，每层一条随机数流，两个方向可以不同。
     Layout2(Box<Layout2>),
+    /// 布局 2 的分段路径：两端之间五段（A 局域网、A 出口、公网、B 出口、B 局域网），每段一个 `Path`，
+    /// 见 `peerdesk_core::path::segments`。
+    Segmented(Box<SegmentedPlan>),
 }
 
 impl NetworkPlan {
@@ -447,7 +452,17 @@ impl NetworkPlan {
     pub const fn layout(&self) -> u32 {
         match self {
             NetworkPlan::Layout1(_) => 1,
-            NetworkPlan::Layout2(_) => 2,
+            NetworkPlan::Layout2(_) | NetworkPlan::Segmented(_) => 2,
+        }
+    }
+
+    /// 指纹行身份里的网络部分：布局 1 是空的（和加布局 2 之前逐字节相同），布局 2 是 ` layout2`，分段是 ` layout2-segments`。
+    #[must_use]
+    pub const fn identity(&self) -> &'static str {
+        match self {
+            NetworkPlan::Layout1(_) => "",
+            NetworkPlan::Layout2(_) => " layout2",
+            NetworkPlan::Segmented(_) => " layout2-segments",
         }
     }
 
@@ -501,6 +516,41 @@ pub struct Layout2 {
     pub routes: Vec<RouteChange>,
     /// 交叉流量：挂在哪个方向的瓶颈上（正向是被控端到控制端，画面走的方向），什么源。
     pub cross: Vec<(Dir, CrossSpec)>,
+}
+
+/// 分段路径的网络（布局 2）。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SegmentedPlan {
+    /// 五段起始的参数。
+    pub start: SegmentedConfig,
+    /// 从某个时刻（微秒）起立即换一段的参数（不中断、不发事件）。
+    pub steps: Vec<(u64, SegmentStep)>,
+    /// 按计划的中断和换路（可以同时涉及几段，带新参数的在恢复时刻发一次“路径变了”）。
+    pub routes: Vec<SegmentRoute>,
+    /// 交叉流量：挂在哪一段、哪个方向（正向是 A → B）的瓶颈上，什么源。
+    pub cross: Vec<(Segment, Dir, CrossSpec)>,
+}
+
+/// 分段路径的一次立即换参数。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SegmentStep {
+    /// 换哪一段。
+    pub segment: Segment,
+    /// 这一段两个方向的新参数。
+    pub config: PathConfig,
+    /// 这一段接通还是切断。
+    pub up: bool,
+}
+
+/// 分段路径一段的真值（不进指纹）。
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct SegmentTruth {
+    /// 这一段的计数（主流量和探测都在里面）。
+    pub stats: PathStats,
+    /// 正向（A → B）瓶颈排队的时间平均（毫秒，按帧末采样）。
+    pub mean_queue_ms: f64,
+    /// 正向瓶颈排队的最大值（毫秒，按帧末采样）。
+    pub max_queue_ms: f64,
 }
 
 /// 布局 2 的一次立即换参数。
@@ -587,8 +637,10 @@ pub struct Outcome {
     pub path: Option<PathStats>,
     /// “路径变了”事件送到两端的时刻（微秒），按先后。布局 1 没有事件。**不进指纹**。
     pub route_changes: Vec<u64>,
-    /// 布局 2 每个交叉流量源的计数，按 [`Layout2::cross`] 的顺序。**不进指纹**。
+    /// 布局 2 每个交叉流量源的计数，按 [`Layout2::cross`]（或 [`SegmentedPlan::cross`]）的顺序。**不进指纹**。
     pub cross: Vec<CrossStats>,
+    /// 分段路径每段的真值，按 A → B 的顺序；不是分段路径时为空。**不进指纹**。
+    pub segments: Vec<SegmentTruth>,
 }
 
 /// 两秒一个窗口（对账时比每个窗口发了多少字节，见 `a1-plan.md` 第 4 节）。
@@ -1486,10 +1538,7 @@ fn fingerprint_line(s: &Scenario, o: &Outcome) -> String {
         model.push_str(s.byte_noise.name());
     }
     // 布局 2 同理：布局 1 的行逐字节不变，布局 2 的行身份里多一个 layout2
-    if s.network.layout() != 1 {
-        model.push_str(" layout");
-        model.push_str(&s.network.layout().to_string());
-    }
+    model.push_str(s.network.identity());
     format!(
         "{} {}x{} fps{} {} {} seed{} max{} start{} pace{} probe{}{}{model} {:?} {:016x}\n",
         s.name,
@@ -1637,6 +1686,109 @@ fn run_inner(s: &Scenario, record: bool) -> Result<(Outcome, Option<Vec<u8>>), E
             }
             session(s, record, path, plan.steps.clone())
         }
+        NetworkPlan::Segmented(plan) => {
+            let mut net = Segmented::new(s.seed, plan.start.clone());
+            for change in &plan.routes {
+                net.schedule_route_change(change.clone());
+            }
+            let mut ids = Vec::new();
+            for (segment, dir, spec) in &plan.cross {
+                ids.push((*segment, net.add_cross(*segment, *dir, spec.clone())));
+            }
+            session(
+                s,
+                record,
+                SegmentedWire { net, cross: ids },
+                plan.steps.clone(),
+            )
+        }
+    }
+}
+
+/// 分段路径加上交叉流量源的序号（每个源挂在哪一段、在那一段里是第几个），主循环用它取计数。
+struct SegmentedWire {
+    net: Segmented<Vec<u8>>,
+    cross: Vec<(Segment, usize)>,
+}
+
+impl Network<Vec<u8>> for SegmentedWire {
+    fn send(&mut self, from: usize, to: usize, size_bytes: usize, payload: Vec<u8>) {
+        self.net.send(from, to, size_bytes, payload);
+    }
+    fn peek_time(&self) -> Option<Time> {
+        self.net.peek_time()
+    }
+    fn pop(&mut self) -> Option<peerdesk_core::sim::Delivery<Vec<u8>>> {
+        self.net.pop()
+    }
+    fn advance_to(&mut self, t: Time) {
+        self.net.advance_to(t);
+    }
+    fn in_flight(&self) -> usize {
+        self.net.in_flight()
+    }
+    fn backlog_us(&self, from: usize, to: usize) -> u64 {
+        self.net.backlog_us(from, to)
+    }
+    fn stats(&self) -> NetStats {
+        self.net.stats()
+    }
+    fn next_event_time(&self) -> Option<Time> {
+        self.net.next_event_time()
+    }
+    fn pop_event(&mut self) -> Option<peerdesk_core::path::PathEvent> {
+        self.net.pop_event()
+    }
+}
+
+impl Wire for SegmentedWire {
+    type Step = SegmentStep;
+    fn apply(&mut self, step: &SegmentStep) {
+        self.net
+            .set_dir(step.segment, Dir::Forward, step.config.forward.clone());
+        self.net
+            .set_dir(step.segment, Dir::Reverse, step.config.reverse.clone());
+        self.net.set_up(step.segment, step.up);
+    }
+    /// 五段两个方向的名义传播延迟之和，加 1 ms。
+    fn nominal_rtt_us(&self) -> u64 {
+        let now = self.net.now();
+        Segment::ALL
+            .iter()
+            .flat_map(|s| Dir::BOTH.map(|d| (*s, d)))
+            .map(|(s, d)| self.net.segment(s).dir(d).config().delay.nominal_us(now))
+            .fold(1_000u64, u64::saturating_add)
+    }
+    /// 正向五段里最窄的容量（不限速的段不算；都不限速为 0）。
+    fn true_rate_bps(&self) -> u64 {
+        let now = self.net.now();
+        Segment::ALL
+            .iter()
+            .map(|s| {
+                self.net
+                    .segment(*s)
+                    .dir(Dir::Forward)
+                    .bottleneck()
+                    .rate_at(now)
+            })
+            .filter(|r| *r > 0)
+            .min()
+            .unwrap_or(0)
+    }
+    fn cross(&self) -> Vec<CrossStats> {
+        self.cross
+            .iter()
+            .map(|(s, id)| self.net.segment(*s).cross_stats(*id))
+            .collect()
+    }
+    fn segment_queues_us(&self) -> Vec<u64> {
+        Segment::ALL
+            .iter()
+            .map(|s| self.net.segment(*s).backlog_us(HOST, VIEWER))
+            .collect()
+    }
+    fn segment_stats(&self) -> Vec<PathStats> {
+        self.net.segment_stats()
     }
 }
 
@@ -1652,6 +1804,14 @@ trait Wire: Network<Vec<u8>> {
     fn true_rate_bps(&self) -> u64;
     /// 每个交叉流量源的计数（布局 1 没有交叉流量）。
     fn cross(&self) -> Vec<CrossStats> {
+        Vec::new()
+    }
+    /// 分段路径每段正向瓶颈现在的排队（微秒）；不是分段路径时为空。
+    fn segment_queues_us(&self) -> Vec<u64> {
+        Vec::new()
+    }
+    /// 分段路径每段的计数；不是分段路径时为空。
+    fn segment_stats(&self) -> Vec<PathStats> {
         Vec::new()
     }
 }
@@ -1781,6 +1941,8 @@ fn session<N: Wire>(
     network.sort_by_key(|(t, _)| *t);
     let mut next_link = 0usize;
     let mut route_changes = Vec::new();
+    // 分段路径每段正向排队：（时间加权的和 微秒·微秒，最大 微秒），按帧末采样
+    let mut seg_queue: Vec<(u128, u64)> = Vec::new();
 
     // 每一帧的采集时间，按帧号。
     let mut captured: Vec<Time> = vec![Time::ZERO];
@@ -2106,6 +2268,12 @@ fn session<N: Wire>(
             net.advance_to(tick_end);
             profile.stop(Part::Network, moving);
             now = tick_end;
+            let queues = net.segment_queues_us();
+            seg_queue.resize(queues.len(), (0, 0));
+            for ((sum, max), q) in seg_queue.iter_mut().zip(queues) {
+                *sum = sum.saturating_add(u128::from(q) * u128::from(interval));
+                *max = (*max).max(q);
+            }
             if let Some(j) = journal.as_mut() {
                 j.second(now, tx.stats());
             }
@@ -2168,6 +2336,17 @@ fn session<N: Wire>(
         path: net.path_stats(),
         route_changes,
         cross: net.cross(),
+        segments: net
+            .segment_stats()
+            .into_iter()
+            .zip(&seg_queue)
+            .map(|(stats, (sum, max))| SegmentTruth {
+                stats,
+                // 和 ms() 同一个口径：微秒 → 毫秒
+                mean_queue_ms: *sum as f64 / now.micros().max(1) as f64 / 1000.0,
+                max_queue_ms: ms(*max),
+            })
+            .collect(),
         trace,
     };
     if profile.on {

@@ -318,6 +318,7 @@ pub fn to_text(s: &Scenario) -> Result<String, WorldError> {
             }
         }
         NetworkPlan::Layout2(plan) => layout2::write(&mut w, plan)?,
+        NetworkPlan::Segmented(plan) => layout2::write_segmented(&mut w, plan)?,
     }
     Ok(w.finish())
 }
@@ -428,7 +429,17 @@ pub fn from_text(text: &str) -> Result<Scenario, WorldError> {
                     .to_owned(),
             );
         }
-        NetworkPlan::Layout2(Box::new(layout2::read(&mut kv)?))
+        if kv.has(layout2::SEGMENTED_KEY) {
+            if kv.has("path.fwd") {
+                return bad(
+                    "path.fwd 和 seg.a-lan.fwd 不能同时出现：一个文件要么是单段的路径，要么是五段的分段路径"
+                        .to_owned(),
+                );
+            }
+            NetworkPlan::Segmented(Box::new(layout2::read_segmented(&mut kv)?))
+        } else {
+            NetworkPlan::Layout2(Box::new(layout2::read(&mut kv)?))
+        }
     };
     kv.finish()?;
 
@@ -1506,5 +1517,101 @@ mod tests {
                 "是随机数布局 2 的键",
             );
         }
+    }
+
+    fn segmented_scenario() -> Scenario {
+        use crate::homes;
+        use crate::SegmentStep;
+        use peerdesk_core::path::segments::{Segment, SegmentRoute};
+        use peerdesk_core::path::PathConfig;
+        use peerdesk_core::time::Time;
+        let mut plan = homes::quiet();
+        homes::b_watching_video(&mut plan, Time(1_000_000));
+        homes::a_uploading(&mut plan, Time(2_000_000), true);
+        plan.steps.push((
+            3_000_000,
+            SegmentStep {
+                segment: Segment::Public,
+                config: PathConfig::symmetric(homes::cable_up()),
+                up: false,
+            },
+        ));
+        plan.routes = vec![
+            SegmentRoute {
+                at: Time(4_000_000),
+                down_us: 300_000,
+                down: vec![Segment::ALan, Segment::AEgress],
+                new: vec![
+                    (Segment::ALan, PathConfig::symmetric(homes::wifi())),
+                    (Segment::AEgress, PathConfig::symmetric(homes::cable_down())),
+                ],
+            },
+            SegmentRoute {
+                at: Time(5_000_000),
+                down_us: 10,
+                down: vec![Segment::BLan],
+                new: Vec::new(),
+            },
+        ];
+        let mut s = Scenario::fixed("分段", phases());
+        s.network = NetworkPlan::Segmented(Box::new(plan));
+        s
+    }
+
+    #[test]
+    fn segmented_round_trips_byte_identical() {
+        let text = assert_round_trips(&segmented_scenario());
+        assert!(text.contains("\nrng_layout 2\n"));
+        assert!(text.contains("\nseg.b-egress.fwd "));
+        assert!(text.contains(
+            "\nseg_route.0 at=4000000 down_us=300000 down=a-lan,a-egress new=a-lan,a-egress\n"
+        ));
+        assert!(text.contains("\nseg_route.0.a-egress.rev "));
+        assert!(text.contains("\nseg_route.1 at=5000000 down_us=10 down=b-lan new=-\n"));
+        assert!(text.contains("\nseg_cross.0 seg=b-egress dir=fwd kind=bursts "));
+        assert!(text.contains("\nseg_step.0 at=3000000 seg=public up=0\n"));
+        assert!(!text.contains("\npath.fwd") && !text.contains("\nlinks "));
+        let quiet = Scenario {
+            network: NetworkPlan::Segmented(Box::new(crate::homes::quiet())),
+            ..Scenario::fixed("安静", phases())
+        };
+        let q = assert_round_trips(&quiet);
+        assert!(q.contains("\nseg_routes 0\n") && q.contains("\nseg_cross 0\n"));
+        assert!(!q.contains("down=-"));
+    }
+
+    #[test]
+    fn segmented_reports_bad_values() {
+        let text = to_text(&segmented_scenario()).unwrap();
+        let cases = [
+            ("seg=public up=0", "seg=lan up=0", "段名 \"lan\" 不认识"),
+            ("down=a-lan,a-egress", "down=a-lan,x", "段名 \"x\" 不认识"),
+            (
+                "\nseg_cross.0 seg=b-egress",
+                "\nseg_cross.0 seg=c-egress",
+                "段名",
+            ),
+            (
+                "\nseg_cross.0 seg=b-egress dir=fwd",
+                "\nseg_cross.0 seg=b-egress dir=fwd x=1",
+                "x",
+            ),
+            (
+                "\nseg_steps 1\n",
+                "\nseg_steps 1\npath.fwd x=1\n",
+                "不能同时出现",
+            ),
+        ];
+        for (from, to, want) in cases {
+            rejects(&text, from, to, want);
+        }
+        // 分段的键也不能出现在布局 1 的文件里
+        let one = to_text(&Scenario::fixed("x", phases())).unwrap();
+        rejects(
+            &one,
+            "\nlinks ",
+            "\nseg_cross 0\nlinks ",
+            "是随机数布局 2 的键",
+        );
     }
 }

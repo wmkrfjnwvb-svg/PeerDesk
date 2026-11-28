@@ -8,13 +8,21 @@
 //!   按计划中断和换路，带新参数的在恢复时刻发一次“路径变了”；
 //! - `cross N`，每一项 `cross.<i> dir=fwd|rev kind=cbr|tcp|bursts ...`：交叉流量源。
 //!
+//! 分段路径（`peerdesk_core::path::segments`，五段，每段的正向是 A → B）用 `seg` 开头的另一套键，和上面互斥：
+//! - `seg.<段名>.fwd <cfg>`、`seg.<段名>.rev <cfg>`：五段起始的参数（段名 `a-lan`、`a-egress`、`public`、`b-egress`、`b-lan`）；
+//! - `seg_steps N`，每一项 `seg_step.<i> at=<微秒> seg=<段名> up=0|1`，加 `seg_step.<i>.fwd`、`seg_step.<i>.rev`；
+//! - `seg_routes N`，每一项 `seg_route.<i> at=<微秒> down_us=<微秒> down=<段名,…|-> new=<段名,…|->`，
+//!   `new` 里的每段加 `seg_route.<i>.<段名>.fwd`、`seg_route.<i>.<段名>.rev`；
+//! - `seg_cross N`，每一项 `seg_cross.<i> seg=<段名> dir=fwd|rev kind=…`（其余字段和 `cross.<i>` 一样）。
+//!
 //! 写的时候每个结构都整个解构：以后加了字段，这里编译不过，逼着把它写进文件。
 //! 容量轨迹原样内联（`时长@速率`，逗号隔开），不在这里合并：合并相邻同速率的段在语义上等价，但瓶颈按段算发送时间，
 //! 合并可能差 1 纳秒，同一个世界就有了两种写法和两种结果。要合并在生成轨迹的地方做。
 
 use super::{bad, opt_fields, parse_opt_fields, WorldError};
-use crate::{Layout2, PathStep};
+use crate::{Layout2, PathStep, SegmentStep, SegmentedPlan};
 use peerdesk_core::kv::{join_fields, Kv, KvWriter};
+use peerdesk_core::path::segments::{Segment, SegmentRoute, SegmentedConfig};
 use peerdesk_core::path::{
     Aqm, BottleneckConfig, Capacity, CrossSpec, Delay, Dir, DirConfig, Loss, Noise, PathConfig,
     Policer, QueueLimit, Receiver, RouteChange, TcpConfig, Trace,
@@ -23,7 +31,57 @@ use peerdesk_core::sim::{Busy, Doze, Spikes};
 use peerdesk_core::time::Time;
 
 /// 布局 2 才有的键（出现在布局 1 的文件里要报错）。
-pub(super) const KEYS: [&str; 5] = ["path.fwd", "path.rev", "steps", "routes", "cross"];
+pub(super) const KEYS: [&str; 9] = [
+    "path.fwd",
+    "path.rev",
+    "steps",
+    "routes",
+    "cross",
+    "seg.a-lan.fwd",
+    "seg_steps",
+    "seg_routes",
+    "seg_cross",
+];
+
+/// 分段路径的键（出现了就按分段读）。
+pub(super) const SEGMENTED_KEY: &str = "seg.a-lan.fwd";
+
+const SEGMENT_NAMES: [(&str, Segment); 5] = [
+    ("a-lan", Segment::ALan),
+    ("a-egress", Segment::AEgress),
+    ("public", Segment::Public),
+    ("b-egress", Segment::BEgress),
+    ("b-lan", Segment::BLan),
+];
+
+fn segment_list(v: &[Segment]) -> String {
+    if v.is_empty() {
+        return "-".to_owned();
+    }
+    v.iter().map(|s| s.name()).collect::<Vec<_>>().join(",")
+}
+
+fn parse_segment(name: &str, ctx: &str) -> Result<Segment, WorldError> {
+    SEGMENT_NAMES
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, s)| *s)
+        .map_or_else(
+            || {
+                bad(format!(
+                    "{ctx}：段名 {name:?} 不认识（a-lan、a-egress、public、b-egress、b-lan）"
+                ))
+            },
+            Ok,
+        )
+}
+
+fn parse_segment_list(text: &str, ctx: &str) -> Result<Vec<Segment>, WorldError> {
+    if text == "-" {
+        return Ok(Vec::new());
+    }
+    text.split(',').map(|n| parse_segment(n, ctx)).collect()
+}
 
 fn flag(b: bool) -> String {
     if b { "1" } else { "0" }.to_owned()
@@ -477,8 +535,14 @@ fn cross_fields(dir: Dir, spec: &CrossSpec) -> Result<String, WorldError> {
 }
 
 fn parse_cross(text: &str, ctx: &str) -> Result<(Dir, CrossSpec), WorldError> {
-    const KINDS: [(&str, u8); 3] = [("cbr", 0), ("tcp", 1), ("bursts", 2)];
     let mut f = Kv::parse_fields(text, ctx)?;
+    let got = parse_cross_fields(&mut f)?;
+    f.finish()?;
+    Ok(got)
+}
+
+fn parse_cross_fields(f: &mut Kv) -> Result<(Dir, CrossSpec), WorldError> {
+    const KINDS: [(&str, u8); 3] = [("cbr", 0), ("tcp", 1), ("bursts", 2)];
     let dir = f.take_choice("dir", &DIRS)?;
     let spec = match f.take_choice("kind", &KINDS)? {
         0 => CrossSpec::Cbr {
@@ -490,7 +554,7 @@ fn parse_cross(text: &str, ctx: &str) -> Result<(Dir, CrossSpec), WorldError> {
         1 => CrossSpec::Tcp {
             start: Time(f.take_u64("start")?),
             bytes: f.take_opt_u64("bytes")?,
-            cfg: parse_tcp(&mut f)?,
+            cfg: parse_tcp(f)?,
         },
         _ => CrossSpec::Bursts {
             connections: f.take_u32("connections")?,
@@ -499,10 +563,9 @@ fn parse_cross(text: &str, ctx: &str) -> Result<(Dir, CrossSpec), WorldError> {
             mean_off_us: f.take_u64("mean_off_us")?,
             start_on: f.take_bool("start_on")?,
             start: Time(f.take_u64("start")?),
-            cfg: parse_tcp(&mut f)?,
+            cfg: parse_tcp(f)?,
         },
     };
-    f.finish()?;
     Ok((dir, spec))
 }
 
@@ -585,6 +648,139 @@ pub(super) fn read(kv: &mut Kv) -> Result<Layout2, WorldError> {
         cross.push(parse_cross(&kv.take(&key)?, &key)?);
     }
     Ok(Layout2 {
+        start,
+        steps,
+        routes,
+        cross,
+    })
+}
+
+/// 写分段路径（键的顺序固定）。
+pub(super) fn write_segmented(w: &mut KvWriter, plan: &SegmentedPlan) -> Result<(), WorldError> {
+    let SegmentedPlan {
+        start,
+        steps,
+        routes,
+        cross,
+    } = plan;
+    let SegmentedConfig { segments } = start;
+    for (s, cfg) in Segment::ALL.iter().zip(segments) {
+        put_config(w, &format!("seg.{}", s.name()), cfg)?;
+    }
+    w.put_display("seg_steps", steps.len())?;
+    for (
+        i,
+        (
+            at,
+            SegmentStep {
+                segment,
+                config,
+                up,
+            },
+        ),
+    ) in steps.iter().enumerate()
+    {
+        let key = format!("seg_step.{i}");
+        w.put(
+            &key,
+            &join_fields(&[
+                ("at", at.to_string()),
+                ("seg", segment.name().to_owned()),
+                ("up", flag(*up)),
+            ])?,
+        )?;
+        put_config(w, &key, config)?;
+    }
+    w.put_display("seg_routes", routes.len())?;
+    for (
+        i,
+        SegmentRoute {
+            at,
+            down_us,
+            down,
+            new,
+        },
+    ) in routes.iter().enumerate()
+    {
+        let key = format!("seg_route.{i}");
+        let names: Vec<Segment> = new.iter().map(|(s, _)| *s).collect();
+        w.put(
+            &key,
+            &join_fields(&[
+                ("at", at.micros().to_string()),
+                ("down_us", down_us.to_string()),
+                ("down", segment_list(down)),
+                ("new", segment_list(&names)),
+            ])?,
+        )?;
+        for (s, cfg) in new {
+            put_config(w, &format!("{key}.{}", s.name()), cfg)?;
+        }
+    }
+    w.put_display("seg_cross", cross.len())?;
+    for (i, (segment, dir, spec)) in cross.iter().enumerate() {
+        let fields = cross_fields(*dir, spec)?;
+        w.put(
+            &format!("seg_cross.{i}"),
+            &format!("seg={} {fields}", segment.name()),
+        )?;
+    }
+    Ok(())
+}
+
+/// 读分段路径。
+pub(super) fn read_segmented(kv: &mut Kv) -> Result<SegmentedPlan, WorldError> {
+    let mut start = SegmentedConfig::default();
+    for s in Segment::ALL {
+        *start.segment_mut(s) = take_config(kv, &format!("seg.{}", s.name()))?;
+    }
+    let mut steps = Vec::new();
+    for i in 0..kv.take_u32("seg_steps")? {
+        let key = format!("seg_step.{i}");
+        let mut f = Kv::parse_fields(&kv.take(&key)?, &key)?;
+        let at = f.take_u64("at")?;
+        let segment = parse_segment(&f.take("seg")?, &key)?;
+        let up = f.take_bool("up")?;
+        f.finish()?;
+        steps.push((
+            at,
+            SegmentStep {
+                segment,
+                config: take_config(kv, &key)?,
+                up,
+            },
+        ));
+    }
+    let mut routes = Vec::new();
+    for i in 0..kv.take_u32("seg_routes")? {
+        let key = format!("seg_route.{i}");
+        let mut f = Kv::parse_fields(&kv.take(&key)?, &key)?;
+        let at = Time(f.take_u64("at")?);
+        let down_us = f.take_u64("down_us")?;
+        let down = parse_segment_list(&f.take("down")?, &key)?;
+        let names = parse_segment_list(&f.take("new")?, &key)?;
+        f.finish()?;
+        let mut new = Vec::new();
+        for s in names {
+            new.push((s, take_config(kv, &format!("{key}.{}", s.name()))?));
+        }
+        routes.push(SegmentRoute {
+            at,
+            down_us,
+            down,
+            new,
+        });
+    }
+    let mut cross = Vec::new();
+    for i in 0..kv.take_u32("seg_cross")? {
+        let key = format!("seg_cross.{i}");
+        let mut f = Kv::parse_fields(&kv.take(&key)?, &key)?;
+        let segment = parse_segment(&f.take("seg")?, &key)?;
+        let (dir, spec) = parse_cross_fields(&mut f)?;
+        f.finish()?;
+        cross.push((segment, dir, spec));
+    }
+    Ok(SegmentedPlan {
         start,
         steps,
         routes,
