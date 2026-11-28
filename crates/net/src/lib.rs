@@ -48,6 +48,7 @@ pub mod host;
 mod host_record;
 pub mod ice;
 pub mod identity;
+pub mod logfile;
 pub mod netcheck;
 pub mod node;
 #[cfg(feature = "portmap")]
