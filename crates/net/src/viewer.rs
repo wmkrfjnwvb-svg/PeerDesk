@@ -24,12 +24,12 @@ use tokio::sync::{mpsc, watch};
 use crate::audio::AudioOut;
 use crate::clipsync::{ClipNote, ClipboardHandle};
 use crate::controller::{self, ControllerOptions, LinkHook, LinkQuality, ScreenSink};
-use crate::host::FRAME_DEADLINE_US;
 use crate::identity::to_hex;
 use crate::recorder::{new_visit_id, RecordSetup, ViewRecordSetup};
 use crate::rendezvous::{
     dial_via, fetch_nodes, Dialed, Lookup, Path as Route, PathPolicy, Server, Shim,
 };
+use crate::stream::FRAME_DEADLINE_US;
 use crate::{Fingerprint, Identity, NetError, Node};
 
 /// 网络断开后最多自动重连几次。
@@ -141,6 +141,10 @@ pub trait ViewEnv: Send + Sync {
     fn record(&self) -> Option<RecordSetup>;
     /// 数据目录：身份、集群节点缓存。
     fn data_dir(&self) -> &Path;
+    /// H.264 解码器从哪来；默认 `None`，用控制端默认的（见 [`ControllerOptions::decoder`]）。
+    fn decoder(&self) -> Option<controller::DecoderFactory> {
+        None
+    }
 }
 
 /// 会话结束的原因是不是网络断了（应当换通道重连），而不是对方或自己结束的。
@@ -494,6 +498,7 @@ async fn one_session(
     let session = controller::run(
         link,
         ControllerOptions {
+            decoder: env.decoder(),
             record,
             session: env.session(identity, policy, auth.clone()),
             deadline_us: FRAME_DEADLINE_US,

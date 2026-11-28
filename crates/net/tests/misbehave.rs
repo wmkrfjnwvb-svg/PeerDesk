@@ -174,6 +174,7 @@ async fn controller_survives_a_hostile_host() {
     let ctrl_task = tokio::spawn(controller::run(
         ctrl_link,
         ControllerOptions {
+            decoder: None,
             record: None,
             session: cfg(),
             deadline_us: 30_000,
@@ -255,6 +256,7 @@ async fn controller_handles_bad_handshake_answers_and_vanishing_host() {
     let task = tokio::spawn(controller::run(
         ctrl_link,
         ControllerOptions {
+            decoder: None,
             record: None,
             session: cfg(),
             deadline_us: 1,
@@ -293,6 +295,7 @@ async fn controller_handles_bad_handshake_answers_and_vanishing_host() {
         let task = tokio::spawn(controller::run(
             ctrl_link,
             ControllerOptions {
+                decoder: None,
                 record: None,
                 session: cfg(),
                 deadline_us: 1,
@@ -321,6 +324,7 @@ async fn controller_handles_bad_handshake_answers_and_vanishing_host() {
     let task = tokio::spawn(controller::run(
         ctrl_link,
         ControllerOptions {
+            decoder: None,
             record: None,
             session: cfg(),
             deadline_us: 1,
@@ -357,6 +361,7 @@ async fn controller_handles_bad_handshake_answers_and_vanishing_host() {
     let result = controller::run(
         ctrl_link,
         ControllerOptions {
+            decoder: None,
             record: None,
             session: cfg(),
             deadline_us: 1,
@@ -410,6 +415,7 @@ async fn upload_of_a_missing_file_fails_the_session_cleanly() {
     let result = controller::run(
         ctrl_link,
         ControllerOptions {
+            decoder: None,
             record: None,
             session: cfg(),
             deadline_us: 100_000,
@@ -455,6 +461,7 @@ async fn upload_is_abandoned_when_host_disappears_mid_transfer() {
     let task = tokio::spawn(controller::run(
         ctrl_link,
         ControllerOptions {
+            decoder: None,
             record: None,
             session: cfg(),
             deadline_us: 100_000,
@@ -616,6 +623,7 @@ async fn host_answering_hello_with_nonsense_is_a_protocol_error() {
     let ctrl_task = tokio::spawn(controller::run(
         ctrl_link,
         ControllerOptions {
+            decoder: None,
             record: None,
             session: cfg(),
             deadline_us: 30_000,

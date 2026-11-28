@@ -32,11 +32,12 @@ use crate::host_record::{
     encoded_info, end_reason, frame_record, wall_now_us, HostJournal, Params as RecordParams,
 };
 use crate::recorder::RecordSetup;
-use crate::stream::{read_control, read_kind, write_control, write_file_msg, StreamKind};
+use crate::stream::{
+    control_reader, read_control, read_kind, write_control, write_file_msg, StreamKind,
+    HELLO_TIMEOUT,
+};
 use crate::{Fingerprint, Link, NetError};
 
-/// 等待对端完成应用层握手的时间上限。
-pub(crate) const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 /// 会话结束时等待进行中的文件传输收尾的时间上限。
 const FILE_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// 统计日志的间隔。
@@ -78,8 +79,7 @@ pub const DEFAULT_START_BPS: u64 = ContentPolicy::OFFICE.start_bps;
 pub const DEFAULT_MAX_BPS: u64 = ContentPolicy::OFFICE.max_bps;
 /// 码率下限。
 const MIN_BPS: u64 = 100_000;
-/// 一帧在接收端从首个分片到收齐允许的时间，也是发送端判定丢失的基准（微秒）。
-pub const FRAME_DEADLINE_US: u64 = 100_000;
+pub use crate::stream::FRAME_DEADLINE_US;
 
 /// 输入去向。M1 的系统输入注入实现这个接口。
 pub trait InputSink: Send {
@@ -214,18 +214,6 @@ pub struct HostReport {
     pub end: String,
     /// 业务追踪。
     pub trace: String,
-}
-
-pub(crate) fn control_reader(mut recv: quinn::RecvStream) -> mpsc::Receiver<Control> {
-    let (tx, rx) = mpsc::channel(16);
-    tokio::spawn(async move {
-        while let Ok(msg) = read_control(&mut recv).await {
-            if tx.send(msg).await.is_err() {
-                break;
-            }
-        }
-    });
-    rx
 }
 
 /// 编码线程的任务：一帧任务、画面、画面是否变了、采集时间（会话的单调时钟，记录用）。

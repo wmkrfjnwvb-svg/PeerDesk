@@ -9,7 +9,9 @@
 //!   （[`REFINE_FRAMES`]）。画面一直在变（打字、拖动）时不补：补了也马上被新内容盖掉，白费流量。
 //! - 丢了帧：下一帧编关键帧。以后改为从长期参考帧恢复。
 
+#[cfg(feature = "soft")]
 use openh264::decoder::Decoder;
+#[cfg(feature = "soft")]
 use openh264::formats::YUVSource;
 
 pub mod annexb;
@@ -25,19 +27,22 @@ pub mod fitted_v2;
 #[cfg(target_os = "linux")]
 pub mod gpu;
 pub mod qp;
+#[cfg(feature = "soft")]
 pub mod soft;
 pub mod stall;
 #[cfg(target_os = "linux")]
 mod vaapi;
 use backend::{EncoderBackend, Finished, FrameAsk, FrameInput, Rates, Submitted};
 use peerdesk_core::error::Error;
-use peerdesk_core::frame::{ContentDesc, Frame, GpuFrame, GpuHandle, LumaDesc, Nv12, Picture};
+#[cfg(feature = "soft")]
+use peerdesk_core::frame::Picture;
+use peerdesk_core::frame::{ContentDesc, Frame, GpuFrame, GpuHandle, LumaDesc, Nv12};
 use peerdesk_core::policy::ContentPolicy;
 use peerdesk_core::scale::encode_size;
 use peerdesk_core::screen::Screen;
-use peerdesk_core::video::{
-    Codec, EncodeTiming, EncodedFrame, FrameHeader, VideoDecoder, VideoEncoder,
-};
+#[cfg(feature = "soft")]
+use peerdesk_core::video::VideoDecoder;
+use peerdesk_core::video::{Codec, EncodeTiming, EncodedFrame, FrameHeader, VideoEncoder};
 
 /// 画面停下后最多再编几帧来补清晰（硬件编码：不知道 QP，按帧数和大小判断；软件编码补到最小 QP，见 [`qp`]）。
 pub const REFINE_FRAMES: u8 = 12;
@@ -48,6 +53,7 @@ const MIN_BPS: u64 = 64_000;
 /// 硬件编码器运行中出错、改用软件编码之后，过这么久再试一次硬件。
 /// 硬件出错多半是一时的（驱动忙、显卡在切换），整场会话都用软件编码代价太大（1080p 以上帧率、耗电都差一截）；
 /// 但每次换编码器要出一个关键帧，不能试得太勤。RustDesk 是连续失败 3 次才停用硬件（`P-industry.md` 主题 2）。
+#[cfg(feature = "soft")]
 const HW_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
 /// 一场会话里最多再试这么多次，还出错就一直用软件编码。
 const HW_RETRY_MAX: u32 = 3;
@@ -71,12 +77,14 @@ pub const DEFAULT_MAX_BPS: u64 = 50_000_000;
 pub const BIG_FRAME_US: u64 = ContentPolicy::OFFICE.big_frame_us;
 /// 最小 QP：补清晰时能达到的画质上限。
 const MIN_QP: u8 = qp::MIN_QP;
+#[cfg(feature = "soft")]
 fn codec_error(what: &'static str) -> impl Fn(openh264::Error) -> Error {
     move |_| Error::Inconsistent(what)
 }
 
 /// OpenH264 要求宽高都是偶数：奇数时补一行（列），复制边上的像素。
 /// 用 `open` 打开的硬件编码器编 `frames`：一行结果（Windows；macOS 用 `vt::probe` 对比几种设置）。
+#[cfg(feature = "soft")]
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 fn report_with(
     open: HardwareOpener,
@@ -134,6 +142,7 @@ pub fn screen_to_nv12(screen: &Screen) -> (u32, u32, Vec<u8>) {
 }
 
 /// 软件解码器解不解得了这一帧（Annex B）。
+#[cfg(feature = "soft")]
 fn soft_decodes(dec: Option<&mut H264Decoder>, width: u32, height: u32, data: &[u8]) -> bool {
     let header = FrameHeader {
         codec: Codec::H264,
@@ -146,6 +155,7 @@ fn soft_decodes(dec: Option<&mut H264Decoder>, width: u32, height: u32, data: &[
 
 /// 硬件编码器体检：用本系统的硬件编码器（macOS 对比几种设置）编 `frames`（NV12，第一帧要求关键帧），
 /// 每种设置一行结果。没有硬件编码器时说明原因。
+#[cfg(feature = "soft")]
 #[must_use]
 pub fn hardware_report(width: u32, height: u32, frames: &[Vec<u8>]) -> Vec<String> {
     // 软件解码器能不能接上硬件编出的码流（接收端在 Linux 上用它）
@@ -306,6 +316,7 @@ pub fn open_system_hardware_decoder() -> Result<Box<dyn HardwareDecoder>, String
 }
 
 /// H.264 解码：有硬件解码器就用（macOS），出错时改用 OpenH264 并且不再换回。
+#[cfg(feature = "soft")]
 pub struct AutoH264Decoder {
     hw: Option<Box<dyn HardwareDecoder>>,
     soft: H264Decoder,
@@ -313,6 +324,7 @@ pub struct AutoH264Decoder {
     screen: Option<Screen>,
 }
 
+#[cfg(feature = "soft")]
 impl std::fmt::Debug for AutoH264Decoder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AutoH264Decoder")
@@ -321,6 +333,7 @@ impl std::fmt::Debug for AutoH264Decoder {
     }
 }
 
+#[cfg(feature = "soft")]
 impl AutoH264Decoder {
     /// 用本系统的硬件解码器（没有就只用软件）。
     ///
@@ -346,6 +359,7 @@ impl AutoH264Decoder {
     }
 }
 
+#[cfg(feature = "soft")]
 impl VideoDecoder for AutoH264Decoder {
     fn decode(&mut self, header: &FrameHeader, data: &[u8]) -> Result<Option<&Screen>, Error> {
         if let Some(hw) = self.hw.as_mut() {
@@ -426,6 +440,7 @@ impl VideoDecoder for AutoH264Decoder {
 }
 
 /// 系统解码器的显示名：在 CPU 上解的（例如没有显卡解码时的 Media Foundation）不能叫“硬件”。
+#[cfg(feature = "soft")]
 fn decoder_label(name: &str) -> String {
     if name.contains("CPU") {
         format!("系统 {name}")
@@ -665,12 +680,14 @@ impl std::fmt::Debug for H264Encoder {
 }
 
 impl H264Encoder {
+    #[cfg(feature = "soft")]
     /// 创建。`fps` 是发送端的帧率，用来把每帧预算换算成码率。
     #[must_use]
     pub fn new(fps: u32) -> Self {
         Self::with_max_bps(fps, DEFAULT_MAX_BPS)
     }
 
+    #[cfg(feature = "soft")]
     /// 创建，指定码率上限。
     #[must_use]
     pub fn with_max_bps(fps: u32, max_bps: u64) -> Self {
@@ -1454,18 +1471,21 @@ impl VideoEncoder for H264Encoder {
 }
 
 /// H.264 解码器（OpenH264）。
+#[cfg(feature = "soft")]
 pub struct H264Decoder {
     decoder: Decoder,
     rgb: Vec<u8>,
     screen: Option<Screen>,
 }
 
+#[cfg(feature = "soft")]
 impl std::fmt::Debug for H264Decoder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("H264Decoder").finish_non_exhaustive()
     }
 }
 
+#[cfg(feature = "soft")]
 impl H264Decoder {
     /// 创建。
     pub fn new() -> Result<Self, Error> {
@@ -1477,6 +1497,7 @@ impl H264Decoder {
     }
 }
 
+#[cfg(feature = "soft")]
 impl VideoDecoder for H264Decoder {
     fn decode(&mut self, header: &FrameHeader, data: &[u8]) -> Result<Option<&Screen>, Error> {
         let Some(yuv) = self
@@ -1542,7 +1563,7 @@ impl VideoDecoder for H264Decoder {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "soft"))]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
     use super::*;
@@ -3413,7 +3434,7 @@ mod tests {
 
 /// Windows 的系统 H.264 解码器只对“和 Main 兼容”的码流用显卡（DXVA）：Baseline 要带
 /// constraint_set1_flag（受约束的 Baseline），否则悄悄用 CPU 解。确认我们编出来的码流是这样。
-#[cfg(test)]
+#[cfg(all(test, feature = "soft"))]
 mod sps_profile {
     #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
     use super::*;

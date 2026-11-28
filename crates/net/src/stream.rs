@@ -7,6 +7,24 @@ use quinn::{RecvStream, SendStream};
 
 use crate::NetError;
 
+/// 等待对端完成应用层握手的时间上限（被控端和控制端共用）。
+pub(crate) const HELLO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// 一帧在接收端从首个分片到收齐允许的时间，也是发送端判定丢失的基准（微秒）。
+pub const FRAME_DEADLINE_US: u64 = 100_000;
+
+/// 在后台读控制流，读到的消息放进通道；流断了就结束。
+pub(crate) fn control_reader(mut recv: RecvStream) -> tokio::sync::mpsc::Receiver<Control> {
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    tokio::spawn(async move {
+        while let Ok(msg) = read_control(&mut recv).await {
+            if tx.send(msg).await.is_err() {
+                break;
+            }
+        }
+    });
+    rx
+}
+
 /// 流的用途。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamKind {

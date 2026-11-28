@@ -25,14 +25,14 @@ macro_rules! note {
 
 #[cfg(feature = "media")]
 pub mod audio;
-#[cfg(feature = "media")]
+#[cfg(feature = "soft")]
 pub mod bench;
 pub mod browse;
 pub mod candidates;
 pub mod clipsync;
 #[cfg(feature = "media")]
 pub mod controller;
-#[cfg(feature = "media")]
+#[cfg(feature = "soft")]
 pub mod demo;
 pub mod diag;
 pub mod error;
@@ -40,9 +40,11 @@ pub mod files;
 pub mod framelog;
 pub mod fs_store;
 pub mod gateway;
-#[cfg(feature = "media")]
+#[cfg(feature = "soft")]
 pub mod host;
 #[cfg(feature = "media")]
+// 控制端只用到其中几个函数，其余是被控端的记录（要 `soft`）
+#[cfg_attr(not(feature = "soft"), allow(dead_code))]
 mod host_record;
 pub mod ice;
 pub mod identity;
