@@ -22,7 +22,7 @@
 use std::collections::HashMap;
 
 use crate::fake::{ByteModel, ModelInput, MODEL_MAX_QP};
-use crate::fitted::{exp2_q32, log2_q16, micro, ModelError};
+use crate::fitted::{exp2_q32, log2_q16, micro, ModelError, Noise};
 
 /// 随包带的 openh264 模型文件（屏幕内容实时模式，复杂度低），输入是画面区域。
 pub const OPENH264_V2: &str = include_str!("../models/openh264-v2.tsv");
@@ -78,6 +78,8 @@ pub struct RegionTable {
     head: u64,
     /// 普通帧的残差标准差（log2 单位，10⁻⁶）。
     sigma: i128,
+    /// 序列内的残差标准差（帧间波动，不含结构误差；见 [`Noise::Within`]）。
+    sigma_within: i128,
     key: KeyRow,
     c: Coeffs,
     /// 地板只在 QP 不超过这个数时有。
@@ -98,6 +100,7 @@ impl RegionTable {
         let mut form = None;
         let mut head = None;
         let mut sigma = None;
+        let mut sigma_within = None;
         let mut key = None;
         let mut floor_max = None;
         let mut scene = None;
@@ -121,6 +124,7 @@ impl RegionTable {
                 "形式" => form = Some(at(1)?.to_owned()),
                 "帧头" => head = Some(int(1)?),
                 "残差标准差" => sigma = Some(micro(at(1)?)?),
+                "序列内残差标准差" => sigma_within = Some(micro(at(1)?)?),
                 "关键帧" => {
                     key = Some(KeyRow {
                         head: int(1)?,
@@ -183,16 +187,18 @@ impl RegionTable {
         };
         let key = key.ok_or_else(|| missing("关键帧"))?;
         let sigma = sigma.ok_or_else(|| missing("残差标准差"))?;
+        let sigma_within = sigma_within.ok_or_else(|| missing("序列内残差标准差"))?;
         // 对 QP 单调的条件：每一项随 QP 增大不增；画质差的权重 2^(e·g) 随 g 不减（g 随 QP 变小）
         if c.b_d > 0 || c.b_m > 0 || c.b_s > 0 || c.b_f > 0 || key.b > 0 {
             return bad("系数会让字节数随 QP 增大");
         }
-        if c.e < 0 || c.c_d < 0 || c.c_m < 0 || sigma < 0 || key.sigma < 0 {
+        if c.e < 0 || c.c_d < 0 || c.c_m < 0 || sigma < 0 || key.sigma < 0 || sigma_within < 0 {
             return bad("系数会让字节数随 QP 增大或残差标准差为负");
         }
         Ok(Self {
             head: head.ok_or_else(|| missing("帧头"))?,
             sigma,
+            sigma_within,
             key,
             c,
             floor_max_qp: floor_max.ok_or_else(|| missing("地板最大QP"))?,
@@ -219,14 +225,17 @@ impl RegionTable {
 #[derive(Debug, Clone)]
 pub struct RegionByteModel {
     table: RegionTable,
-    noise: bool,
+    noise: Noise,
 }
 
 impl RegionByteModel {
     /// 用 `table`，打开残差扰动。
     #[must_use]
     pub const fn new(table: RegionTable) -> Self {
-        Self { table, noise: true }
+        Self {
+            table,
+            noise: Noise::Full,
+        }
     }
 
     /// 随包带的 openh264 模型。
@@ -240,7 +249,14 @@ impl RegionByteModel {
     /// 打开或关掉残差扰动。
     #[must_use]
     pub const fn with_noise(mut self, on: bool) -> Self {
-        self.noise = on;
+        self.noise = if on { Noise::Full } else { Noise::Off };
+        self
+    }
+
+    /// 选扰动的方式（见 [`Noise`]）。[`Noise::Within`] 用模型文件里的“序列内残差标准差”。
+    #[must_use]
+    pub const fn with_noise_kind(mut self, noise: Noise) -> Self {
+        self.noise = noise;
         self
     }
 
@@ -352,7 +368,14 @@ impl ByteModel for RegionByteModel {
                 self.normal_body_q32(input, qp),
             )
         };
-        if self.noise {
+        let sigma = match self.noise {
+            Noise::Off => 0,
+            Noise::Full => sigma,
+            // 关键帧的残差没有序列内的部分可拆（一个序列只有一个关键帧），不加
+            Noise::Within if input.key => 0,
+            Noise::Within => self.table.sigma_within,
+        };
+        if sigma != 0 {
             let x = sigma * Self::gauss_q16(input) / MICRO;
             total = (total.min(TOTAL_CAP_Q32) * exp2_q32(x)) >> 32;
         }
@@ -375,7 +398,7 @@ mod tests {
     use crate::fake::{Regions, GAP_BINS};
 
     /// 手写的一份小系数：数都取得好算（指数里的系数多是 0.5、1、−0.1 这种）。
-    const SAMPLE: &str = "# 注释\n形式\tF3\n帧头\t13\n残差标准差\t0.5\n\
+    const SAMPLE: &str = "# 注释\n形式\tF3\n帧头\t13\n残差标准差\t0.5\n序列内残差标准差\t0.2\n\
         关键帧\t40\t0.8\t-0.15\t1\t0.15\t0.25\n地板最大QP\t17\n\
         参数\ta_d\t2\n参数\tb_d\t-0.1\n参数\tc_d\t0.5\n参数\td_d\t0.25\n\
         参数\ta_m\t1\n参数\tb_m\t-0.1\n参数\tc_m\t0.5\n参数\tf\t-3\n\
@@ -560,6 +583,39 @@ mod tests {
             quiet.bytes(&ModelInput { serial: 3, ..busy }),
             quiet.bytes(&ModelInput { serial: 4, ..busy })
         );
+        // 只用序列内 σ（样例表里是 0.2）：波动小得多，中位不变；关键帧不加
+        let within = RegionByteModel::new(table()).with_noise_kind(Noise::Within);
+        let logs: Vec<f64> = (0..2000u32)
+            .map(|serial| (within.bytes(&ModelInput { serial, ..busy }) as f64 / base).log2())
+            .collect();
+        let mean = logs.iter().sum::<f64>() / logs.len() as f64;
+        let var = logs.iter().map(|l| (l - mean).powi(2)).sum::<f64>() / logs.len() as f64;
+        assert!(mean.abs() < 0.04, "均值 {mean}");
+        assert!((var.sqrt() - 0.2).abs() < 0.03, "标准差 {}", var.sqrt());
+        let key = ModelInput { key: true, ..busy };
+        assert_eq!(
+            within.bytes(&ModelInput { serial: 3, ..key }),
+            quiet.bytes(&ModelInput { serial: 9, ..key }),
+            "序列内扰动不动关键帧"
+        );
+        assert_ne!(
+            m.bytes(&ModelInput { serial: 3, ..key }),
+            m.bytes(&ModelInput { serial: 9, ..key }),
+            "全 σ 的扰动关键帧也加"
+        );
+        // 三种方式都能选；老的开关等于全 σ 和不加
+        assert_eq!(
+            RegionByteModel::new(table())
+                .with_noise_kind(Noise::Off)
+                .bytes(&busy),
+            quiet.bytes(&busy)
+        );
+        assert_eq!(
+            RegionByteModel::new(table())
+                .with_noise_kind(Noise::Full)
+                .bytes(&ModelInput { serial: 5, ..busy }),
+            m.bytes(&ModelInput { serial: 5, ..busy })
+        );
     }
 
     #[test]
@@ -596,8 +652,10 @@ mod tests {
             SAMPLE.replace("帧头\t13\n", ""),
             SAMPLE.replace("帧头\t13", "帧头\tx"),
             SAMPLE.replace("帧头\t13", "帧头"),
-            SAMPLE.replace("残差标准差\t0.5\n", ""),
+            SAMPLE.replace("\n残差标准差\t0.5\n", "\n"),
             SAMPLE.replace("残差标准差\t0.5", "残差标准差\t-0.5"),
+            SAMPLE.replace("序列内残差标准差\t0.2\n", ""),
+            SAMPLE.replace("序列内残差标准差\t0.2", "序列内残差标准差\t-0.2"),
             SAMPLE.replace("关键帧\t40\t0.8\t-0.15\t1\t0.15\t0.25\n", ""),
             SAMPLE.replace("-0.15\t1\t0.15", "0.15\t1\t0.15"),
             SAMPLE.replace("0.15\t0.25\n", "0.15\t-0.25\n"),
@@ -729,6 +787,8 @@ mod tests {
     fn the_shipped_model_file_loads_and_has_the_right_shape() {
         let table = RegionTable::openh264_v2().unwrap();
         assert!((100..=1001).contains(&table.scene_key_permille()));
+        // 序列内的 σ 比全部残差的 σ 小（它只是其中帧间波动的那一部分）
+        assert!(table.sigma_within > 0 && table.sigma_within < table.sigma);
         let m = RegionByteModel::openh264_v2().unwrap().with_noise(false);
         assert_eq!(m.scene_key_permille(), table.scene_key_permille());
         let busy = Regions {

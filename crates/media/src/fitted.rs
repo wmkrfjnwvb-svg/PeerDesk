@@ -244,7 +244,10 @@ pub struct FittedByteModel {
     table: ModelTable,
     /// 普通帧用哪一类的系数（[`ANY`] 是各类合在一起拟合的）。
     class: String,
-    noise: bool,
+    noise: Noise,
+    /// 序列内残差标准差（10⁻⁶ 的 log2）：[`Noise::Within`] 时普通帧用它。模型文件里没有这个数，由调用方给
+    /// （[`Self::with_within_sigma`]）；没给是 0。
+    within: i128,
 }
 
 impl FittedByteModel {
@@ -266,7 +269,8 @@ impl FittedByteModel {
         Ok(Self {
             table,
             class: class.to_owned(),
-            noise: true,
+            noise: Noise::Full,
+            within: 0,
         })
     }
 
@@ -281,7 +285,16 @@ impl FittedByteModel {
     /// 打开或关掉残差扰动。
     #[must_use]
     pub const fn with_noise(mut self, on: bool) -> Self {
-        self.noise = on;
+        self.noise = if on { Noise::Full } else { Noise::Off };
+        self
+    }
+
+    /// 扰动只用序列内的残差标准差 `sigma_micro`（10⁻⁶ 的 log2，见 [`Noise::Within`]）。
+    /// 这个模型的文件里没有拆过残差，数由调用方按 `scripts/m2b-residuals.py` 的结果给。
+    #[must_use]
+    pub const fn with_within_sigma(mut self, sigma_micro: u32) -> Self {
+        self.noise = Noise::Within;
+        self.within = sigma_micro as i128;
         self
     }
 
@@ -337,6 +350,24 @@ impl FittedByteModel {
     }
 }
 
+/// 给模型的预测加多少扰动。
+///
+/// 模型是在 log2 上做最小二乘拟合的，预测的是每帧字节数的**中位**。扰动是乘一个 2^(σZ)（Z 标准正态）：中位不变，
+/// 均值变成 2^(σ²·ln2/2) 倍。所以 σ 取多大决定了一段内容的总字节被抬高多少：
+/// - 模型文件里的“残差标准差”是全部拟合行合在一起的，主要是结构误差（这一类内容、这个 QP 整段偏大或偏小），
+///   不是帧与帧之间的波动。拿它当每帧独立的扰动，总字节被抬高 1.77 倍（v2）、3.23 倍（v1），还凭空多出大帧。
+/// - 帧与帧之间真正的波动是“序列之内”的那一部分（同一段画面按同一个 QP 连着编，每帧相对这一段的平均偏多少），
+///   v2 是 0.573、v1 是 0.527（`scripts/m2b-residuals.py`，M2b 的拟合集），总字节只抬高约 1.08 倍。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Noise {
+    /// 不加：每帧就是模型的中位预测。
+    Off,
+    /// 只用序列内的残差标准差：帧间波动，不含结构误差。
+    Within,
+    /// 用全部残差的标准差（原来的做法，留着对照；会把总字节抬高，见上）。
+    Full,
+}
+
 /// Q16 的 log2 换成 10⁻⁶ 单位。
 const fn q16_to_micro(v: i128) -> i128 {
     v * MICRO / ONE_Q16
@@ -367,8 +398,15 @@ impl ByteModel for FittedByteModel {
             x_micro += row.e * up;
         }
         let mut x_q16 = x_micro.saturating_mul(ONE_Q16).div_euclid(MICRO);
-        if self.noise {
-            x_q16 += row.sigma * Self::gauss_q16(input) / MICRO;
+        let sigma = match self.noise {
+            Noise::Off => 0,
+            Noise::Full => row.sigma,
+            // 关键帧、补清晰一步的残差没有序列内的部分可拆（一个序列只有一帧），不加
+            Noise::Within if input.key || refine => 0,
+            Noise::Within => self.within,
+        };
+        if sigma != 0 {
+            x_q16 += sigma * Self::gauss_q16(input) / MICRO;
         }
         let body = (exp2_q32(x_q16) + (1 << 31)) >> 32;
         let total = u128::from(row.head).saturating_add(body);
@@ -589,6 +627,43 @@ mod tests {
         assert_eq!(
             quiet.bytes(&ModelInput { serial: 3, ..input }),
             quiet.bytes(&ModelInput { serial: 4, ..input })
+        ); // 只用序列内 σ（由调用方给，这里 0.3）：关键帧不加；普通帧的波动是 0.3，中位不变
+        let within = m.clone().with_within_sigma(300_000);
+        assert_eq!(
+            within.bytes(&ModelInput { serial: 3, ..input }),
+            quiet.bytes(&ModelInput { serial: 4, ..input }),
+            "序列内扰动不动关键帧"
+        );
+        let normal = ModelInput {
+            key: false,
+            changed_permille: 400,
+            ..input
+        };
+        let base = quiet.bytes(&normal) as f64;
+        let logs: Vec<f64> = (0..2000u32)
+            .map(|serial| (within.bytes(&ModelInput { serial, ..normal }) as f64 / base).log2())
+            .collect();
+        let mean = logs.iter().sum::<f64>() / logs.len() as f64;
+        let var = logs.iter().map(|l| (l - mean).powi(2)).sum::<f64>() / logs.len() as f64;
+        assert!(mean.abs() < 0.05, "均值 {mean}");
+        // 样例表里普通帧的正文不比帧头大多少，帧头不参与扰动，所以整帧的波动比 0.3 小一点
+        assert!((0.2..0.33).contains(&var.sqrt()), "标准差 {}", var.sqrt());
+        // 补清晰一步也不加（一个序列只有一帧，没有序列内的部分）
+        let refine = ModelInput {
+            key: false,
+            changed_permille: 0,
+            prev_qp: Some(normal.qp.saturating_add(6)),
+            ..input
+        };
+        assert_eq!(
+            within.bytes(&ModelInput {
+                serial: 3,
+                ..refine
+            }),
+            quiet.bytes(&ModelInput {
+                serial: 8,
+                ..refine
+            })
         );
     }
 
