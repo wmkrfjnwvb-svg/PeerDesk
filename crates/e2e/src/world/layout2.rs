@@ -25,7 +25,7 @@ use peerdesk_core::kv::{join_fields, Kv, KvWriter};
 use peerdesk_core::path::segments::{Segment, SegmentRoute, SegmentedConfig};
 use peerdesk_core::path::{
     Aqm, BottleneckConfig, Capacity, CrossSpec, Delay, Dir, DirConfig, Loss, Noise, PathConfig,
-    Policer, QueueLimit, Receiver, RouteChange, TcpConfig, Trace,
+    Pdv, Policer, QueueLimit, Receiver, RouteChange, TcpConfig, Trace,
 };
 use peerdesk_core::sim::{Busy, Doze, Spikes};
 use peerdesk_core::time::Time;
@@ -333,9 +333,10 @@ fn dir_fields(c: &DirConfig) -> Result<String, WorldError> {
         fifo_jitter,
         spikes,
         doze,
+        pdv,
     } = noise;
     let Receiver { busy, batch_us } = receiver;
-    Ok(join_fields(&[
+    let mut fields = vec![
         (
             "policer",
             policer.map_or("-".to_owned(), |p| opt_fields(&[p.rate_bps, p.burst_bytes])),
@@ -364,7 +365,12 @@ fn dir_fields(c: &DirConfig) -> Result<String, WorldError> {
             busy.map_or("-".to_owned(), |b| opt_fields(&[b.every_us, b.length_us])),
         ),
         ("batch_us", batch_us.to_string()),
-    ])?)
+    ];
+    // NR-BPDV 是后来加的：只在打开时写，没开它的世界文件和以前逐字节相同（哈希不变）
+    if let Some(p) = pdv {
+        fields.push(("pdv", p.std_us.to_string()));
+    }
+    Ok(join_fields(&fields)?)
 }
 
 fn parse_dir(text: &str, ctx: &str) -> Result<DirConfig, WorldError> {
@@ -408,6 +414,13 @@ fn parse_dir(text: &str, ctx: &str) -> Result<DirConfig, WorldError> {
         }
     });
     let batch_us = f.take_u64("batch_us")?;
+    let pdv = if f.has("pdv") {
+        Some(Pdv {
+            std_us: f.take_u64("pdv")?,
+        })
+    } else {
+        None
+    };
     f.finish()?;
     Ok(DirConfig {
         policer,
@@ -426,6 +439,7 @@ fn parse_dir(text: &str, ctx: &str) -> Result<DirConfig, WorldError> {
             fifo_jitter,
             spikes,
             doze,
+            pdv,
         },
         receiver: Receiver { busy, batch_us },
         loss_before_bottleneck,
@@ -467,8 +481,9 @@ fn tcp_fields(c: &TcpConfig) -> Vec<(&'static str, String)> {
         max_rto_us,
         initial_rto_us,
         granularity_us,
+        sack,
     } = c;
-    vec![
+    let mut fields = vec![
         ("mss_bytes", mss_bytes.to_string()),
         ("ack_bytes", ack_bytes.to_string()),
         ("init_cwnd", init_cwnd_segments.to_string()),
@@ -476,7 +491,12 @@ fn tcp_fields(c: &TcpConfig) -> Vec<(&'static str, String)> {
         ("max_rto_us", max_rto_us.to_string()),
         ("initial_rto_us", initial_rto_us.to_string()),
         ("granularity_us", granularity_us.to_string()),
-    ]
+    ];
+    // SACK 是后来加的（默认开）：只在关掉时写，没写的世界文件读出来是开（和默认一样）
+    if !*sack {
+        fields.push(("sack", flag(false)));
+    }
+    fields
 }
 
 fn parse_tcp(f: &mut Kv) -> Result<TcpConfig, WorldError> {
@@ -488,6 +508,11 @@ fn parse_tcp(f: &mut Kv) -> Result<TcpConfig, WorldError> {
         max_rto_us: f.take_u64("max_rto_us")?,
         initial_rto_us: f.take_u64("initial_rto_us")?,
         granularity_us: f.take_u64("granularity_us")?,
+        sack: if f.has("sack") {
+            f.take_bool("sack")?
+        } else {
+            true
+        },
     })
 }
 

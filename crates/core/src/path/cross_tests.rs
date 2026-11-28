@@ -355,7 +355,7 @@ fn two_tcp_flows_with_the_same_rtt_share_the_bottleneck_fairly() {
         totals.push((ga + gb) * 8.0 / 120.0 / 10_000_000.0);
     }
     println!(
-        "[TCP] 两条同 RTT：吞吐比范围 {:.3}–{:.3}；合计利用率 {:.3}",
+        "[TCP] 两条同 RTT：吞吐比范围 {:.6}–{:.6}；合计利用率 {:.3}",
         ratios.iter().copied().fold(9.0, f64::min),
         ratios.iter().copied().fold(0.0, f64::max),
         totals.iter().sum::<f64>() / 12.0
@@ -618,4 +618,40 @@ fn a_burst_of_thirty_connections_on_a_narrow_link_loses_packets_but_finishes() {
     );
     let st = p.cross_stats(id);
     assert!(st.queue_dropped > 0 && st.tcp.retransmits > 0, "{st:?}");
+}
+
+/// A2-2 留下的问题（`a2-plan.md` 第 4 节）：深队列里慢启动冲出去以后，不带 SACK 的 NewReno 前 35 秒几乎收不到按序的字节。
+/// 带 SACK（默认）：前 5 秒就有按序收到的字节，5–10 秒的利用率不低于 90%。NewReno 的数一起打出来对照。
+#[test]
+fn with_sack_a_deep_queue_does_not_stall_slow_start() {
+    let run = |sack: bool| {
+        let mut p = path(
+            1,
+            queue(cap(10_000_000), QueueLimit::delay(200_000), Aqm::TailDrop),
+        );
+        let id = p.add_cross(
+            Dir::Forward,
+            CrossSpec::Tcp {
+                cfg: TcpConfig {
+                    sack,
+                    ..TcpConfig::default()
+                },
+                start: Time::ZERO,
+                bytes: None,
+            },
+        );
+        p.advance_to(Time(5_000_000));
+        let at5 = p.cross_stats(id).delivered_bytes;
+        p.advance_to(Time(10_000_000));
+        let at10 = p.cross_stats(id).delivered_bytes;
+        (at5, (at10 - at5) as f64 * 8.0 / 5.0 / 10_000_000.0)
+    };
+    let (s5, s_util) = run(true);
+    let (n5, n_util) = run(false);
+    println!(
+        "[TCP] 200 ms 丢尾：SACK 前 5 秒按序 {s5} B、5–10 秒利用率 {s_util:.3}；NewReno {n5} B、{n_util:.3}"
+    );
+    assert!(s5 > 1_000_000, "{s5}");
+    assert!(s_util > 0.9, "{s_util}");
+    assert!(n5 < s5, "对照：NewReno 前 5 秒 {n5}");
 }

@@ -63,6 +63,8 @@ pub mod layer {
     pub const DOZE: &str = "doze";
     /// 接收端忙。
     pub const BUSY: &str = "busy";
+    /// RFC 8868 的不乱序有界延迟变化（NR-BPDV）。
+    pub const PDV: &str = "pdv";
 }
 
 /// 流的种子：blake3（世界种子 8 字节小端 ‖ 方向 1 字节 ‖ 层名）的前 8 个字节（小端）。

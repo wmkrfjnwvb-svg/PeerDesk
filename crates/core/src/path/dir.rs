@@ -61,6 +61,7 @@ impl DirConfig {
                 fifo_jitter: link.fifo_jitter,
                 spikes: link.spikes,
                 doze: link.doze,
+                pdv: None,
             },
             receiver: Receiver {
                 busy: link.busy,
@@ -138,6 +139,8 @@ pub struct DirState {
     batch: Option<(Time, u64)>,
     last_depart: Option<Time>,
     last_arrival: Option<Time>,
+    /// NR-BPDV：上一个包加了延迟变化之后的到达时刻和它的串行时间（微秒）。
+    pdv_last: Option<(Time, u64)>,
     // 每层一条随机数流
     rng_bottleneck: LayerRng,
     rng_loss: LayerRng,
@@ -146,6 +149,7 @@ pub struct DirState {
     rng_spikes: LayerRng,
     rng_doze: LayerRng,
     rng_busy: LayerRng,
+    rng_pdv: LayerRng,
 }
 
 impl DirState {
@@ -164,6 +168,7 @@ impl DirState {
             batch: None,
             last_depart: None,
             last_arrival: None,
+            pdv_last: None,
             rng_bottleneck: stream(layer::BOTTLENECK),
             rng_loss: stream(layer::LOSS),
             rng_delay: stream(layer::DELAY),
@@ -171,6 +176,7 @@ impl DirState {
             rng_spikes: stream(layer::SPIKES),
             rng_doze: stream(layer::DOZE),
             rng_busy: stream(layer::BUSY),
+            rng_pdv: stream(layer::PDV),
         };
         s.reconfigure(cfg, Time::ZERO);
         s
@@ -250,13 +256,14 @@ impl DirState {
             layer::SPIKES => &self.rng_spikes.log,
             layer::DOZE => &self.rng_doze.log,
             layer::BUSY => &self.rng_busy.log,
+            layer::PDV => &self.rng_pdv.log,
             _ => &[],
         }
     }
 
     /// 各层随机数流各抽了多少个数：（层名，个数）。
     #[must_use]
-    pub fn draws(&self) -> [(&'static str, u64); 7] {
+    pub fn draws(&self) -> [(&'static str, u64); 8] {
         [
             (layer::BOTTLENECK, self.rng_bottleneck.drawn()),
             (layer::LOSS, self.rng_loss.drawn()),
@@ -265,6 +272,7 @@ impl DirState {
             (layer::SPIKES, self.rng_spikes.drawn()),
             (layer::DOZE, self.rng_doze.drawn()),
             (layer::BUSY, self.rng_busy.drawn()),
+            (layer::PDV, self.rng_pdv.drawn()),
         ]
     }
 
@@ -283,6 +291,11 @@ impl DirState {
             .noise
             .doze
             .map(|d| d.wake_us / 2 + self.rng_doze.below(d.wake_us / 2 + 1));
+        let pdv = self
+            .cfg
+            .noise
+            .pdv
+            .map(|p| p.sample(self.rng_pdv.next_u64()));
 
         // 1 中断
         if !up {
@@ -331,6 +344,19 @@ impl DirState {
                 at = at.plus(wake);
             }
             self.last_depart = Some(depart);
+        }
+        // RFC 8868 的 NR-BPDV：加延迟变化，再保证不早于上一个包加上它的串行时间
+        if let Some(z) = pdv {
+            at = at.plus(z);
+            if let Some((prev, serial)) = self.pdv_last {
+                at = at.max(prev.plus(serial));
+            }
+            // 不限速（速率 0）时串行为 0
+            let serial = size_bytes
+                .saturating_mul(8_000_000)
+                .checked_div(self.bottleneck.rate_at(depart))
+                .unwrap_or(0);
+            self.pdv_last = Some((at, serial));
         }
         // 7 接收端：批量收、接收端忙
         if self.cfg.receiver.batch_us > 0 {
