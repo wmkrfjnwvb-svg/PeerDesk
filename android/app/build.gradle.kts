@@ -4,6 +4,11 @@ plugins {
     alias(libs.plugins.kotlin.compose)
 }
 
+// 界面截图（Paparazzi，JVM 上渲染 Compose 成 PNG，不要模拟器）：只在加 -Pscreenshots 时启用，
+// 平时的 testDebugUnitTest 不受影响（不装插件、截图测试的源码也不编译）。用法见 android/screenshots.sh。
+val screenshots = project.hasProperty("screenshots")
+if (screenshots) apply(plugin = "app.cash.paparazzi")
+
 android {
     namespace = "ai.peerdesk.app"
     compileSdk = 36
@@ -35,6 +40,10 @@ android {
     packaging { jniLibs { useLegacyPackaging = false } }
 
     testOptions { unitTests.isReturnDefaultValues = true }
+}
+
+if (screenshots) {
+    android.sourceSets.getByName("test").java.srcDir("src/screenshots/java")
 }
 
 kotlin {

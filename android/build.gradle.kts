@@ -3,4 +3,6 @@ plugins {
     alias(libs.plugins.android.application) apply false
     alias(libs.plugins.kotlin.android) apply false
     alias(libs.plugins.kotlin.compose) apply false
+    // 界面截图测试（只在 -Pscreenshots 时用，见 app/build.gradle.kts）
+    alias(libs.plugins.paparazzi) apply false
 }

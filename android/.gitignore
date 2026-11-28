@@ -1,0 +1,3 @@
+# 截图测试的输出（android/screenshots.sh 生成，不进仓库）
+/screenshots/
+/app/src/test/snapshots/
