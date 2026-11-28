@@ -56,28 +56,32 @@
 //! 和 `Net` 的差别（A2-3 对账时要知道）：丢包在瓶颈之后（`Net` 在之前，丢掉的包不占容量）；
 //! 容量误差用纳秒记，不是每个包向下取整到微秒；尖峰和接收端忙的时间表从 0 起算。
 //!
-//! # 交叉流量（A2-2）怎么接
+//! # 交叉流量
 //!
 //! 交叉流量只在瓶颈这一层注入：瓶颈之前只有限速器，它不改变包的先后，所以每个包到瓶颈时，比它早到的包都已经处理过了。
-//! 入口是 [`Path::inject_cross`]：它让一个包在 `at` 时刻到达这个方向的瓶颈，占队列、占容量、受丢尾和 CoDel 约束，
-//! 和主流量完全一样，不再经过后面的层；返回它离开瓶颈的时刻，被丢了返回 `None`。要求：
-//! 1. 调用的先后就是到达瓶颈的先后：`at` 不能早于上一个到达瓶颈的包（主流量的 `send` 用 `now` 作到达时刻）；
-//! 2. `at` 不能晚于 `now`。
+//! 两个入口：
+//! - [`Path::add_cross`] 挂一个源（[`CrossSpec`]：定速背景流、TCP 长连接、RFC 8868 的一阵一阵的短连接），
+//!   它的事件在 `send`、`advance_to`、`pop` 开头随时钟按时间顺序处理掉（细节和随机数见 `cross.rs` 的模块文档）。
+//!   `peek_time` 不需要处理：交叉流量不产生主流量的送达。
+//! - [`Path::inject_cross`] 让外部驱动的一个包在 `at` 时刻到达瓶颈（只经过瓶颈）；要求 `at` 不早于上一个到达瓶颈的包、
+//!   不晚于 `now`。
 //!
-//! 所以 A2-2 的做法是：在 `Path` 里给每个方向挂一组交叉流源，每个源只回答“下一个包什么时候到、多大”；
-//! 在 `send`、`advance_to`、`peek_time` 的开头，把所有 `at <= now` 的交叉包按时间顺序（多个源归并）注入进来，
-//! 然后才处理主流量。开环的源（定速、一阵一阵的短连接）这样就够了；闭环的 TCP 需要确认：
-//! 确认包用同一个 `Path` 的反方向 `send` 发（它们占反向的容量），收到确认的时刻由送达事件推动，和主流量一样。
-//! 每个源用自己的随机数流，名字 `cross/<序号>`，用 [`LayerRng::new`] 创建。
+//! 交叉流量的包占队列、占容量、受丢尾和 CoDel 约束，和主流量完全一样；有接收端的（TCP）还要过丢包层和传播延迟，
+//! 确认走反方向，占反向的容量，也会丢。限速器、延迟噪声、接收端三层不经过。
+//! 每个源一条随机数流 `cross/<序号>`，每条 TCP 连接每个方向一条车道，都不动主流量的流。
 
 mod bottleneck;
 mod codel;
+mod cross;
 mod delay;
 mod dir;
 mod loss;
 mod policer;
 pub mod rng;
+pub mod tcp;
 
+#[cfg(test)]
+mod cross_tests;
 #[cfg(test)]
 mod testkit;
 #[cfg(test)]
@@ -90,11 +94,13 @@ use crate::Time;
 
 pub use bottleneck::{Aqm, Bottleneck, BottleneckConfig, Capacity, QueueLimit, Trace, Verdict};
 pub use codel::Codel;
+pub use cross::{BurstRecord, CrossSpec, CrossStats};
 pub use delay::{Delay, DelayState, Noise, Receiver, Windows};
-pub use dir::{DirConfig, DirState, Outcome};
+pub use dir::{DirConfig, DirState, Lane, Outcome, Transit};
 pub use loss::{burst_probabilities, Loss, LossState};
 pub use policer::{Policer, PolicerState};
 pub use rng::{layer, stream_seed, Dir, LayerRng};
+pub use tcp::{TcpConfig, TcpReceiver, TcpSender, TcpStats};
 
 /// 两个方向的参数。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -226,6 +232,10 @@ pub struct Path<T> {
     events: VecDeque<PathEvent>,
     queue: BTreeMap<(Time, u64), Delivery<T>>,
     next_id: u64,
+    /// 交叉流量源，和在途的交叉包。
+    sources: Vec<cross::Source>,
+    cross_queue: BTreeMap<(Time, u64), cross::Item>,
+    cross_next_id: u64,
 }
 
 impl<T> Path<T> {
@@ -247,6 +257,9 @@ impl<T> Path<T> {
             events: VecDeque::new(),
             queue: BTreeMap::new(),
             next_id: 0,
+            sources: Vec::new(),
+            cross_queue: BTreeMap::new(),
+            cross_next_id: 0,
         }
     }
 
@@ -355,6 +368,7 @@ impl<T> Path<T> {
             return;
         };
         self.apply_due();
+        self.drive_cross();
         let now = self.now;
         let up = self.is_up(now);
         let size = u64::try_from(size_bytes).unwrap_or(u64::MAX);
@@ -396,6 +410,7 @@ impl<T> Path<T> {
         if at > self.now {
             return Err(CrossError::Future);
         }
+        self.drive_cross();
         let size = u64::try_from(size_bytes).unwrap_or(u64::MAX);
         let (d, stats) = self.dir_mut(dir);
         let last = d.bottleneck().last_arrival();
@@ -412,6 +427,73 @@ impl<T> Path<T> {
         }
     }
 
+    /// 在 `dir` 方向的瓶颈上挂一个交叉流量源，返回它的序号。`start` 早于现在的按现在算。
+    /// 源的事件在 `send`、`advance_to`、`pop` 里随时钟往前处理（见 [`cross`] 模块文档）。
+    pub fn add_cross(&mut self, dir: Dir, spec: CrossSpec) -> usize {
+        let index = self.sources.len();
+        self.sources
+            .push(cross::Source::new(self.seed, index, dir, spec, self.now));
+        index
+    }
+
+    /// 交叉流量源的计数（序号不存在时全 0）。
+    #[must_use]
+    pub fn cross_stats(&self, id: usize) -> CrossStats {
+        self.sources
+            .get(id)
+            .map(cross::Source::stats)
+            .unwrap_or_default()
+    }
+
+    /// 短连接源的记录（每一阵的空闲时长、开始、结束、每条连接的字节数）。
+    #[must_use]
+    pub fn cross_bursts(&self, id: usize) -> &[BurstRecord] {
+        self.sources.get(id).map_or(&[], cross::Source::bursts)
+    }
+
+    /// 交叉 TCP 源第一条连接的发送端（看窗口、RTO）。
+    #[must_use]
+    pub fn cross_sender(&self, id: usize) -> Option<&TcpSender> {
+        self.sources.get(id).and_then(cross::Source::sender)
+    }
+
+    /// 把所有 `≤ now` 的交叉流量事件按时间顺序处理掉；同一时刻先处理包的送达，再处理定时器。
+    fn drive_cross(&mut self) {
+        if self.sources.is_empty() {
+            return;
+        }
+        loop {
+            let timer = self
+                .sources
+                .iter()
+                .enumerate()
+                .filter_map(|(i, s)| s.next_time().map(|t| (t, i)))
+                .min();
+            let delivery = self.cross_queue.keys().next().copied();
+            let mut ctx = cross::Ctx {
+                dirs: &mut self.dirs,
+                queue: &mut self.cross_queue,
+                next_id: &mut self.cross_next_id,
+                seed: self.seed,
+            };
+            match (delivery, timer) {
+                (Some((td, _)), tm) if td <= self.now && tm.is_none_or(|(t, _)| td <= t) => {
+                    if let Some((_, item)) = ctx.queue.pop_first() {
+                        if let Some(src) = self.sources.get_mut(item.src()) {
+                            src.deliver(&mut ctx, item.src(), td, item);
+                        }
+                    }
+                }
+                (_, Some((t, i))) if t <= self.now => {
+                    if let Some(src) = self.sources.get_mut(i) {
+                        src.fire(&mut ctx, i, t);
+                    }
+                }
+                (Some(_) | None, Some(_) | None) => break,
+            }
+        }
+    }
+
     /// 下一次送达的时间；队列为空时返回 `None`。
     #[must_use]
     pub fn peek_time(&self) -> Option<Time> {
@@ -423,6 +505,7 @@ impl<T> Path<T> {
         let (_, delivery) = self.queue.pop_first()?;
         self.now = self.now.max(delivery.at);
         self.apply_due();
+        self.drive_cross();
         let i = Dir::from_nodes(delivery.from, delivery.to).map_or(0, Dir::index);
         if let Some(s) = self.stats.get_mut(i) {
             s.delivered = s.delivered.saturating_add(1);
@@ -434,6 +517,7 @@ impl<T> Path<T> {
     pub fn advance_to(&mut self, t: Time) {
         self.now = self.now.max(t);
         self.apply_due();
+        self.drive_cross();
     }
 
     /// 还在途中的包数。

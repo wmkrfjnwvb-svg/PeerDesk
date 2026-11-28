@@ -65,6 +65,42 @@ impl DirConfig {
     }
 }
 
+/// 交叉流（有接收端的）在一个方向上的一条“车道”：自己的随机数流、丢包状态、延迟状态。
+#[derive(Debug, Clone)]
+pub struct Lane {
+    rng: LayerRng,
+    loss: LossState,
+    delay: DelayState,
+}
+
+impl Lane {
+    /// 车道的随机数流由（世界种子，方向，名字）导出，和别的层、别的流互不相干。
+    #[must_use]
+    pub fn new(world_seed: u64, dir: Dir, name: &str) -> Self {
+        Self {
+            rng: LayerRng::new(world_seed, dir, name),
+            loss: LossState::default(),
+            delay: DelayState::default(),
+        }
+    }
+}
+
+/// 交叉流的一个包穿过一个方向的结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transit {
+    /// 瓶颈丢尾或 CoDel 丢了。
+    QueueDropped,
+    /// 丢包层丢了（占过容量）。
+    Lost,
+    /// 在 `at` 时刻到达接收端；`wait_us` 是它在瓶颈里等了多久。
+    Arrives {
+        /// 到达时刻。
+        at: Time,
+        /// 在瓶颈里等的时间（微秒）。
+        wait_us: u64,
+    },
+}
+
 /// 一个包的结局。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
@@ -163,6 +199,28 @@ impl DirState {
     #[must_use]
     pub const fn bottleneck(&self) -> &Bottleneck {
         &self.bottleneck
+    }
+
+    /// 一个有接收端的交叉流（TCP 的数据包或确认）穿过这个方向：瓶颈（和主流量共用队列和容量）、
+    /// 丢包层、传播延迟。限速器、延迟噪声、接收端这几层不经过（那是主流量那条链路自己的毛病）。
+    /// 丢包用流自己的随机数和状态（`lane`），不动主流量的流。
+    pub fn cross_transit(&mut self, lane: &mut Lane, at: Time, size_bytes: u64) -> Transit {
+        let draw = self.cfg.loss.enabled().then(|| lane.rng.next_u64());
+        let done = match self
+            .bottleneck
+            .arrive(&mut self.rng_bottleneck, at, size_bytes)
+        {
+            Verdict::Departs { done, .. } => done,
+            Verdict::TailDropped | Verdict::AqmDropped => return Transit::QueueDropped,
+        };
+        let wait_us = self.bottleneck.last_wait_us();
+        if let Some(d) = draw {
+            if lane.loss.lost(self.cfg.loss, d) {
+                return Transit::Lost;
+            }
+        }
+        let at = lane.delay.arrival(&self.cfg.delay, &mut lane.rng, done);
+        Transit::Arrives { at, wait_us }
     }
 
     /// 交叉流量注入的入口：只经过瓶颈这一层（见 `Path::inject_cross`）。
