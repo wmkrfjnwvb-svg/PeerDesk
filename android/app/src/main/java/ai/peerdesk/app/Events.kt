@@ -80,6 +80,8 @@ fun parseEvent(line: String?): CoreEvent? {
 sealed interface ViewOp {
     data class Zoom(val factor: Float, val cx: Float, val cy: Float) : ViewOp
     data class Pan(val dx: Float, val dy: Float) : ViewOp
+    /** 长按到点了：震一下。 */
+    data object Haptic : ViewOp
 }
 
 /** 解析 `touch`/`tick` 返回的变换数组；null、空串、坏格式都当作“没有变换”。 */
@@ -98,6 +100,7 @@ fun parseViewOps(json: String?): List<ViewOp> {
                             o.optDouble("cy", 0.0).toFloat(),
                         ),
                     )
+                    "haptic" -> add(ViewOp.Haptic)
                     "pan" -> add(
                         ViewOp.Pan(o.optDouble("dx", 0.0).toFloat(), o.optDouble("dy", 0.0).toFloat()),
                     )

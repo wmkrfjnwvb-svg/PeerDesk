@@ -121,7 +121,7 @@ fun ConnectScreen(ui: UiState, vm: PeerDeskViewModel) {
         ) { Text(stringResource(R.string.connect_button)) }
 
         Text(
-            stringResource(R.string.connect_background_note),
+            stringResource(R.string.connect_background_note) + "\n" + stringResource(R.string.connect_gestures),
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )

@@ -21,10 +21,11 @@ class NativeSession(private val handle: Long) {
     fun touch(id: Int, phase: Int, x: Float, y: Float, tMs: Long): String? =
         use(null) { Native.touch(it, id, phase, x, y, tMs) }
     fun tick(tMs: Long): String? = use(null) { Native.tick(it, tMs) }
-    fun setView(rect: ViewRect, zoomed: Boolean, viewW: Int, viewH: Int) = use(Unit) {
-        Native.setView(it, rect.left, rect.top, rect.width, rect.height, zoomed, viewW, viewH)
+    fun setView(rect: ViewRect, viewW: Int, viewH: Int) = use(Unit) {
+        Native.setView(it, rect.left, rect.top, rect.width, rect.height, viewW, viewH)
     }
-    fun setMode(mode: Int) = use(Unit) { Native.setMode(it, mode) }
+    fun button(button: Int, down: Boolean) = use(Unit) { Native.button(it, button, down) }
+    fun pointAt(x: Float, y: Float) = use(Unit) { Native.pointAt(it, x, y) }
     fun key(keycode: Int, down: Boolean): Boolean = use(false) { Native.key(it, keycode, down) }
     fun text(text: String) = use(Unit) { Native.text(it, text) }
     fun releaseAll() = use(Unit) { Native.releaseAll(it) }

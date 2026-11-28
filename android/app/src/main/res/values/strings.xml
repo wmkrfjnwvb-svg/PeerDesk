@@ -20,11 +20,15 @@
     <string name="session_connecting">Connecting…</string>
     <string name="session_reconnecting">Connection lost, reconnecting (attempt %1$d): %2$s</string>
     <string name="toolbar_disconnect">Disconnect</string>
-    <string name="toolbar_mode_direct">Direct touch</string>
-    <string name="toolbar_mode_trackpad">Trackpad</string>
     <string name="toolbar_keyboard">Keyboard</string>
     <string name="toolbar_hide">Hide toolbar</string>
     <string name="toolbar_show">Show toolbar</string>
+    <string name="mouse_left_desc">Left mouse button. Hold it and drag to select; the pointer is the arrow tip.</string>
+    <string name="mouse_right_desc">Right mouse button</string>
+    <string name="mouse_handle_desc">Mouse body. Drag it to move the pointer.</string>
+    <string name="mouse_close_desc">Shrink the mouse to a small icon</string>
+    <string name="mouse_mini_desc">Small mouse. Tap to open the full mouse, or drag to move it.</string>
+    <string name="connect_gestures">Gestures: tap = left click, swipe = move the view, long-press then release = right click, long-press then drag = drag, two-finger tap = right click, two fingers = scroll, pinch = zoom. Tap the small on-screen mouse for a full mouse with left and right buttons.</string>
     <string name="route_direct">Direct</string>
     <string name="route_relay">Relay</string>
 

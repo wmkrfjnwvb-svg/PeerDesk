@@ -3,6 +3,7 @@ package ai.peerdesk.app
 import android.app.Activity
 import android.content.Context
 import android.view.KeyEvent
+import android.view.HapticFeedbackConstants
 import android.view.View
 import android.view.ViewConfiguration
 import androidx.activity.compose.BackHandler
@@ -14,6 +15,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.WindowInsetsSides
@@ -27,6 +29,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.FilterChip
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -42,10 +45,26 @@ import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.RoundRect
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.scale
+import androidx.compose.ui.graphics.drawscope.translate
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.unit.IntOffset
+import kotlin.math.roundToInt
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import kotlinx.coroutines.delay
@@ -62,6 +81,24 @@ fun SessionScreen(ui: UiState, vm: PeerDeskViewModel) {
     var pressed by remember { mutableStateOf(false) }
     var keyCatcher by remember { mutableStateOf<KeyCatcherView?>(null) }
     val imeVisible = WindowInsets.ime.getBottom(density) > 0
+    val hostView = LocalView.current
+    // 大鼠标的尺寸：宽 96 dp、本体高 150 dp，上面一条 30 dp 放箭头和关闭按钮，小图标 48 dp
+    LaunchedEffect(density) {
+        with(density) {
+            vm.setMouseSizes(
+                MouseSizes(
+                    width = 96.dp.toPx(), height = 150.dp.toPx(), arrowH = 30.dp.toPx(),
+                    closeSize = 30.dp.toPx(), miniSize = 48.dp.toPx(),
+                ),
+            )
+        }
+    }
+    val vmouse = ui.vmouse
+    val miniBox = ui.miniBox
+    // 长按到点了：震一下（HapticFeedbackConstants.LONG_PRESS 不需要 VIBRATE 权限）
+    LaunchedEffect(vm) {
+        vm.haptics.collect { hostView.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS) }
+    }
 
     BackHandler { vm.disconnect() }
 
@@ -99,15 +136,26 @@ fun SessionScreen(ui: UiState, vm: PeerDeskViewModel) {
                 factory = { c ->
                     TouchLayerView(
                         c,
-                        onOps = { ops, t -> vm.forwardTouch(ops, t) },
+                        tapSlopPx = slopPx,
+                        onTouches = { ops, t -> vm.forwardTouch(ops, t) },
                         onPressed = { pressed = it },
+                        onMouse = vm::onMouseEvent,
                     )
                 },
                 update = {
-                    it.onOps = { ops, t -> vm.forwardTouch(ops, t) }
+                    it.onTouches = { ops, t -> vm.forwardTouch(ops, t) }
                     it.onPressed = { p -> pressed = p }
+                    it.onMouse = vm::onMouseEvent
+                    // 大鼠标（或小鼠标）上的手指不转发给 touch，其余手指都转发
+                    it.router.hitTest = when {
+                        ui.mouseExpanded && vmouse != null -> { x, y -> vmouse.hit(x, y) }
+                        !ui.mouseExpanded && miniBox != null -> { x, y -> if (miniBox.contains(x, y)) Zone.Mini else null }
+                        else -> null
+                    }
                 },
             )
+            if (ui.mouseExpanded && vmouse != null) VirtualMouse(vmouse, ui.buttonsDown)
+            else if (!ui.mouseExpanded && miniBox != null) MiniMouse(miniBox)
         }
 
         if (!ui.connected && ui.quality == null) {
@@ -178,16 +226,6 @@ private fun Toolbar(ui: UiState, vm: PeerDeskViewModel, imeVisible: Boolean, onK
                     onClick = vm::disconnect,
                     colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
                 ) { Text(stringResource(R.string.toolbar_disconnect)) }
-                FilterChip(
-                    selected = !ui.trackpad,
-                    onClick = { vm.setTrackpad(false) },
-                    label = { Text(stringResource(R.string.toolbar_mode_direct)) },
-                )
-                FilterChip(
-                    selected = ui.trackpad,
-                    onClick = { vm.setTrackpad(true) },
-                    label = { Text(stringResource(R.string.toolbar_mode_trackpad)) },
-                )
                 FilterChip(
                     selected = imeVisible,
                     onClick = onKeyboard,
@@ -269,4 +307,104 @@ private fun KeyButton(label: String, onClick: () -> Unit) {
 @Composable
 private fun ModButton(label: String, locked: Boolean, onClick: () -> Unit) {
     FilterChip(selected = locked, onClick = onClick, label = { Text(label) })
+}
+
+/** 箭头光标的外形（相对箭头尖的坐标，单位 dp）。 */
+private fun arrowPath(): Path = Path().apply {
+    moveTo(0f, 0f)
+    lineTo(0f, 17f)
+    lineTo(4.2f, 13f)
+    lineTo(7.4f, 20f)
+    lineTo(10f, 19f)
+    lineTo(6.9f, 12.2f)
+    lineTo(12f, 12.2f)
+    close()
+}
+
+/**
+ * 展开的大鼠标：顶上一个箭头（尖 = 远程光标位置）和右上角的关闭按钮，下面是鼠标：
+ * 上半左右两个键，下半是身体（拖把）。只负责画，触摸由触摸层按坐标分流（见 [TouchRouter]）。
+ */
+@Composable
+private fun VirtualMouse(m: VMouse, down: Set<Int>) {
+    val d = LocalDensity.current
+    val primary = MaterialTheme.colorScheme.primary
+    val leftDesc = stringResource(R.string.mouse_left_desc)
+    val rightDesc = stringResource(R.string.mouse_right_desc)
+    val bodyDesc = stringResource(R.string.mouse_handle_desc)
+    val closeDesc = stringResource(R.string.mouse_close_desc)
+    Canvas(Modifier.fillMaxSize()) {
+        val u = d.density
+        val shell = Color.Black.copy(alpha = 0.5f)
+        val line = Color.White.copy(alpha = 0.85f)
+        // 鼠标外形：上圆下圆的长圆角矩形，上半分成左右两键
+        val top = m.left.top
+        val l = m.left.left
+        val w = m.left.width * 2
+        val h = (m.body.top + m.body.height) - top
+        val r = CornerRadius(w / 2, w / 2)
+        val shellPath = Path().apply { addRoundRect(RoundRect(l, top, l + w, top + h, r)) }
+        drawPath(shellPath, shell)
+        if (0 in down) {
+            val p = Path().apply {
+                addRoundRect(RoundRect(m.left.left, m.left.top, m.left.left + m.left.width, m.left.top + m.left.height, topLeftCornerRadius = r))
+            }
+            drawPath(p, primary.copy(alpha = 0.85f))
+        }
+        if (1 in down) {
+            val p = Path().apply {
+                addRoundRect(RoundRect(m.right.left, m.right.top, m.right.left + m.right.width, m.right.top + m.right.height, topRightCornerRadius = r))
+            }
+            drawPath(p, primary.copy(alpha = 0.85f))
+        }
+        drawPath(shellPath, line, style = Stroke(width = 1.6f * u))
+        drawLine(line, Offset(l + w / 2, top), Offset(l + w / 2, m.left.top + m.left.height), 1.4f * u)
+        drawLine(line, Offset(l, m.body.top), Offset(l + w, m.body.top), 1.4f * u)
+        // 身体上的“抓握”提示：三道短横线
+        for (i in -1..1) {
+            val y = m.body.top + m.body.height / 2 + i * 6 * u
+            drawLine(line.copy(alpha = 0.5f), Offset(l + w / 2 - 12 * u, y), Offset(l + w / 2 + 12 * u, y), 1.6f * u)
+        }
+        // 关闭按钮：圆底加叉
+        val cx = m.close.left + m.close.width / 2
+        val cy = m.close.top + m.close.height / 2
+        drawCircle(Color.Black.copy(alpha = 0.6f), radius = 10 * u, center = Offset(cx, cy))
+        drawLine(Color.White, Offset(cx - 4 * u, cy - 4 * u), Offset(cx + 4 * u, cy + 4 * u), 1.8f * u)
+        drawLine(Color.White, Offset(cx - 4 * u, cy + 4 * u), Offset(cx + 4 * u, cy - 4 * u), 1.8f * u)
+        // 箭头光标，尖对准 (tipX, tipY)
+        translate(m.tipX, m.tipY) {
+            scale(u * 1.2f, u * 1.2f, pivot = Offset.Zero) {
+                val p = arrowPath()
+                drawPath(p, Color.White)
+                drawPath(p, Color.Black, style = Stroke(width = 1.2f))
+            }
+        }
+    }
+    // 给无障碍用的透明块，不接收触摸
+    Box(Modifier.fillMaxSize()) {
+        fun Modifier.at(b: PxBox) = this
+            .offset { IntOffset(b.left.roundToInt(), b.top.roundToInt()) }
+            .size(with(d) { b.width.toDp() }, with(d) { b.height.toDp() })
+        Box(Modifier.at(m.left).semantics { contentDescription = leftDesc })
+        Box(Modifier.at(m.right).semantics { contentDescription = rightDesc })
+        Box(Modifier.at(m.body).semantics { contentDescription = bodyDesc })
+        Box(Modifier.at(m.close).semantics { contentDescription = closeDesc })
+    }
+}
+
+/** 收起后的小鼠标。 */
+@Composable
+private fun MiniMouse(box: PxBox) {
+    val d = LocalDensity.current
+    val desc = stringResource(R.string.mouse_mini_desc)
+    Box(
+        Modifier
+            .offset { IntOffset(box.left.roundToInt(), box.top.roundToInt()) }
+            .size(with(d) { box.width.toDp() }, with(d) { box.height.toDp() })
+            .background(Color.Black.copy(alpha = 0.55f), CircleShape)
+            .semantics { contentDescription = desc },
+        contentAlignment = Alignment.Center,
+    ) {
+        Icon(painterResource(R.drawable.ic_mouse), contentDescription = null, tint = Color.White, modifier = Modifier.size(26.dp))
+    }
 }

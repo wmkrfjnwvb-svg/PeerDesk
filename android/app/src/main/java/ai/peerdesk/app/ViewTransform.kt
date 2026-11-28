@@ -86,6 +86,7 @@ fun applyOps(
     when (op) {
         is ViewOp.Zoom -> applyZoom(acc, op.factor, op.cx, op.cy, containerW, containerH, aspect)
         is ViewOp.Pan -> applyPan(acc, op.dx, op.dy, containerW, containerH, aspect)
+        ViewOp.Haptic -> acc
     }
 }
 

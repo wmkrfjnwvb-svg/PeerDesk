@@ -62,4 +62,9 @@ class EventsTest {
         assertTrue(parseViewOps("[]").isEmpty())
         assertTrue(parseViewOps("oops").isEmpty())
     }
+
+    @Test fun hapticOpAndUnknownCursorIgnored() {
+        val ops = parseViewOps("""[{"type":"haptic"},{"type":"cursor","x":0.25,"y":0.75},{"type":"pan","dx":1,"dy":2}]""")
+        assertEquals(listOf(ViewOp.Haptic, ViewOp.Pan(1f, 2f)), ops)
+    }
 }

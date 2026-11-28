@@ -52,20 +52,28 @@ class RemoteSurfaceLayout(
     }
 }
 
-/** 盖在整个会话页上的触摸层：所有手指按 pointer id 逐个转发。 */
+/**
+ * 盖在整个会话页上的触摸层：拿到完整的多点 MotionEvent，按 [TouchRouter] 把每根手指分流：
+ * 普通手指转发给 touch，落在虚拟鼠标上的手指只产生鼠标动作。
+ */
 @SuppressLint("ViewConstructor", "ClickableViewAccessibility")
 class TouchLayerView(
     context: Context,
-    var onOps: (List<TouchOp>, Long) -> Unit,
+    tapSlopPx: Float,
+    var onTouches: (List<TouchOp>, Long) -> Unit,
     var onPressed: (Boolean) -> Unit,
+    var onMouse: (MouseEvent) -> Unit,
 ) : View(context) {
+    val router = TouchRouter(tapSlopPx)
+
     override fun onTouchEvent(e: MotionEvent): Boolean {
         val n = e.pointerCount
         val ids = IntArray(n) { e.getPointerId(it) }
         val xs = FloatArray(n) { e.getX(it) }
         val ys = FloatArray(n) { e.getY(it) }
-        val ops = touchOps(e.actionMasked, e.actionIndex, ids, xs, ys)
-        if (ops.isNotEmpty()) onOps(ops, e.eventTime)
+        val r = router.route(e.actionMasked, e.actionIndex, ids, xs, ys)
+        r.mouse.forEach(onMouse)
+        if (r.touches.isNotEmpty()) onTouches(r.touches, e.eventTime)
         when (e.actionMasked) {
             MotionEvent.ACTION_DOWN -> onPressed(true)
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> onPressed(false)

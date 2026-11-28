@@ -8,7 +8,10 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
@@ -40,7 +43,15 @@ data class UiState(
     val quality: CoreEvent.Quality? = null,
     val reconnecting: CoreEvent.Reconnecting? = null,
     val coreNotice: String? = null,
-    val trackpad: Boolean = false,
+    /** 屏幕上的鼠标是展开的大鼠标，还是收成了小鼠标（默认小鼠标）。 */
+    val mouseExpanded: Boolean = false,
+    val buttonsDown: Set<Int> = emptySet(),
+    val mouseFx: Float = MOUSE_DEFAULT_FX,
+    val mouseFy: Float = MOUSE_DEFAULT_FY,
+    val miniFx: Float = MINI_DEFAULT_FX,
+    val miniFy: Float = MINI_DEFAULT_FY,
+    /** 大小鼠标的像素尺寸，界面按 dp 换算后设置；没设置前不画。 */
+    val mouseSizes: MouseSizes? = null,
     val toolbarVisible: Boolean = true,
     val locked: Set<ModKey> = emptySet(),
 
@@ -52,6 +63,10 @@ data class UiState(
     val peerOs: PeerOs get() = peer?.os ?: PeerOs.Unknown
     val aspect: Float get() = aspectOf(quality?.width ?: 0, quality?.height ?: 0)
     val rect: ViewRect get() = rectOf(view, containerW, containerH, aspect)
+    val vmouse: VMouse?
+        get() = mouseSizes?.let { vmouseLayout(containerW, containerH, mouseFx, mouseFy, it) }
+    val miniBox: PxBox?
+        get() = mouseSizes?.let { miniLayout(containerW, containerH, miniFx, miniFy, it) }
 }
 
 /**
@@ -68,9 +83,18 @@ class PeerDeskViewModel(app: Application) : AndroidViewModel(app) {
             code = prefs.getString(KEY_CODE, "") ?: "",
             // 记住的密码是加密存的（见 SecretStore），解不开就当没记住
             password = prefs.getString(KEY_PASSWORD, null)?.let(SecretStore::decrypt) ?: "",
+            mouseExpanded = prefs.getBoolean(KEY_MOUSE_EXPANDED, false),
+            mouseFx = prefs.getFloat(KEY_MOUSE_FX, MOUSE_DEFAULT_FX),
+            mouseFy = prefs.getFloat(KEY_MOUSE_FY, MOUSE_DEFAULT_FY),
+            miniFx = prefs.getFloat(KEY_MINI_FX, MINI_DEFAULT_FX),
+            miniFy = prefs.getFloat(KEY_MINI_FY, MINI_DEFAULT_FY),
         ),
     )
     val ui: StateFlow<UiState> = _ui.asStateFlow()
+
+    /** 手势识别说“长按到点了”：界面收到后震一下。 */
+    private val _haptics = MutableSharedFlow<Unit>(extraBufferCapacity = 4)
+    val haptics: SharedFlow<Unit> = _haptics.asSharedFlow()
 
     @Volatile private var session: NativeSession? = null
     private val bar = ShortcutBarState()
@@ -99,7 +123,7 @@ class PeerDeskViewModel(app: Application) : AndroidViewModel(app) {
             it.copy(
                 phase = Phase.Session, notice = null, connected = false, route = Route.Unknown,
                 peer = null, quality = null, reconnecting = null, coreNotice = null,
-                trackpad = false, view = ViewState(), locked = emptySet(),
+                buttonsDown = emptySet(), view = ViewState(), locked = emptySet(),
             )
         }
     }
@@ -110,6 +134,7 @@ class PeerDeskViewModel(app: Application) : AndroidViewModel(app) {
     fun startSession(surface: Surface, slopPx: Float, notchPx: Float) {
         if (session != null || _ui.value.phase != Phase.Session) return
         val s = _ui.value
+        synchronized(heldButtons) { heldButtons.clear() }
         userDisconnect = false
         backgroundEnd = false
         stopRequestedAt = 0L
@@ -121,6 +146,7 @@ class PeerDeskViewModel(app: Application) : AndroidViewModel(app) {
             return
         }
         val ns = NativeSession(h)
+        pushedRect = null
         session = ns
         pushView()
         viewModelScope.launch(Dispatchers.IO) { eventLoop(ns) }
@@ -228,22 +254,106 @@ class PeerDeskViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun applyViewOps(ops: List<ViewOp>) {
         if (ops.isEmpty()) return
+        if (ops.any { it == ViewOp.Haptic }) _haptics.tryEmit(Unit)
         _ui.update { it.copy(view = applyOps(it.view, ops, it.containerW, it.containerH, it.aspect)) }
         pushView()
     }
 
-    /** 把画面矩形告诉核心（布局、缩放、平移变了都要调）。 */
+    /** 上次告诉核心的画面矩形；没变就不再发（每个质量事件、长按震动都会走到 [pushView]）。 */
+    private var pushedRect: ViewRect? = null
+
+    /** 把画面矩形告诉核心（布局、缩放、平移变了都要调）。矩形没变什么也不做。 */
     private fun pushView() {
         val ns = session ?: return
         val s = _ui.value
         if (s.containerW <= 0f || s.containerH <= 0f) return
+        val rect = s.rect
+        if (rect == pushedRect) return
+        pushedRect = rect
         // 被控端按“画面画出来有多大”编码：放大时画面变大，字也要跟着清楚（被控端按自己的原始分辨率封顶）
-        ns.setView(s.rect, isZoomed(s.view), s.rect.width.toInt(), s.rect.height.toInt())
+        ns.setView(rect, rect.width.toInt(), rect.height.toInt())
+        // 画面缩放、平移、布局变了，同一个箭头尖对应的远程位置也变了：大鼠标展开着就重新对一次。
+        // 只在矩形变了时做：否则触屏拖拽（按着左键）中途来一个质量事件，选区会跳到箭头尖。
+        pointAtTip(ns, s)
     }
 
-    fun setTrackpad(on: Boolean) {
-        _ui.update { it.copy(trackpad = on) }
-        session?.setMode(if (on) 1 else 0)
+    private fun pointAtTip(ns: NativeSession? = session, s: UiState = _ui.value) {
+        if (ns == null || !s.mouseExpanded) return
+        s.vmouse?.let { ns.pointAt(it.tipX, it.tipY) }
+    }
+
+    fun setMouseSizes(sizes: MouseSizes) {
+        if (_ui.value.mouseSizes != sizes) _ui.update { it.copy(mouseSizes = sizes) }
+    }
+
+    /** 触摸层认出的鼠标动作。 */
+    fun onMouseEvent(e: MouseEvent) {
+        when (e) {
+            is MouseEvent.ButtonDown -> {
+                pointAtTip() // 先把光标放到箭头尖，再按键
+                mouseButton(e.index, true)
+            }
+            is MouseEvent.ButtonUp -> mouseButton(e.index, false)
+            is MouseEvent.Move -> {
+                _ui.update { s ->
+                    val z = s.mouseSizes ?: return@update s
+                    val (fx, fy) = dragMouseGroup(
+                        s.mouseFx, s.mouseFy, e.dx, e.dy, s.containerW, s.containerH, z.width, z.arrowH + z.height,
+                    )
+                    s.copy(mouseFx = fx, mouseFy = fy)
+                }
+                pointAtTip()
+            }
+            is MouseEvent.MiniMove -> _ui.update { s ->
+                val z = s.mouseSizes ?: return@update s
+                val (fx, fy) = dragMouseGroup(s.miniFx, s.miniFy, e.dx, e.dy, s.containerW, s.containerH, z.miniSize, z.miniSize)
+                s.copy(miniFx = fx, miniFy = fy)
+            }
+            MouseEvent.DragEnd -> saveMouse()
+            // 收起不发任何输入；已按住的键由触摸层在抬起时松开
+            MouseEvent.Collapse -> {
+                _ui.update { s ->
+                    val z = s.mouseSizes
+                    val big = s.vmouse
+                    if (z == null || big == null) return@update s.copy(mouseExpanded = false)
+                    val (fx, fy) = collapsedFrom(big.bounds, s.containerW, s.containerH, z)
+                    s.copy(mouseExpanded = false, miniFx = fx, miniFy = fy)
+                }
+                saveMouse()
+            }
+            MouseEvent.Expand -> {
+                _ui.update { s ->
+                    val z = s.mouseSizes
+                    val mini = s.miniBox
+                    if (z == null || mini == null) return@update s.copy(mouseExpanded = true)
+                    val (fx, fy) = expandedFrom(mini, s.containerW, s.containerH, z)
+                    s.copy(mouseExpanded = true, mouseFx = fx, mouseFy = fy)
+                }
+                saveMouse()
+                pointAtTip()
+            }
+        }
+    }
+
+    private val heldButtons = HashSet<Int>()
+
+    /** 屏幕上的左键（0）、右键（1）。重复的按下/抬起不转发。 */
+    fun mouseButton(index: Int, down: Boolean) {
+        val ns = session ?: return
+        val changed = synchronized(heldButtons) { if (down) heldButtons.add(index) else heldButtons.remove(index) }
+        if (!changed) return
+        _ui.update { it.copy(buttonsDown = if (down) it.buttonsDown + index else it.buttonsDown - index) }
+        ns.button(index, down)
+    }
+
+    /** 记住大小鼠标的位置。 */
+    private fun saveMouse() {
+        val s = _ui.value
+        prefs.edit()
+            .putFloat(KEY_MOUSE_FX, s.mouseFx).putFloat(KEY_MOUSE_FY, s.mouseFy)
+            .putFloat(KEY_MINI_FX, s.miniFx).putFloat(KEY_MINI_FY, s.miniFy)
+            .putBoolean(KEY_MOUSE_EXPANDED, s.mouseExpanded)
+            .apply()
     }
 
     fun toggleToolbar() = _ui.update { it.copy(toolbarVisible = !it.toolbarVisible) }
@@ -285,6 +395,11 @@ class PeerDeskViewModel(app: Application) : AndroidViewModel(app) {
 
     companion object {
         private const val KEY_SERVER = "server"
+        private const val KEY_MOUSE_FX = "mouse_fx"
+        private const val KEY_MOUSE_FY = "mouse_fy"
+        private const val KEY_MINI_FX = "mini_fx"
+        private const val KEY_MINI_FY = "mini_fy"
+        private const val KEY_MOUSE_EXPANDED = "mouse_expanded"
         private const val KEY_CODE = "code"
         private const val KEY_PASSWORD = "password-sealed"
         private const val STOP_GRACE_MS = 3000L
