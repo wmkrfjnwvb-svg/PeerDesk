@@ -538,9 +538,25 @@ pub fn case_5_6(queue_ms: u64, seed: u64) -> Case {
 }
 
 /// 5.7 对抗短 TCP：300 s；2 Mbps；两路媒体 5 s 起；十条短 TCP 流，2 条开始时是开、8 条是关。
-/// 每一条照 RFC 8868 第 5.1 节：一阵 30 条连接同时取 30–50 KB，阵与阵之间的空闲按均值 10 秒的指数分布。
+///
+/// 两种读法（主会话 2026-11-28 定：主用例照 8867 字面，30 个连接的作为压力变体另跑，报告里两种都标明）：
+/// - **主用例**（`connections = 1`）：RFC 8867 第 5.7 节原文“Number and types of sources: ten (10), short-lived TCP flows”，
+///   “Each short TCP flow is modeled as a sequence of file downloads interleaved with idle periods”。十条流，每条一个连接，
+///   下载和空闲交替；文件大小和空闲时间照它引的 RFC 8868 第 5.1 节（30–50 KB，空闲均值 10 秒的指数分布）；
+/// - **压力变体**（`connections = 30`）：RFC 8868 第 5.1 节“30 connections start simultaneously fetching small (30-50 KB)
+///   amounts of data”，理解成每条流一阵 30 个连接，合计最多 300 个连接抢 2 Mbps。
 #[must_use]
 pub fn case_5_7(seed: u64) -> Case {
+    case_5_7_with(1, seed)
+}
+
+/// 5.7 的压力变体：每条短流一阵 30 个连接（见 [`case_5_7`]）。
+#[must_use]
+pub fn case_5_7_stress(seed: u64) -> Case {
+    case_5_7_with(30, seed)
+}
+
+fn case_5_7_with(connections: u32, seed: u64) -> Case {
     let path = PathConfig::symmetric(dir(
         Capacity::Constant {
             rate_bps: 2_000_000,
@@ -554,7 +570,7 @@ pub fn case_5_7(seed: u64) -> Case {
                 Dir::Forward,
                 CrossSpec::Bursts {
                     cfg: TcpConfig::default(),
-                    connections: 30,
+                    connections,
                     min_bytes: 30_000,
                     max_bytes: 50_000,
                     mean_off_us: 10_000_000,
@@ -564,9 +580,20 @@ pub fn case_5_7(seed: u64) -> Case {
             )
         })
         .collect();
+    let (id, title) = if connections == 1 {
+        (
+            "5.7".to_owned(),
+            "5.7 对抗短 TCP（十条，每条一个连接，2 开 8 关；照 RFC 8867 字面）".to_owned(),
+        )
+    } else {
+        (
+            format!("5.7-stress{connections}"),
+            format!("5.7 压力变体（十条，每条一阵 {connections} 个连接；照 RFC 8868 第 5.1 节的另一种读法）"),
+        )
+    };
     build(
-        "5.7".to_owned(),
-        "5.7 对抗短 TCP（十条，2 开 8 关）".to_owned(),
+        id,
+        title,
         300,
         path,
         tcp,
@@ -609,6 +636,28 @@ pub fn case_5_8(seed: u64) -> Case {
     )
 }
 
+/// 量内容自己的上限：一路、不限速、单程 50 ms、60 秒（主会话 2026-11-28）。它的平均接收速率就是这份内容在 1.5 Mbps
+/// 封顶下最多能出多少；报告里的“稳定值 ÷ min(公平份额, 内容上限)”用它，内容出满了不会被看成不公平。
+#[must_use]
+pub fn ceiling_case(seed: u64) -> Case {
+    let path = PathConfig::symmetric(dir(Capacity::Unlimited, 50_000, 300_000));
+    build(
+        "ceiling".to_owned(),
+        "内容自己的上限（不限速）".to_owned(),
+        60,
+        path,
+        Vec::new(),
+        vec![MediaFlow {
+            audio: false,
+            ..flow(0, 60)
+        }],
+        &[],
+        vec![(0, 0)],
+        vec![(0, 0)],
+        seed,
+    )
+}
+
 /// 全部用例（5.1 两种做法 × 两档延迟，5.2、5.3 两种做法，5.6 两档队列）。
 #[must_use]
 pub fn cases(seed: u64) -> Vec<Case> {
@@ -630,6 +679,7 @@ pub fn cases(seed: u64) -> Vec<Case> {
         v.push(case_5_6(q, seed));
     }
     v.push(case_5_7(seed));
+    v.push(case_5_7_stress(seed));
     v.push(case_5_8(seed));
     v
 }
@@ -719,6 +769,8 @@ pub struct SpanFlow {
     pub fair_bps: f64,
     /// 稳定值（最后 10 秒的接收速率均值；段太短时是整段的均值）。
     pub stable_bps: f64,
+    /// min(公平份额, 内容自己的上限)；没给内容上限时等于公平份额。
+    pub capped_fair_bps: f64,
     /// 收敛。
     pub convergence: Convergence,
     /// 振荡次数。
@@ -747,6 +799,8 @@ pub struct FlowReport {
     pub loss: f64,
     /// 反馈开销（反馈字节 ÷ 画面字节）。
     pub feedback_overhead: f64,
+    /// 每帧到齐要多久（首片到收齐）的中位、95%、99%（毫秒）。
+    pub assembly_ms: (Option<u64>, Option<u64>, Option<u64>),
     /// 冻结次数。
     pub freezes: u32,
     /// 最长等待（毫秒）。
@@ -934,9 +988,10 @@ pub fn oscillations(
     n
 }
 
-/// 算一个用例跑一遍的指标。`outcomes` 和 `c.multi.pairs` 一一对应；`cross` 是共享网络的交叉流计数（`Outcome::cross`）。
+/// 算一个用例跑一遍的指标。`outcomes` 和 `c.multi.pairs` 一一对应。`ceiling_bps` 是内容自己的上限（[`ceiling_case`] 量出来的），
+/// 没有就给 `None`。
 #[must_use]
-pub fn report(c: &Case, outcomes: &[Outcome]) -> Report {
+pub fn report(c: &Case, outcomes: &[Outcome], ceiling_bps: Option<f64>) -> Report {
     let rates: Vec<Vec<f64>> = c
         .media
         .iter()
@@ -969,6 +1024,11 @@ pub fn report(c: &Case, outcomes: &[Outcome]) -> Report {
                     1.0 - recv as f64 / sent as f64
                 },
                 feedback_overhead: o.flow.feedback_bytes as f64 / media_bytes.max(1) as f64,
+                assembly_ms: (
+                    o.flow.assembly_percentile_ms(50),
+                    o.flow.assembly_percentile_ms(95),
+                    o.flow.assembly_percentile_ms(99),
+                ),
                 freezes: o.freezes,
                 max_wait_ms: o.max_wait_ms,
             }
@@ -989,6 +1049,7 @@ pub fn report(c: &Case, outcomes: &[Outcome]) -> Report {
                     flow: i,
                     fair_bps: fair,
                     stable_bps: stable,
+                    capped_fair_bps: ceiling_bps.map_or(fair, |c| fair.min(c)),
                     convergence: conv,
                     oscillations: oscillations(&o.flow.recv_bytes, offset, span, fair),
                 });
@@ -1081,7 +1142,7 @@ mod tests {
     #[test]
     fn the_cases_follow_the_rfc_tables() {
         let all = cases(1);
-        assert_eq!(all.len(), 14);
+        assert_eq!(all.len(), 15);
         let c = case_5_1(Mechanism::Trace, 50, 1);
         assert_eq!(c.duration_us, 100_000_000);
         assert_eq!(
@@ -1205,6 +1266,18 @@ mod tests {
         let NetworkPlan::Layout2(p) = &c7.multi.network else {
             panic!()
         };
+        let NetworkPlan::Layout2(ps) = &case_5_7_stress(1).multi.network else {
+            panic!()
+        };
+        assert!(ps.cross.iter().all(
+            |(_, c)| !matches!(c, CrossSpec::Bursts { connections, .. } if *connections != 30)
+        ));
+        assert!(p.cross.iter().all(
+            |(_, c)| !matches!(c, CrossSpec::Bursts { connections, .. } if *connections != 1)
+        ));
+        assert_eq!(case_5_7_stress(1).id, "5.7-stress30");
+        let ceil = ceiling_case(1);
+        assert_eq!((ceil.media.len(), ceil.media[0].audio), (1, false));
         let on = p
             .cross
             .iter()

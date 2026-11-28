@@ -31,6 +31,9 @@ pub struct FlowLog {
     pub capacity_bps: Vec<u64>,
     /// 每格帧末采到的这一对画面方向的真实排队（微秒，取这一格里的最大）。
     pub queue_us: Vec<u64>,
+    /// 每帧到齐要多久（控制端收到第一个分片到收齐，毫秒）的直方图，格子同 `delay_hist_ms`。
+    /// 窄链路上一帧在瓶颈上摊开（4G 的虚假重传、5.1 物理 1 Mbps 的低利用率都是这个机制），B 阶段改帧大小和重传时机时直接比它。
+    pub assembly_hist_ms: Vec<u64>,
 }
 
 /// 最多记多少格（10 小时）：再往后的不记，免得一个离谱的时刻申请天量内存。
@@ -91,6 +94,17 @@ impl FlowLog {
         add(&mut self.delay_hist_ms, ms, 1);
     }
 
+    /// 控制端收齐了一帧，从第一个分片到收齐用了 `us` 微秒。
+    pub fn assembled(&mut self, us: u64) {
+        if self.assembly_hist_ms.is_empty() {
+            self.assembly_hist_ms.resize(DELAY_HIST_MS, 0);
+        }
+        let ms = usize::try_from(us / 1_000)
+            .unwrap_or(usize::MAX)
+            .min(DELAY_HIST_MS - 1);
+        add(&mut self.assembly_hist_ms, ms, 1);
+    }
+
     /// 控制端发出一份 `bytes` 字节的反馈。
     pub fn feedback(&mut self, bytes: u64) {
         self.feedback_bytes = self.feedback_bytes.saturating_add(bytes);
@@ -120,20 +134,13 @@ impl FlowLog {
     /// 单程延迟的分位（毫秒）：`pct` 是百分数；没有包时为 `None`。
     #[must_use]
     pub fn delay_percentile_ms(&self, pct: u64) -> Option<u64> {
-        let total: u64 = self.delay_hist_ms.iter().sum();
-        if total == 0 {
-            return None;
-        }
-        // 最小的 i，使得不超过 i 毫秒的包数不少于 total × pct / 100
-        let want = (total * pct).div_ceil(100).max(1);
-        let mut seen = 0u64;
-        for (i, n) in self.delay_hist_ms.iter().enumerate() {
-            seen += n;
-            if seen >= want {
-                return u64::try_from(i).ok();
-            }
-        }
-        None
+        percentile(&self.delay_hist_ms, pct)
+    }
+
+    /// 每帧到齐要多久的分位（毫秒）；没有收齐的帧时为 `None`。
+    #[must_use]
+    pub fn assembly_percentile_ms(&self, pct: u64) -> Option<u64> {
+        percentile(&self.assembly_hist_ms, pct)
     }
 
     /// 发出、收到的包数合计。
@@ -144,6 +151,24 @@ impl FlowLog {
             self.recv_packets.iter().sum(),
         )
     }
+}
+
+/// 直方图（第 i 格是 [i, i+1) 毫秒）的分位：最小的 i，使得不超过 i 的个数不少于总数 × pct / 100。
+fn percentile(hist: &[u64], pct: u64) -> Option<u64> {
+    let total: u64 = hist.iter().sum();
+    if total == 0 {
+        return None;
+    }
+    // 最小的 i，使得不超过 i 毫秒的包数不少于 total × pct / 100
+    let want = (total * pct).div_ceil(100).max(1);
+    let mut seen = 0u64;
+    for (i, n) in hist.iter().enumerate() {
+        seen += n;
+        if seen >= want {
+            return u64::try_from(i).ok();
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -160,6 +185,11 @@ mod tests {
         f.received(Time(250_000), 1_200, 50_500);
         f.received(Time(260_000), 1_200, 10_000_000);
         f.feedback(80);
+        f.assembled(3_500);
+        f.assembled(25_000);
+        assert_eq!(f.assembly_percentile_ms(50), Some(3));
+        assert_eq!(f.assembly_percentile_ms(100), Some(25));
+        assert_eq!(FlowLog::default().assembly_percentile_ms(50), None);
         f.sample(Time(10_000), 5_000_000, 3_000);
         f.sample(Time(90_000), 4_000_000, 1_000);
         assert_eq!(f.sent_bytes, vec![2_400, 1_200]);

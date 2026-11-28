@@ -12,7 +12,7 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-use peerdesk_e2e::rfc8867::{cases, report, Case, Convergence, Report};
+use peerdesk_e2e::rfc8867::{cases, ceiling_case, report, Case, Convergence, Report};
 use peerdesk_e2e::run_multi;
 
 struct Options {
@@ -92,8 +92,8 @@ fn section(id: &str, title: &str, runs: &[Report]) -> String {
     let Some(first) = runs.first() else {
         return s;
     };
-    s.push_str("| 路 | 接收速率 kbps | 单程延迟中位 / 95% / 99% ms | 接收端丢包 | 反馈开销 | 冻结 | 最长等待 ms |\n");
-    s.push_str("|---|---|---|---|---|---|---|\n");
+    s.push_str("| 路 | 接收速率 kbps | 单程延迟中位 / 95% / 99% ms | 每帧到齐中位 / 95% / 99% ms | 接收端丢包 | 反馈开销 | 冻结 | 最长等待 ms |\n");
+    s.push_str("|---|---|---|---|---|---|---|---|\n");
     for i in 0..first.flows.len() {
         let col = |f: &dyn Fn(&Report) -> Option<f64>| -> Vec<f64> {
             runs.iter().filter_map(f).collect()
@@ -103,25 +103,31 @@ fn section(id: &str, title: &str, runs: &[Report]) -> String {
         let p50 = col(&|r| get(r).and_then(|f| f.delay_ms.0).map(|x| x as f64));
         let p95 = col(&|r| get(r).and_then(|f| f.delay_ms.1).map(|x| x as f64));
         let p99 = col(&|r| get(r).and_then(|f| f.delay_ms.2).map(|x| x as f64));
+        let a50 = col(&|r| get(r).and_then(|f| f.assembly_ms.0).map(|x| x as f64));
+        let a95 = col(&|r| get(r).and_then(|f| f.assembly_ms.1).map(|x| x as f64));
+        let a99 = col(&|r| get(r).and_then(|f| f.assembly_ms.2).map(|x| x as f64));
         let loss = col(&|r| get(r).map(|f| f.loss));
         let fb = col(&|r| get(r).map(|f| f.feedback_overhead));
         let fr = col(&|r| get(r).map(|f| f64::from(f.freezes)));
         let mw = col(&|r| get(r).map(|f| f.max_wait_ms));
         s.push_str(&format!(
-            "| {} | {} | {} / {} / {} | {}% | {}% | {} | {} |\n",
+            "| {} | {} | {} / {} / {} | {} / {} / {} | {}% | {}% | {} | {} |\n",
             i + 1,
             fmt(&rate, 1e-3, 0),
             fmt(&p50, 1.0, 0),
             fmt(&p95, 1.0, 0),
             fmt(&p99, 1.0, 0),
+            fmt(&a50, 1.0, 0),
+            fmt(&a95, 1.0, 0),
+            fmt(&a99, 1.0, 0),
             fmt(&loss, 100.0, 2),
             fmt(&fb, 100.0, 1),
             fmt(&fr, 1.0, 1),
             fmt(&mw, 1.0, 0),
         ));
     }
-    s.push_str("\n| 段 | 路 | 公平份额 kbps | 稳定值 ÷ 公平份额 | 收敛（收敛 / 未收敛 / 段太短） | 收敛时间 s（收敛的） | 振荡 | 同方向公平（最小 ÷ 最大） |\n");
-    s.push_str("|---|---|---|---|---|---|---|---|\n");
+    s.push_str("\n| 段 | 路 | 公平份额 kbps | 稳定值 ÷ 公平份额 | 稳定值 ÷ min(公平份额, 内容上限) | 收敛（收敛 / 未收敛 / 段太短） | 收敛时间 s（收敛的） | 振荡 | 同方向公平（最小 ÷ 最大） |\n");
+    s.push_str("|---|---|---|---|---|---|---|---|---|\n");
     for (k, span) in first.spans.iter().enumerate() {
         let label = format!(
             "{}–{} s",
@@ -139,6 +145,12 @@ fn section(id: &str, title: &str, runs: &[Report]) -> String {
                 .filter_map(&at)
                 .filter(|x| x.fair_bps > 0.0)
                 .map(|x| x.stable_bps / x.fair_bps)
+                .collect();
+            let capped: Vec<f64> = runs
+                .iter()
+                .filter_map(&at)
+                .filter(|x| x.capped_fair_bps > 0.0)
+                .map(|x| x.stable_bps / x.capped_fair_bps)
                 .collect();
             let (mut c, mut n, mut t) = (0, 0, 0);
             let mut times = Vec::new();
@@ -163,10 +175,11 @@ fn section(id: &str, title: &str, runs: &[Report]) -> String {
                 String::new()
             };
             s.push_str(&format!(
-                "| {label} | {} | {:.0} | {} | {c} / {n} / {t} | {} | {} | {fairness} |\n",
+                "| {label} | {} | {:.0} | {} | {} | {c} / {n} / {t} | {} | {} | {fairness} |\n",
                 f.flow + 1,
                 f.fair_bps / 1e3,
                 fmt(&ratio, 1.0, 2),
+                fmt(&capped, 1.0, 2),
                 if times.is_empty() {
                     "—".to_owned()
                 } else {
@@ -223,6 +236,29 @@ fn main() -> ExitCode {
                 .collect()
         })
         .collect();
+    // 内容自己的上限：每个种子不限速跑一次，取平均接收速率（各种子再平均）
+    let ceilings: Vec<f64> = (1..=o.seeds)
+        .filter_map(|seed| {
+            let c = ceiling_case(seed);
+            let c = match o.size {
+                Some((w, h)) => peerdesk_e2e::rfc8867::with_size(c, w, h),
+                None => c,
+            };
+            let out = run_multi(&c.multi).ok()?;
+            report(&c, &out, None)
+                .flows
+                .first()
+                .map(|f| f.mean_recv_bps)
+        })
+        .collect();
+    let ceiling =
+        (!ceilings.is_empty()).then(|| ceilings.iter().sum::<f64>() / ceilings.len() as f64);
+    let _ = writeln!(
+        std::io::stderr(),
+        "内容上限 {:.0} kbps（{} 个种子）",
+        ceiling.unwrap_or(0.0) / 1e3,
+        ceilings.len()
+    );
     let n_cases = all.first().map_or(0, Vec::len);
     let jobs_list: Vec<(usize, usize)> = (0..n_cases)
         .flat_map(|c| (0..all.len()).map(move |s| (c, s)))
@@ -244,7 +280,7 @@ fn main() -> ExitCode {
                 let t0 = std::time::Instant::now();
                 match run_multi(&case.multi) {
                     Ok(out) => {
-                        let r = report(case, &out);
+                        let r = report(case, &out, ceiling);
                         let _ = writeln!(
                             std::io::stderr(),
                             "{} 种子 {}：{:.0} 秒",
@@ -268,10 +304,16 @@ fn main() -> ExitCode {
     });
     let results = results.into_inner().unwrap_or_default();
     let mut md = format!(
-        "# RFC 8867 基础用例的结果（{} 个种子，{} 次运行，{:.0} 分钟）\n\n由 `crates/e2e/examples/rfc8867.rs` 生成；指标的定义见 `crates/e2e/src/rfc8867.rs` 的模块文档。\n\n",
+        "# RFC 8867 基础用例的结果（{} 个种子，{} 次运行，{:.0} 分钟）\n\n由 `crates/e2e/examples/rfc8867.rs` 生成；指标的定义见 `crates/e2e/src/rfc8867.rs` 的模块文档。\n\n\
+         - 画面 {}；内容自己的上限（不限速跑出来的平均接收速率）{} kbps。\n\
+         - “稳定值 ÷ 公平份额”在公平份额封顶 1.5 Mbps 的段里，最多只能到“内容上限 ÷ 1.5 Mbps”；所以另给“稳定值 ÷ min(公平份额, 内容上限)”，内容出满了不算不公平。\n\
+         - 段短于 15 秒（不够 10 秒稳定值加 5 秒保持）的记“段太短”，不算收敛也不算未收敛（5.5 前 40 秒每 10 秒加一路，都是这样）。\n\
+         - 5.7 有两种读法：主用例照 RFC 8867 第 5.7 节字面（“ten (10), short-lived TCP flows”，每条一个连接，下载和空闲交替）；`5.7-stress30` 照 RFC 8868 第 5.1 节“30 connections start simultaneously fetching small (30-50 KB) amounts of data”，每条一阵 30 个连接。\n\n",
         o.seeds,
         jobs_list.len(),
-        started.elapsed().as_secs_f64() / 60.0
+        started.elapsed().as_secs_f64() / 60.0,
+        o.size.map_or("640×360（RFC 8867 第 4.3 节的范围是 144p–720p）".to_owned(), |(w, h)| format!("{w}×{h}")),
+        ceiling.map_or("—".to_owned(), |c| format!("{:.0}", c / 1e3)),
     );
     for (ci, runs) in results.iter().enumerate() {
         let Some(case) = all.first().and_then(|v| v.get(ci)) else {

@@ -775,7 +775,17 @@ impl<'a> Pair<'a> {
         // 单程延迟：两端用的都是这一对的本地时钟
         self.flow.received(now, size, now.since(header.send_time));
         let receiving = self.profile.start();
+        let before = self.rx.stats();
         let got = self.stage.receive(&mut self.rx, now, header, body);
+        // 这个包让几帧收齐了：每帧到齐要多久（收齐的帧数和用时之和的增量；一次收齐几帧时取平均）
+        let after = self.rx.stats();
+        let frames = after.assembled.saturating_sub(before.assembled);
+        if frames > 0 {
+            let us = after.assembly_us_sum.saturating_sub(before.assembly_us_sum);
+            for _ in 0..frames {
+                self.flow.assembled(us / u64::from(frames));
+            }
+        }
         self.profile.stop(
             if got.is_some() {
                 Part::Decode

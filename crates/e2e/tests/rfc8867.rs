@@ -6,19 +6,20 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-use peerdesk_e2e::rfc8867::{cases, report, truncated, Case};
+use peerdesk_e2e::rfc8867::{cases, ceiling_case, report, truncated, Case};
 use peerdesk_e2e::run_multi;
 
 fn check(c: &Case) {
     let out = run_multi(&c.multi).unwrap();
     assert_eq!(out.len(), c.media.len(), "{}", c.id);
-    let r = report(c, &out);
+    let r = report(c, &out, None);
     for (i, f) in r.flows.iter().enumerate() {
         assert!(out[i].frames > 0, "{} 第 {} 路没有发帧", c.id, i + 1);
         assert!(f.mean_recv_bps > 0.0, "{} 第 {} 路没收到", c.id, i + 1);
         assert!(f.delay_ms.0.is_some(), "{}", c.id);
         assert!((0.0..=1.0).contains(&f.loss), "{}", c.id);
         assert!(f.feedback_overhead > 0.0, "{}", c.id);
+        assert!(f.assembly_ms.0.is_some(), "{}", c.id);
     }
     assert!(!r.spans.is_empty(), "{}", c.id);
     assert!(r.utilization > 0.0, "{}", c.id);
@@ -27,7 +28,8 @@ fn check(c: &Case) {
 
 #[test]
 fn every_rfc_8867_case_runs_and_has_metrics() {
-    let all: Vec<Case> = cases(1).into_iter().map(|c| truncated(c, 10)).collect();
+    let mut all: Vec<Case> = cases(1).into_iter().map(|c| truncated(c, 10)).collect();
+    all.push(truncated(ceiling_case(1), 10));
     let next = AtomicUsize::new(0);
     let failures = Mutex::new(Vec::new());
     let jobs = std::thread::available_parallelism()
