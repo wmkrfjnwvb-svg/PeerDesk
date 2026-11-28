@@ -28,20 +28,50 @@ fun fitSize(containerW: Float, containerH: Float, aspect: Float): Pair<Float, Fl
     }
 }
 
-/** 平移不超出画面边缘：画面比容器小的方向固定居中；比容器大的方向，画面边缘不离开容器边缘。 */
-private fun clampPan(pan: Float, shown: Float, container: Float): Float {
-    val limit = max(0f, (shown - container) / 2f)
-    return pan.coerceIn(-limit, limit)
+/** 容器四边被盖住的宽度（像素，容器坐标）：工具条、刘海等。画面可以被拉到不被盖住的区域里。 */
+data class Edges(val left: Float, val top: Float, val right: Float, val bottom: Float) {
+    companion object {
+        val ZERO = Edges(0f, 0f, 0f, 0f)
+    }
 }
 
-/** 把缩放限制在 1–5 倍，并把平移夹在画面边缘内（容器或画面尺寸变了也用它重新夹）。 */
-fun clampState(s: ViewState, containerW: Float, containerH: Float, aspect: Float): ViewState {
+/**
+ * 被盖住的边距：上边是工具条（显示时）的下沿和刘海上沿里大的那个，左右下边是刘海。
+ * 键盘不在这里算（由 imeShift 单独处理），避免算两次。
+ */
+fun safeInsets(toolbarVisible: Boolean, toolbarBottom: Float, cutout: Edges): Edges =
+    Edges(
+        left = cutout.left.coerceAtLeast(0f),
+        top = max(if (toolbarVisible) toolbarBottom else 0f, cutout.top).coerceAtLeast(0f),
+        right = cutout.right.coerceAtLeast(0f),
+        bottom = cutout.bottom.coerceAtLeast(0f),
+    )
+
+/**
+ * 一个方向上的平移范围。C 容器长度、h 画面长度、S/E 起止边距，c0 = (C-h)/2（居中时画面起点）。
+ * - h >= C-S-E：画面盖住整个安全区，起点在 [C-E-h, S]，即 pan ∈ [(C-E-h)-c0, S-c0]：
+ *   画面起点最多拉到 S，终点最少停在 C-E。
+ * - h < C-S-E：画面比安全区小，居中在安全区里：pan = (S-E)/2。
+ * 边距都是 0 时和原来一样（h>=C 时 ±(h-C)/2，否则 0）。
+ */
+private fun clampPan(pan: Float, shown: Float, container: Float, start: Float, end: Float): Float {
+    val c0 = (container - shown) / 2f
+    if (shown < container - start - end) return (start - end) / 2f
+    val lo = (container - end - shown) - c0
+    val hi = start - c0
+    return pan.coerceIn(lo, hi)
+}
+
+/** 把缩放限制在 1–5 倍，并把平移夹在允许范围内（容器、画面尺寸或边距变了也用它重新夹）。 */
+fun clampState(
+    s: ViewState, containerW: Float, containerH: Float, aspect: Float, insets: Edges = Edges.ZERO,
+): ViewState {
     val (bw, bh) = fitSize(containerW, containerH, aspect)
     val z = s.zoom.coerceIn(MIN_ZOOM, MAX_ZOOM)
     return ViewState(
         zoom = z,
-        panX = clampPan(s.panX, bw * z, containerW),
-        panY = clampPan(s.panY, bh * z, containerH),
+        panX = clampPan(s.panX, bw * z, containerW, insets.left, insets.right),
+        panY = clampPan(s.panY, bh * z, containerH, insets.top, insets.bottom),
     )
 }
 
@@ -56,6 +86,7 @@ fun rectOf(s: ViewState, containerW: Float, containerH: Float, aspect: Float): V
 fun applyZoom(
     s: ViewState, factor: Float, cx: Float, cy: Float,
     containerW: Float, containerH: Float, aspect: Float,
+    insets: Edges = Edges.ZERO,
 ): ViewState {
     if (!factor.isFinite() || factor <= 0f) return s
     val old = rectOf(s, containerW, containerH, aspect)
@@ -70,13 +101,14 @@ fun applyZoom(
     val newLeft = cx - fx * newW
     val newTop = cy - fy * newH
     val moved = ViewState(newZoom, newLeft - (containerW - newW) / 2f, newTop - (containerH - newH) / 2f)
-    return clampState(moved, containerW, containerH, aspect)
+    return clampState(moved, containerW, containerH, aspect, insets)
 }
 
 fun applyPan(
     s: ViewState, dx: Float, dy: Float,
     containerW: Float, containerH: Float, aspect: Float,
-): ViewState = clampState(s.copy(panX = s.panX + dx, panY = s.panY + dy), containerW, containerH, aspect)
+    insets: Edges = Edges.ZERO,
+): ViewState = clampState(s.copy(panX = s.panX + dx, panY = s.panY + dy), containerW, containerH, aspect, insets)
 
 /** 依次执行手势识别给的变换。 */
 fun applyOps(
@@ -84,10 +116,11 @@ fun applyOps(
     containerW: Float, containerH: Float, aspect: Float,
     /** 键盘把画面往上顶了多少像素：手势给的是屏幕坐标，换成没顶之前的坐标再算缩放中心。 */
     imeShift: Float = 0f,
+    insets: Edges = Edges.ZERO,
 ): ViewState = ops.fold(s) { acc, op ->
     when (op) {
-        is ViewOp.Zoom -> applyZoom(acc, op.factor, op.cx, op.cy + imeShift, containerW, containerH, aspect)
-        is ViewOp.Pan -> applyPan(acc, op.dx, op.dy, containerW, containerH, aspect)
+        is ViewOp.Zoom -> applyZoom(acc, op.factor, op.cx, op.cy + imeShift, containerW, containerH, aspect, insets)
+        is ViewOp.Pan -> applyPan(acc, op.dx, op.dy, containerW, containerH, aspect, insets)
         ViewOp.Haptic -> acc
         is ViewOp.Tap -> acc
     }

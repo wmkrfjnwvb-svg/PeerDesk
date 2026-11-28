@@ -29,6 +29,7 @@
     <string name="connect_gestures">手势：点一下 = 左键；滑动 = 移动画面；长按后松开 = 右键；长按后拖动 = 拖拽；双指点 = 右键；双指滑动 = 滚动；捏合 = 缩放。点屏幕上的小鼠标，展开成带左右键的大鼠标。</string>
     <string name="toolbar_export_trace">导出上次的手势记录</string>
     <string name="trace_share_title">PeerDesk 手势记录</string>
+    <string name="back_again_to_disconnect">再按一次返回键断开</string>
     <string name="route_direct">直连</string>
     <string name="route_relay">中继</string>
 

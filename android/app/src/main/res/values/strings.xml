@@ -31,6 +31,7 @@
     <string name="connect_gestures">Gestures: tap = left click, swipe = move the view, long-press then release = right click, long-press then drag = drag, two-finger tap = right click, two fingers = scroll, pinch = zoom. Tap the small on-screen mouse for a full mouse with left and right buttons.</string>
     <string name="toolbar_export_trace">Export last session\'s gesture log</string>
     <string name="trace_share_title">PeerDesk gesture log</string>
+    <string name="back_again_to_disconnect">Press back again to disconnect</string>
     <string name="route_direct">Direct</string>
     <string name="route_relay">Relay</string>
 

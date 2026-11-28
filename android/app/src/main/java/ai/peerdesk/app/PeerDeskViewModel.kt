@@ -63,6 +63,10 @@ data class UiState(
     /** 画面被软键盘向上顶起的距离（像素，>= 0）。 */
     val imeShift: Float = 0f,
     val toolbarVisible: Boolean = true,
+    /** 工具条下沿在容器坐标里的位置（像素），界面测量后报告。 */
+    val toolbarBottom: Float = 0f,
+    /** 刘海（display cutout）四边的宽度（像素）。 */
+    val cutout: Edges = Edges.ZERO,
     val locked: Set<ModKey> = emptySet(),
 
     // 画面布局
@@ -70,6 +74,8 @@ data class UiState(
     val containerH: Float = 0f,
     val view: ViewState = ViewState(),
 ) {
+    /** 画面平移时要避开的边距：工具条（显示时）和刘海。键盘由 imeShift 处理，不在这里。 */
+    val insets: Edges get() = safeInsets(toolbarVisible, toolbarBottom, cutout)
     val peerOs: PeerOs get() = peer?.os ?: PeerOs.Unknown
     val aspect: Float get() = aspectOf(quality?.width ?: 0, quality?.height ?: 0)
     /** 没有被键盘顶起时画面的矩形（缩放、平移的计算都以它为准）。 */
@@ -160,6 +166,7 @@ class PeerDeskViewModel(app: Application) : AndroidViewModel(app) {
         backgroundEnd = false
         stopRequestedAt = 0L
         bar.reset()
+        backTracker.reset()
         val dataDir = getApplication<Application>().filesDir.absolutePath
         val h = Native.start(dataDir, s.server.trim(), s.code, s.password, surface, slopPx, notchPx)
         if (h == 0L) {
@@ -219,7 +226,7 @@ class PeerDeskViewModel(app: Application) : AndroidViewModel(app) {
                     var next = s.copy(quality = ev, reconnecting = null)
                     if (sizeChanged) {
                         // 画面宽高比变了：按新比例重新夹住平移
-                        next = next.copy(view = clampState(next.view, next.containerW, next.containerH, next.aspect))
+                        next = next.copy(view = clampState(next.view, next.containerW, next.containerH, next.aspect, next.insets))
                     }
                     next
                 }
@@ -263,7 +270,7 @@ class PeerDeskViewModel(app: Application) : AndroidViewModel(app) {
 
     fun onContainerSize(w: Float, h: Float) {
         if (w != _ui.value.containerW || h != _ui.value.containerH) trace.addContainer(SystemClock.uptimeMillis(), w, h)
-        _ui.update { it.copy(containerW = w, containerH = h, view = clampState(it.view, w, h, it.aspect)) }
+        _ui.update { it.copy(containerW = w, containerH = h, view = clampState(it.view, w, h, it.aspect, it.insets)) }
         pushView()
     }
 
@@ -309,7 +316,7 @@ class PeerDeskViewModel(app: Application) : AndroidViewModel(app) {
         val taps = ops.filterIsInstance<ViewOp.Tap>()
         // 点击坐标是动作发生时的屏幕坐标，输入位置按变换之前显示的矩形换算
         val before = _ui.value.shownRect
-        _ui.update { it.copy(view = applyOps(it.view, ops, it.containerW, it.containerH, it.aspect, it.imeShift)) }
+        _ui.update { it.copy(view = applyOps(it.view, ops, it.containerW, it.containerH, it.aspect, it.imeShift, it.insets)) }
         taps.forEach { addRippleAt(it.x, it.y, it.button); if (it.button == 0) setInputPoint(before, it.x, it.y) }
         pushView()
     }
@@ -482,7 +489,40 @@ class PeerDeskViewModel(app: Application) : AndroidViewModel(app) {
             .apply()
     }
 
-    fun toggleToolbar() = _ui.update { it.copy(toolbarVisible = !it.toolbarVisible) }
+    /** 显示/收起工具条：上边距变了，重新夹住平移。 */
+    fun toggleToolbar() = setToolbarVisible(!_ui.value.toolbarVisible)
+
+    private fun setToolbarVisible(visible: Boolean) {
+        _ui.update { reclamp(it.copy(toolbarVisible = visible)) }
+        pushView()
+    }
+
+    private fun reclamp(s: UiState): UiState =
+        s.copy(view = clampState(s.view, s.containerW, s.containerH, s.aspect, s.insets))
+
+    /** 界面报告工具条下沿和刘海：变了就重新夹住平移并告诉核心。 */
+    fun onSafeInsets(toolbarBottom: Float, cutout: Edges) {
+        if (toolbarBottom == _ui.value.toolbarBottom && cutout == _ui.value.cutout) return
+        _ui.update { reclamp(it.copy(toolbarBottom = toolbarBottom, cutout = cutout)) }
+        pushView()
+    }
+
+    // —— 返回键 ——
+
+    private val backTracker = BackPressTracker(BACK_WINDOW_MS) { SystemClock.uptimeMillis() }
+
+    /**
+     * 会话中按返回：第一次显示工具条并让界面提示，2 秒内再按一次才断开。
+     * 返回要界面做的事（提示文字界面自己取）。
+     */
+    fun onBackPressed(): BackAction {
+        val a = backTracker.onBack()
+        when (a) {
+            BackAction.ShowHint -> if (!_ui.value.toolbarVisible) setToolbarVisible(true)
+            BackAction.Disconnect -> disconnect()
+        }
+        return a
+    }
 
     // —— 键盘 ——
 
@@ -531,5 +571,7 @@ class PeerDeskViewModel(app: Application) : AndroidViewModel(app) {
         private const val STOP_GRACE_MS = 3000L
         /** 编码尺寸提示在最后一次变化后等这么久才更新。 */
         const val HINT_DELAY_MS = 300L
+        /** 会话中第二次返回要在这么久之内才断开。 */
+        const val BACK_WINDOW_MS = 2000L
     }
 }

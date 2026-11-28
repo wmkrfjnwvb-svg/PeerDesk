@@ -4,6 +4,7 @@ import android.app.Activity
 import android.content.Context
 import android.view.KeyEvent
 import android.os.SystemClock
+import android.widget.Toast
 import android.view.HapticFeedbackConstants
 import android.view.View
 import android.view.ViewConfiguration
@@ -23,7 +24,7 @@ import androidx.compose.foundation.layout.WindowInsetsSides
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.only
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.safeDrawing
+import androidx.compose.foundation.layout.displayCutout
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.rememberScrollState
@@ -35,7 +36,9 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -52,7 +55,10 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.layout.boundsInRoot
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -71,6 +77,7 @@ import androidx.compose.ui.unit.IntOffset
 import kotlin.math.roundToInt
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -114,7 +121,32 @@ fun SessionScreen(ui: UiState, vm: PeerDeskViewModel) {
         vm.haptics.collect { hostView.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS) }
     }
 
-    BackHandler { vm.disconnect() }
+    // 沉浸式：会话中隐藏状态栏和导航栏（从边缘滑一下临时露出），离开会话页或 Activity 销毁时恢复
+    DisposableEffect(hostView) {
+        val window = (ctx as? Activity)?.window
+        val controller = window?.let { WindowCompat.getInsetsController(it, hostView) }
+        controller?.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        controller?.hide(WindowInsetsCompat.Type.systemBars())
+        onDispose { controller?.show(WindowInsetsCompat.Type.systemBars()) }
+    }
+
+    // 刘海和工具条下沿：画面平移要避开它们（上边距 = 工具条下沿和刘海上沿里大的那个）
+    val layoutDirection = LocalLayoutDirection.current
+    val cutoutInsets = WindowInsets.displayCutout
+    val cutout = Edges(
+        cutoutInsets.getLeft(density, layoutDirection).toFloat(),
+        cutoutInsets.getTop(density).toFloat(),
+        cutoutInsets.getRight(density, layoutDirection).toFloat(),
+        cutoutInsets.getBottom(density).toFloat(),
+    )
+    var toolbarBottom by remember { mutableFloatStateOf(0f) }
+    LaunchedEffect(cutout, toolbarBottom) { vm.onSafeInsets(toolbarBottom, cutout) }
+
+    // 返回键：第一次显示工具条并提示，2 秒内再按一次才断开（边缘滑动手势操作时容易误触）
+    val backHint = stringResource(R.string.back_again_to_disconnect)
+    BackHandler {
+        if (vm.onBackPressed() == BackAction.ShowHint) Toast.makeText(ctx, backHint, Toast.LENGTH_SHORT).show()
+    }
 
     // 有手指按着时每 50 ms 调一次 tick，手势识别靠它判断长按
     LaunchedEffect(pressed) {
@@ -188,7 +220,7 @@ fun SessionScreen(ui: UiState, vm: PeerDeskViewModel) {
             )
         }
 
-        Toolbar(ui, vm, imeVisible, onKeyboard = {
+        Toolbar(ui, vm, imeVisible, onBottom = { toolbarBottom = it }, onKeyboard = {
             val v = keyCatcher
             val window = (ctx as? Activity)?.window
             if (v != null && window != null) {
@@ -224,8 +256,8 @@ fun SessionScreen(ui: UiState, vm: PeerDeskViewModel) {
 }
 
 @Composable
-private fun Toolbar(ui: UiState, vm: PeerDeskViewModel, imeVisible: Boolean, onKeyboard: () -> Unit) {
-    Box(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Top + WindowInsetsSides.Horizontal))) {
+private fun Toolbar(ui: UiState, vm: PeerDeskViewModel, imeVisible: Boolean, onBottom: (Float) -> Unit, onKeyboard: () -> Unit) {
+    Box(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.displayCutout.only(WindowInsetsSides.Top + WindowInsetsSides.Horizontal))) {
         if (!ui.toolbarVisible) {
             TextButton(
                 onClick = vm::toggleToolbar,
@@ -236,6 +268,8 @@ private fun Toolbar(ui: UiState, vm: PeerDeskViewModel, imeVisible: Boolean, onK
         Column(
             Modifier
                 .fillMaxWidth()
+                // 工具条的下沿（容器坐标）：显示时画面不能被它盖住的那一段
+                .onGloballyPositioned { onBottom(it.boundsInRoot().bottom) }
                 .background(Color.Black.copy(alpha = 0.6f))
                 .padding(horizontal = 8.dp, vertical = 4.dp),
         ) {
