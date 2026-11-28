@@ -90,8 +90,6 @@ fun SessionScreen(ui: UiState, vm: PeerDeskViewModel) {
     val imeBottom = WindowInsets.ime.getBottom(density)
     val imeVisible = imeBottom > 0
     val hostView = LocalView.current
-    val scope = rememberCoroutineScope()
-    val exportTitle = stringResource(R.string.trace_share_title)
     // 快捷键栏在键盘上方，可见区域的下沿是它的顶
     var barH by remember { mutableIntStateOf(0) }
     LaunchedEffect(density) { vm.density = density.density }
@@ -190,14 +188,7 @@ fun SessionScreen(ui: UiState, vm: PeerDeskViewModel) {
             )
         }
 
-        Toolbar(ui, vm, imeVisible, onExport = {
-            // 先在主线程取文本（记录是内存里的），写文件放后台，再弹出系统分享
-            val text = vm.traceText()
-            scope.launch {
-                val uri = withContext(Dispatchers.IO) { writeTraceFile(ctx, text) }
-                ctx.startActivity(shareTraceIntent(uri, exportTitle))
-            }
-        }, onKeyboard = {
+        Toolbar(ui, vm, imeVisible, onKeyboard = {
             val v = keyCatcher
             val window = (ctx as? Activity)?.window
             if (v != null && window != null) {
@@ -233,7 +224,7 @@ fun SessionScreen(ui: UiState, vm: PeerDeskViewModel) {
 }
 
 @Composable
-private fun Toolbar(ui: UiState, vm: PeerDeskViewModel, imeVisible: Boolean, onExport: () -> Unit, onKeyboard: () -> Unit) {
+private fun Toolbar(ui: UiState, vm: PeerDeskViewModel, imeVisible: Boolean, onKeyboard: () -> Unit) {
     Box(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Top + WindowInsetsSides.Horizontal))) {
         if (!ui.toolbarVisible) {
             TextButton(
@@ -261,11 +252,6 @@ private fun Toolbar(ui: UiState, vm: PeerDeskViewModel, imeVisible: Boolean, onE
                     selected = imeVisible,
                     onClick = onKeyboard,
                     label = { Text(stringResource(R.string.toolbar_keyboard)) },
-                )
-                FilterChip(
-                    selected = false,
-                    onClick = onExport,
-                    label = { Text(stringResource(R.string.toolbar_export_trace)) },
                 )
                 TextButton(onClick = vm::toggleToolbar) {
                     Text(stringResource(R.string.toolbar_hide), color = Color.White)

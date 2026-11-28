@@ -290,6 +290,9 @@ class PeerDeskViewModel(app: Application) : AndroidViewModel(app) {
         trace.addMotion(t, action, index, ids, xs, ys)
 
     /** 手势记录的 JSON Lines 文本（头部带密度和容器尺寸）。 */
+    /** 上一次会话有没有手势记录（连接页据此显示“导出上次的手势记录”）。 */
+    fun hasTrace(): Boolean = !trace.isEmpty()
+
     fun traceText(): String {
         val s = _ui.value
         return trace.toJsonLines(density, s.containerW, s.containerH)

@@ -11,6 +11,12 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
+import androidx.compose.material3.TextButton
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.ui.platform.LocalContext
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -119,6 +125,20 @@ fun ConnectScreen(ui: UiState, vm: PeerDeskViewModel) {
             enabled = canConnect,
             modifier = Modifier.fillMaxWidth(),
         ) { Text(stringResource(R.string.connect_button)) }
+
+        // 手势记录在会话结束后导出：会话中弹出系统分享会把应用切到后台，会话就断了
+        if (ui.phase == Phase.Connect && vm.hasTrace()) {
+            val ctx = LocalContext.current
+            val scope = rememberCoroutineScope()
+            val title = stringResource(R.string.trace_share_title)
+            TextButton(onClick = {
+                val text = vm.traceText()
+                scope.launch {
+                    val uri = withContext(Dispatchers.IO) { writeTraceFile(ctx, text) }
+                    ctx.startActivity(shareTraceIntent(uri, title))
+                }
+            }) { Text(stringResource(R.string.toolbar_export_trace)) }
+        }
 
         Text(
             stringResource(R.string.connect_background_note) + "\n" + stringResource(R.string.connect_gestures),

@@ -44,6 +44,9 @@ class GestureTrace(private val windowMs: Long = 120_000L) {
     @Synchronized
     fun size(): Int = entries.size
 
+    @Synchronized
+    fun isEmpty(): Boolean = entries.isEmpty()
+
     private fun add(e: TraceEntry) {
         entries.addLast(e)
         // 以最新一条为准，丢掉比窗口更老的
