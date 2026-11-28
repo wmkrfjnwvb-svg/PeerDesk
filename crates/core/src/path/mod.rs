@@ -77,6 +77,7 @@ mod dir;
 mod loss;
 mod policer;
 pub mod rng;
+pub mod tcp;
 
 #[cfg(test)]
 mod testkit;
@@ -95,6 +96,7 @@ pub use dir::{DirConfig, DirState, Outcome};
 pub use loss::{burst_probabilities, Loss, LossState};
 pub use policer::{Policer, PolicerState};
 pub use rng::{layer, stream_seed, Dir, LayerRng};
+pub use tcp::{TcpConfig, TcpReceiver, TcpSender, TcpStats};
 
 /// 两个方向的参数。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
