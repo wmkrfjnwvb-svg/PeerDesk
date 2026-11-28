@@ -1,7 +1,9 @@
 //! 批量运行器（只在本地跑，不进 CI、不进安装包）：输入一批世界文件（[`peerdesk_e2e::world`]），并行跑，
 //! 每个会话输出一行 CSV。
 //!
-//! 用法：`batch [--jobs N] [--out 文件.csv] <世界文件或目录>...`
+//! 用法：`batch [--jobs N] [--out 文件.csv] [--codec 名字] [--byte-model 名字] [--byte-noise 名字] <世界文件或目录>...`
+//! - `--codec`、`--byte-model`、`--byte-noise`：把读进来的每个世界换一档再跑（世界文件本身不改）。三档对账时用同一批
+//!   L1 的世界文件跑出 L0.5、L0 的各种配置；`session` 列是不随这三样变的会话身份，汇总脚本（`scripts/a1-reconcile.py`）靠它对上。
 //! - 目录：取其中所有 `*.world`（不递归），按文件名排序；参数里的顺序保留。
 //! - 输出按输入顺序，不按完成顺序（同一批输入每次输出的行顺序相同）。默认写标准输出，`--out` 写文件。
 //! - `--jobs`：并行的线程数，默认是机器的核数。
@@ -14,8 +16,8 @@
 //! 墙上耗时（`wall_ms`）是这个会话在它那条线程上用掉的时间；并行时核被别的会话抢占，会偏大。量速度用 `--jobs 1`。
 //!
 //! 列：见 [`HEADER`]。`fingerprint` 和 `PEERDESK_E2E_FINGERPRINTS` 里每行最后那个数相同（那个文件还会记场景的身份）。
-//! a1-plan 第 4 节要的量里，`Outcome` 现在**没有**的：每两秒窗口的字节、降码率次数、帧率换档次数；
-//! 码率的中位和 5% 分位用反馈特征行（每次反馈一行）里的估计码率算，不是按时间加权。
+//! `rate_p50_kbps`、`rate_p5_kbps` 按反馈的条数算（偏向有动静的时段，留着和以前的数对照）；
+//! `rate_time_p50_kbps`、`rate_time_p5_kbps` 按时间加权。`window_bytes` 是每两秒窗口发出的字节，分号隔开。
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -26,11 +28,12 @@ use std::time::Instant;
 
 use peerdesk_core::estimator::{ProbeVerdict, RateState};
 use peerdesk_e2e::world::{World, EXTENSION};
-use peerdesk_e2e::{fingerprint, Action, Outcome};
+use peerdesk_e2e::{fingerprint, Action, ByteModelKind, ByteNoise, CodecKind, Outcome};
 
 fn header() -> String {
     let mut cols: Vec<String> = [
         "world_hash",
+        "session",
         "name",
         "codec",
         "byte_model",
@@ -77,6 +80,16 @@ fn header() -> String {
             "probe_idle_sent",
             "probe_bytes",
             "sharp_ms",
+            // 对账用（A1 第五步加的）：场景的身份三样、Outcome::tally 的六样
+            "seed",
+            "estimator",
+            "byte_noise",
+            "rate_time_p50_kbps",
+            "rate_time_p5_kbps",
+            "rate_cuts",
+            "rate_deep_cuts",
+            "fps_changes",
+            "window_bytes",
             "fingerprint",
             "error",
         ]
@@ -127,6 +140,7 @@ fn row(world: &World, o: &Outcome, wall_ms: f64) -> String {
         .collect();
     let mut cols = vec![
         world.hash.clone(),
+        peerdesk_e2e::world::session_key(&world.scenario).unwrap_or_default(),
         field(&world.scenario.name),
         o.codec.name().to_owned(),
         world.scenario.byte_model.name().to_owned(),
@@ -174,6 +188,21 @@ fn row(world: &World, o: &Outcome, wall_ms: f64) -> String {
         } else {
             sharp.join(";")
         },
+        world.scenario.seed.to_string(),
+        o.estimator.to_owned(),
+        world.scenario.byte_noise.name().to_owned(),
+        (o.tally.rate_time_p50_bps / 1000).to_string(),
+        (o.tally.rate_time_p5_bps / 1000).to_string(),
+        o.tally.rate_cuts.to_string(),
+        o.tally.rate_deep_cuts.to_string(),
+        o.tally.fps_changes.to_string(),
+        // 每个两秒窗口发出的字节，分号隔开
+        o.tally
+            .window_bytes
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(";"),
         format!("{:016x}", fingerprint(o)),
         String::new(),
     ]);
@@ -191,8 +220,15 @@ fn error_row(label: &str, why: &str) -> String {
     )
 }
 
-fn run_one(path: &Path) -> Result<String, String> {
+fn run_one(path: &Path, tier: &Tier) -> Result<String, String> {
     let world = World::load(path).map_err(|e| e.to_string())?;
+    let world = if tier.is_set() {
+        world
+            .retiered(tier.codec, tier.byte_model, tier.byte_noise)
+            .map_err(|e| format!("{}：换档失败：{e}", world.hash))?
+    } else {
+        world
+    };
     let started = Instant::now();
     let outcome = world.run().map_err(|e| format!("{}：{e}", world.hash))?;
     Ok(row(
@@ -221,15 +257,32 @@ fn collect(args: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
     Ok(files)
 }
 
+/// 把读进来的每个世界换一档再跑（对账用）：给了哪一样就换哪一样。
+#[derive(Clone, Copy, Default)]
+struct Tier {
+    codec: Option<CodecKind>,
+    byte_model: Option<ByteModelKind>,
+    byte_noise: Option<ByteNoise>,
+}
+
+impl Tier {
+    const fn is_set(&self) -> bool {
+        self.codec.is_some() || self.byte_model.is_some() || self.byte_noise.is_some()
+    }
+}
+
 struct Options {
     jobs: usize,
     out: Option<PathBuf>,
     inputs: Vec<PathBuf>,
+    tier: Tier,
 }
 
 fn parse_args() -> Result<Options, String> {
     let mut jobs = std::thread::available_parallelism().map_or(1, usize::from);
     let (mut out, mut inputs) = (None, Vec::new());
+    let mut tier = Tier::default();
+    let named = |what: &str, v: Option<String>| v.ok_or(format!("{what} 后面要跟名字"));
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -242,6 +295,32 @@ fn parse_args() -> Result<Options, String> {
                     .ok_or(format!("--jobs {v:?} 不对，应当是正整数"))?;
             }
             "--out" => out = Some(PathBuf::from(args.next().ok_or("--out 后面要跟文件名")?)),
+            "--codec" => {
+                let v = named("--codec", args.next())?;
+                tier.codec = Some(peerdesk_e2e::world::codec_named(&v).ok_or(format!(
+                    "--codec {v:?} 不认识（tile、h264、h264-l05、h264-l0）"
+                ))?);
+            }
+            "--byte-model" => {
+                let v = named("--byte-model", args.next())?;
+                tier.byte_model = Some(
+                    ByteModelKind::ALL
+                        .iter()
+                        .find(|(n, _)| *n == v)
+                        .map(|(_, m)| *m)
+                        .ok_or(format!("--byte-model {v:?} 不认识"))?,
+                );
+            }
+            "--byte-noise" => {
+                let v = named("--byte-noise", args.next())?;
+                tier.byte_noise = Some(
+                    ByteNoise::ALL
+                        .iter()
+                        .find(|(n, _)| *n == v)
+                        .map(|(_, m)| *m)
+                        .ok_or(format!("--byte-noise {v:?} 不认识（default、within、off）"))?,
+                );
+            }
             "--help" | "-h" => return Err(String::new()),
             flag if flag.starts_with("--") => return Err(format!("不认识的参数 {flag}")),
             path => inputs.push(PathBuf::from(path)),
@@ -250,7 +329,12 @@ fn parse_args() -> Result<Options, String> {
     if inputs.is_empty() {
         return Err("没有给世界文件或目录".to_owned());
     }
-    Ok(Options { jobs, out, inputs })
+    Ok(Options {
+        jobs,
+        out,
+        inputs,
+        tier,
+    })
 }
 
 /// 按输入顺序往外写：第 i 个会话的结果先放进格子，从头起连续到齐的行写出去。
@@ -281,7 +365,8 @@ fn main() -> ExitCode {
             }
             let _ = writeln!(
                 std::io::stderr(),
-                "用法：batch [--jobs N] [--out 文件.csv] <世界文件或目录>..."
+                "用法：batch [--jobs N] [--out 文件.csv] [--codec 名字] [--byte-model 名字] [--byte-noise 名字] <世界文件或目录>...\n\
+                 后三个参数把读进来的每个世界换一档再跑（对账用），世界文件本身不改"
             );
             return ExitCode::from(2);
         }
@@ -313,13 +398,14 @@ fn main() -> ExitCode {
         sink,
     });
     let failed = AtomicUsize::new(0);
+    let tier = opts.tier;
     let started = Instant::now();
     std::thread::scope(|scope| {
         for _ in 0..opts.jobs.min(files.len().max(1)) {
             let _ = scope.spawn(|| loop {
                 let i = next.fetch_add(1, Ordering::Relaxed);
                 let Some(path) = files.get(i) else { break };
-                let line = match run_one(path) {
+                let line = match run_one(path, &tier) {
                     Ok(line) => line,
                     Err(why) => {
                         let _ = failed.fetch_add(1, Ordering::Relaxed);
