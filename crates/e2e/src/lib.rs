@@ -1900,6 +1900,14 @@ fn run_inner(s: &Scenario, record: bool) -> Result<(Outcome, Option<Vec<u8>>), E
                             acc.max_wait = acc.max_wait.max(wait);
                             if wait > FREEZE_US {
                                 acc.freezes += 1;
+                                if trace_events {
+                                    trace.push(format!(
+                                        "[{:>6} ms] 冻结：画面在 {} ms 变了，等了 {} ms 才显示出来",
+                                        now.micros() / 1000,
+                                        since.micros() / 1000,
+                                        wait / 1000
+                                    ));
+                                }
                             }
                         }
                     }

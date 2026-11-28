@@ -1,0 +1,71 @@
+# PeerDesk 世界文件：一次仿真会话的全部输入（格式见 crates/e2e/src/world.rs）。
+# 文件名是内容哈希；结果只由这里的内容决定，不受环境变量影响。
+world 1
+name ms-09217
+width 1280
+height 720
+fps 30
+codec h264
+byte_model default
+rng_layout 1
+seed 9
+estimator v1
+profile wireless
+policy office
+start_bps 1000000
+max_bps 30000000
+pacing 0
+fec rs
+start_probe 1
+probe_ids 1
+phases 22
+phase.0 action=idle frames=30
+phase.1 action=typing frames=90
+phase.2 action=idle frames=30
+phase.3 action=scrolling frames=60
+phase.4 action=idle frames=30
+phase.5 action=dragging frames=60
+phase.6 action=idle frames=30
+phase.7 action=switching frames=15
+phase.8 action=idle frames=30
+phase.9 action=video frames=90
+phase.10 action=idle frames=30
+phase.11 action=idle frames=30
+phase.12 action=typing frames=90
+phase.13 action=idle frames=30
+phase.14 action=scrolling frames=60
+phase.15 action=idle frames=30
+phase.16 action=dragging frames=60
+phase.17 action=idle frames=30
+phase.18 action=switching frames=15
+phase.19 action=idle frames=30
+phase.20 action=video frames=90
+phase.21 action=idle frames=30
+links 27
+link.0 at=0 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=0 rate_bps=400000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.1 at=4020000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=1 rate_bps=400000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.2 at=5040000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=0 rate_bps=400000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.3 at=5220000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=12 rate_bps=400000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.4 at=6180000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=4 rate_bps=400000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.5 at=6240000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=0 rate_bps=400000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.6 at=10800000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=1 rate_bps=400000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.7 at=11760000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=0 rate_bps=400000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.8 at=11940000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=12 rate_bps=400000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.9 at=12960000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=0 rate_bps=400000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.10 at=17520000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=1 rate_bps=400000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.11 at=18540000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=0 rate_bps=400000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.12 at=18660000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=12 rate_bps=400000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.13 at=19680000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=0 rate_bps=400000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.14 at=24240000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=1 rate_bps=400000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.15 at=25260000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=0 rate_bps=400000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.16 at=25380000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=12 rate_bps=400000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.17 at=26400000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=0 rate_bps=400000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.18 at=30960000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=1 rate_bps=400000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.19 at=31980000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=0 rate_bps=400000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.20 at=32160000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=12 rate_bps=400000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.21 at=33120000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=0 rate_bps=400000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.22 at=37680000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=1 rate_bps=400000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.23 at=38700000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=0 rate_bps=400000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.24 at=38880000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=12 rate_bps=400000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.25 at=39840000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=4 rate_bps=400000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.26 at=39900000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=0 rate_bps=400000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
