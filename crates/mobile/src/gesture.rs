@@ -613,11 +613,12 @@ fn distance(a: (f32, f32), b: (f32, f32)) -> f32 {
 /// libinput（Linux 触摸板）看两根手指的方向，同向是滚动、反向是捏合，只有一根在动时先等一等。
 ///
 /// 1. 都还没动够（距离变化不到 2 倍防抖距离、中点没走过防抖距离）：再等。
-/// 2. 两根都动了：方向相近（夹角小于 45°）或者中点走的是距离变化的 [`DOMINANCE`] 倍以上，是滚动；方向相反（大于 90°）是捏合。
-///    （夹角在中间时“距离变化是中点走的 2 倍以上”几何上不会出现：两根都动、又不反向，中点总会跟着走。）
-/// 3. 还分不出（只有一根在动，或者夹角在中间）：先等。真机上两指上下叠着滚动时，一根常比另一根早动 40 毫秒，
-///    这 40 毫秒里两指距离缩了 49 像素、中点只走了 24，看起来就是捏合。等到有一根走过 4 倍防抖距离、
-///    或者过了 [`ONE_FINGER_WAIT_MS`]：距离变化大于中点走的是捏合（一指按着一指拉开），否则是滚动。
+/// 2. 两根都动了：方向相反（大于 90°）是捏合；两根走得差不多、并且方向相近（小于 45°）或者中点走的是距离变化的
+///    [`DOMINANCE`] 倍以上，是滚动。
+/// 3. 还分不出（只有一根在动、两根走的差得多，或者夹角在中间）：先等。真机上两指上下叠着滚动时，一根常比另一根
+///    早动 40 多毫秒；快速往上滑时领先的那根在这段时间里走了 97 像素，两指距离缩了 96、中点只走了 48，看起来就是捏合
+///    （2026-11-28 第二份记录）。等到过了 [`ONE_FINGER_WAIT_MS`]（或者走过 8 倍防抖距离）：距离变化大于中点走的是捏合
+///    （一指按着一指拉开），否则是滚动。
 fn classify(a: Finger, b: Finger, slop: f32, elapsed_ms: u64) -> Two {
     let span = (distance(a.last, b.last) - distance(a.start, b.start)).abs();
     let travel = distance(midpoint(a.start, b.start), midpoint(a.last, b.last));
@@ -630,15 +631,18 @@ fn classify(a: Finger, b: Finger, slop: f32, elapsed_ms: u64) -> Two {
     let still = slop / 2.0;
     if la > still && lb > still {
         let cos = (da.0 * db.0 + da.1 * db.1) / (la * lb);
-        if cos > std::f32::consts::FRAC_1_SQRT_2 || travel > span * DOMINANCE {
-            return Two::Scroll;
-        }
         if cos < 0.0 {
             return Two::Pinch;
         }
+        // 同向还要两根走得差不多（短的至少是长的一半）：一指按着时那根手指也会漂一点，方向可能碰巧相同
+        let alike = la.min(lb) >= la.max(lb) * 0.5;
+        if alike && (cos > std::f32::consts::FRAC_1_SQRT_2 || travel > span * DOMINANCE) {
+            return Two::Scroll;
+        }
     }
-    // 还分不出（只有一根在动，或者两根的方向在 45°–90° 之间）：等到走远了或者到了时限，按哪个量大定，不会一直不定
-    if la.max(lb) <= slop * 4.0 && elapsed_ms < ONE_FINGER_WAIT_MS {
+    // 还分不出（只有一根在动、两根走的差得多，或者方向在 45°–90° 之间）：主要按时间等（另一根晚动一般不超过 50 毫秒，
+    // 快速滑动时领先的那根在这段时间里能走 100 像素，所以不能按距离早早定）；走得特别远是保险。到了按哪个量大定，不会一直不定
+    if la.max(lb) <= slop * 8.0 && elapsed_ms < ONE_FINGER_WAIT_MS {
         return Two::Undecided;
     }
     if span > travel {
@@ -915,11 +919,11 @@ mod tests {
         let mut s = g();
         s.touch(&t(1, Phase::Down, 400.0, 300.0, 0));
         s.touch(&t(2, Phase::Down, 600.0, 300.0, 10));
-        // 一根不动、一根拉开 40：只有一根在动，还没走过 4 倍防抖距离，先等另一根
+        // 一根不动、一根拉开：只有一根在动，先等另一根（它可能只是晚动）
         assert!(s.touch(&t(2, Phase::Move, 640.0, 300.0, 20)).is_empty());
-        // 拉到 60：另一根还不动，距离变化（60）大于中点走的（30），是一指按着一指拉开的捏合。
+        // 两根按下 150 毫秒后另一根还不动，距离变化（60）大于中点走的（30），是一指按着一指拉开的捏合。
         // 从两根都按下那一刻补上：以那时的中点为中心放大 260/200，再跟着中点平移
-        let out = s.touch(&t(2, Phase::Move, 660.0, 300.0, 30));
+        let out = s.touch(&t(2, Phase::Move, 660.0, 300.0, 10 + ONE_FINGER_WAIT_MS));
         assert_eq!(
             out,
             vec![
@@ -932,7 +936,7 @@ mod tests {
             ]
         );
         // 之后每次相对上一次
-        let out = s.touch(&t(1, Phase::Move, 340.0, 300.0, 40));
+        let out = s.touch(&t(1, Phase::Move, 340.0, 300.0, 170));
         assert_eq!(
             out,
             vec![
@@ -945,8 +949,8 @@ mod tests {
             ]
         );
         // 第三根手指：作废，等三根都抬起
-        assert!(s.touch(&t(3, Phase::Down, 10.0, 10.0, 45)).is_empty());
-        assert!(s.touch(&t(3, Phase::Move, 20.0, 10.0, 50)).is_empty());
+        assert!(s.touch(&t(3, Phase::Down, 10.0, 10.0, 175)).is_empty());
+        assert!(s.touch(&t(3, Phase::Move, 20.0, 10.0, 180)).is_empty());
         for id in [1, 2] {
             assert!(s.touch(&t(id, Phase::Up, 0.0, 0.0, 60)).is_empty());
             assert_ne!(s.state, State::Idle);
@@ -1069,7 +1073,9 @@ mod tests {
             ((380.0, 420.0), (620.0, 180.0)),
         ];
         for (i, (a, b)) in path.into_iter().enumerate() {
-            for act in both(&mut s, a, b, 20 + u64::try_from(i).unwrap_or(0) * 10) {
+            // 一根按着不动：要等到时限（两根按下后 150 毫秒）才定成捏合，所以从那以后开始走
+            let at = 10 + ONE_FINGER_WAIT_MS + u64::try_from(i).unwrap_or(0) * 10;
+            for act in both(&mut s, a, b, at) {
                 for p in &mut under {
                     match act {
                         Action::Zoom { factor, cx, cy } => {
@@ -1188,6 +1194,22 @@ mod tests {
         assert_eq!(
             classify(across, still, slop, ONE_FINGER_WAIT_MS),
             Two::Scroll
+        );
+        // 真机第二份记录：两指上下叠着快速上滑，领先的那根 35 毫秒走了 97 像素、另一根还没动：等，不当成捏合
+        let lead = f((603.0, 1770.0), (581.0, 1675.0));
+        let lag = f((575.0, 1416.0), (575.0, 1416.0));
+        assert_eq!(classify(lead, lag, 24.0, 35), Two::Undecided);
+        // 另一根跟上来、走得差不多：同向，滚动
+        let lead = f((603.0, 1770.0), (581.0, 1600.0));
+        let lag = f((575.0, 1416.0), (580.0, 1310.0));
+        assert_eq!(classify(lead, lag, 24.0, 70), Two::Scroll);
+        // 一指按着、按着的那根漂了一点、方向碰巧相同：走的差得多，不算滚动；到时限按捏合定
+        let mover = f((400.0, 400.0), (400.0, 340.0));
+        let anchor = f((400.0, 100.0), (400.0, 93.0));
+        assert_eq!(classify(mover, anchor, 10.0, 60), Two::Undecided);
+        assert_eq!(
+            classify(mover, anchor, 10.0, ONE_FINGER_WAIT_MS),
+            Two::Pinch
         );
         // 都没动够
         assert_eq!(

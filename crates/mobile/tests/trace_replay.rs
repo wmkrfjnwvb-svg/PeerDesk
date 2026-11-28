@@ -1,10 +1,12 @@
 //! 用真机导出的手势记录回放手势识别（`tests/data/` 里的记录，格式见文件开头）。
 //! 喂法和 Android 界面一样：移动整个事件一起交（`moves`），按下、抬起、取消逐根交（`touch`），画面矩形变了调 `set_view`。
+// 打印每个手势的识别结果，`--nocapture` 时看得到（排查真机问题用）。
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,
-    clippy::indexing_slicing
+    clippy::indexing_slicing,
+    clippy::print_stdout
 )]
 
 use peerdesk_core::input::InputEvent;
@@ -149,11 +151,8 @@ fn replay(lines: &[Line]) -> Vec<Seen> {
     out
 }
 
-#[test]
-fn the_real_trace_from_2026_11_28() {
-    let lines = parse(include_str!("data/trace-2026-11-28-pinch-scroll.txt"));
-    let seen = replay(&lines);
-    for s in &seen {
+fn print(seen: &[Seen]) {
+    for s in seen {
         println!(
             "{:6.2}s p{} span {:+5.0} travel {:4.0} zoom {:3} wheel {:3} pan {:3} tap {}",
             s.start_ms as f32 / 1000.0,
@@ -166,15 +165,20 @@ fn the_real_trace_from_2026_11_28() {
             s.taps
         );
     }
-    // 用户的意图从手指本身看得出来：两指间距基本不变、走得远是滚动；间距变化大、中点不怎么动是捏合
+}
+
+/// 用户的意图从手指本身看得出来：中点走得远、两指间距基本不变（走的超过间距变化的 3 倍）是滚动；
+/// 间距变化大、中点不怎么动（变化超过走的 2 倍）是捏合。滚动不能缩放、要滚；捏合不能滚、要缩放。
+/// 返回（滚动次数，捏合次数）。
+fn check(seen: &[Seen]) -> (usize, usize) {
     let two: Vec<&Seen> = seen.iter().filter(|s| s.fingers == 2).collect();
     let scrolls: Vec<&&Seen> = two
         .iter()
-        .filter(|s| s.span.abs() < 60.0 && s.travel > 200.0)
+        .filter(|s| s.travel > 200.0 && s.travel > s.span.abs() * 3.0)
         .collect();
     let pinches: Vec<&&Seen> = two
         .iter()
-        .filter(|s| s.span.abs() > 200.0 && s.travel < 150.0)
+        .filter(|s| s.span.abs() > 200.0 && s.span.abs() > s.travel * 2.0)
         .collect();
     let bad_scroll: Vec<_> = scrolls
         .iter()
@@ -194,10 +198,6 @@ fn the_real_trace_from_2026_11_28() {
         bad_pinch
     );
     assert!(
-        scrolls.len() >= 20 && pinches.len() >= 15,
-        "记录里的手势数不对"
-    );
-    assert!(
         bad_scroll.is_empty(),
         "滚动被当成了缩放（或者没滚）：{bad_scroll:?}"
     );
@@ -205,4 +205,25 @@ fn the_real_trace_from_2026_11_28() {
         bad_pinch.is_empty(),
         "捏合被当成了滚动（或者没缩放）：{bad_pinch:?}"
     );
+    (scrolls.len(), pinches.len())
+}
+
+/// 第一份（11-28 9 点）：三指被系统取消后卡死、双指滚动被当成缩放。
+#[test]
+fn the_real_trace_from_2026_11_28() {
+    let seen = replay(&parse(include_str!(
+        "data/trace-2026-11-28-pinch-scroll.txt"
+    )));
+    print(&seen);
+    let (scrolls, pinches) = check(&seen);
+    assert!(scrolls >= 20 && pinches >= 15, "记录里的手势数不对");
+}
+
+/// 第二份：两指上下叠着快速上滑，领先的手指 35 毫秒走了 97 像素、另一根才开始动（14.72 秒那次）。
+#[test]
+fn the_second_trace_from_2026_11_28() {
+    let seen = replay(&parse(include_str!("data/trace-2026-11-28-scroll-end.txt")));
+    print(&seen);
+    let (scrolls, pinches) = check(&seen);
+    assert!(scrolls >= 2 && pinches >= 4, "记录里的手势数不对");
 }
