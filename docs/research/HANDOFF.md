@@ -1,4 +1,4 @@
-# 交接：所有进行中的工作和下一步（2026-11-28 14:00 UTC，主会话写）
+# 交接：所有进行中的工作和下一步（2026-11-28 16:10 UTC，主会话写）
 
 会话没了也能接上：每一项写了分支、最后的提交、做到哪、下一步。决定和方案的详细内容在各自的文档里，这里只是索引。
 分工照 CLAUDE.md：主会话调度、审查、合并、做产品；diskagent 会话做仿真框架；指纹（`crates/e2e/golden/fingerprints.txt`）只由主会话改。
@@ -17,7 +17,7 @@
 
 ## 2. 进行中
 
-### 2.1 Android 控制端（主会话）——**已合进 dev**（本次合并），分支 `android` 最后 4d3f302
+### 2.1 Android 控制端（主会话）——**已合进 dev**（57b9fc2，后续 ab79991：中文输入、手机诊断日志、截图测试）
 
 - 方案和进度：`R-android.md`（第 7 节进度表，真机反馈和根因都写在里面）。
 - 合进 dev 的：`peerdesk-net::viewer`（桌面和手机共用的访问驱动）、OpenH264 可选、`crates/mobile`（会话、手势状态机、按键映射、MediaCodec 解到 Surface、JNI）、
@@ -40,6 +40,15 @@
 
 - `devices` 分支 rebase 到 dev 之后推成了新分支 `devices-s1`（原来的 `devices` 不能强推）。S0、S1a–S1d，测试和 lint 都过。
 - 下一步：O-phase1-plan P1 的两处改动——账户号改成 16 字节（老的 8 字节补零，UUID 第 9 字节是变体位、不会重号；令牌、账本、中继票、心跳的兼容做法见本次会话的设计：老账户号仍写 16 位十六进制）；入表令牌改成绑定账户、默认一次性、1 小时。然后合进 dev。
+
+### 2.4 终端、文件、界面的打磨（主会话，2026-11-28 产品负责人提）
+
+- 计划和标准：`N-terminal-files-ui-plan.md`（文件像 Windows 资源管理器、终端到 iTerm2 一档、界面照国外最好的做各种状态；文件和拷贝合成一个传输引擎；观看模式以后加；不做帧率设置）。
+- 调研：`industry-terminal.md`、`industry-file-manager.md`（带我们代码缺口的行号）、`industry-ui-reference.md`、`industry-lowlatency-hevc-avc444.md`（编解码，v1 之后）。
+- 审查：`U1-review-desktop.md`、`U1-review-android.md`（问题表按严重度、验收各 8 条）。
+- 截图：桌面端按 CI 的 gui-screenshot 在 Xvfb 下跑；Android 用 `android/screenshots.sh`（Paparazzi，256 张，PNG 不进仓库）。
+- **进行中**：U2-a（子代理，分支 `ui-u2a`）——默认官方服务器（桌面和手机）、结构化的失败原因（核心给原因代码，两端翻成原因加办法，英文原样进“详情”，文件传输失败不再是调试输出）。
+- 接下来：U2-b Android 状态（连接中步骤、重连压暗加横幅、三格信号、横屏自动隐藏、配色和对比度、手势提示）；U2-c 桌面“状态截图台”和修；F1 文件正确和诚实；T1、T2 终端。
 
 ## 3. 排队（按 `O-standard-plan.md` 的顺序）
 
