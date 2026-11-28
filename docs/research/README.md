@@ -51,6 +51,8 @@ fpsfix 第 2、3 步暂停，等设计定了再决定保留什么。和对手（
 
 | # | 事项 | 负责 | 说明 |
 | --- | --- | --- | --- |
+| 3a | 补齐标配：连入确认、多显示器、Mac 和 Linux 无人值守、隐私屏、虚拟显示器、唤醒和重启连回、会话内开关、文件权限；Agent 功能追 Jump | 我 + Sonnet | 优先计划：`O-standard-plan.md`（依据 `reports/PeerDesk 同类产品周边功能对照.md`） |
+| 3b | Android 控制端（Rust 底座 + Kotlin/Compose，系统硬解） | 我 | `R-android.md`，分支 `android` |
 | 4 | 第一阶段（付钱和留存）：账户设备表、登录、在线状态、主机健康、手机网页版、提醒、体检向导、订阅、本机 MCP；并行 iOS P0 | 我 + Fable | 分步计划和验收：`O-phase1-plan.md`（P1–P10） |
 | 5 | 账户和订阅（计费挂在账户上，不挂在设备指纹上） | 我 | 赚钱方案第 3 节；技术调研 `O-accounts-research.md`（Supabase 令牌校验、桌面和无屏幕主机登录、Stripe 接法、胶水代码放哪） |
 | 6 | 上架：公司主体、Apple 和 Windows 签名、App Store、商店账号 | 你 | 产品负责人自己准备（2026-11-27） |
