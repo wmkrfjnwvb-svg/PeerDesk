@@ -107,5 +107,7 @@ crates/mobile/               Rust 核心（编成 libpeerdesk_mobile.so）
 | A2 | 完成（真机待测）：`android/codec.rs` MediaCodec 解到 Surface（先默认解码器、再系统软件解码器；低延迟设置分 6 档，`configure` 失败退一档，键名按 Moonlight 核对过）；`android/bridge.rs` 11 个 JNI 函数（开始、取事件、触点、长按计时、画面位置、触控模式、按键、文字、松开全部、断开、释放）；`Picture::Presented`；按键码到 HID、SPS/PPS 提取、低延迟档位都是纯逻辑有测试；`libpeerdesk_mobile.so` 2.7 MB，不含 OpenH264 |
 | A3 | 完成（真机待测）：`android/` Gradle 工程（Gradle 8.14.3、AGP 8.13.2、Kotlin 2.3.21、Compose BOM 2026.02.01）；连接页、会话页（SurfaceView 在裁剪容器里改尺寸来缩放平移）、工具条（延迟、帧率、码率、丢包和原因）、快捷键栏（修饰键按一下锁住）、软键盘、外接键盘；`scripts/android-build.sh` 一条命令编出 APK（debug 33 MB）；40 个 JVM 单元测试。服务器名的 DNS 改到会话线程里查，不卡界面；被控端按画面实际画出的大小编码（放大时更清楚） |
 | A3 真机反馈 | 产品负责人 11-28 实测能连上、能看、能点。修了：句柄按位放进 long（Android 11 起堆指针带标记）；密码显示开关；记住设备码和密码（Keystore 加密）。手势按 ToDesk 改（`gesture.rs` 开头的表，14 个测试），加虚拟鼠标（`MouseAssist.kt`：按手指按下的位置分流，19 个 JVM 测试）；JNI 加 `pointAt`、`button`，去掉触控模式。画面矩形没变时不再发 `setView`/`pointAt`（否则触屏拖拽中途来一个质量事件，选区会跳到箭头尖）。JVM 测试共 60 个。真机待测：鼠标尺寸（大 96×180 dp、小 48 dp）、手感 |
-| A4、A5 | A4（CI 出 APK）和 A5（真机闭环）下一步 |
+| A3 真机第二、三轮 | 捏合抖：一个触摸事件拆成逐根手指更新、缩放不跟手、每帧改 SurfaceView 尺寸、编码尺寸提示每步都发 → 整个事件一起交（`moves`）、以旧中点缩放再跟中点平移、SurfaceView 改用缩放平移变换、尺寸提示 300 ms 防抖。点击水波、软键盘让位（adjustPan 的思路）、会话全屏、平移夹边算上工具条和刘海、返回键按两次才断开、手势记录导出（连接页） |
+| A3 真机手势记录（11-28） | 产品负责人导出的 84 秒记录（`crates/mobile/tests/data/trace-2026-11-28-pinch-scroll.txt`，`tests/trace_replay.rs` 回放）找到两个根因：(1) 三指被系统拿走，取消事件只带一根手指，状态机按个数等三根抬起，从此所有手势都没反应（“卡死”）→ 取消就是整个手势作废、等抬起按编号、新手势第一根手指（`ACTION_DOWN`）先清掉留下的状态，界面的鼠标分流同样处理；(2) 双指滚动被当成缩放：两指上下叠着时一根比另一根早动 40 ms，或者两指几乎同时按下被系统先报成一根、跳了 240 像素 → 两指距离和中点从两根都按下那一刻量；只有一根在动时先等（4 倍防抖距离或 150 ms），两根都动看方向（libinput 的做法）；定了以后从那一刻补上。回放：滚动 23 次判错从 8 降到 0，捏合 20 次判错从 13 降到 0 |
+| A4、A5 | A4（CI 出 APK，`android` 任务已加）和 A5（真机闭环）下一步 |
 

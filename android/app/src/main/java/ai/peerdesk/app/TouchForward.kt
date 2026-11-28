@@ -8,6 +8,8 @@ object TouchPhase {
     const val MOVE = 1
     const val UP = 2
     const val CANCEL = 3
+    /** 新手势的第一根手指（`ACTION_DOWN`）：核心先把上一个手势留下的状态清掉，再当按下处理。 */
+    const val FIRST = 4
 }
 
 /** 一个手指的一次事件。 */

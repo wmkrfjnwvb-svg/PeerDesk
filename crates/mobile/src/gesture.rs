@@ -33,6 +33,8 @@ pub const TWO_FINGER_GAP_MS: u64 = 150;
 pub const TWO_FINGER_TAP_MS: u64 = 300;
 /// 双指判断：一个量（两指距离的变化、中点走过的距离）是另一个的这么多倍，就定成它（见 `classify`）。
 pub const DOMINANCE: f32 = 2.0;
+/// 双指只有一根在动时，最多等多久（毫秒）再定（另一根可能只是晚一点动；照 libinput 的做法）。
+pub const ONE_FINGER_WAIT_MS: u64 = 150;
 /// 滚轮一格的高精度增量（和桌面端、Windows 的 `WHEEL_DELTA` 一样）。
 const NOTCH: f32 = 120.0;
 /// 鼠标左键、右键的编号（见 [`InputEvent::MouseButton`]）。
@@ -175,16 +177,19 @@ enum State {
     Held { f: Finger },
     /// 拖拽中：左键按着，跟着手指走。
     Drag { f: Finger },
-    /// 两根手指。`dist` 是上一次两指的距离，`scroll` 是没发出去的滚动余数（滚轮单位）。
+    /// 两根手指。两根的 `start` 是第二根按下那一刻的位置（判断和“定了以后补上”都从这里量），
+    /// `since` 是那一刻的时间；`dist` 是上一次两指的距离，`scroll` 是没发出去的滚动余数（滚轮单位）。
     Two {
         a: Finger,
         b: Finger,
         what: Two,
         dist: f32,
         scroll: (f32, f32),
+        since: u64,
     },
-    /// 手势已经结束（例如双指点完了），等剩下的手指都抬起，期间什么也不发。
-    Done { left: usize },
+    /// 手势已经结束（例如双指点完了），等还按着的这几根手指（编号）都抬起，期间什么也不发。
+    /// 记编号不记个数：系统取消时给的事件里手指数不一定对（真机上见过三指被系统拿走，取消事件只带一根）。
+    Done { ids: Vec<u32> },
 }
 
 /// 触控状态机。
@@ -240,8 +245,10 @@ impl Gestures {
             what,
             dist,
             scroll,
+            since,
         } = self.state.clone()
         {
+            let now = touches.iter().map(|t| t.t_ms).max().unwrap_or(since);
             let before = midpoint(a.last, b.last);
             let mut ours = false;
             for t in touches.iter().filter(|t| t.phase == Phase::Move) {
@@ -258,7 +265,7 @@ impl Gestures {
                 return Vec::new();
             }
             let mut out = Vec::new();
-            self.state = self.two_moved(a, b, what, dist, scroll, before, &mut out);
+            self.state = self.two_moved(a, b, what, dist, scroll, since, now, before, &mut out);
             return out;
         }
         touches
@@ -268,8 +275,23 @@ impl Gestures {
             .collect()
     }
 
-    /// 处理一个触点。
+    /// 整个手势作废，回到没有手指的状态：系统取消（来电、系统手势拿走）、或者界面知道这是新手势的第一根手指
+    /// （Android 的 `ACTION_DOWN` 说明之前的手指都已经抬起，留下的状态一定是丢了事件）。拖拽中就先松开左键。
+    pub fn reset(&mut self) -> Vec<Action> {
+        let out = if matches!(self.state, State::Drag { .. }) {
+            vec![button_action(LEFT, false)]
+        } else {
+            Vec::new()
+        };
+        self.state = State::Idle;
+        out
+    }
+
+    /// 处理一个触点。取消（[`Phase::Cancel`]）不管是哪根手指，都是整个手势作废（Android 的取消就是这个意思），见 [`Self::reset`]。
     pub fn touch(&mut self, t: &Touch) -> Vec<Action> {
+        if t.phase == Phase::Cancel {
+            return self.reset();
+        }
         let mut out = Vec::new();
         let state = std::mem::replace(&mut self.state, State::Idle);
         self.state = match (state, t.phase) {
@@ -289,17 +311,25 @@ impl Gestures {
                     what,
                     dist,
                     scroll,
+                    since,
                 },
                 phase,
-            ) => self.two(a, b, what, dist, scroll, t, phase, &mut out),
-            (State::Done { left }, Phase::Down) => State::Done {
-                left: left.saturating_add(1),
-            },
-            (State::Done { left }, Phase::Move) => State::Done { left },
-            (State::Done { left }, Phase::Up | Phase::Cancel) => match left.saturating_sub(1) {
-                0 => State::Idle,
-                left => State::Done { left },
-            },
+            ) => self.two(a, b, what, dist, scroll, since, t, phase, &mut out),
+            (State::Done { mut ids }, Phase::Down) => {
+                if !ids.contains(&t.id) {
+                    ids.push(t.id);
+                }
+                State::Done { ids }
+            }
+            (State::Done { ids }, Phase::Move | Phase::Cancel) => State::Done { ids },
+            (State::Done { mut ids }, Phase::Up) => {
+                ids.retain(|id| *id != t.id);
+                if ids.is_empty() {
+                    State::Idle
+                } else {
+                    State::Done { ids }
+                }
+            }
         };
         out
     }
@@ -325,14 +355,18 @@ impl Gestures {
     ) -> State {
         if t.id != f.id {
             if phase == Phase::Down && t.t_ms.saturating_sub(f.down_ms) <= LONG_PRESS_MS {
-                // 第二根手指：进入双指
+                // 第二根手指：进入双指。第一根的起点挪到现在的位置：两指距离、中点都从两根都按下的这一刻量
+                // （ScaleGestureDetector 也是这样；真机上见过两根几乎同时按下时，系统先把它们报成一根、跳了 240 像素，
+                // 拿第一根当初按下的地方当起点，两指距离就像从 8 涨到 234，被当成捏合）
                 let b = Finger::new(t);
+                let a = Finger { start: f.last, ..f };
                 return State::Two {
-                    a: f,
+                    a,
                     b,
                     what: Two::Undecided,
-                    dist: distance(f.last, b.last),
+                    dist: distance(a.last, b.last),
                     scroll: (0.0, 0.0),
+                    since: t.t_ms,
                 };
             }
             return State::One { f, moved };
@@ -432,6 +466,7 @@ impl Gestures {
         what: Two,
         dist: f32,
         scroll: (f32, f32),
+        since: u64,
         t: &Touch,
         phase: Phase,
         out: &mut Vec<Action>,
@@ -445,7 +480,9 @@ impl Gestures {
         };
         match (phase, which) {
             // 第三根手指：留给系统，这个手势作废（已经开始的滚动、缩放就停在那儿）
-            (Phase::Down, None) => State::Done { left: 3 },
+            (Phase::Down, None) => State::Done {
+                ids: vec![a.id, b.id, t.id],
+            },
             (Phase::Down, Some(_)) | (Phase::Move | Phase::Up | Phase::Cancel, None) => {
                 State::Two {
                     a,
@@ -453,6 +490,7 @@ impl Gestures {
                     what,
                     dist,
                     scroll,
+                    since,
                 }
             }
             (Phase::Move, Some(first)) => {
@@ -462,15 +500,17 @@ impl Gestures {
                 } else {
                     b.last = (t.x, t.y);
                 }
-                self.two_moved(a, b, what, dist, scroll, before, out)
+                self.two_moved(a, b, what, dist, scroll, since, t.t_ms, before, out)
             }
-            (Phase::Up | Phase::Cancel, Some(_)) => {
+            (Phase::Up | Phase::Cancel, Some(first)) => {
                 let quick = t.t_ms.saturating_sub(a.down_ms) <= TWO_FINGER_TAP_MS
                     && b.down_ms.saturating_sub(a.down_ms) <= TWO_FINGER_GAP_MS;
                 if phase == Phase::Up && what == Two::Undecided && quick {
                     self.click(RIGHT, midpoint(a.last, b.last), out);
                 }
-                State::Done { left: 1 }
+                State::Done {
+                    ids: vec![if first { b.id } else { a.id }],
+                }
             }
         }
     }
@@ -489,13 +529,20 @@ impl Gestures {
         mut what: Two,
         mut dist: f32,
         mut scroll: (f32, f32),
-        before: (f32, f32),
+        since: u64,
+        now_ms: u64,
+        mut before: (f32, f32),
         out: &mut Vec<Action>,
     ) -> State {
         let after = midpoint(a.last, b.last);
         let now_dist = distance(a.last, b.last);
         if what == Two::Undecided {
-            what = classify(a, b, self.slop);
+            what = classify(a, b, self.slop, now_ms.saturating_sub(since));
+            if what != Two::Undecided {
+                // 刚定下来：把没定之前走过的也补上（从两根都按下那一刻量），画面和滚动不落后手指
+                before = midpoint(a.start, b.start);
+                dist = distance(a.start, b.start);
+            }
             if what == Two::Scroll {
                 out.push(Action::Input(self.pointer_at(midpoint(a.start, b.start))));
             }
@@ -536,6 +583,7 @@ impl Gestures {
             what,
             dist,
             scroll,
+            since,
         }
     }
 
@@ -558,39 +606,45 @@ fn distance(a: (f32, f32), b: (f32, f32)) -> f32 {
     (a.0 - b.0).hypot(a.1 - b.1)
 }
 
-/// 双指还没定时看一眼：捏合、滚动，还是再等等。
+/// 双指还没定时看一眼：捏合、滚动，还是再等等。`elapsed_ms` 是两根都按下以后过了多久。
 ///
-/// 两个量：两指距离从按下起变了多少（`span`），两指中点从按下起走了多远（`travel`）。业内做法：
-/// - Android 的 `ScaleGestureDetector`：两指距离变化超过防抖距离的 2 倍才算开始捏合；
-/// - libinput（Linux 触摸板）：看两根手指是不是朝同一个方向走，同向是滚动；滚动比捏合常见得多，分不清时偏向滚动。
+/// 量的都是从两根都按下那一刻起：两指距离变了多少（`span`），中点走了多远（`travel`），两根各自走了多远、往哪走。
+/// 业内做法：Android 的 `ScaleGestureDetector` 两指距离变化超过防抖距离的 2 倍才算开始捏合；
+/// libinput（Linux 触摸板）看两根手指的方向，同向是滚动、反向是捏合，只有一根在动时先等一等。
 ///
-/// 所以：中点走过防抖距离、或者两指距离变了 2 倍防抖距离之前，再等；之后
-/// - 一个量是另一个的 [`DOMINANCE`] 倍以上：定成它；
-/// - 分不出：两根手指都动了而且方向相近（夹角小于 45°）是滚动；有一根基本没动（一指按着、一指拉开的捏法）
-///   或者方向相反是捏合。
-fn classify(a: Finger, b: Finger, slop: f32) -> Two {
+/// 1. 都还没动够（距离变化不到 2 倍防抖距离、中点没走过防抖距离）：再等。
+/// 2. 两根都动了：方向相近（夹角小于 45°）或者中点走的是距离变化的 [`DOMINANCE`] 倍以上，是滚动；方向相反（大于 90°）是捏合。
+///    （夹角在中间时“距离变化是中点走的 2 倍以上”几何上不会出现：两根都动、又不反向，中点总会跟着走。）
+/// 3. 还分不出（只有一根在动，或者夹角在中间）：先等。真机上两指上下叠着滚动时，一根常比另一根早动 40 毫秒，
+///    这 40 毫秒里两指距离缩了 49 像素、中点只走了 24，看起来就是捏合。等到有一根走过 4 倍防抖距离、
+///    或者过了 [`ONE_FINGER_WAIT_MS`]：距离变化大于中点走的是捏合（一指按着一指拉开），否则是滚动。
+fn classify(a: Finger, b: Finger, slop: f32, elapsed_ms: u64) -> Two {
     let span = (distance(a.last, b.last) - distance(a.start, b.start)).abs();
     let travel = distance(midpoint(a.start, b.start), midpoint(a.last, b.last));
     if span <= slop * 2.0 && travel <= slop {
         return Two::Undecided;
     }
-    if span > travel * DOMINANCE {
-        return Two::Pinch;
-    }
-    if travel > span * DOMINANCE {
-        return Two::Scroll;
-    }
     let da = (a.last.0 - a.start.0, a.last.1 - a.start.1);
     let db = (b.last.0 - b.start.0, b.last.1 - b.start.1);
     let (la, lb) = (da.0.hypot(da.1), db.0.hypot(db.1));
-    if la.min(lb) <= slop / 2.0 {
-        return Two::Pinch;
+    let still = slop / 2.0;
+    if la > still && lb > still {
+        let cos = (da.0 * db.0 + da.1 * db.1) / (la * lb);
+        if cos > std::f32::consts::FRAC_1_SQRT_2 || travel > span * DOMINANCE {
+            return Two::Scroll;
+        }
+        if cos < 0.0 {
+            return Two::Pinch;
+        }
     }
-    // 夹角的余弦大于 cos 45°
-    if (da.0 * db.0 + da.1 * db.1) > la * lb * std::f32::consts::FRAC_1_SQRT_2 {
-        Two::Scroll
-    } else {
+    // 还分不出（只有一根在动，或者两根的方向在 45°–90° 之间）：等到走远了或者到了时限，按哪个量大定，不会一直不定
+    if la.max(lb) <= slop * 4.0 && elapsed_ms < ONE_FINGER_WAIT_MS {
+        return Two::Undecided;
+    }
+    if span > travel {
         Two::Pinch
+    } else {
+        Two::Scroll
     }
 }
 
@@ -830,19 +884,16 @@ mod tests {
         let mut s = g();
         s.touch(&t(1, Phase::Down, 400.0, 300.0, 0));
         s.touch(&t(2, Phase::Down, 600.0, 300.0, 10));
-        // 一根手指往下 30：中点往下 15，超过防抖距离，开始滚动。先把光标放到起点的中点，再滚（15/40 格向上）
-        let out = s.touch(&t(1, Phase::Move, 400.0, 330.0, 20));
+        // 只有一根往下 30：另一根可能只是晚一点动，先等
+        assert!(s.touch(&t(1, Phase::Move, 400.0, 330.0, 20)).is_empty());
+        // 另一根也往下 30：同向，是滚动。先把光标放到起点的中点，再把这 30 一次补上（30/40 格向上）
+        let out = s.touch(&t(2, Phase::Move, 600.0, 330.0, 30));
         assert_eq!(
             out,
             vec![
                 mv(32768, 26214),
-                Action::Input(InputEvent::Wheel { dx: 0, dy: 45 })
+                Action::Input(InputEvent::Wheel { dx: 0, dy: 90 })
             ]
-        );
-        let out = s.touch(&t(2, Phase::Move, 600.0, 330.0, 30));
-        assert_eq!(
-            out,
-            vec![Action::Input(InputEvent::Wheel { dx: 0, dy: 45 })]
         );
         // 往右划：往左滚（负）
         s.touch(&t(1, Phase::Move, 440.0, 330.0, 40));
@@ -864,34 +915,37 @@ mod tests {
         let mut s = g();
         s.touch(&t(1, Phase::Down, 400.0, 300.0, 0));
         s.touch(&t(2, Phase::Down, 600.0, 300.0, 10));
-        // 一根不动、一根拉开 40：距离变化超过 2 倍防抖距离，算捏合。以旧中点为中心缩放，再跟着中点平移
-        let out = s.touch(&t(2, Phase::Move, 640.0, 300.0, 20));
+        // 一根不动、一根拉开 40：只有一根在动，还没走过 4 倍防抖距离，先等另一根
+        assert!(s.touch(&t(2, Phase::Move, 640.0, 300.0, 20)).is_empty());
+        // 拉到 60：另一根还不动，距离变化（60）大于中点走的（30），是一指按着一指拉开的捏合。
+        // 从两根都按下那一刻补上：以那时的中点为中心放大 260/200，再跟着中点平移
+        let out = s.touch(&t(2, Phase::Move, 660.0, 300.0, 30));
         assert_eq!(
             out,
             vec![
                 Action::Zoom {
-                    factor: 1.2,
+                    factor: 1.3,
                     cx: 500.0,
                     cy: 300.0
                 },
-                Action::Pan { dx: 20.0, dy: 0.0 }
+                Action::Pan { dx: 30.0, dy: 0.0 }
             ]
         );
         // 之后每次相对上一次
-        let out = s.touch(&t(1, Phase::Move, 340.0, 300.0, 30));
+        let out = s.touch(&t(1, Phase::Move, 340.0, 300.0, 40));
         assert_eq!(
             out,
             vec![
                 Action::Zoom {
-                    factor: 1.25,
-                    cx: 520.0,
+                    factor: 320.0 / 260.0,
+                    cx: 530.0,
                     cy: 300.0
                 },
                 Action::Pan { dx: -30.0, dy: 0.0 }
             ]
         );
         // 第三根手指：作废，等三根都抬起
-        assert!(s.touch(&t(3, Phase::Down, 10.0, 10.0, 40)).is_empty());
+        assert!(s.touch(&t(3, Phase::Down, 10.0, 10.0, 45)).is_empty());
         assert!(s.touch(&t(3, Phase::Move, 20.0, 10.0, 50)).is_empty());
         for id in [1, 2] {
             assert!(s.touch(&t(id, Phase::Up, 0.0, 0.0, 60)).is_empty());
@@ -1036,7 +1090,8 @@ mod tests {
 
     #[test]
     fn one_event_moves_both_fingers_at_once() {
-        // 对称捏开：一次事件两根手指一起走，一次缩放，中心不动（逐根交的话中心会来回跳）
+        // 对称捏开：一次事件两根手指一起走，一次缩放，中心不动（逐根交的话中心会来回跳）。
+        // 定下来的那次从两根按下时（距离 200）补上
         let mut s = g();
         s.touch(&t(1, Phase::Down, 400.0, 300.0, 0));
         s.touch(&t(2, Phase::Down, 600.0, 300.0, 10));
@@ -1045,7 +1100,7 @@ mod tests {
         assert_eq!(
             out,
             vec![Action::Zoom {
-                factor: 240.0 / 210.0,
+                factor: 1.2,
                 cx: 500.0,
                 cy: 300.0
             }]
@@ -1062,6 +1117,83 @@ mod tests {
         s.touch(&t(1, Phase::Down, 100.0, 300.0, 0));
         let out = s.moves(&[t(1, Phase::Move, 150.0, 300.0, 20)]);
         assert_eq!(out, vec![Action::Pan { dx: 50.0, dy: 0.0 }]);
+    }
+
+    #[test]
+    fn a_cancel_from_the_system_ends_the_whole_gesture() {
+        // 真机（2026-11-28）：三根手指按下后被系统拿走，取消事件只带一根手指。以前按个数等三根都抬起，从此卡住
+        let mut s = g();
+        s.touch(&t(0, Phase::Down, 228.0, 300.0, 0));
+        s.touch(&t(1, Phase::Down, 736.0, 400.0, 11));
+        s.touch(&t(2, Phase::Down, 721.0, 300.0, 45));
+        assert!(matches!(s.state, State::Done { .. }));
+        assert!(s.touch(&t(0, Phase::Cancel, 0.0, 0.0, 62)).is_empty());
+        assert_eq!(s.state, State::Idle);
+        // 下一个捏合照常
+        s.touch(&t(0, Phase::Down, 400.0, 300.0, 900));
+        s.touch(&t(1, Phase::Down, 600.0, 300.0, 910));
+        assert_eq!(zooms(&both(&mut s, (350.0, 300.0), (650.0, 300.0), 930)), 1);
+    }
+
+    #[test]
+    fn leftover_fingers_are_counted_by_id() {
+        // 双指点完：等剩下那根抬起；同一根重复报按下不多算，不认识的抬起不管
+        let mut s = g();
+        s.touch(&t(1, Phase::Down, 400.0, 350.0, 0));
+        s.touch(&t(2, Phase::Down, 600.0, 350.0, 40));
+        s.touch(&t(1, Phase::Up, 400.0, 350.0, 150));
+        assert_eq!(s.state, State::Done { ids: vec![2] });
+        s.touch(&t(2, Phase::Down, 600.0, 350.0, 160));
+        s.touch(&t(9, Phase::Up, 0.0, 0.0, 170));
+        assert!(s.touch(&t(2, Phase::Move, 610.0, 350.0, 175)).is_empty());
+        assert_eq!(s.state, State::Done { ids: vec![2] });
+        s.touch(&t(3, Phase::Down, 100.0, 100.0, 180));
+        s.touch(&t(2, Phase::Up, 600.0, 350.0, 190));
+        assert_eq!(s.state, State::Done { ids: vec![3] });
+        s.touch(&t(3, Phase::Up, 100.0, 100.0, 200));
+        assert_eq!(s.state, State::Idle);
+        // 新手势的第一根手指：界面先 reset，留下的状态清掉（没在拖拽就什么也不发）
+        s.touch(&t(5, Phase::Down, 100.0, 100.0, 300));
+        s.touch(&t(6, Phase::Down, 200.0, 100.0, 310));
+        s.touch(&t(7, Phase::Down, 300.0, 100.0, 320));
+        assert!(s.reset().is_empty());
+        assert_eq!(s.state, State::Idle);
+    }
+
+    #[test]
+    fn the_two_finger_rules_cover_the_corner_cases() {
+        let f = |start: (f32, f32), last: (f32, f32)| Finger {
+            id: 0,
+            start,
+            last,
+            down_ms: 0,
+        };
+        let slop = 10.0;
+        // 两根都动、夹角在 45°–90° 之间：中点走得远（距离变化的 2 倍以上）是滚动；分不出先等，到时限按哪个量大定
+        let a = f((0.0, 0.0), (-40.0, -40.0));
+        assert_eq!(
+            classify(a, f((200.0, 0.0), (160.0, 10.0)), slop, 20),
+            Two::Scroll
+        );
+        let a = f((0.0, 0.0), (0.0, 30.0));
+        let b = f((200.0, 0.0), (230.0, 5.0));
+        assert_eq!(classify(a, b, slop, 20), Two::Undecided);
+        assert_eq!(classify(a, b, slop, ONE_FINGER_WAIT_MS), Two::Pinch);
+        // 只有一根动、还没走远：150 毫秒内再等，过了就定（距离变化大于中点走的是捏合，否则滚动）
+        let still = f((200.0, 0.0), (200.0, 0.0));
+        let along = f((0.0, 0.0), (-30.0, 0.0));
+        assert_eq!(classify(along, still, slop, 100), Two::Undecided);
+        assert_eq!(classify(along, still, slop, ONE_FINGER_WAIT_MS), Two::Pinch);
+        let across = f((0.0, 0.0), (0.0, 30.0));
+        assert_eq!(
+            classify(across, still, slop, ONE_FINGER_WAIT_MS),
+            Two::Scroll
+        );
+        // 都没动够
+        assert_eq!(
+            classify(f((0.0, 0.0), (3.0, 3.0)), still, slop, 500),
+            Two::Undecided
+        );
     }
 
     #[test]

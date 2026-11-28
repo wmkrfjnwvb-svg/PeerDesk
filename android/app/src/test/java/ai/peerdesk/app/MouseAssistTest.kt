@@ -164,6 +164,27 @@ class MouseAssistTest {
         assertFalse(res.mouse.isNotEmpty())
     }
 
+    @Test fun aSystemCancelWithFewerFingersStillReleasesTheMouse() {
+        // 左键按着（手指 1），系统取消整个手势，但取消事件里只带手指 2：左键也要松开
+        val r = expandedRouter()
+        route(r, MotionEvent.ACTION_DOWN, 0, Triple(1, lx, ly))
+        route(r, MotionEvent.ACTION_POINTER_DOWN, 1, Triple(1, lx, ly), Triple(2, 5f, 5f))
+        val res = route(r, MotionEvent.ACTION_CANCEL, 0, Triple(2, 0f, 0f))
+        assertEquals(listOf<MouseEvent>(MouseEvent.ButtonUp(0)), res.mouse)
+        assertEquals(listOf(TouchOp(2, TouchPhase.CANCEL, 0f, 0f)), res.touches)
+        // 之后手指 1 的抬起不会再松一次
+        assertTrue(route(r, MotionEvent.ACTION_UP, 0, Triple(1, lx, ly)).mouse.isEmpty())
+    }
+
+    @Test fun aNewGestureEndsLeftoversAndTellsTheCore() {
+        // 抬起事件丢了（左键手指一直没抬）：下一个手势的第一根手指先把它收尾，转发的是“新手势”
+        val r = expandedRouter()
+        route(r, MotionEvent.ACTION_DOWN, 0, Triple(1, lx, ly))
+        val res = route(r, MotionEvent.ACTION_DOWN, 0, Triple(3, 5f, 5f))
+        assertEquals(listOf<MouseEvent>(MouseEvent.ButtonUp(0)), res.mouse)
+        assertEquals(listOf(TouchOp(3, TouchPhase.FIRST, 5f, 5f)), res.touches)
+    }
+
     @Test fun withoutHitTestEverythingIsForwarded() {
         val r = TouchRouter()
         val res = route(r, MotionEvent.ACTION_DOWN, 0, Triple(1, lx, ly))

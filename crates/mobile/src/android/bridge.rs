@@ -123,7 +123,10 @@ pub extern "system" fn Java_ai_peerdesk_app_Native_nextEvent<'local>(
     new_string(&mut env, json)
 }
 
-/// 一个触点。`phase`：0 按下、1 移动、2 抬起、3 取消。返回要界面做的缩放、平移（JSON 数组）或 null。
+/// 新手势第一根手指（`ACTION_DOWN`）的阶段码：先清掉上一个手势留下的状态，再当按下处理。
+const FIRST_DOWN: jint = 4;
+
+/// 一个触点。`phase`：0 按下、1 移动、2 抬起、3 取消、4 新手势的第一根手指按下。返回要界面做的缩放、平移（JSON 数组）或 null。
 #[no_mangle]
 pub extern "system" fn Java_ai_peerdesk_app_Native_touch<'local>(
     mut env: JNIEnv<'local>,
@@ -136,7 +139,12 @@ pub extern "system" fn Java_ai_peerdesk_app_Native_touch<'local>(
     t_ms: jlong,
 ) -> jstring {
     let out = handle(h).and_then(|h| {
-        let phase = Phase::from_code(phase)?;
+        let first = phase == FIRST_DOWN;
+        let phase = if first {
+            Phase::Down
+        } else {
+            Phase::from_code(phase)?
+        };
         let touch = Touch {
             id: u32::try_from(id).unwrap_or(0),
             phase,
@@ -144,11 +152,10 @@ pub extern "system" fn Java_ai_peerdesk_app_Native_touch<'local>(
             y,
             t_ms: u64::try_from(t_ms).unwrap_or(0),
         };
-        let actions = h
-            .gestures
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .touch(&touch);
+        let mut gestures = h.gestures.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut actions = if first { gestures.reset() } else { Vec::new() };
+        actions.extend(gestures.touch(&touch));
+        drop(gestures);
         apply(&h.session, actions)
     });
     new_string(&mut env, out)

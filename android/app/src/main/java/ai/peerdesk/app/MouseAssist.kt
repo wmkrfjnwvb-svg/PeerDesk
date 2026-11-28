@@ -1,5 +1,6 @@
 package ai.peerdesk.app
 
+import android.view.MotionEvent
 import kotlin.math.hypot
 
 /** 容器像素坐标里的矩形。 */
@@ -165,6 +166,9 @@ class TouchRouter(private val tapSlopPx: Float = 8f) {
         val touches = ArrayList<TouchOp>()
         val moves = ArrayList<TouchOp>()
         val mouse = ArrayList<MouseEvent>()
+        // 新手势开始、或者系统取消了整个手势：之前的手指一个不留地收尾（还按着的鼠标键要松开）。
+        // 真机上见过系统拿走三指手势时，取消事件里只带一根手指，按事件里的手指收尾会漏掉别的手指
+        if (action == MotionEvent.ACTION_DOWN || action == MotionEvent.ACTION_CANCEL) endAll(mouse)
         for (op in ops) {
             if (op.phase == TouchPhase.DOWN) {
                 val role: Role = when (hitTest?.invoke(op.x, op.y)) {
@@ -173,7 +177,10 @@ class TouchRouter(private val tapSlopPx: Float = 8f) {
                     Zone.Body -> Role.Body(op.x, op.y)
                     Zone.Close -> Role.Close
                     Zone.Mini -> Role.Mini(op.x, op.y, op.x, op.y)
-                    null -> Role.Forward.also { touches.add(op) }
+                    // 第一根手指告诉核心“新手势”，让它清掉可能留下的状态
+                    null -> Role.Forward.also {
+                        touches.add(if (action == MotionEvent.ACTION_DOWN) op.copy(phase = TouchPhase.FIRST) else op)
+                    }
                 }
                 roles[op.id] = role
                 continue
@@ -223,5 +230,21 @@ class TouchRouter(private val tapSlopPx: Float = 8f) {
             if (ending) roles.remove(op.id)
         }
         return RouteResult(touches, moves, mouse)
+    }
+
+    /** 所有还记着的手指都按“结束”收尾：按着的键松开，拖过的保存位置。 */
+    private fun endAll(mouse: MutableList<MouseEvent>) {
+        for (role in roles.values) {
+            when (role) {
+                is Role.Key -> {
+                    mouse.add(MouseEvent.ButtonUp(role.index))
+                    if (role.moved) mouse.add(MouseEvent.DragEnd)
+                }
+                is Role.Body -> mouse.add(MouseEvent.DragEnd)
+                is Role.Mini -> if (role.moved) mouse.add(MouseEvent.DragEnd)
+                Role.Forward, Role.Close -> Unit
+            }
+        }
+        roles.clear()
     }
 }
