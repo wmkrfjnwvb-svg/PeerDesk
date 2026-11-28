@@ -177,3 +177,20 @@ Wi-Fi 没有“尖峰频率、时长、幅度”的现成分布（类型调研�
    - Starlink 数据是 CC BY 4.0：数据目录的 README 和 `THIRD_PARTY_NOTICES.md` 都要署名；
    - 清单确定地生成世界，清单自己的哈希写进报告头，说明报告是哪个总体。
 6. **顺序**：A3-1（交叉流真实化）放在 A2-4c 之后，或者和 A2-4c 的长测量并行，由 diskagent 定。
+
+## 10. 蜂窝数据的许可调查（2026-11-28；Sonnet 子代理查，许可字段我在源头又核了一遍）
+
+| 数据 | 下载 | 内容 | 许可（原文） | 结论 |
+|---|---|---|---|---|
+| UCC 4G LTE “Beyond Throughput”（Raca 等，MMSys 2018），Zenodo 1219679 | 直接下载，不用账号；`LTE_Dataset.zip` 2.25 MB | 135 条，每条约 15 分钟，每秒一个点，上下行吞吐 0–173 Mbit/s；静止、步行、汽车、电车、火车；爱尔兰两家运营商 | Zenodo 的许可字段 `cc-by-4.0`（API 返回 `{'id': 'cc-by-4.0'}`） | **可用**，要署名。另一个 `ns3_dataset.zip` 是合成的，不用 |
+| UCC 5G “The Next Generation”（MMSys 2020），GitHub uccmisl/5Gdataset | 直接下载 | 约 2 MB，每秒的指标和吞吐 | 仓库 LICENSE 是 “GNU GENERAL PUBLIC LICENSE Version 3”；Zenodo 3751194 没有许可字段 | **不能用**（GPL，项目规矩） |
+| Mahimahi 自带的蜂窝轨迹（ravinet/mahimahi 的 `traces/`） | 直接下载 | 2013 年左右美国 LTE（Verizon、AT&T、T-Mobile），每个放行机会一行 | 仓库的 `COPYING` 是 “GNU GENERAL PUBLIC LICENSE Version 3”；轨迹目录没有另外的许可 | **不能用**（GPL） |
+| Kousias 等，罗马 4G、NB-IoT、5G NSA（Zenodo 8224890） | 直接下载，几 GB | 测量日志、测速，不是连续的容量序列 | `cc-by-4.0` | 许可可以，但不是我们要的那种轨迹，先不用 |
+| Caso 等，“Chronicles of 5G NSA”（Zenodo 17208871） | 直接下载，约 1 GB | 被动测量的指标 | `cc-by-4.0` | 同上，先不用 |
+
+做法：
+- 4G/5G 类型先用 UCC 4G 的吞吐轨迹，加合成轨迹；
+- 吞吐是 TCP 吞吐，不是链路容量，和 Lumos5G 一样当容量的下界用；
+- 进仓库前去掉位置和小区的字段（我们不存位置信息）；
+- 数据目录的 README 和 `THIRD_PARTY_NOTICES.md` 写明出处（Zenodo DOI 10.5281/zenodo.1219679 和 MMSys 2018 的论文）；
+- 5G 没有找到许可合适、免账号的连续轨迹，5G 先用合成轨迹，标“可信度低”，等 Lumos5G。
