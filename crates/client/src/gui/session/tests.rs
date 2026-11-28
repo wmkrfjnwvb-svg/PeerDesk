@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::gui::form::end_text;
+use peerdesk_net::rendezvous::{Lookup, PathPolicy};
 use peerdesk_net::service::{RelayService, SignalService};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -925,7 +926,7 @@ fn pixels_are_converted() {
         ]
     );
     // 通过服务器连接时用双栈端口；直接连地址时跟着地址族
-    assert!(view_bind(&Target::Device {
+    assert!(viewer::bind_for(&Target::Device {
         server: Server {
             addr: "1.2.3.4:1".parse().unwrap(),
             pin: None
@@ -943,5 +944,5 @@ fn pixels_are_converted() {
         addr: "[::1]:1".parse().unwrap(),
         pin: None,
     };
-    assert!(view_bind(&v4).is_ipv4() && view_bind(&v6).is_ipv6());
+    assert!(viewer::bind_for(&v4).is_ipv4() && viewer::bind_for(&v6).is_ipv6());
 }

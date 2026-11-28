@@ -1,4 +1,4 @@
-# 交接：所有进行中的工作和下一步（2026-11-28 13:00 UTC，主会话写）
+# 交接：所有进行中的工作和下一步（2026-11-28 14:00 UTC，主会话写）
 
 会话没了也能接上：每一项写了分支、最后的提交、做到哪、下一步。决定和方案的详细内容在各自的文档里，这里只是索引。
 分工照 CLAUDE.md：主会话调度、审查、合并、做产品；diskagent 会话做仿真框架；指纹（`crates/e2e/golden/fingerprints.txt`）只由主会话改。
@@ -17,22 +17,15 @@
 
 ## 2. 进行中
 
-### 2.1 Android 控制端（主会话）——分支 `android`，已在云端
+### 2.1 Android 控制端（主会话）——**已合进 dev**（本次合并），分支 `android` 最后 4d3f302
 
-- 方案和进度：`R-android.md`（第 7 节进度表）。真机验证过：能连上、能看、能点（11-28）。
-- 259aa39：手势照 ToDesk（`gesture.rs` 开头的表）、虚拟鼠标（小鼠标 ↔ 大鼠标：左键、右键、身体、关闭，`MouseAssist.kt`）；APK 发给产品负责人测过。
-- 产品负责人第二轮反馈和处理（fcca0e3，Rust 已完成、测过）：
-  - 捏合抖：根因是一个触摸事件拆成逐根手指更新、缩放不跟手、每帧改 SurfaceView 尺寸、编码尺寸提示每步都发。
-    改成整个事件一起交（`Gestures::moves`、JNI `moves`）、以旧中点缩放再跟中点平移；
-  - 双指滚动和捏合冲突：判据改成比较两指距离变化和中点走过的距离，分不出看方向（照 Android ScaleGestureDetector、libinput），真实手势的测试；
-  - 点击告诉界面位置（`tap`）：画水波、记住输入位置。
-- **进行中**（Kotlin，子代理在做，WIP 44d2023、b7b130f 未审）：批量移动、SurfaceView 改用缩放平移变换、编码尺寸提示 300 ms 防抖、箭头尖挪到左键正上方、点击水波和按键时箭头缩小、
-  软键盘弹出时把输入位置让到键盘上面（adjustPan 的思路）、导出手势记录（真机问题拿原始触点回放）。
-  下一步：审代码 → `scripts/android-build.sh` 和 JVM 测试 → 提交 → APK 发产品负责人。
-- 合进 dev 前的本地门槛（已把 dev 758ac0b 合进 android）：覆盖率过（行 99.12%）；e2e 在跑；clippy 要重跑（合并后 e2e 的 `Picture` 匹配缺 `Presented`，已补）。
-  过了以后去掉 `[skip ci]` 推一次，让 CI（含新的 android 任务）跑，再合进 dev。
-- CI 新的 `android` 任务（f031521）：改了 `android/`、`crates/mobile/` 才跑；`[android]`、`[pkg]` 上传 APK。CLAUDE.md 表里加了 `[android]`（在 android 分支，合并后生效）。
-- 之后：诊断页、切后台不断开。
+- 方案和进度：`R-android.md`（第 7 节进度表，真机反馈和根因都写在里面）。
+- 合进 dev 的：`peerdesk-net::viewer`（桌面和手机共用的访问驱动）、OpenH264 可选、`crates/mobile`（会话、手势状态机、按键映射、MediaCodec 解到 Surface、JNI）、
+  `android/` Kotlin + Compose 界面（连接页、会话页、虚拟鼠标、点击水波、软键盘让位、会话全屏、返回键按两次、手势记录导出）、CI 的 `android` 任务（`[android]` 标记）。
+- 真机记录回放（`crates/mobile/tests/trace_replay.rs`，两份产品负责人的记录）：滚动 25 次、捏合 26 次全对；修过的根因：系统取消只带一根手指时卡死、
+  两指上下叠着滚动时一根比另一根早动 40 多毫秒被当成捏合。
+- 合并的 CI 带 `[mac]`（桌面控制端改用共用驱动、OpenH264 改可选，先在 macOS 上验证），过了再推一次 `[win]`。
+- 下一步：等产品负责人测 4d3f302 的 APK；诊断页（首帧、解码耗时、帧率、冻结）、切后台不断开；iOS 以后。
 - 构建：`source scripts/android-env.sh`；SDK 在 `~/android-sdk`（`scripts/android-setup.sh` 装，许可协议产品负责人已同意）。新容器要重新装。
 
 ### 2.2 仿真框架 A2-4（diskagent 会话）——分支 `sim-a2`
@@ -42,6 +35,8 @@
   收敛时间加“未收敛”记法和“稳定值 ÷ 公平份额”；最终报告 12 个种子。
 - 分三步：A2-4a 多会话（进行中，12:36 起）→ A2-4b NR-BPDV 抖动和 TCP SACK → A2-4c RFC 8867 八个用例和 RFC 8868 指标的报告。
 - 为了早点进 A3：A2-4b 合并后 diskagent 就开始写 A3 的设计，和 A2-4c 的长时间运行并行。
+- A2-4a 交审（sim-a2 39f7e89）：主循环拆分通过（153 行逐字节相同、144/144 相同、两对共享瓶颈测试）；**有一个 bug 要先修**：`Shared::pop` 会把加了额外延迟的包提前送到
+  （内层下一个包比延迟的晚时直接返回延迟的那个），5.5 的 RTT 公平会判错。修完和 A2-4b 一起合进 dev，golden 加 A2-4a 新增的 `zero` 一行。
 - 记下的问题（不是仿真的错）：A 家有人上传、出口没有 AQM 时码率掉到 2.1 Mbps、冻结 16.8 次；长 TCP 把码率挤到 106 kbps；换路后约 0.7 秒才恢复。
 
 ### 2.3 账户设备表（主会话）——分支 `devices-s1`，最后 4acff3a
@@ -51,7 +46,7 @@
 
 ## 3. 排队（按 `O-standard-plan.md` 的顺序）
 
-1. Android 第三轮改完、真机测过、合进 dev（2.1）。
+1. Android 真机反馈继续（2.1），诊断页、切后台不断开。
 2. S1 连入确认（设计已定，见 `O-standard-plan.md` 2.1）。
 3. S2 多显示器、S3 Mac 和 Linux 无人值守、S6 唤醒和重启连回、S7 会话内开关、S8 文件权限（S7、S8 可以派 Sonnet）。
 4. 账户线 P1–P3b（本地用自己生成的密钥测，不等 Supabase）。

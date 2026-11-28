@@ -5,3 +5,12 @@
 *.profraw
 .claude/worktrees/
 __pycache__/
+
+# Android 工程
+/android/.gradle/
+/android/build/
+/android/app/build/
+/android/local.properties
+/android/app/src/main/jniLibs/
+/android/.kotlin/
+*.iml

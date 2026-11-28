@@ -9,7 +9,7 @@ publish = false
 
 [dependencies]
 peerdesk-core.workspace = true
-peerdesk-media.workspace = true
+peerdesk-media = { workspace = true, features = ["source"] }
 png = "0.18.1"
 
 [lints]

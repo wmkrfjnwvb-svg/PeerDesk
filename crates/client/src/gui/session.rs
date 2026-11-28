@@ -15,23 +15,26 @@ use peerdesk_core::auth::{Auth, Limiter};
 use peerdesk_core::crypto::Policy;
 use peerdesk_core::frame::{Frame, Picture};
 use peerdesk_core::input::InputEvent;
-use peerdesk_core::proto::{Caps, PeerOs};
+use peerdesk_core::proto::PeerOs;
 use peerdesk_core::screen::Screen;
+use peerdesk_core::session::SessionConfig;
 use peerdesk_core::signal::format_code;
 use peerdesk_net::clipsync::{ClipNote, ClipboardHandle};
-use peerdesk_net::controller::{self, ControllerOptions, LinkHook, ScreenSink};
-use peerdesk_net::host::{self, HostOptions, ScreenSource, FRAME_DEADLINE_US};
+use peerdesk_net::controller::{self, LinkHook, ScreenSink};
+use peerdesk_net::host::{self, HostOptions, ScreenSource};
 use peerdesk_net::identity::to_hex;
 use peerdesk_net::netcheck::{prepare_host, NetReport};
-use peerdesk_net::rendezvous::{
-    dial_via, fetch_nodes, register_with, Dialed, Lookup, Path as Route, PathPolicy, Server, Shim,
+use peerdesk_net::rendezvous::{register_with, Path as Route, Server};
+use peerdesk_net::viewer::{self, ViewEnv};
+pub use peerdesk_net::viewer::{
+    free_limit_text, network_lost, server_order, Summary, RECONNECT_TRIES,
 };
 use peerdesk_net::{Identity, NetError, Node};
 use tokio::sync::watch;
 
 use super::form::Target;
 use crate::local::{check_local_in, local_input, local_screen_in, Tap};
-use crate::remote::{join_cluster, load_nodes, runtime, save_nodes, session, stay_registered};
+use crate::remote::{join_cluster, runtime, session, stay_registered};
 
 /// 请求界面重绘。
 pub type Repaint = Arc<dyn Fn() + Send + Sync>;
@@ -586,21 +589,6 @@ impl ScreenSink for GuiSink {
     }
 }
 
-/// 一次观看会话的总结。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Summary {
-    /// 会话为什么结束。
-    pub end: String,
-    /// 是不是本端主动断开的。
-    pub cancelled: bool,
-    /// 结束时的往返延迟。
-    pub rtt: Option<Duration>,
-    /// 收到的画面字节数。
-    pub video_bytes: u64,
-    /// 会话时长。
-    pub elapsed: Duration,
-}
-
 /// 控制端会话线程发给界面的事件。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ViewEvent {
@@ -633,6 +621,29 @@ pub enum ViewEvent {
     /// 握手完成，得知被控端的系统和电脑名（老版本为未知、空）。助手据此选 Ctrl 还是 Cmd，
     /// 设备列表据此显示电脑名。
     Peer(PeerOs, String),
+}
+
+impl From<viewer::ViewEvent> for ViewEvent {
+    fn from(event: viewer::ViewEvent) -> Self {
+        match event {
+            viewer::ViewEvent::Connected {
+                peer,
+                remote,
+                route,
+                detail,
+            } => Self::Connected {
+                peer,
+                remote,
+                route,
+                detail,
+            },
+            viewer::ViewEvent::Reconnecting { attempt, why } => Self::Reconnecting { attempt, why },
+            viewer::ViewEvent::Notice(text) => Self::Notice(text),
+            viewer::ViewEvent::Clipboard(note) => Self::Clipboard(note),
+            viewer::ViewEvent::Quality(q) => Self::Quality(q),
+            viewer::ViewEvent::Peer(os, name) => Self::Peer(os, name),
+        }
+    }
 }
 
 /// 打开本机系统剪贴板。测试构建里没有（测试不碰开发者电脑的剪贴板）。
@@ -671,46 +682,6 @@ fn test_capture() -> Option<peerdesk_net::audio::CaptureHandle> {
 
 fn test_playback() -> peerdesk_net::audio::PlaybackHandle {
     peerdesk_net::audio::PlaybackHandle(Arc::new(peerdesk_net::audio::Recorder::default()))
-}
-
-/// 网络断开后最多自动重连几次。
-pub const RECONNECT_TRIES: u32 = 3;
-/// 两次重连之间等多久。
-const RECONNECT_GAP: Duration = Duration::from_secs(1);
-/// 多久看一次中继有没有发来通知。
-const NOTICE_POLL: Duration = Duration::from_millis(500);
-/// 走中继时，过多久试一次直连（中继是成本，直连更快）：先试得勤一些，之后每 5 分钟一次。
-/// 打洞失败多半是 NAT 本身的限制，频繁重试没用，也给服务器添负担。
-const UPGRADE_SCHEDULE: [Duration; 3] = [
-    Duration::from_secs(15),
-    Duration::from_secs(45),
-    Duration::from_secs(120),
-];
-/// 之后每隔多久试一次。
-const UPGRADE_EVERY: Duration = Duration::from_secs(300);
-/// [`PathPolicy::RelayFirst`]：先走中继出画面，这么久之后就试直连。
-const RELAY_FIRST_UPGRADE: Duration = Duration::from_secs(1);
-
-/// 会话结束的原因是不是网络断了（应当换通道重连），而不是对方或自己结束的。
-#[must_use]
-pub fn network_lost(end: &str) -> bool {
-    [
-        "timed out",
-        "超时",
-        "connection lost",
-        "reset",
-        "closed by peer: 0",
-    ]
-    .iter()
-    .any(|k| end.contains(k))
-        && !end.contains("对端结束会话")
-}
-
-/// 免费额度用完时给用户看的话。
-#[must_use]
-pub fn free_limit_text(retry_secs: u32) -> String {
-    let minutes = retry_secs.div_ceil(60).max(1);
-    format!("免费服务器拥挤，请约 {minutes} 分钟后重试（免费用户每 10 分钟的中继流量有限额）")
 }
 
 /// 控制端会话的句柄。丢弃时断开。
@@ -831,18 +802,6 @@ pub fn start_view(
     }
 }
 
-/// 控制端绑定的地址：直接连地址时跟它同一地址族；通过服务器连接时用双栈端口
-/// （IPv4 和 IPv6 的候选路径都能探测）。
-const fn view_bind(target: &Target) -> SocketAddr {
-    match target {
-        Target::Addr { addr, .. } if addr.is_ipv6() => {
-            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
-        }
-        Target::Addr { .. } => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
-        Target::Device { .. } => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
-    }
-}
-
 async fn view_main(
     target: Target,
     auth: Auth,
@@ -854,10 +813,11 @@ async fn view_main(
 ) -> Result<Summary, NetError> {
     let policy = Policy::recommended();
     let identity = Identity::load_or_create(&data_dir)?;
-    let bind = view_bind(&target);
+    let bind = viewer::bind_for(&target);
     // 系统不支持 IPv6 时退回 IPv4。
     let v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
     let node = Arc::new(Node::bind_first(&[bind, v4], &identity, &policy)?);
+    let env: Arc<dyn ViewEnv> = Arc::new(GuiEnv { sink, ev, data_dir });
     let started = Instant::now();
     let result = tokio::select! {
         () = stopped(&mut stop) => Ok(Summary {
@@ -865,7 +825,7 @@ async fn view_main(
             elapsed: started.elapsed(),
             ..Summary::default()
         }),
-        r = watch_remote(&node, &identity, &policy, target, auth, sink, input, &ev, &data_dir) => r,
+        r = viewer::drive(&node, &identity, &policy, target, auth, env, input) => r,
     };
     close_nodes(&[node]).await;
     match &result {
@@ -882,309 +842,55 @@ async fn view_main(
     result
 }
 
-/// 要试的服务器：用户配置的那个在前，然后是缓存的其他节点（去重）。
-#[must_use]
-pub fn server_order(seed: Server, cached: Vec<Server>) -> Vec<Server> {
-    let mut list = vec![seed];
-    for n in cached {
-        if !list.iter().any(|s| s.addr == n.addr) {
-            list.push(n);
-        }
-    }
-    list
-}
-
-/// 一次会话的结果：正常结束、网络断了（可以重连）、服务器通知（例如免费额度用完）。
-enum Outcome {
-    Done(Summary),
-    Lost(String),
-    Notice(String),
-    /// 走中继时在后台打通了直连：结束这一次（中继）会话，在这条直连上重新开始。
-    Upgrade(Box<Dialed>),
-}
-
-/// 走中继时在后台反复试直连，通了就交出这条连接（不返回就是一直没通）。
-async fn find_direct(
-    node: &Node,
-    servers: &[Server],
-    device: &Lookup,
-    policy: PathPolicy,
-    account: &str,
-) -> Dialed {
-    let first = if policy == PathPolicy::RelayFirst {
-        vec![RELAY_FIRST_UPGRADE]
-    } else {
-        UPGRADE_SCHEDULE.to_vec()
-    };
-    let mut waits = first.into_iter().chain(std::iter::repeat(UPGRADE_EVERY));
-    loop {
-        let wait = waits.next().unwrap_or(UPGRADE_EVERY);
-        tokio::time::sleep(wait).await;
-        match dial_via(node, servers, device, PathPolicy::DirectOnly, account).await {
-            Ok(dialed) if dialed.shim.is_none() => {
-                peerdesk_net::note!(
-                    info,
-                    "控制：直连打通了（{}），从中继切过去",
-                    dialed.route.label()
-                );
-                return dialed;
-            }
-            Ok(_) => {}
-            Err(e) => peerdesk_net::note!(info, "控制：试直连没通（{e}），继续走中继"),
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn watch_remote(
-    node: &Node,
-    identity: &Identity,
-    policy: &Policy,
-    target: Target,
-    auth: Auth,
+/// 桌面界面给访问驱动（[`viewer::drive`]）的东西：画面进界面的槽，事件进界面的通道。
+struct GuiEnv {
     sink: GuiSink,
-    input: tokio::sync::mpsc::Receiver<InputEvent>,
-    ev: &Emitter<ViewEvent>,
-    data_dir: &std::path::Path,
-) -> Result<Summary, NetError> {
-    // 输入事件先进这里，再转给当前这一次会话（重连后转给新会话）。
-    let current: Arc<Mutex<Option<tokio::sync::mpsc::Sender<InputEvent>>>> =
-        Arc::new(Mutex::new(None));
-    let forward = Arc::clone(&current);
-    let mut input = input;
-    let forwarder = tokio::spawn(async move {
-        while let Some(event) = input.recv().await {
-            let tx = forward
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .clone();
-            if let Some(tx) = tx {
-                let _ = tx.send(event).await;
-            }
-        }
-    });
-    let started = Instant::now();
-    let mut attempt = 0u32;
-    let mut upgraded: Option<Box<Dialed>> = None;
-    // 一次访问（从点连接到最终断开）：升级直连和断线重连换了连接，记录靠它串起来
-    let visit = Mutex::new(crate::diag_record::Visit::new());
-    let result = loop {
-        let (tx, rx) = tokio::sync::mpsc::channel(256);
-        *current.lock().unwrap_or_else(PoisonError::into_inner) = Some(tx);
-        let outcome = one_session(
-            node,
-            identity,
-            policy,
-            &target,
-            &auth,
-            sink.clone(),
-            rx,
-            ev,
-            data_dir,
-            upgraded.take(),
-            &visit,
-        )
-        .await;
-        match outcome {
-            Ok(Outcome::Done(summary)) => break Ok(summary),
-            // 换到直连：不算重连次数
-            Ok(Outcome::Upgrade(dialed)) => {
-                visit
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .note_upgrade();
-                upgraded = Some(dialed);
-            }
-            Ok(Outcome::Notice(text)) => {
-                ev.send(ViewEvent::Notice(text.clone()));
-                break Ok(Summary {
-                    end: text,
-                    elapsed: started.elapsed(),
-                    ..Summary::default()
-                });
-            }
-            Ok(Outcome::Lost(why)) if attempt < RECONNECT_TRIES => {
-                attempt += 1;
-                visit
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .note_lost();
-                peerdesk_net::note!(warn, "控制：网络断开（{why}），第 {attempt} 次重连");
-                ev.send(ViewEvent::Reconnecting { attempt, why });
-                tokio::time::sleep(RECONNECT_GAP).await;
-            }
-            Ok(Outcome::Lost(why)) => break Err(NetError::Closed(why)),
-            // 第一次就连不上：直接报错；重连时连不上：再试，用完次数再报错。
-            Err(e) if attempt > 0 && attempt < RECONNECT_TRIES => {
-                attempt += 1;
-                ev.send(ViewEvent::Reconnecting {
-                    attempt,
-                    why: e.to_string(),
-                });
-                tokio::time::sleep(RECONNECT_GAP).await;
-            }
-            Err(e) => break Err(e),
-        }
-    };
-    forwarder.abort();
-    result
+    ev: Emitter<ViewEvent>,
+    data_dir: PathBuf,
 }
 
-/// 连一次并跑一次会话。
-#[allow(clippy::too_many_arguments)]
-async fn one_session(
-    node: &Node,
-    identity: &Identity,
-    policy: &Policy,
-    target: &Target,
-    auth: &Auth,
-    sink: GuiSink,
-    input: tokio::sync::mpsc::Receiver<InputEvent>,
-    ev: &Emitter<ViewEvent>,
-    data_dir: &std::path::Path,
-    upgraded: Option<Box<Dialed>>,
-    visit: &Mutex<crate::diag_record::Visit>,
-) -> Result<Outcome, NetError> {
-    // 走中继时，会话中在后台试直连（用户没要求只走中继时）
-    let mut direct_search = None;
-    // 走中继时的本机转发器要保持到会话结束。
-    let (link, shim, route, detail) = match target {
-        Target::Addr { addr, pin } => (
-            node.connect(*addr, pin.as_ref()).await?,
-            None,
-            Route::Direct,
-            String::new(),
-        ),
-        Target::Device {
-            server,
-            device,
-            policy,
-            account,
-        } => {
-            let servers = server_order(*server, load_nodes(data_dir));
-            let dialed = match upgraded {
-                Some(dialed) => *dialed,
-                None => dial_via(node, &servers, device, *policy, account).await?,
-            };
-            if dialed.shim.is_some() && policy.upgrades() {
-                direct_search = Some((servers.clone(), *device, *policy, account.clone()));
-            }
-            // 顺便更新集群节点缓存，下次这个服务器崩了还能换别的节点。
-            if let Ok(nodes) = fetch_nodes(node, server).await {
-                if !nodes.is_empty() {
-                    let _ = save_nodes(data_dir, &nodes);
-                }
-            }
-            let rtt = dialed.rtt_us.map_or_else(String::new, |us| {
-                format!(
-                    " {:.1} ms",
-                    Duration::from_micros(us).as_secs_f64() * 1000.0
-                )
-            });
-            let note = if dialed.shim.is_some() && !dialed.relay_note.is_empty() {
-                format!("，{}", dialed.relay_note)
-            } else {
-                String::new()
-            };
-            let detail = format!("{}{rtt}{note}", dialed.route.label());
-            (dialed.link, dialed.shim, dialed.path, detail)
-        }
-    };
-    peerdesk_net::note!(
-        info,
-        "控制：已连上 {}（{}），路径 {route:?} {detail}",
-        link.remote_addr(),
-        to_hex(link.peer_fingerprint())
-            .get(..16)
-            .unwrap_or_default()
-    );
-    ev.send(ViewEvent::Connected {
-        peer: to_hex(link.peer_fingerprint()),
-        remote: link.remote_addr(),
-        route,
-        detail,
-    });
-    let started = Instant::now();
-    // 会话记录：会话号在 link 交给会话之前取
-    let record = visit
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .begin(link.session_id().ok(), data_dir);
-    let session = controller::run(
-        link,
-        ControllerOptions {
-            record,
-            session: session(identity, policy, auth.clone()),
-            deadline_us: FRAME_DEADLINE_US,
-            duration: None,
-            clipboard: {
-                let ev = ev.clone();
-                system_clipboard(Box::new(move |note| ev.send(ViewEvent::Clipboard(note))))
-            },
-            on_established: {
-                let ev = ev.clone();
-                Some(controller::EstablishedHook(Arc::new(
-                    move |caps: Caps, name: &str| {
-                        ev.send(ViewEvent::Peer(caps.os(), name.to_owned()));
-                    },
-                )))
-            },
-            on_link: Some(LinkHook({
-                let files = Arc::clone(&sink.files);
-                Arc::new(move |link| {
-                    *files.lock().unwrap_or_else(PoisonError::into_inner) = link;
-                })
-            })),
-            on_quality: {
-                let ev = ev.clone();
-                Some(controller::QualityHook(Arc::new(move |q| {
-                    ev.send(ViewEvent::Quality(q))
-                })))
-            },
-            audio: Some(peerdesk_net::audio::AudioOut {
-                playback: SYSTEM_AUDIO.1(),
-                on: sink.sound.clone(),
-            }),
-            view: Some(sink.view.clone()),
-        },
-        Box::new(sink),
-        input,
-        None,
-    );
-    // 走中继时盯着中继的通知：免费额度用完就结束会话并告诉用户原因。
-    let notice = async {
-        loop {
-            tokio::time::sleep(NOTICE_POLL).await;
-            if let Some((_, retry)) = shim.as_ref().and_then(Shim::notice) {
-                return free_limit_text(retry);
-            }
-        }
-    };
-    let upgrade = async {
-        match &direct_search {
-            Some((servers, device, policy, account)) => {
-                find_direct(node, servers, device, *policy, account).await
-            }
-            None => std::future::pending().await,
-        }
-    };
-    tokio::select! {
-        // 旧连接随会话一起放开；被控端看到同一个控制端的新连接就结束旧会话（见 host_main）
-        dialed = upgrade => Ok(Outcome::Upgrade(Box::new(dialed))),
-        report = session => {
-            let report = report?;
-            if network_lost(&report.end) {
-                return Ok(Outcome::Lost(report.end));
-            }
-            Ok(Outcome::Done(Summary {
-                end: report.end,
-                cancelled: false,
-                rtt: Some(report.rtt),
-                video_bytes: report.video_bytes,
-                elapsed: started.elapsed(),
-            }))
-        }
-        text = notice => Ok(Outcome::Notice(text)),
+impl ViewEnv for GuiEnv {
+    fn event(&self, event: viewer::ViewEvent) {
+        self.ev.send(ViewEvent::from(event));
+    }
+
+    fn sink(&self) -> Box<dyn ScreenSink> {
+        Box::new(self.sink.clone())
+    }
+
+    fn session(&self, identity: &Identity, policy: &Policy, auth: Auth) -> SessionConfig {
+        session(identity, policy, auth)
+    }
+
+    fn clipboard(&self) -> Option<ClipboardHandle> {
+        let ev = self.ev.clone();
+        system_clipboard(Box::new(move |note| ev.send(ViewEvent::Clipboard(note))))
+    }
+
+    fn audio(&self) -> Option<peerdesk_net::audio::AudioOut> {
+        Some(peerdesk_net::audio::AudioOut {
+            playback: SYSTEM_AUDIO.1(),
+            on: self.sink.sound.clone(),
+        })
+    }
+
+    fn view(&self) -> Option<watch::Receiver<(u16, u16)>> {
+        Some(self.sink.view.clone())
+    }
+
+    fn on_link(&self) -> Option<LinkHook> {
+        let files = Arc::clone(&self.sink.files);
+        Some(LinkHook(Arc::new(move |link| {
+            *files.lock().unwrap_or_else(PoisonError::into_inner) = link;
+        })))
+    }
+
+    fn record(&self) -> Option<peerdesk_net::recorder::RecordSetup> {
+        crate::diag_record::setup(&self.data_dir)
+    }
+
+    fn data_dir(&self) -> &std::path::Path {
+        &self.data_dir
     }
 }
 

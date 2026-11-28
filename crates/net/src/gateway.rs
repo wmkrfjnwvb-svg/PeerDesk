@@ -188,7 +188,9 @@ pub fn default_gateways() -> Vec<IpAddr> {
     platform_gateways()
 }
 
-#[cfg(target_os = "linux")]
+/// Android 也是 Linux 内核，路由表在同样的文件里；但 Android 10 起普通应用读不到 `/proc/net`（SELinux 限制），
+/// 读不到就是空列表，调用方照常说明“找不到路由器”。手机端以后由应用层（ConnectivityManager）把网关告诉核心。
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn platform_gateways() -> Vec<IpAddr> {
     let v4 = std::fs::read_to_string("/proc/net/route").unwrap_or_default();
     let v6 = std::fs::read_to_string("/proc/net/ipv6_route").unwrap_or_default();

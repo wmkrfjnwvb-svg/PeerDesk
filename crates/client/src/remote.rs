@@ -239,33 +239,9 @@ pub(crate) async fn stay_registered(
 /// 隔多久重新问一次集群节点列表（新加入的节点也登记上）。
 const CLUSTER_REFRESH: Duration = Duration::from_secs(60);
 
-/// 集群节点缓存文件：上次从服务器得到的节点列表，服务器崩了也能换到别的节点。
-const NODES_FILE: &str = "cluster-nodes.txt";
-
-/// 读缓存的集群节点（每行 `地址 指纹`），读不懂的行跳过。
-#[must_use]
-pub fn load_nodes(dir: &Path) -> Vec<Server> {
-    std::fs::read_to_string(dir.join(NODES_FILE))
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|line| {
-            let (addr, pin) = line.split_once(' ')?;
-            Some(Server {
-                addr: addr.parse().ok()?,
-                pin: Some(parse_hex(pin.trim()).ok()?),
-            })
-        })
-        .collect()
-}
-
-/// 存集群节点缓存。
-pub fn save_nodes(dir: &Path, nodes: &[Server]) -> std::io::Result<()> {
-    let text: String = nodes
-        .iter()
-        .filter_map(|n| Some(format!("{} {}\n", n.addr, to_hex(n.pin.as_ref()?))))
-        .collect();
-    std::fs::write(dir.join(NODES_FILE), text)
-}
+#[cfg(test)]
+use peerdesk_net::viewer::NODES_FILE;
+pub use peerdesk_net::viewer::{load_nodes, save_nodes};
 
 /// 也在集群里其他节点上登记：任何一个节点崩了，设备仍然在线，别的节点照样能找到它。
 /// 节点列表从 `seed` 问来（问不到时用缓存），每隔一段时间再问一次，新加入的节点也登记上。
@@ -730,10 +706,14 @@ async fn connect_session(
         })
     });
     // 命令行连接只有一份会话，一次访问就是它
-    let record = crate::diag_record::Visit::new().begin(link.session_id().ok(), &args.data_dir);
+    let record = peerdesk_net::viewer::Visit::new().begin(
+        link.session_id().ok(),
+        crate::diag_record::setup(&args.data_dir),
+    );
     let report = controller::run(
         link,
         ControllerOptions {
+            decoder: None,
             record,
             session: session(identity, policy, args.auth.clone()),
             deadline_us: 100_000,

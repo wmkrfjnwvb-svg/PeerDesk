@@ -279,6 +279,14 @@ pub enum Picture {
     /// 只有“显示的是什么”、没有像素（仿真里的假解码器出的，见 `docs/research/Q-redesign/a1-plan.md`）。
     /// 界面用不了它：产品里不会出现。
     Described(Described),
+    /// 平台的解码器已经直接画到屏幕上了（手机端 MediaCodec 解到 Surface，见 `docs/research/R-android.md`），
+    /// 没有像素交给界面；控制端照常按它统计帧率、冻结。
+    Presented {
+        /// 画面宽（像素）。
+        width: u16,
+        /// 画面高（像素）。
+        height: u16,
+    },
 }
 
 /// 假解码器交出的“显示出来的是什么”（没有像素）：仿真的显示端量尺按它判清晰、判有没有追上源画面。
@@ -302,13 +310,14 @@ impl Picture {
             Self::Rgb(s) => (s.width(), s.height()),
             Self::Nv12(n) => (n.width(), n.height()),
             Self::Described(d) => d.size,
+            Self::Presented { width, height } => (*width, *height),
         }
     }
 
     /// 转成 RGB 画面（在 CPU 上转颜色：只给测试、截图检查用，界面不用）。
     ///
     /// # Errors
-    /// 尺寸不对（不会发生：NV12 创建时已经检查过）；或者是 [`Self::Described`]（没有像素）。
+    /// 尺寸不对（不会发生：NV12 创建时已经检查过）；或者是 [`Self::Described`]、[`Self::Presented`]（没有像素）。
     pub fn to_screen(&self) -> Result<Screen, Error> {
         match self {
             Self::Rgb(s) => Ok(Screen::clone(s)),
@@ -319,7 +328,7 @@ impl Picture {
                 nv12_to_rgb(y, uv, w, w, h, &mut pixels);
                 Screen::from_pixels(n.width(), n.height(), pixels)
             }
-            Self::Described(_) => Err(Error::InvalidArgument(
+            Self::Described(_) | Self::Presented { .. } => Err(Error::InvalidArgument(
                 "只有描述、没有像素的画面不能转成 RGB",
             )),
         }
@@ -498,6 +507,13 @@ mod tests {
         });
         assert_eq!(described.size(), (8, 6));
         assert!(described.to_screen().is_err());
+        // 平台解码器已经画到屏幕上的：有尺寸，没有像素
+        let shown = Picture::Presented {
+            width: 1280,
+            height: 720,
+        };
+        assert_eq!(shown.size(), (1280, 720));
+        assert!(shown.to_screen().is_err());
     }
 
     #[test]

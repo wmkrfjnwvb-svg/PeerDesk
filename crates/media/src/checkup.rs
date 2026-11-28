@@ -1504,7 +1504,7 @@ fn budget_of(rates: Rates) -> usize {
     usize::try_from(rates.bps / 8 / u64::from(rates.fps.max(1))).unwrap_or(usize::MAX)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "soft"))]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
     use std::sync::Arc;

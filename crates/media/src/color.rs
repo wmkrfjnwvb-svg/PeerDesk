@@ -45,6 +45,7 @@ pub fn rgb_to_i420(
 }
 
 /// RGB 字节（每像素 3 字节）打包成 `0x00RRGGBB`，追加到 `out` 后面。
+#[cfg(feature = "soft")]
 pub fn pack_rgb(rgb: &[u8], out: &mut Vec<u32>) {
     out.extend(
         rgb.chunks_exact(3)
@@ -52,7 +53,7 @@ pub fn pack_rgb(rgb: &[u8], out: &mut Vec<u32>) {
     );
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "soft"))]
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;

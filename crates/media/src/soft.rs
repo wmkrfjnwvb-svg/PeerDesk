@@ -26,8 +26,7 @@ use crate::backend::{
 };
 use crate::qp;
 
-/// openh264 每层固定 QP 的默认值（`SVC_QUALITY_BASE_QP`）：新开的编码器第一帧就是按它编的。
-pub const DEFAULT_LAYER_QP: u8 = 26;
+pub use crate::qp::DEFAULT_LAYER_QP;
 
 /// openh264 软件编码后端。
 pub struct OpenH264Backend {

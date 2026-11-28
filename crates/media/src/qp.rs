@@ -20,6 +20,9 @@
 //!   低 QP 降一步就是几十 KB，传几秒，用户一动新画面就排在它后面。
 
 /// 最小 QP：补清晰补到这里为止（再小几乎看不出区别，白费流量）。
+/// openh264 每层固定 QP 的默认值（`SVC_QUALITY_BASE_QP`）：新开的编码器第一帧就是按它编的。
+/// 放在这里而不是 `soft`：仿真的假后端照 openh264 的属性时也要它，手机端不带 `soft` 时也编得过。
+pub const DEFAULT_LAYER_QP: u8 = 26;
 pub const MIN_QP: u8 = 12;
 /// 最大 QP。
 pub const MAX_QP: u8 = 51;

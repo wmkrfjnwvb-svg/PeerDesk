@@ -9,8 +9,11 @@ rust-version.workspace = true
 [features]
 # 画面编解码（会话的被控端和控制端）。服务端只做信令和中继，不需要它，也就不用编译 C++ 的 openh264，
 # 可以静态链接 musl 发布。
-default = ["media", "portmap"]
+default = ["media", "soft", "portmap"]
 media = ["dep:peerdesk-media"]
+# 软件 H.264（OpenH264）：被控端编码、控制端默认的解码器都要它。手机端不带：用系统的硬件解码器，
+# 由调用方通过 `ControllerOptions::decoder` 提供（见 docs/research/R-android.md）。
+soft = ["media", "peerdesk-media/source"]
 # 请家里的路由器为本机映射端口（UPnP、NAT-PMP、PCP）。
 portmap = ["dep:igd-next"]
 

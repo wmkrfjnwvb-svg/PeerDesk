@@ -5,7 +5,8 @@ name: CI
 # 提交信息里有 [full] 或手动运行时照跑（见 changes 任务）。
 # Windows / macOS 的测试、平台实机测试、界面截图、安装包按需触发：
 # - 提交信息里写 [mac] 或 [win]：只跑那个平台的测试和实机测试；[full]：全部平台加界面截图；
-#   [pkg]：打安装包（同时验证 Docker 镜像能构建）；[load]：服务端并发压力测试（Linux）。
+#   [pkg]：打安装包（同时验证 Docker 镜像能构建）；[load]：服务端并发压力测试（Linux）；
+#   [android]：上传 Android 的 APK（构建和单元测试在改了 android/、crates/mobile/ 时照跑，见 android 任务）。
 #   可以组合，例如 [mac][pkg]。先在一个平台上验证，过了再跑其他平台；
 # - 在 Actions 页面手动运行（Run workflow），选择范围：full / macos-tests / windows-tests / packages。
 on:
@@ -95,6 +96,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       e2e: ${{ steps.diff.outputs.e2e }}
+      android: ${{ steps.diff.outputs.android }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -108,6 +110,7 @@ jobs:
         run: |
           set -euo pipefail
           run=true
+          android=true
           from=""
           case "$EVENT" in
             push) from="$BEFORE" ;;
@@ -123,12 +126,66 @@ jobs:
             else
               run=false
             fi
+            # Android：界面工程、手机核心、Android 脚本、本工作流。核心依赖的 core、media、net 改了接口时，
+            # 手机核心的平台无关部分已经在 check 任务的 clippy 里编过（只有 JNI 接线要 Android 目标才编）。
+            if echo "$changed" | grep -Eq '^(android/|crates/mobile/|scripts/android-|\.github/workflows/)'; then
+              android=true
+            else
+              android=false
+            fi
           fi
           case "$MESSAGE" in
-            *'[full]'*) run=true ;;
+            *'[full]'*) run=true; android=true ;;
+          esac
+          case "$MESSAGE" in
+            *'[android]'*|*'[pkg]'*) android=true ;;
           esac
           echo "端到端测试：$run"
+          echo "Android：$android"
           echo "e2e=$run" >> "$GITHUB_OUTPUT"
+          echo "android=$android" >> "$GITHUB_OUTPUT"
+
+  # Android 控制端：交叉编译 Rust 核心（arm64）、Gradle 编 APK、跑 JVM 单元测试。
+  # 只在改了 android/、crates/mobile/、Android 脚本时跑（见 changes），或者提交信息里有 [android]、[pkg]、[full]。
+  # SDK 用 GitHub Ubuntu 机器预装的那份（许可协议已在镜像里接受），缺的固定版本（平台 36、编译工具 36.0.0、
+  # NDK r29，和 scripts/android-setup.sh 一致）用 sdkmanager 补装。APK 只在 [android]、[pkg] 时上传，保留 7 天。
+  android:
+    name: android (apk + unit tests)
+    needs: changes
+    if: ${{ needs.changes.outputs.android == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show && rustup target add aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: android
+          workspaces: ". -> target-android"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+          cache: gradle
+      - name: Android SDK pieces
+        run: |
+          set -euo pipefail
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-36" "build-tools;36.0.0" "ndk;29.0.14206865" > /dev/null
+      - name: Build APK
+        run: scripts/android-build.sh
+      - name: Unit tests (JVM)
+        run: ./gradlew --no-daemon testDebugUnitTest
+        working-directory: android
+      - name: Name
+        if: ${{ contains(github.event.head_commit.message, '[android]') || contains(github.event.head_commit.message, '[pkg]') }}
+        run: echo "SHORT=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@v4
+        if: ${{ contains(github.event.head_commit.message, '[android]') || contains(github.event.head_commit.message, '[pkg]') }}
+        with:
+          name: peerdesk-${{ env.SHORT }}-android-arm64-debug
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 7
 
   # 截图和指标作为构建产物上传，表格贴到运行摘要里。
   e2e:

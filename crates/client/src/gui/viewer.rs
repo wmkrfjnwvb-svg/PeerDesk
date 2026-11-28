@@ -182,9 +182,10 @@ impl Viewer {
                     self.showing_yuv = true;
                     None
                 }
-                Picture::Nv12(_) | Picture::Rgb(_) | Picture::Described(_) => {
-                    picture.to_screen().ok()
-                }
+                Picture::Nv12(_)
+                | Picture::Rgb(_)
+                | Picture::Described(_)
+                | Picture::Presented { .. } => picture.to_screen().ok(),
             };
             if let Some(screen) = cpu {
                 self.showing_yuv = false;

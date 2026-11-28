@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">PeerDesk</string>
+
+    <string name="connect_title">连接到电脑</string>
+    <string name="connect_server">服务器</string>
+    <string name="connect_server_hint">主机:端口</string>
+    <string name="connect_code">设备码</string>
+    <string name="connect_password">密码</string>
+    <string name="connect_button">连接</string>
+    <string name="connect_bad_code">设备码是 9 位数字。</string>
+    <string name="connect_background_note">离开应用后会断开连接，回来需要重新连接。</string>
+    <string name="connect_failed">连接失败：%1$s</string>
+    <string name="connect_ended">会话已结束：%1$s</string>
+    <string name="connect_ended_background">应用切到了后台，连接已断开。请重新连接。</string>
+    <string name="connect_no_surface">显示面不可用。请关闭应用后重新打开。</string>
+
+    <string name="session_connecting">正在连接…</string>
+    <string name="session_reconnecting">连接中断，正在重连（第 %1$d 次）：%2$s</string>
+    <string name="toolbar_disconnect">断开</string>
+    <string name="toolbar_keyboard">键盘</string>
+    <string name="toolbar_hide">收起工具条</string>
+    <string name="toolbar_show">展开工具条</string>
+    <string name="mouse_left_desc">鼠标左键。按住并拖动可以选中内容；指针就是箭头尖。</string>
+    <string name="mouse_right_desc">鼠标右键</string>
+    <string name="mouse_handle_desc">鼠标身体。拖动它来移动指针。</string>
+    <string name="mouse_close_desc">把鼠标缩成小鼠标</string>
+    <string name="mouse_mini_desc">小鼠标。点一下展开成大鼠标，也可以拖动换位置。</string>
+    <string name="connect_gestures">手势：点一下 = 左键；滑动 = 移动画面；长按后松开 = 右键；长按后拖动 = 拖拽；双指点 = 右键；双指滑动 = 滚动；捏合 = 缩放。点屏幕上的小鼠标，展开成带左右键的大鼠标。</string>
+    <string name="toolbar_export_trace">导出上次的手势记录</string>
+    <string name="trace_share_title">PeerDesk 手势记录</string>
+    <string name="back_again_to_disconnect">再按一次返回键断开</string>
+    <string name="route_direct">直连</string>
+    <string name="route_relay">中继</string>
+
+    <string name="status_line">%1$d 毫秒 · %2$d 帧/秒 · %3$s · 丢包 %4$s</string>
+    <string name="status_mbps">%1$.1f Mbps</string>
+    <string name="status_kbps">%1$d kbps</string>
+    <string name="status_waiting">等待第一帧…</string>
+    <string name="diag_router">本机到路由器这一段慢或在丢包（到路由器 %1$d 毫秒）。靠近路由器，或换到 5 GHz 频段。</string>
+    <string name="diag_internet">问题出在公网，不是你的 Wi-Fi。等一等或换个网络可能有帮助。</string>
+    <string name="diag_unmeasured">网络慢或丢包。没能测到路由器，原因多半在公网这一段。</string>
+
+    <string name="key_esc">Esc</string>
+    <string name="key_tab">Tab</string>
+    <string name="key_ctrl">Ctrl</string>
+    <string name="key_alt">Alt</string>
+    <string name="key_win">Win</string>
+    <string name="key_cmd">Cmd</string>
+    <string name="connect_show_password">显示密码</string>
+    <string name="connect_hide_password">隐藏密码</string>
+</resources>
