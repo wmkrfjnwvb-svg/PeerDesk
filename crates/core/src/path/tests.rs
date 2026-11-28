@@ -1751,6 +1751,7 @@ fn loss_before_bottleneck_applies_to_cross_traffic() {
             },
         );
         p.advance_to(Time(3_000_000));
+        assert_eq!(p.cross_sources(), 1);
         p.cross_stats(id)
     };
     let (late, early) = (run(false), run(true));
