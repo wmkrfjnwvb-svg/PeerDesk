@@ -1377,7 +1377,7 @@ mod tests {
                 (
                     Dir::Reverse,
                     CrossSpec::Tcp {
-                        cfg: tcp,
+                        cfg: TcpConfig { sack: false, ..tcp },
                         start: Time(5),
                         bytes: Some(1_000_000),
                     },
@@ -1418,6 +1418,7 @@ mod tests {
         assert_eq!(text.matches(" pdv=").count(), 1, "没开的方向不写");
         assert!(text.contains("\nroute.1 at=2000000 down_us=50000 new=0\n"));
         assert!(!text.contains("route.1.fwd"));
+        assert_eq!(text.matches(" sack=0").count(), 1, "只在关掉 SACK 时写");
         // 布局 1 转过来的也能来回；布局 1 的写法和以前一样（哈希不变）由 round_trips_are_byte_identical 守着
         let mut converted = busy_scenario();
         converted.network = converted.network.to_layout2(true);

@@ -104,7 +104,7 @@ pub use dir::{DirConfig, DirState, Lane, Outcome, Transit};
 pub use loss::{burst_probabilities, Loss, LossState};
 pub use policer::{Policer, PolicerState};
 pub use rng::{layer, stream_seed, Dir, LayerRng};
-pub use tcp::{TcpConfig, TcpReceiver, TcpSender, TcpStats};
+pub use tcp::{SackBlocks, TcpConfig, TcpReceiver, TcpSender, TcpStats};
 
 /// 两个方向的参数。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

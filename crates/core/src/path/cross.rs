@@ -31,7 +31,7 @@ use crate::Time;
 
 use super::dir::{DirState, Lane, Transit};
 use super::rng::{Dir, LayerRng};
-use super::tcp::{TcpConfig, TcpReceiver, TcpSender, TcpStats};
+use super::tcp::{SackBlocks, TcpConfig, TcpReceiver, TcpSender, TcpStats};
 use super::Verdict;
 
 /// 交叉流量的种类。
@@ -125,7 +125,8 @@ pub struct BurstRecord {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ItemKind {
     Data(u64),
-    Ack(u64),
+    /// 累计确认和 SACK 块。
+    Ack(u64, SackBlocks),
 }
 
 /// 在途的交叉包（已经算好什么时候到）。
@@ -463,6 +464,7 @@ impl Source {
             ItemKind::Data(seq) => {
                 let before = flow.rcv.delivered();
                 let ack = flow.rcv.on_segment(seq);
+                let blocks = flow.rcv.sack_blocks(seq);
                 self.stats.delivered_bytes +=
                     (flow.rcv.delivered() - before) * cfg.mss_bytes as u64;
                 let reverse = dir.other();
@@ -475,7 +477,7 @@ impl Source {
                             src: item.src,
                             generation: item.generation,
                             flow: item.flow,
-                            kind: ItemKind::Ack(ack),
+                            kind: ItemKind::Ack(ack, blocks),
                         };
                         ctx.push(at, it);
                     }
@@ -483,9 +485,9 @@ impl Source {
                     Transit::Lost => self.stats.ack_lost += 1,
                 }
             }
-            ItemKind::Ack(ack) => {
+            ItemKind::Ack(ack, blocks) => {
                 let mut out = Vec::new();
-                flow.snd.on_ack(t, ack, &mut out);
+                flow.snd.on_ack_sack(t, ack, blocks, &mut out);
                 send_data(
                     ctx,
                     dir,
@@ -650,7 +652,7 @@ mod tests {
             src: 0,
             generation: 99,
             flow: 0,
-            kind: ItemKind::Ack(5),
+            kind: ItemKind::Ack(5, [None; 3]),
         };
         let missing = Item {
             src: 0,

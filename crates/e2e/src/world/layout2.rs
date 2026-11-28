@@ -481,8 +481,9 @@ fn tcp_fields(c: &TcpConfig) -> Vec<(&'static str, String)> {
         max_rto_us,
         initial_rto_us,
         granularity_us,
+        sack,
     } = c;
-    vec![
+    let mut fields = vec![
         ("mss_bytes", mss_bytes.to_string()),
         ("ack_bytes", ack_bytes.to_string()),
         ("init_cwnd", init_cwnd_segments.to_string()),
@@ -490,7 +491,12 @@ fn tcp_fields(c: &TcpConfig) -> Vec<(&'static str, String)> {
         ("max_rto_us", max_rto_us.to_string()),
         ("initial_rto_us", initial_rto_us.to_string()),
         ("granularity_us", granularity_us.to_string()),
-    ]
+    ];
+    // SACK 是后来加的（默认开）：只在关掉时写，没写的世界文件读出来是开（和默认一样）
+    if !*sack {
+        fields.push(("sack", flag(false)));
+    }
+    fields
 }
 
 fn parse_tcp(f: &mut Kv) -> Result<TcpConfig, WorldError> {
@@ -502,6 +508,11 @@ fn parse_tcp(f: &mut Kv) -> Result<TcpConfig, WorldError> {
         max_rto_us: f.take_u64("max_rto_us")?,
         initial_rto_us: f.take_u64("initial_rto_us")?,
         granularity_us: f.take_u64("granularity_us")?,
+        sack: if f.has("sack") {
+            f.take_bool("sack")?
+        } else {
+            true
+        },
     })
 }
 

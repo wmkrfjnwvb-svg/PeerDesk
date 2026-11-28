@@ -1,17 +1,31 @@
-//! 包一级的 TCP NewReno：发送端和接收端的状态机，不依赖路径模型，时间由调用方传入。
+//! 包一级的 TCP（NewReno，默认带 SACK）：发送端和接收端的状态机，不依赖路径模型，时间由调用方传入。
 //!
 //! 依据：RFC 5681（慢启动、拥塞避免、快速重传、快速恢复）、RFC 6582（NewReno：部分确认）、
-//! RFC 6298（RTO 的计算）。不追求和任何内核逐字节一样，只要“会把队列填满、丢包后退让”两个行为对
+//! RFC 6298（RTO 的计算）、RFC 2018（SACK 选项）、RFC 6675（基于 SACK 的保守丢包恢复）。不追求和任何内核逐字节一样，只要“会把队列填满、丢包后退让”两个行为对
 //! （`a2-plan.md` 第 4 节）。简化和取舍，每一条都影响结果，所以写在这里：
 //! - 序号以“包”为单位（一个包 = 一个 MSS），窗口用字节记（`cwnd = n × MSS`），公式照 RFC 5681 的字节写法；
 //! - **接收端每个包都回确认，不用延迟确认**（RFC 1122 允许每两个包确认一次）。后果：慢启动时窗口增长比常见内核快
 //!   （每个包 +1 MSS，而不是每两个包 +1 MSS），拥塞避免时每个往返仍然只涨 1 个 MSS，吞吐公式不受影响；
-//! - 没有 SACK（RFC 2018）：一个窗口里丢多个包时，NewReno 每个往返只能补一个，这正是 NewReno 的特点；
+//! - SACK（`TcpConfig::sack`，默认开，A2-4b 加，见下面一节）。关掉就是不带 SACK 的 NewReno：一个窗口里丢多个包时，
+//!   每个往返只能补一个，深队列里慢启动冲出去之后会停很久（`a2-plan.md` 第 4 节 A2-2 的结果）；
 //! - 没有限制性重传（RFC 3042）、没有窗口缩放和接收窗口（接收端窗口无限大，只受拥塞窗口限制）、没有 ECN；
 //! - 超时之后回到 `snd_una` 重发（go-back-N），随后的确认会跳过接收端已经收到的包；
 //! - RTO 的最小值可设（RFC 6298 第 2.4 条建议 1 s，测试里可以设小）；
 //! - 只测一个包的往返时间，重传的包不取样（Karn 算法）。
-
+//!
+//! # SACK（RFC 2018、RFC 6675）
+//!
+//! 实机的 TCP 都带 SACK，量尺要接近真实，所以默认打开（2026-11-28 主会话定）。按包为单位，做法照 RFC 6675：
+//! - 接收端每个确认带最多 3 个 SACK 块（`[开始, 结束)`，按包序号）。第一块是刚收到的包所在的那一段（RFC 2018 第 4 节），
+//!   其余按序号从高到低（原文是“最近报过的”，这里简化）；
+//! - 发送端记分板记哪些包被 SACK 过。一个包之上被 SACK 的包不少于 3 个（DupThresh）就算丢了（`IsLost`）；
+//! - 进入恢复：3 个重复确认，或者 `snd_una` 已经算丢了（RFC 6675 第 5 节第 4 步）。
+//!   RecoveryPoint = 已发的最高序号，ssthresh = 在途 / 2（至少 2 个 MSS），cwnd = ssthresh，重传第一个没被 SACK 的包；
+//! - 恢复期间按 `pipe` 发：pipe = [snd_una, snd_nxt) 里没被 SACK 的包中，没算丢的个数，加已经重传过的个数。
+//!   cwnd − pipe 还够一个 MSS 就发：先发最低的、算丢了、还没重传过的包，没有就发新数据（RFC 6675 NextSeg() 的第 1、2 条；
+//!   第 3、4 条（没算丢的包的“救援”重传）不做）；
+//! - 累计确认越过 RecoveryPoint 就退出恢复，cwnd 保持 ssthresh；
+//! - 超时：照 RFC 2018 第 8 节把 SACK 记分板清掉（接收端可能“反悔”），go-back-N 重发。
 use std::collections::BTreeSet;
 
 use crate::Time;
@@ -33,6 +47,8 @@ pub struct TcpConfig {
     pub initial_rto_us: u64,
     /// 时钟粒度 G（微秒），RFC 6298 的 `RTO = SRTT + max(G, 4 × RTTVAR)`。
     pub granularity_us: u64,
+    /// 用 SACK（RFC 2018、RFC 6675），默认开。关掉是不带 SACK 的 NewReno（A2-2 的行为）。
+    pub sack: bool,
 }
 
 impl Default for TcpConfig {
@@ -45,9 +61,16 @@ impl Default for TcpConfig {
             max_rto_us: 60_000_000,
             initial_rto_us: 1_000_000,
             granularity_us: 1_000,
+            sack: true,
         }
     }
 }
+
+/// 一个确认带的 SACK 块：最多 3 个 `[开始, 结束)`（按包序号）。
+pub type SackBlocks = [Option<(u64, u64)>; 3];
+
+/// RFC 6675 的 DupThresh：一个包之上被 SACK 的包有这么多，就算它丢了。
+const DUP_THRESH: u64 = 3;
 
 /// 发送端的计数。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -87,6 +110,10 @@ pub struct TcpSender {
     timed: Option<(u64, Time)>,
     rto_at: Option<Time>,
     stats: TcpStats,
+    /// SACK 记分板：被 SACK 过的包（都在 `snd_una` 之上）。
+    sacked: BTreeSet<u64>,
+    /// 这次恢复里已经重传过的包。
+    rexmit: BTreeSet<u64>,
 }
 
 impl TcpSender {
@@ -111,6 +138,8 @@ impl TcpSender {
             timed: None,
             rto_at: None,
             stats: TcpStats::default(),
+            sacked: BTreeSet::new(),
+            rexmit: BTreeSet::new(),
         }
     }
 
@@ -183,6 +212,10 @@ impl TcpSender {
         while (self.nxt - self.una) * mss < self.cwnd && self.total.is_none_or(|t| self.nxt < t) {
             let seq = self.nxt;
             self.nxt += 1;
+            // 超时以后 go-back-N 时，接收端已经 SACK 过的不重发（记分板在超时时清空，这里只在没清空时起作用）
+            if self.sacked.contains(&seq) {
+                continue;
+            }
             self.emit(now, seq, out);
         }
         if self.rto_at.is_none() && self.nxt > self.una {
@@ -282,6 +315,138 @@ impl TcpSender {
     }
 
     /// 超时（`next_timer` 到了）：RFC 5681 第 3.1 条。
+    /// 收到一个带 SACK 块的确认。`TcpConfig::sack` 关着时 SACK 块不看，和 [`Self::on_ack`] 一样。
+    pub fn on_ack_sack(&mut self, now: Time, ack: u64, blocks: SackBlocks, out: &mut Vec<u64>) {
+        if !self.cfg.sack {
+            self.on_ack(now, ack, out);
+            return;
+        }
+        let mss = self.mss();
+        let lo = ack.max(self.una);
+        for (start, end) in blocks.into_iter().flatten() {
+            for seq in start.max(lo)..end.min(self.nxt) {
+                let _ = self.sacked.insert(seq);
+            }
+        }
+        if ack > self.una {
+            let acked = ack - self.una;
+            self.una = ack;
+            self.nxt = self.nxt.max(ack);
+            self.dupacks = 0;
+            self.sacked = self.sacked.split_off(&ack);
+            self.rexmit = self.rexmit.split_off(&ack);
+            if let Some((s, t0)) = self.timed {
+                if s < ack {
+                    self.sample_rtt(now.since(t0));
+                    self.timed = None;
+                }
+            }
+            if self.in_recovery {
+                if self.recover.is_some_and(|r| ack > r) {
+                    // 越过 RecoveryPoint：退出恢复，cwnd 保持 ssthresh
+                    self.in_recovery = false;
+                    self.cwnd = self.ssthresh;
+                    self.rexmit.clear();
+                }
+            } else if self.cwnd < self.ssthresh {
+                self.cwnd += (acked * mss).min(mss);
+            } else {
+                self.cwnd += (mss * mss / self.cwnd).max(1);
+            }
+            self.rto_at = (self.una < self.nxt).then(|| now.plus(self.rto));
+        } else if self.nxt > self.una {
+            self.dupacks += 1;
+        }
+        let lost_una = self.nxt > self.una && self.is_lost(self.una);
+        if !self.in_recovery
+            && self.nxt > self.una
+            && (self.dupacks >= 3 || lost_una)
+            && self.recover.is_none_or(|r| self.una > r)
+        {
+            let flight = (self.nxt - self.una) * mss;
+            self.ssthresh = (flight / 2).max(2 * mss);
+            self.cwnd = self.ssthresh;
+            self.recover = Some(self.nxt - 1);
+            self.in_recovery = true;
+            self.stats.fast_retransmits += 1;
+            self.rexmit.clear();
+            // 第一个没被 SACK 的包
+            let first = (self.una..self.nxt)
+                .find(|s| !self.sacked.contains(s))
+                .unwrap_or(self.una);
+            let _ = self.rexmit.insert(first);
+            self.retransmit(first, out);
+            self.rto_at = Some(now.plus(self.rto));
+        }
+        if self.in_recovery {
+            self.send_in_recovery(now, out);
+        } else {
+            self.fill(now, out);
+        }
+    }
+
+    /// RFC 6675 的 IsLost：`seq` 之上被 SACK 的包不少于 DupThresh 个。
+    fn is_lost(&self, seq: u64) -> bool {
+        self.sacked.range(seq + 1..).take(3).count() as u64 >= DUP_THRESH
+    }
+
+    /// RFC 6675 的 pipe（按包），见模块文档。从高往低走一遍，边走边数之上被 SACK 的包。
+    fn pipe(&self) -> u64 {
+        let mut above = 0u64;
+        let mut pipe = 0u64;
+        for seq in (self.una..self.nxt).rev() {
+            if self.sacked.contains(&seq) {
+                above += 1;
+                continue;
+            }
+            if above < DUP_THRESH {
+                pipe += 1;
+            }
+            if self.rexmit.contains(&seq) {
+                pipe += 1;
+            }
+        }
+        pipe
+    }
+
+    /// 最低的、算丢了、这次恢复里还没重传过的包。
+    fn next_lost(&self) -> Option<u64> {
+        let mut above = self.sacked.len() as u64;
+        for seq in self.una..self.nxt {
+            if self.sacked.contains(&seq) {
+                above = above.saturating_sub(1);
+                continue;
+            }
+            if above < DUP_THRESH {
+                return None;
+            }
+            if !self.rexmit.contains(&seq) {
+                return Some(seq);
+            }
+        }
+        None
+    }
+
+    /// 恢复期间：cwnd − pipe 还够一个 MSS 就发，先补洞，再发新数据（RFC 6675 第 5 节的 NextSeg() 第 1、2 条）。
+    fn send_in_recovery(&mut self, now: Time, out: &mut Vec<u64>) {
+        let mss = self.mss();
+        while self.cwnd >= (self.pipe() + 1) * mss {
+            if let Some(seq) = self.next_lost() {
+                let _ = self.rexmit.insert(seq);
+                self.retransmit(seq, out);
+            } else if self.total.is_none_or(|t| self.nxt < t) {
+                let seq = self.nxt;
+                self.nxt += 1;
+                self.emit(now, seq, out);
+            } else {
+                break;
+            }
+        }
+        if self.rto_at.is_none() && self.nxt > self.una {
+            self.rto_at = Some(now.plus(self.rto));
+        }
+    }
+
     pub fn on_timeout(&mut self, now: Time, out: &mut Vec<u64>) {
         if self.una >= self.nxt {
             self.rto_at = None;
@@ -295,6 +460,9 @@ impl TcpSender {
         self.dupacks = 0;
         self.recover = Some(self.nxt - 1);
         self.timed = None;
+        // RFC 2018 第 8 节：超时后不再相信 SACK 过的位
+        self.sacked.clear();
+        self.rexmit.clear();
         self.stats.timeouts += 1;
         self.rto = (self.rto * 2).min(self.cfg.max_rto_us);
         // 回到最早没确认的包重发
@@ -325,6 +493,38 @@ impl TcpReceiver {
     }
 
     /// 收到第 `seq` 个包，返回要回的确认号（下一个想要的包）。每个包都回，重复的、乱序的也回（重复确认）。
+    /// 这个确认带的 SACK 块（RFC 2018）：`last` 是刚收到的包；第一块是它所在的那一段（它在累计确认之下时没有这一块），
+    /// 其余按序号从高到低，最多 3 块。
+    #[must_use]
+    pub fn sack_blocks(&self, last: u64) -> SackBlocks {
+        // 乱序收到的包连成的段：[开始, 结束)
+        let mut ranges: Vec<(u64, u64)> = Vec::new();
+        for &seq in &self.ahead {
+            match ranges.last_mut() {
+                Some((_, end)) if *end == seq => *end = seq + 1,
+                Some(_) | None => ranges.push((seq, seq + 1)),
+            }
+        }
+        let mut blocks: SackBlocks = [None; 3];
+        let first = ranges.iter().position(|(a, b)| *a <= last && last < *b);
+        let mut slot = blocks.iter_mut();
+        if let Some(i) = first {
+            if let (Some(b), Some(r)) = (slot.next(), ranges.get(i)) {
+                *b = Some(*r);
+            }
+        }
+        for (i, r) in ranges.iter().enumerate().rev() {
+            if Some(i) == first {
+                continue;
+            }
+            match slot.next() {
+                Some(b) => *b = Some(*r),
+                None => break,
+            }
+        }
+        blocks
+    }
+
     pub fn on_segment(&mut self, seq: u64) -> u64 {
         if seq == self.next {
             self.next += 1;
@@ -345,7 +545,7 @@ mod tests {
 
     enum Ev {
         Data(u64),
-        Ack(u64),
+        Ack(u64, SackBlocks),
     }
 
     /// 一个只有固定单程延迟、不限带宽的网络；`lose(seq, 第几次发这个包)` 决定丢不丢数据包。
@@ -386,10 +586,11 @@ mod tests {
                     match ev {
                         Ev::Data(seq) => {
                             let ack = rcv.on_segment(seq);
-                            events.insert((now.plus(one_way_us), id), Ev::Ack(ack));
+                            let blocks = rcv.sack_blocks(seq);
+                            events.insert((now.plus(one_way_us), id), Ev::Ack(ack, blocks));
                             id += 1;
                         }
-                        Ev::Ack(a) => snd.on_ack(now, a, &mut out),
+                        Ev::Ack(a, b) => snd.on_ack_sack(now, a, b, &mut out),
                     }
                 }
                 (_, tm) => {
@@ -401,12 +602,113 @@ mod tests {
         }
     }
 
+    /// 不带 SACK 的 NewReno（下面这些测试测的是 NewReno 自己的行为）。
     fn cfg() -> TcpConfig {
         TcpConfig {
             min_rto_us: 200_000,
             initial_rto_us: 200_000,
+            sack: false,
             ..TcpConfig::default()
         }
+    }
+
+    fn sack() -> TcpConfig {
+        TcpConfig {
+            sack: true,
+            ..cfg()
+        }
+    }
+
+    /// 一个窗口里丢 4 个包：SACK 在一次恢复里一个往返补完（4 次重传、1 次快速重传、不超时），NewReno 要一个洞一个往返。
+    #[test]
+    fn sack_repairs_several_losses_in_one_round_trip() {
+        let holes = [20u64, 22, 24, 26];
+        let lose = |seq: u64, n: u32| n == 1 && holes.contains(&seq);
+        // 只传 40 个包：补洞在完成的关键路径上（传得多时，完成时刻由后面的数据决定，看不出差别）
+        let (s, rs, t_sack) = run(sack(), 40, 10_000, lose);
+        let (n, rn, t_reno) = run(cfg(), 40, 10_000, lose);
+        assert_eq!((rs.delivered(), rn.delivered()), (40, 40));
+        let st = s.stats();
+        assert_eq!(
+            (st.retransmits, st.fast_retransmits, st.timeouts),
+            (4, 1, 0)
+        );
+        assert!(
+            t_sack.micros() + 2 * 20_000 <= t_reno.micros(),
+            "SACK {t_sack:?}，NewReno {t_reno:?}"
+        );
+        assert!(n.stats().retransmits >= 4);
+        assert!(!s.in_recovery());
+        assert!(s.sacked.is_empty() && s.rexmit.is_empty());
+    }
+
+    /// 关掉 SACK 时，带 SACK 块的确认和不带的完全一样。
+    #[test]
+    fn with_sack_off_the_blocks_are_ignored() {
+        let lose = |seq: u64, n: u32| n == 1 && (seq == 30 || seq == 31);
+        let (a, _, ta) = run(cfg(), 120, 5_000, lose);
+        let mut b = TcpSender::new(cfg(), Some(120));
+        let mut out = Vec::new();
+        b.start(Time::ZERO, &mut out);
+        b.on_ack_sack(Time(1), 0, [Some((5, 9)), None, None], &mut out);
+        assert!(b.sacked.is_empty());
+        assert_eq!(a.stats().timeouts, 0);
+        assert!(ta.micros() > 0);
+    }
+
+    /// SACK 块：第一块是刚收到的包所在的段，其余从高到低，最多 3 块；刚收到的包在累计确认之下时没有“第一块”。
+    #[test]
+    fn sack_blocks_follow_rfc_2018() {
+        let mut r = TcpReceiver::new();
+        for seq in [0, 1, 3, 4, 6, 8, 9, 12] {
+            let _ = r.on_segment(seq);
+        }
+        assert_eq!(r.delivered(), 2);
+        assert_eq!(
+            r.sack_blocks(6),
+            [Some((6, 7)), Some((12, 13)), Some((8, 10))]
+        );
+        assert_eq!(
+            r.sack_blocks(3),
+            [Some((3, 5)), Some((12, 13)), Some((8, 10))]
+        );
+        assert_eq!(
+            r.sack_blocks(1),
+            [Some((12, 13)), Some((8, 10)), Some((6, 7))]
+        );
+        assert_eq!(TcpReceiver::new().sack_blocks(0), [None; 3]);
+    }
+
+    /// 判丢（IsLost）要之上有 3 个被 SACK 的包；pipe 只算没被 SACK、没算丢的，加重传过的。
+    #[test]
+    fn scoreboard_is_lost_and_pipe() {
+        let mut s = TcpSender::new(sack(), None);
+        let mut out = Vec::new();
+        s.start(Time::ZERO, &mut out); // 0..10 在途
+        assert_eq!(out.len(), 10);
+        out.clear();
+        // 0 丢了，1、2 被 SACK：还没到 3 个
+        s.on_ack_sack(Time(10), 0, [Some((1, 3)), None, None], &mut out);
+        assert!(!s.is_lost(0) && !s.in_recovery());
+        assert_eq!(s.pipe(), 8);
+        // 再 SACK 3：0 算丢了，进恢复并重传 0
+        s.on_ack_sack(Time(11), 0, [Some((3, 4)), None, None], &mut out);
+        assert!(s.is_lost(0) && s.in_recovery());
+        assert_eq!(out.first(), Some(&0));
+        assert_eq!(s.stats().fast_retransmits, 1);
+        // 超时：记分板清空
+        let mut out = Vec::new();
+        s.on_timeout(Time(2_000_000), &mut out);
+        assert!(s.sacked.is_empty() && s.rexmit.is_empty());
+        assert_eq!(out.first(), Some(&0));
+        // 恢复中发不出东西时，定时器要在
+        let mut t = TcpSender::new(sack(), Some(3));
+        let mut out = Vec::new();
+        t.start(Time::ZERO, &mut out);
+        t.rto_at = None;
+        t.in_recovery = true;
+        t.send_in_recovery(Time(5), &mut out);
+        assert_eq!(t.next_timer(), Some(Time(5).plus(t.rto())));
     }
 
     #[test]
