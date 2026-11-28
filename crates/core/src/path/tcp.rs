@@ -25,7 +25,8 @@
 //!   cwnd − pipe 还够一个 MSS 就发：先发最低的、算丢了、还没重传过的包，没有就发新数据（RFC 6675 NextSeg() 的第 1、2 条；
 //!   第 3、4 条（没算丢的包的“救援”重传）不做）；
 //! - 累计确认越过 RecoveryPoint 就退出恢复，cwnd 保持 ssthresh；
-//! - 超时：照 RFC 2018 第 8 节把 SACK 记分板清掉（接收端可能“反悔”），go-back-N 重发。
+//! - 超时：照 RFC 2018 第 8 节把 SACK 记分板清掉（接收端可能“反悔”），go-back-N 重发；之后到的、关于超时前发过的包的
+//!   SACK 不记（只记 `[snd_una, snd_nxt)` 里的），所以接收端已经有的包也会再发一遍。超时在带 SACK 时很少见，这样做偏保守。
 use std::collections::BTreeSet;
 
 use crate::Time;
@@ -212,10 +213,6 @@ impl TcpSender {
         while (self.nxt - self.una) * mss < self.cwnd && self.total.is_none_or(|t| self.nxt < t) {
             let seq = self.nxt;
             self.nxt += 1;
-            // 超时以后 go-back-N 时，接收端已经 SACK 过的不重发（记分板在超时时清空，这里只在没清空时起作用）
-            if self.sacked.contains(&seq) {
-                continue;
-            }
             self.emit(now, seq, out);
         }
         if self.rto_at.is_none() && self.nxt > self.una {
