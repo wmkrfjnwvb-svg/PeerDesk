@@ -239,7 +239,13 @@ mod tests {
     #[test]
     fn guard_self_runs_the_program_and_reports_a_missing_path() {
         let mut out = Vec::new();
-        let true_exe = std::path::PathBuf::from("/bin/true");
+        // macOS 没有 /bin/true（在 /usr/bin/true），Linux 两处都有。找不到的程序守护会一直重试，
+        // 测试里的“睡一会儿”是空的，所以用了不存在的路径就会死循环（2026-11-28 macOS CI 卡到 75 分钟超时）
+        let true_exe = ["/usr/bin/true", "/bin/true"]
+            .iter()
+            .map(std::path::PathBuf::from)
+            .find(|p| p.exists())
+            .expect("找不到 true 程序");
         assert_eq!(guard_self(Ok(true_exe), &mut out, &mut |_| ()), 0);
         let broken = Err(std::io::Error::other("没有路径"));
         assert_eq!(guard_self(broken, &mut out, &mut |_| ()), EXIT_FAILED);

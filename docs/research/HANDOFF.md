@@ -50,6 +50,8 @@
 5. Agent 功能 G1–G4（工具分层草案在 `industry-agent-remote-control.md`）。
 6. 隐私屏、虚拟显示器（做法在 `industry-privacy-virtual-display.md`；Mac 虚拟屏要无显示器的 Mac mini 实测）。
 7. “停下后没变清晰”在微软轨迹上很普遍（11-28 基线 144 次里 111 次）：和 #79 补清晰策略一起查。
+   真机：静止时补清晰的小帧让闲着也有 140–300 kbps（中继成本），小变化只补变化的那块（bench-competitors 第 2 节）。
+8. 打字的“操作到画面”量尺（分支 `reaction`，Fable 在做第 1 步）；4G 虚假重传（NACK 3b，B 阶段第一步，bench-competitors 第 4 节）。
 
 ## 4. 推到云端的其他分支（没合进 dev，保存着）
 
@@ -57,7 +59,13 @@
 `worktree-agent-a8b1b3f174e8aa283`、`worktree-agent-a9615c6713cd1d397`、`a2-cross`（已合）、`tray`、`panel`、`rate2`（已合）、
 `presence`（在线状态轮询，不合并，换成订阅）、`music-mode`、`ui-redesign`、`ui-stage3`。
 
+## 4.5 对标实测
+
+`bench-competitors-2026-11-28.md`：ToDesk、UU 远程（响应、帧率、画质），4G 虚假重传的两端日志和根因，以后怎么量。
+
 ## 5. 要产品负责人办的（不急，到了再准备）
+
+- Lumos5G 数据集的下载账号（A3 的 5G 类型要用；没有之前 5G 用合成轨迹，标“可信度低”）。
 
 - 真机测：#71 的安装包（7c56f8c 的 CI 产物）、Android APK（手势改完后的新版）。
 - 以后：Supabase 测试项目、Stripe 沙盒、发信服务（账户线 P2、P8）；苹果开发者账号和 Mac（iOS、Mac 公证）；
