@@ -498,7 +498,11 @@ fn real_log_rhythm_keeps_the_rate_and_the_frame_rate() {
         &o,
         "没有拥塞证据时不把码率砍掉一半以上",
         deep.len() <= 1,
-        &format!("{} 次：{:?}", deep.len(), deep.iter().take(3).collect::<Vec<_>>()),
+        &format!(
+            "{} 次：{:?}",
+            deep.len(),
+            deep.iter().take(3).collect::<Vec<_>>()
+        ),
     );
     let mut after: Vec<u64> = o
         .features
