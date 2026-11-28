@@ -18,7 +18,7 @@ use peerdesk_core::video::VideoDecoder;
 use peerdesk_net::NetError;
 
 use super::codec::SurfaceDecoder;
-use crate::gesture::{Gestures, Mode, Phase, Touch, View, RIGHT};
+use crate::gesture::{Gestures, Phase, Touch, View, RIGHT};
 use crate::{
     addr_from_handle, apply, device_target, handle_from_addr, keymap, DecoderFactory, ScreenSink,
     Session, SinkFactory,
@@ -103,7 +103,7 @@ pub extern "system" fn Java_ai_peerdesk_app_Native_start<'local>(
     };
     let handle = Box::new(Handle {
         session,
-        gestures: Mutex::new(Gestures::new(Mode::Direct, view, slop, notch)),
+        gestures: Mutex::new(Gestures::new(view, slop, notch)),
     });
     handle_from_addr(Box::into_raw(handle) as usize)
 }
@@ -205,27 +205,26 @@ pub extern "system" fn Java_ai_peerdesk_app_Native_setView<'local>(
     }
 }
 
-/// 触控模式：0 触屏模式，1 鼠标模式（鼠标助手）。返回值同 `touch`（进鼠标模式时交出光标位置）。
+/// 大鼠标的箭头尖到了界面上的 (`x`, `y`)（像素，和触点同一个坐标系）：把被控端的指针移过去。
 #[no_mangle]
-pub extern "system" fn Java_ai_peerdesk_app_Native_setMode<'local>(
-    mut env: JNIEnv<'local>,
+pub extern "system" fn Java_ai_peerdesk_app_Native_pointAt<'local>(
+    _env: JNIEnv<'local>,
     _class: JClass<'local>,
     h: jlong,
-    mode: jint,
-) -> jstring {
-    let out = handle(h).and_then(|h| {
+    x: jfloat,
+    y: jfloat,
+) {
+    if let Some(h) = handle(h) {
         let actions = h
             .gestures
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .set_mode(Mode::from_code(mode));
-        apply(&h.session, actions)
-    });
-    new_string(&mut env, out)
+            .point(x, y);
+        let _ = apply(&h.session, actions);
+    }
 }
 
-/// 屏幕上的“左键”“右键”按钮（鼠标助手）：`button` 0 左键、1 右键，`down` 按下或抬起。
-/// 鼠标模式下点在光标处；按住左键再用另一根手指移动光标，就是精细地选中文字。
+/// 大鼠标的左键、右键：`button` 0 左键、1 右键，`down` 按下或抬起。按在指针现在的位置（界面先调 `pointAt`）。
 #[no_mangle]
 pub extern "system" fn Java_ai_peerdesk_app_Native_button<'local>(
     _env: JNIEnv<'local>,

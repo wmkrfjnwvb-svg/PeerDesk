@@ -17,7 +17,7 @@ use peerdesk_core::input::InputEvent;
 use peerdesk_core::proto::Caps;
 use peerdesk_core::screen::Workload;
 use peerdesk_core::session::SessionConfig;
-use peerdesk_mobile::gesture::{Action, Gestures, Mode, Phase, Touch, View};
+use peerdesk_mobile::gesture::{Action, Gestures, Phase, Touch, View};
 use peerdesk_mobile::{device_target, Event, ScreenSink, Session, SinkFactory};
 use peerdesk_net::demo::DemoDesktop;
 use peerdesk_net::host::{self, HostOptions, InputSink};
@@ -145,7 +145,7 @@ fn a_phone_session_sees_frames_and_its_taps_reach_the_host() {
         width: 390.0,
         height: 220.0,
     };
-    let mut g = Gestures::new(Mode::Direct, view, 8.0, 40.0);
+    let mut g = Gestures::new(view, 8.0, 40.0);
     let mut actions = g.touch(&Touch {
         id: 1,
         phase: Phase::Down,
@@ -260,12 +260,11 @@ fn view_changes_go_back_to_the_ui_and_inputs_go_out() {
                 Action::Input(InputEvent::ReleaseAll),
                 Action::Pan { dx: -3.0, dy: 4.0 },
                 Action::Haptic,
-                Action::Cursor { x: 0.25, y: 1.0 },
             ]
         )
         .as_deref(),
         Some(
-            r#"[{"type":"zoom","factor":1.5,"cx":10,"cy":20.5},{"type":"pan","dx":-3,"dy":4},{"type":"haptic"},{"type":"cursor","x":0.25,"y":1}]"#
+            r#"[{"type":"zoom","factor":1.5,"cx":10,"cy":20.5},{"type":"pan","dx":-3,"dy":4},{"type":"haptic"}]"#
         )
     );
 }

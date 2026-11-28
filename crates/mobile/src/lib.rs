@@ -418,7 +418,7 @@ pub fn addr_from_handle(handle: i64) -> Option<usize> {
     usize::try_from(bits).ok().filter(|&a| a != 0)
 }
 
-/// 手势状态机的输出：输入事件发给被控端，缩放、平移、震动、光标位置交回界面（一行 JSON 数组，没有就是 `None`）。
+/// 手势状态机的输出：输入事件发给被控端，缩放、平移、震动交回界面（一行 JSON 数组，没有就是 `None`）。
 pub fn apply(session: &Session, actions: Vec<gesture::Action>) -> Option<String> {
     let mut view = Vec::new();
     for action in actions {
@@ -433,9 +433,6 @@ pub fn apply(session: &Session, actions: Vec<gesture::Action>) -> Option<String>
                 view.push(format!("{{\"type\":\"pan\",\"dx\":{dx},\"dy\":{dy}}}"));
             }
             gesture::Action::Haptic => view.push("{\"type\":\"haptic\"}".to_owned()),
-            gesture::Action::Cursor { x, y } => {
-                view.push(format!("{{\"type\":\"cursor\",\"x\":{x},\"y\":{y}}}"));
-            }
         }
     }
     (!view.is_empty()).then(|| format!("[{}]", view.join(",")))
