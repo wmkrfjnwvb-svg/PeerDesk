@@ -13,7 +13,7 @@
 //! - **随机数布局**：[`RNG_LAYOUT`]（现在只有 1，见 `a1-plan.md` 第 2 节）写在文件里，读到别的号就报错，不会用错的布局跑。
 
 use crate::content::Action;
-use crate::{ByteModelKind, CodecKind, EstimatorKind, Outcome, Phase, Scenario};
+use crate::{ByteModelKind, ByteNoise, CodecKind, EstimatorKind, Outcome, Phase, Scenario};
 use peerdesk_core::adaptive::Profile;
 use peerdesk_core::error::Error;
 use peerdesk_core::kv::{content_hash, join_fields, Kv, KvError, KvWriter};
@@ -246,8 +246,10 @@ pub fn to_text(s: &Scenario) -> Result<String, WorldError> {
         policy,
         probe_ids,
         byte_model,
+        byte_noise,
     } = s;
     check_byte_model(*codec, *byte_model)?;
+    check_byte_noise(*byte_model, *byte_noise)?;
     let named = |what: &str, found: Option<&str>| {
         found
             .map(str::to_owned)
@@ -266,6 +268,10 @@ pub fn to_text(s: &Scenario) -> Result<String, WorldError> {
         named("编码种类", name_of(&CODECS, *codec))?.as_str(),
     )?;
     w.put("byte_model", byte_model.name())?;
+    // 扰动是后来加的键：只在不是默认时写。这样没有它的老世界文件照样读得进来，默认的场景写出来和以前逐字节相同（哈希不变）
+    if *byte_noise != ByteNoise::Default {
+        w.put("byte_noise", byte_noise.name())?;
+    }
     w.put_display("rng_layout", RNG_LAYOUT)?;
     w.put_display("seed", seed)?;
     w.put(
@@ -301,6 +307,17 @@ pub fn to_text(s: &Scenario) -> Result<String, WorldError> {
     Ok(w.finish())
 }
 
+/// 占位的字节模型没有扰动：配了别的写法就拒绝（否则同样的会话有两个哈希）。
+fn check_byte_noise(model: ByteModelKind, noise: ByteNoise) -> Result<(), WorldError> {
+    if model == ByteModelKind::Default && noise != ByteNoise::Default {
+        return bad(format!(
+            "字节模型 default（占位）没有扰动，byte_noise 只能不写或写 default，不能写 {}",
+            noise.name()
+        ));
+    }
+    Ok(())
+}
+
 fn check_byte_model(codec: CodecKind, model: ByteModelKind) -> Result<(), WorldError> {
     let fake = matches!(codec, CodecKind::H264L05 | CodecKind::H264L0);
     if !fake && model != ByteModelKind::Default {
@@ -331,6 +348,11 @@ pub fn from_text(text: &str) -> Result<Scenario, WorldError> {
     let fps = kv.take_u32("fps")?;
     let codec = kv.take_choice("codec", &CODECS)?;
     let byte_model = kv.take_choice("byte_model", &ByteModelKind::ALL)?;
+    let byte_noise = if kv.has("byte_noise") {
+        kv.take_choice("byte_noise", &ByteNoise::ALL)?
+    } else {
+        ByteNoise::Default
+    };
     let rng_layout = kv.take_u32("rng_layout")?;
     if rng_layout != RNG_LAYOUT {
         return bad(format!(
@@ -354,6 +376,7 @@ pub fn from_text(text: &str) -> Result<Scenario, WorldError> {
         return bad("fps 不能为 0".to_owned());
     }
     check_byte_model(codec, byte_model)?;
+    check_byte_noise(byte_model, byte_noise)?;
 
     let count = kv.take_u32("phases")?;
     if count == 0 {
@@ -395,7 +418,30 @@ pub fn from_text(text: &str) -> Result<Scenario, WorldError> {
     s.policy = policy;
     s.probe_ids = probe_ids;
     s.byte_model = byte_model;
+    s.byte_noise = byte_noise;
     Ok(s)
+}
+
+/// 编码种类的名字 → 值（`tile`、`h264`、`h264-l05`、`h264-l0`）。
+#[must_use]
+pub fn codec_named(name: &str) -> Option<CodecKind> {
+    CODECS.iter().find(|(n, _)| *n == name).map(|(_, c)| *c)
+}
+
+/// 会话的身份：不管用哪一档仿真（L1、L0.5、L0）、哪个字节模型、哪种扰动，同一份画面、网络、算法配置得到同一个键。
+/// 三档对账靠它把同一个会话的几次运行对上。算法：把这三项换成固定值（`h264`、`default`、默认扰动）之后的世界文件的哈希。
+/// 块编码不参与对账，保持原样（键和它自己的世界哈希相同）。
+///
+/// # Errors
+/// 同 [`to_text`]。
+pub fn session_key(s: &Scenario) -> Result<String, WorldError> {
+    let mut base = s.clone();
+    if base.codec.is_h264() {
+        base.codec = CodecKind::H264;
+    }
+    base.byte_model = ByteModelKind::Default;
+    base.byte_noise = ByteNoise::Default;
+    Ok(hash(&to_text(&base)?))
 }
 
 /// 世界文件文本的哈希（16 位十六进制）。
@@ -469,6 +515,27 @@ impl World {
         }
         let scenario = from_text(&text).map_err(|e| WorldError::Format(format!("{shown}：{e}")))?;
         Ok(Self { hash, scenario })
+    }
+
+    /// 同一个会话换一档仿真：编码种类、字节模型、扰动换成给定的（`None` 的不换），哈希按新内容重算。
+    /// 对账时用一批 L1 的世界文件跑出 L0.5、L0 各种配置，不用另外导出。
+    ///
+    /// # Errors
+    /// 换完之后的组合不合法（真编码器配了字节模型、占位模型配了扰动）。
+    pub fn retiered(
+        &self,
+        codec: Option<CodecKind>,
+        byte_model: Option<ByteModelKind>,
+        byte_noise: Option<ByteNoise>,
+    ) -> Result<Self, WorldError> {
+        let mut scenario = self.scenario.clone();
+        scenario.codec = codec.unwrap_or(scenario.codec);
+        scenario.byte_model = byte_model.unwrap_or(scenario.byte_model);
+        scenario.byte_noise = byte_noise.unwrap_or(scenario.byte_noise);
+        Ok(Self {
+            hash: hash(&to_text(&scenario)?),
+            scenario,
+        })
     }
 
     /// 跑这个世界。
@@ -1010,5 +1077,82 @@ mod tests {
         assert!(WorldError::Run(Error::InvalidArgument("c"))
             .to_string()
             .starts_with("仿真出错："));
+    }
+
+    /// 扰动的键：默认时不写（老的世界文件、默认场景的哈希都不变），不是默认时写出来能读回；
+    /// 占位模型配了扰动、不认识的写法都拒绝。
+    #[test]
+    fn byte_noise_is_written_only_when_it_is_not_the_default() {
+        let mut s = l0_scenario();
+        let plain = to_text(&s).unwrap();
+        assert!(!plain.contains("byte_noise"), "{plain}");
+        assert_eq!(from_text(&plain).unwrap().byte_noise, ByteNoise::Default);
+        for (name, noise) in [("within", ByteNoise::Within), ("off", ByteNoise::Off)] {
+            s.byte_noise = noise;
+            let text = to_text(&s).unwrap();
+            assert!(text.contains(&format!("\nbyte_noise {name}\n")), "{text}");
+            let back = from_text(&text).unwrap();
+            assert_eq!(back.byte_noise, noise);
+            assert_eq!(to_text(&back).unwrap(), text);
+            assert_ne!(hash(&text), hash(&plain));
+        }
+        // 明写 default 也读得进来
+        let explicit = plain.replace("\nrng_layout", "\nbyte_noise default\nrng_layout");
+        assert_eq!(from_text(&explicit).unwrap().byte_noise, ByteNoise::Default);
+        assert!(
+            from_text(&plain.replace("\nrng_layout", "\nbyte_noise loud\nrng_layout")).is_err()
+        );
+        // 占位模型没有扰动
+        let mut placeholder = Scenario::fixed("p", s.phases.clone());
+        placeholder.codec = CodecKind::H264L0;
+        placeholder.byte_noise = ByteNoise::Off;
+        assert!(to_text(&placeholder).is_err());
+        placeholder.byte_noise = ByteNoise::Default;
+        let text = to_text(&placeholder).unwrap();
+        assert!(from_text(&text.replace("\nrng_layout", "\nbyte_noise off\nrng_layout")).is_err());
+    }
+
+    /// 会话的身份不随仿真的档、字节模型、扰动变；画面、网络、种子任何一样变了就变。换档之后的世界哈希跟着内容走。
+    #[test]
+    fn the_session_key_ignores_the_tier_and_follows_everything_else() {
+        let l1 = World {
+            hash: String::new(),
+            scenario: busy_scenario(),
+        };
+        let key = session_key(&l1.scenario).unwrap();
+        assert_eq!(
+            key,
+            hash(&to_text(&l1.scenario).unwrap()),
+            "L1 的键就是它的世界哈希"
+        );
+        let l0 = l1
+            .retiered(
+                Some(CodecKind::H264L0),
+                Some(ByteModelKind::Openh264V2),
+                Some(ByteNoise::Within),
+            )
+            .unwrap();
+        assert_eq!(l0.scenario.codec, CodecKind::H264L0);
+        assert_eq!(l0.hash, hash(&to_text(&l0.scenario).unwrap()));
+        assert_ne!(l0.hash, key);
+        assert_eq!(session_key(&l0.scenario).unwrap(), key);
+        let l05 = l1.retiered(Some(CodecKind::H264L05), None, None).unwrap();
+        assert_eq!(session_key(&l05.scenario).unwrap(), key);
+        let mut other = l1.scenario.clone();
+        other.seed += 1;
+        assert_ne!(session_key(&other).unwrap(), key);
+        // 不合法的组合：真编码器配字节模型、占位模型配扰动
+        assert!(l1
+            .retiered(None, Some(ByteModelKind::Openh264V1), None)
+            .is_err());
+        assert!(l1
+            .retiered(Some(CodecKind::H264L0), None, Some(ByteNoise::Off))
+            .is_err());
+        // 块编码不参与对账：键就是它自己
+        let mut tile = l1.scenario.clone();
+        tile.codec = CodecKind::Tile;
+        assert_eq!(session_key(&tile).unwrap(), hash(&to_text(&tile).unwrap()));
+        assert_eq!(codec_named("h264-l05"), Some(CodecKind::H264L05));
+        assert_eq!(codec_named("mpeg2"), None);
     }
 }

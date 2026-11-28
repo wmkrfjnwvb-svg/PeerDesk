@@ -98,8 +98,8 @@ impl ByteModelKind {
     }
 
     /// 造模型。[`run_probed`] 在跑的时候，外面再套一层记录。
-    fn build(self) -> Result<Box<dyn ByteModel>, Error> {
-        let model = self.build_plain()?;
+    fn build(self, noise: ByteNoise) -> Result<Box<dyn ByteModel>, Error> {
+        let model = self.build_plain(noise)?;
         Ok(if PROBE.with(|p| p.borrow().is_some()) {
             Box::new(Probed(model))
         } else {
@@ -107,18 +107,64 @@ impl ByteModelKind {
         })
     }
 
-    fn build_plain(self) -> Result<Box<dyn ByteModel>, Error> {
+    fn build_plain(self, noise: ByteNoise) -> Result<Box<dyn ByteModel>, Error> {
+        use peerdesk_media::fitted::Noise;
         Ok(match self {
+            // 占位模型没有扰动
             Self::Default => Box::new(DefaultByteModel),
-            Self::Openh264V1 => Box::new(
-                FittedByteModel::openh264_v1()
-                    .map_err(|_| Error::Inconsistent("随包的 openh264-v1 字节模型文件读不出来"))?,
-            ),
-            Self::Openh264V2 => Box::new(
-                RegionByteModel::openh264_v2()
-                    .map_err(|_| Error::Inconsistent("随包的 openh264-v2 字节模型文件读不出来"))?,
-            ),
+            Self::Openh264V1 => {
+                let model = FittedByteModel::openh264_v1()
+                    .map_err(|_| Error::Inconsistent("随包的 openh264-v1 字节模型文件读不出来"))?;
+                Box::new(match noise {
+                    ByteNoise::Default => model,
+                    ByteNoise::Within => model.with_within_sigma(OPENH264_V1_WITHIN_SIGMA_MICRO),
+                    ByteNoise::Off => model.with_noise(false),
+                })
+            }
+            Self::Openh264V2 => {
+                let model = RegionByteModel::openh264_v2()
+                    .map_err(|_| Error::Inconsistent("随包的 openh264-v2 字节模型文件读不出来"))?;
+                Box::new(model.with_noise_kind(match noise {
+                    ByteNoise::Default => Noise::Full,
+                    ByteNoise::Within => Noise::Within,
+                    ByteNoise::Off => Noise::Off,
+                }))
+            }
         })
+    }
+}
+
+/// 字节模型的预测上加多少扰动（只对实测拟合的模型有意义；见 `peerdesk_media::fitted::Noise`）。世界文件里的 `byte_noise` 键。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ByteNoise {
+    /// 模型自己的默认：全部残差的标准差（会把总字节抬高，留着是为了现有结果不变；占位模型没有扰动，只能写这个）。
+    Default,
+    /// 只用序列内的残差标准差（帧间波动）。
+    Within,
+    /// 不加扰动：每帧就是模型的中位预测。
+    Off,
+}
+
+/// openh264-v1 的序列内残差标准差（10⁻⁶ 的 log2）。v1 的模型文件里没有拆过残差（文件不动），数来自
+/// `scripts/m2b-residuals.py` 在 M2b 拟合集上的结果：全部残差 2.219 = 序列之间 2.155 + 序列之内 0.527。
+const OPENH264_V1_WITHIN_SIGMA_MICRO: u32 = 527_139;
+
+impl ByteNoise {
+    /// 全部，（文本里的名字，值）。
+    pub const ALL: [(&'static str, Self); 3] = [
+        ("default", Self::Default),
+        ("within", Self::Within),
+        ("off", Self::Off),
+    ];
+
+    /// 文本里的名字。
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Within => "within",
+            Self::Off => "off",
+        }
     }
 }
 
@@ -195,23 +241,20 @@ impl CodecKind {
     }
 
     /// 造一对编码器和解码器。`tag` 是源画面的内容版本，只有 L0.5 用（假后端每交一帧读一次）。
-    fn make(
-        self,
-        fps: u32,
-        max_bps: u64,
-        policy: &ContentPolicy,
-        tag: &Arc<AtomicU64>,
-        feed: &ChangeFeed,
-        byte_model: ByteModelKind,
-    ) -> Result<Codecs, Error> {
+    fn make(self, s: &Scenario, tag: &Arc<AtomicU64>, feed: &ChangeFeed) -> Result<Codecs, Error> {
+        let (fps, max_bps, policy) = (s.fps, s.max_bps, &s.policy);
+        let (byte_model, byte_noise) = (s.byte_model, s.byte_noise);
         Ok(match self {
             CodecKind::H264L0 => {
                 // 和 L0.5 同一个假后端，只多收“内容描述”这种输入；版本号从描述里来，不用拨
                 let mut cfg = FakeConfig::like_openh264();
                 cfg.inputs.described = true;
-                let backend =
-                    FakeBackend::new(cfg, Arc::new(ManualClock::new()), byte_model.build()?)
-                        .with_change_feed(feed.clone());
+                let backend = FakeBackend::new(
+                    cfg,
+                    Arc::new(ManualClock::new()),
+                    byte_model.build(byte_noise)?,
+                )
+                .with_change_feed(feed.clone());
                 (
                     Box::new(
                         H264Encoder::with_max_bps(fps, max_bps)
@@ -227,7 +270,7 @@ impl CodecKind {
                 let backend = FakeBackend::new(
                     FakeConfig::like_openh264(),
                     Arc::new(ManualClock::new()),
-                    byte_model.build()?,
+                    byte_model.build(byte_noise)?,
                 )
                 .with_version_tag(Arc::clone(tag))
                 .with_change_feed(feed.clone());
@@ -337,6 +380,8 @@ pub struct Scenario {
     pub probe_ids: bool,
     /// 假后端的字节模型（只对 [`CodecKind::H264L05`]、[`CodecKind::H264L0`] 有意义）。默认是占位模型。
     pub byte_model: ByteModelKind,
+    /// 字节模型的扰动（默认是模型自己的做法；占位模型只能是默认）。
+    pub byte_noise: ByteNoise,
 }
 
 impl Scenario {
@@ -378,6 +423,7 @@ impl Scenario {
             policy: ContentPolicy::OFFICE,
             probe_ids: true,
             byte_model: ByteModelKind::Default,
+            byte_noise: ByteNoise::Default,
         }
     }
 }
@@ -450,6 +496,107 @@ pub struct Outcome {
     pub estimator: &'static str,
     /// 每次反馈一行特征，带着仿真知道的真实情况（以后训练 AI 模型用）。
     pub features: Vec<FeatureRow>,
+    /// 对账用的几样（见 [`Tally`]）。**不进指纹**：它们只是把会话里已经发生的事多数了一遍，加它们不改变任何行为，
+    /// 指纹基准因此逐字节不变。
+    pub tally: Tally,
+}
+
+/// 两秒一个窗口（对账时比每个窗口发了多少字节，见 `a1-plan.md` 第 4 节）。
+pub const WINDOW_US: u64 = 2_000_000;
+
+/// 三档对账要比、而 [`Outcome`] 原来没有的量。只读会话的状态，不影响会话。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Tally {
+    /// 每个两秒窗口里被控端发出的字节（含数据报头，和各阶段的字节数同一个口径），按发出的时刻分窗。
+    pub window_bytes: Vec<u64>,
+    /// 降码率的次数：处理完一份反馈或一次定时任务之后，码率比之前低。
+    pub rate_cuts: u32,
+    /// 其中降幅过半的次数。
+    pub rate_deep_cuts: u32,
+    /// 帧率换档的次数（升、降都算）。
+    pub fps_changes: u32,
+    /// 按时间加权的码率中位（比特每秒）：一半的时间码率不低于它。
+    pub rate_time_p50_bps: u64,
+    /// 按时间加权的码率 5% 分位：95% 的时间码率不低于它。
+    pub rate_time_p5_bps: u64,
+}
+
+/// 会话进行中数这几样。
+#[derive(Debug, Default)]
+struct Counter {
+    tally: Tally,
+    last_rate: Option<u64>,
+    last_fps: Option<u32>,
+    /// （码率，在这个码率上停了多久）。
+    held: Vec<(u64, u64)>,
+}
+
+impl Counter {
+    /// 被控端在 `now` 发出了 `bytes` 字节。
+    fn sent(&mut self, now: Time, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        let index = usize::try_from(now.micros() / WINDOW_US).unwrap_or(usize::MAX);
+        if self.tally.window_bytes.len() <= index {
+            self.tally.window_bytes.resize(index.saturating_add(1), 0);
+        }
+        if let Some(slot) = self.tally.window_bytes.get_mut(index) {
+            *slot = slot.saturating_add(bytes);
+        }
+    }
+
+    /// 发送端刚处理完一件事（一份反馈、一次定时任务、编了一帧）：看码率、帧率变没变。
+    fn after(&mut self, rate_bps: u64, fps: u32) {
+        if let Some(before) = self.last_rate.replace(rate_bps) {
+            if rate_bps < before {
+                self.tally.rate_cuts = self.tally.rate_cuts.saturating_add(1);
+                if rate_bps.saturating_mul(2) < before {
+                    self.tally.rate_deep_cuts = self.tally.rate_deep_cuts.saturating_add(1);
+                }
+            }
+        }
+        if self
+            .last_fps
+            .replace(fps)
+            .is_some_and(|before| before != fps)
+        {
+            self.tally.fps_changes = self.tally.fps_changes.saturating_add(1);
+        }
+    }
+
+    /// 码率是 `rate_bps` 的状态又持续了 `us` 微秒。
+    fn held(&mut self, rate_bps: u64, us: u64) {
+        match self.held.last_mut() {
+            Some((rate, total)) if *rate == rate_bps => *total = total.saturating_add(us),
+            Some(_) | None => self.held.push((rate_bps, us)),
+        }
+    }
+
+    /// 会话结束：算按时间加权的分位，补齐最后一个窗口（`end` 是会话结束的时刻）。
+    fn finish(mut self, end: Time) -> Tally {
+        let windows = usize::try_from(end.micros().div_ceil(WINDOW_US)).unwrap_or(usize::MAX);
+        if self.tally.window_bytes.len() < windows {
+            self.tally.window_bytes.resize(windows, 0);
+        }
+        self.held.sort_unstable();
+        let total: u64 = self.held.iter().map(|(_, us)| *us).sum();
+        // 从低到高累加时间：累计到总时间的 p% 时的那个码率
+        let at = |percent: u64| {
+            let need = total.saturating_mul(percent).div_ceil(100).max(1);
+            let mut seen = 0u64;
+            self.held
+                .iter()
+                .find(|(_, us)| {
+                    seen = seen.saturating_add(*us);
+                    seen >= need
+                })
+                .map_or(0, |(rate, _)| *rate)
+        };
+        self.tally.rate_time_p50_bps = at(50);
+        self.tally.rate_time_p5_bps = at(5);
+        self.tally
+    }
 }
 
 /// 码率控制各状态占了多少时间，以及量尺的核对项：仿真知道瓶颈里真实排了多久，真实队列高
@@ -1013,6 +1160,7 @@ impl Stopwatch {
 }
 
 /// 和产品（`peerdesk_net::host` 的 `send_paced`）一样：节奏器是唯一出口，发出的包记进发送历史。
+/// 返回这一次发到链路上的字节数。
 fn send_ready(
     pacer: &mut peerdesk_core::pacer::Pacer,
     tx: &mut MediaSender,
@@ -1020,8 +1168,8 @@ fn send_ready(
     net: &mut Net<Vec<u8>>,
     now: Time,
     seq: &mut u32,
-    bytes: &mut u64,
-) -> Result<(), Error> {
+) -> Result<u64, Error> {
+    let mut bytes = 0u64;
     for o in pacer.pop_ready(now, tx.pacing_bps(pacing)) {
         let header = Header {
             channel: Channel::Video,
@@ -1033,10 +1181,11 @@ fn send_ready(
         tx.on_packet_sent(now, *seq, &o);
         *seq = seq.wrapping_add(1);
         let datagram = encode_datagram(&header, &o.body)?;
-        *bytes = bytes.saturating_add(u64::try_from(datagram.len()).unwrap_or(u64::MAX));
+        let len = u64::try_from(datagram.len()).unwrap_or(u64::MAX);
+        bytes = bytes.saturating_add(len);
         net.send(HOST, VIEWER, datagram.len(), datagram);
     }
-    Ok(())
+    Ok(bytes)
 }
 
 /// 网络控制器的定时任务间隔（和产品一样 25 ms）。
@@ -1377,9 +1526,7 @@ fn run_inner(s: &Scenario, record: bool) -> Result<(Outcome, Option<Vec<u8>>), E
     let mut profile = Stopwatch::from_env();
     let tag = Arc::new(AtomicU64::new(0));
     let feed = ChangeFeed::default();
-    let (encoder, decoder) =
-        s.codec
-            .make(s.fps, s.max_bps, &s.policy, &tag, &feed, s.byte_model)?;
+    let (encoder, decoder) = s.codec.make(s, &tag, &feed)?;
     // L1 在收包的当场解码；L0.5、L0 走控制端用的延后解码（解码器交给量尺里的 DecodeWorker）
     let (mut stage, inline): (Box<dyn Stage>, Option<Box<dyn VideoDecoder>>) = match s.codec {
         CodecKind::H264L0 => {
@@ -1469,6 +1616,7 @@ fn run_inner(s: &Scenario, record: bool) -> Result<(Outcome, Option<Vec<u8>>), E
     let mut pending = false;
     let mut overall_freezes = 0u32;
     let mut states = StateShare::default();
+    let mut counter = Counter::default();
     let mut journal = record.then(|| Journal::new(s, tx.estimator()));
 
     let mut now = Time::ZERO;
@@ -1533,6 +1681,7 @@ fn run_inner(s: &Scenario, record: bool) -> Result<(Outcome, Option<Vec<u8>>), E
                 let changed = std::mem::take(&mut pending);
                 let encoding = profile.start();
                 let out = stage.encode(&mut tx, now, changed, rtt)?;
+                counter.after(tx.rate_bps(), tx.fps());
                 profile.stop(Part::Encode, encoding);
                 if let Some(j) = journal.as_mut() {
                     j.frame(now, &tx, before, changed);
@@ -1555,15 +1704,9 @@ fn run_inner(s: &Scenario, record: bool) -> Result<(Outcome, Option<Vec<u8>>), E
                 // 和产品一样经发送节奏控制发出（见 peerdesk_core::pacer）
                 pacer.push(out);
                 let sending = profile.start();
-                send_ready(
-                    &mut pacer,
-                    &mut tx,
-                    pacing,
-                    &mut net,
-                    now,
-                    &mut seq,
-                    &mut acc.bytes,
-                )?;
+                let wire = send_ready(&mut pacer, &mut tx, pacing, &mut net, now, &mut seq)?;
+                acc.bytes = acc.bytes.saturating_add(wire);
+                counter.sent(now, wire);
                 profile.stop(Part::Send, sending);
             }
             // 这一帧的时间内：投递数据报、发反馈。
@@ -1584,6 +1727,7 @@ fn run_inner(s: &Scenario, record: bool) -> Result<(Outcome, Option<Vec<u8>>), E
                     net.backlog_us(HOST, VIEWER),
                     when.since(now),
                 );
+                counter.held(tx.rate_bps(), when.since(now));
                 let moving = profile.start();
                 net.advance_to(when);
                 profile.stop(Part::Network, moving);
@@ -1591,6 +1735,7 @@ fn run_inner(s: &Scenario, record: bool) -> Result<(Outcome, Option<Vec<u8>>), E
                 let controlling = profile.start();
                 if next_tick <= now {
                     tx.on_tick(now);
+                    counter.after(tx.rate_bps(), tx.fps());
                     for cluster in tx.take_probes() {
                         pacer.push_probe(cluster);
                     }
@@ -1620,15 +1765,9 @@ fn run_inner(s: &Scenario, record: bool) -> Result<(Outcome, Option<Vec<u8>>), E
                 }
                 profile.stop(Part::Control, controlling);
                 let sending = profile.start();
-                send_ready(
-                    &mut pacer,
-                    &mut tx,
-                    pacing,
-                    &mut net,
-                    now,
-                    &mut seq,
-                    &mut acc.bytes,
-                )?;
+                let wire = send_ready(&mut pacer, &mut tx, pacing, &mut net, now, &mut seq)?;
+                acc.bytes = acc.bytes.saturating_add(wire);
+                counter.sent(now, wire);
                 profile.stop(Part::Send, sending);
                 let controlling = profile.start();
                 let feedback_due = next_feedback <= now && {
@@ -1678,19 +1817,15 @@ fn run_inner(s: &Scenario, record: bool) -> Result<(Outcome, Option<Vec<u8>>), E
                         // 反馈；顺便按请求重传丢了的分片。
                         let controlling = profile.start();
                         let again = tx.on_feedback_datagram(now, body).unwrap_or_default();
+                        counter.after(tx.rate_bps(), tx.fps());
                         pacer.retain(|o| tx.wanted(o));
                         pacer.push_front(again);
                         profile.stop(Part::Control, controlling);
                         let sending = profile.start();
-                        send_ready(
-                            &mut pacer,
-                            &mut tx,
-                            pacing,
-                            &mut net,
-                            now,
-                            &mut seq,
-                            &mut acc.bytes,
-                        )?;
+                        let wire =
+                            send_ready(&mut pacer, &mut tx, pacing, &mut net, now, &mut seq)?;
+                        acc.bytes = acc.bytes.saturating_add(wire);
+                        counter.sent(now, wire);
                         profile.stop(Part::Send, sending);
                         if trace_events {
                             for e in tx.take_events() {
@@ -1769,6 +1904,7 @@ fn run_inner(s: &Scenario, record: bool) -> Result<(Outcome, Option<Vec<u8>>), E
                 net.backlog_us(HOST, VIEWER),
                 tick_end.since(now),
             );
+            counter.held(tx.rate_bps(), tick_end.since(now));
             let moving = profile.start();
             net.advance_to(tick_end);
             profile.stop(Part::Network, moving);
@@ -1831,6 +1967,7 @@ fn run_inner(s: &Scenario, record: bool) -> Result<(Outcome, Option<Vec<u8>>), E
         sent_bytes,
         estimator: tx.estimator(),
         features,
+        tally: counter.finish(now),
         trace,
     };
     if profile.on {
@@ -2055,6 +2192,110 @@ mod tests {
         let o = run(&s).unwrap();
         assert!(o.freezes >= 1, "{}", o.freezes);
         assert!(o.max_wait_ms >= 400.0, "{}", o.max_wait_ms);
+    }
+
+    /// 对账用的计数：按发出的时刻分两秒一个窗口；码率变低算一次降码率、降幅过半另数；帧率变了算一次换档；
+    /// 码率的分位按停留的时间加权，不按反馈的条数。
+    #[test]
+    fn the_counter_tallies_windows_cuts_fps_steps_and_time_weighted_rates() {
+        let mut c = Counter::default();
+        c.sent(Time(0), 100);
+        c.sent(Time(1_999_999), 50);
+        c.sent(Time(2_000_000), 7);
+        c.sent(Time(6_500_000), 9);
+        // 第一次只是记下起点，不算变化
+        c.after(8_000_000, 60);
+        c.after(8_000_000, 60);
+        c.after(6_000_000, 60); // 降了，不到一半
+        c.after(2_000_000, 30); // 降幅过半；帧率换档
+        c.after(9_000_000, 30); // 升，不算
+        c.after(9_000_000, 60); // 帧率换回去
+                                // 8 Mbps 停 1 秒，1 Mbps 停 9 秒（分两段记），20 Mbps 停 10 秒
+        c.held(8_000_000, 1_000_000);
+        c.held(1_000_000, 4_000_000);
+        c.held(1_000_000, 5_000_000);
+        c.held(20_000_000, 10_000_000);
+        assert_eq!(c.held.len(), 3, "同一个码率连着的两段合成一段");
+        let t = c.finish(Time(9_000_000));
+        // 会话 9 秒：5 个窗口，最后一个没有流量也补上
+        assert_eq!(t.window_bytes, [150, 7, 0, 9, 0]);
+        assert_eq!((t.rate_cuts, t.rate_deep_cuts, t.fps_changes), (2, 1, 2));
+        // 总共 20 秒：最低的 5%（1 秒）落在 1 Mbps；一半（10 秒）正好是 1 Mbps 9 秒加 8 Mbps 1 秒
+        assert_eq!(t.rate_time_p5_bps, 1_000_000);
+        assert_eq!(t.rate_time_p50_bps, 8_000_000);
+        // 什么都没发生：全是 0，不出错
+        let empty = Counter::default().finish(Time::ZERO);
+        assert_eq!(empty, Tally::default());
+    }
+
+    /// 真跑一个会话：窗口的字节加起来等于各阶段的字节；这些量不进指纹。
+    #[test]
+    fn the_tally_adds_up_and_stays_out_of_the_fingerprint() {
+        let s = Scenario::new(
+            "tally",
+            vec![
+                Phase {
+                    action: Action::Typing,
+                    frames: 45,
+                },
+                Phase {
+                    action: Action::Idle,
+                    frames: 45,
+                },
+            ],
+        );
+        let o = run(&s).unwrap();
+        assert_eq!(o.tally.window_bytes.len(), 2, "3 秒的会话是两个窗口");
+        assert_eq!(o.tally.window_bytes.iter().sum::<u64>(), o.sent_bytes);
+        assert!(o.tally.rate_time_p50_bps >= o.tally.rate_time_p5_bps);
+        assert!(o.tally.rate_time_p5_bps > 0);
+        let mut other = o.clone();
+        other.tally.rate_cuts += 5;
+        other.tally.window_bytes.push(1);
+        assert_eq!(fingerprint(&other), fingerprint(&o));
+    }
+
+    /// 字节模型的扰动三种写法：全 σ（模型的默认）、只用序列内 σ、不加。同一个会话三种的字节数各不相同；
+    /// 占位模型没有扰动，怎么写都一样。
+    #[test]
+    fn byte_noise_changes_the_fitted_models_only() {
+        let phases = vec![
+            Phase {
+                action: Action::Scrolling,
+                frames: 30,
+            },
+            Phase {
+                action: Action::Idle,
+                frames: 15,
+            },
+        ];
+        for model in [ByteModelKind::Openh264V1, ByteModelKind::Openh264V2] {
+            let bytes: Vec<u64> = ByteNoise::ALL
+                .iter()
+                .map(|(name, noise)| {
+                    assert_eq!(noise.name(), *name);
+                    let mut s = Scenario::new("noise", phases.clone());
+                    s.codec = CodecKind::H264L05;
+                    s.byte_model = model;
+                    s.byte_noise = *noise;
+                    run(&s).unwrap().sent_bytes
+                })
+                .collect();
+            assert!(
+                bytes[0] != bytes[1] && bytes[1] != bytes[2] && bytes[0] != bytes[2],
+                "{model:?} {bytes:?}"
+            );
+        }
+        let placeholder: Vec<u64> = ByteNoise::ALL
+            .iter()
+            .map(|(_, noise)| {
+                let mut s = Scenario::new("noise", phases.clone());
+                s.codec = CodecKind::H264L05;
+                s.byte_noise = *noise;
+                run(&s).unwrap().sent_bytes
+            })
+            .collect();
+        assert!(placeholder.iter().all(|b| *b == placeholder[0]));
     }
 
     /// 指纹：同一场景跑两遍相同；结果里任何一个数、任何一个像素变了都不同；调试记录不算在内。
