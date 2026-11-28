@@ -3,16 +3,21 @@
 //! 界面只转发原始触点（编号、按下/移动/抬起、坐标、时间），并在有手指按着时每隔几十毫秒调一次 [`Gestures::tick`]
 //! （长按要靠时间判断，手指不动时系统不一定发移动事件）。这里决定它是点击、拖拽、滚动还是缩放。
 //!
-//! 手势表（两种模式共用，区别只在“光标在哪”）：
+//! 手势表（2026-11-28 按产品负责人用 ToDesk 的习惯改；同行的做法：TeamViewer 的触摸互动和鼠标互动、
+//! 微软远程桌面的“直接触控”和“鼠标指针”、天翼云电脑的触屏模式和鼠标模式，都是这两种模式）：
 //!
-//! | 手势 | 直接点击模式（点哪是哪） | 触控板模式（手指移动光标） |
+//! | 手势 | 触屏模式（默认，点哪是哪） | 鼠标模式（鼠标助手：屏幕上有光标） |
 //! |---|---|---|
 //! | 单指点 | 在手指处左键单击 | 在光标处左键单击 |
-//! | 单指滑动 | 画面放大时平移画面；没放大时移动光标（不按键） | 移动光标 |
-//! | 长按后拖动 | 在手指处按下左键并拖拽 | 在光标处按下左键并拖拽 |
+//! | 单指滑动 | 移动画面（平移） | 移动光标（精细，像触控板） |
+//! | 长按（震一下）后松开 | 在手指处右键单击 | 在光标处右键单击 |
+//! | 长按（震一下）后拖动 | 从手指处按住左键拖拽 | 从光标处按住左键拖拽 |
 //! | 双指点 | 在两指中点右键单击 | 在光标处右键单击 |
-//! | 双指滑动 | 滚动（先把光标移到两指中点） | 滚动 |
+//! | 双指滑动 | 滚动页面（先把光标移到两指中点） | 滚动页面 |
 //! | 双指捏合 | 缩放画面 | 缩放画面 |
+//!
+//! 鼠标模式另有屏幕上的“左键”“右键”按钮（界面画，按下、抬起调 [`Gestures::button`]）：按住左键、
+//! 另一根手指滑动光标，就是精细地选中文字。
 //!
 //! 滚动是“自然方向”：手指往下，内容跟着往下（等于滚轮向上）。三指及以上不处理，留给系统。
 
@@ -20,7 +25,7 @@ use peerdesk_core::input::InputEvent;
 
 /// 点击最长多久（毫秒）：按下到抬起超过它就不算点击。
 pub const TAP_MS: u64 = 250;
-/// 长按多久（毫秒）开始拖拽。
+/// 长按多久（毫秒）：到点震一下，之后松开是右键、拖动是拖拽。
 pub const LONG_PRESS_MS: u64 = 500;
 /// 双指点：第二根手指要在第一根按下后这么久内按下（毫秒）。
 pub const TWO_FINGER_GAP_MS: u64 = 150;
@@ -31,16 +36,29 @@ pub const PINCH_START: f32 = 0.06;
 /// 滚轮一格的高精度增量（和桌面端、Windows 的 `WHEEL_DELTA` 一样）。
 const NOTCH: f32 = 120.0;
 /// 鼠标左键、右键的编号（见 [`InputEvent::MouseButton`]）。
-const LEFT: u8 = 0;
-const RIGHT: u8 = 1;
+pub const LEFT: u8 = 0;
+/// 见 [`LEFT`]。
+pub const RIGHT: u8 = 1;
 
 /// 触控模式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
-    /// 点哪是哪。
+    /// 触屏模式：点哪是哪。
     Direct,
-    /// 手指移动光标，像笔记本的触控板。
+    /// 鼠标模式：屏幕上有光标，手指移动光标，像笔记本的触控板。
     Trackpad,
+}
+
+impl Mode {
+    /// 界面传来的编号：1 是鼠标模式，别的都是触屏模式。
+    #[must_use]
+    pub const fn from_code(code: i32) -> Self {
+        if code == 1 {
+            Self::Trackpad
+        } else {
+            Self::Direct
+        }
+    }
 }
 
 /// 触点的阶段。
@@ -66,18 +84,6 @@ impl Phase {
             2 => Some(Self::Up),
             3 => Some(Self::Cancel),
             _ => None,
-        }
-    }
-}
-
-impl Mode {
-    /// 界面传来的编号：1 是触控板，别的都是直接点击。
-    #[must_use]
-    pub const fn from_code(code: i32) -> Self {
-        if code == 1 {
-            Self::Trackpad
-        } else {
-            Self::Direct
         }
     }
 }
@@ -108,8 +114,6 @@ pub struct View {
     pub width: f32,
     /// 画面高。
     pub height: f32,
-    /// 画面是不是放大了（单指滑动在直接点击模式下平移画面还是移动光标）。
-    pub zoomed: bool,
 }
 
 /// 状态机的输出。
@@ -132,6 +136,15 @@ pub enum Action {
         dx: f32,
         /// 纵向。
         dy: f32,
+    },
+    /// 长按到点了：界面震一下，告诉用户“现在松开是右键、拖动是拖拽”。
+    Haptic,
+    /// 鼠标模式的光标挪了（被控端画面上的比例，0..=1）：界面在这里画光标；画面放大时光标到了边上，界面跟着平移。
+    Cursor {
+        /// 横向比例。
+        x: f32,
+        /// 纵向比例。
+        y: f32,
     },
 }
 
@@ -174,9 +187,11 @@ enum Two {
 enum State {
     /// 没有手指。
     Idle,
-    /// 一根手指，还没定是点击、滑动还是长按。`moved` 是超过了防抖距离。
+    /// 一根手指，还没到长按。`moved` 是超过了防抖距离（之后就是滑动，不再算点击和长按）。
     One { f: Finger, moved: bool },
-    /// 长按之后：左键按着，跟着手指拖。
+    /// 长按到点了、手指还没动：松开是右键，动了就开始拖拽。
+    Held { f: Finger },
+    /// 拖拽中：左键按着，跟着手指走。
     Drag { f: Finger },
     /// 两根手指。`dist` 是上一次两指的距离，`scroll` 是没发出去的滚动余数（滚轮单位）。
     Two {
@@ -199,7 +214,7 @@ pub struct Gestures {
     slop: f32,
     /// 滚轮一格对应手指移动多少像素。
     notch_px: f32,
-    /// 触控板模式的光标位置（被控端画面上的比例，0..=1）。
+    /// 鼠标模式的光标位置（被控端画面上的比例，0..=1）。
     cursor: (f32, f32),
     state: State,
 }
@@ -218,9 +233,14 @@ impl Gestures {
         }
     }
 
-    /// 换模式（例如工具条上切换）。正在进行的手势照常结束。
-    pub const fn set_mode(&mut self, mode: Mode) {
+    /// 换模式（工具条上的鼠标助手开关）。进鼠标模式时交出光标位置，界面据此画光标。
+    /// 正在进行的手势照常结束。
+    pub fn set_mode(&mut self, mode: Mode) -> Vec<Action> {
         self.mode = mode;
+        match mode {
+            Mode::Trackpad => vec![self.cursor_action(), Action::Input(self.cursor_event())],
+            Mode::Direct => Vec::new(),
+        }
     }
 
     /// 现在的模式。
@@ -234,10 +254,20 @@ impl Gestures {
         self.view = view;
     }
 
-    /// 触控板模式的光标位置（被控端画面上的比例），界面据此画光标。
+    /// 鼠标模式的光标位置（被控端画面上的比例）。
     #[must_use]
     pub const fn cursor(&self) -> (f32, f32) {
         self.cursor
+    }
+
+    /// 屏幕上的“左键”“右键”按钮按下、抬起（鼠标助手）。鼠标模式下先把光标位置发过去，保证点在光标处。
+    pub fn button(&self, button: u8, down: bool) -> Vec<Action> {
+        let mut out = Vec::new();
+        if self.mode == Mode::Trackpad {
+            out.push(Action::Input(self.cursor_event()));
+        }
+        out.push(Action::Input(InputEvent::MouseButton { button, down }));
+        out
     }
 
     /// 处理一个触点。
@@ -252,6 +282,7 @@ impl Gestures {
             // 没按着就来的移动、抬起（例如上一个手势中途换了模式）：忽略
             (State::Idle, Phase::Move | Phase::Up | Phase::Cancel) => State::Idle,
             (State::One { f, moved }, phase) => self.one(f, moved, t, phase, &mut out),
+            (State::Held { f }, phase) => self.held(f, t, phase, &mut out),
             (State::Drag { f }, phase) => self.drag(f, t, phase, &mut out),
             (
                 State::Two {
@@ -275,32 +306,20 @@ impl Gestures {
         out
     }
 
-    /// 时间到了：手指按着不动够久就开始拖拽。有手指按着时界面每隔几十毫秒调一次。
+    /// 时间到了：手指按着不动够久就震一下（之后松开是右键、拖动是拖拽）。有手指按着时界面每隔几十毫秒调一次。
     pub fn tick(&mut self, now_ms: u64) -> Vec<Action> {
-        let mut out = Vec::new();
         if let State::One { f, moved: false } = self.state {
             if now_ms.saturating_sub(f.down_ms) >= LONG_PRESS_MS {
-                let at = self.pointer_at(f.start);
-                out.push(Action::Input(at));
-                out.push(button(LEFT, true));
-                self.state = State::Drag { f };
+                self.state = State::Held { f };
+                return vec![Action::Haptic];
             }
         }
-        out
+        Vec::new()
     }
 
-    fn one(
-        &mut self,
-        mut f: Finger,
-        mut moved: bool,
-        t: &Touch,
-        phase: Phase,
-        out: &mut Vec<Action>,
-    ) -> State {
+    fn one(&mut self, mut f: Finger, mut moved: bool, t: &Touch, phase: Phase, out: &mut Vec<Action>) -> State {
         if t.id != f.id {
-            if phase == Phase::Down
-                && t.t_ms.saturating_sub(f.down_ms) <= TWO_FINGER_GAP_MS.max(LONG_PRESS_MS)
-            {
+            if phase == Phase::Down && t.t_ms.saturating_sub(f.down_ms) <= LONG_PRESS_MS {
                 // 第二根手指：进入双指
                 let b = Finger::new(t);
                 return State::Two {
@@ -327,11 +346,8 @@ impl Gestures {
                 State::One { f, moved }
             }
             Phase::Up => {
-                f.last = (t.x, t.y);
                 if !moved && t.t_ms.saturating_sub(f.down_ms) <= TAP_MS {
-                    out.push(Action::Input(self.pointer_at(f.start)));
-                    out.push(button(LEFT, true));
-                    out.push(button(LEFT, false));
+                    self.click(LEFT, f.start, out);
                 }
                 State::Idle
             }
@@ -339,18 +355,44 @@ impl Gestures {
         }
     }
 
-    /// 单指滑动：直接点击模式下放大了就平移画面、没放大就移动光标；触控板模式移动光标。
+    /// 单指滑动：触屏模式平移画面，鼠标模式移动光标。
     fn slide(&mut self, prev: (f32, f32), now: (f32, f32), out: &mut Vec<Action>) {
         match self.mode {
-            Mode::Direct if self.view.zoomed => out.push(Action::Pan {
+            Mode::Direct => out.push(Action::Pan {
                 dx: now.0 - prev.0,
                 dy: now.1 - prev.1,
             }),
-            Mode::Direct => out.push(Action::Input(self.pointer_at(now))),
             Mode::Trackpad => {
                 self.nudge(prev, now);
+                out.push(self.cursor_action());
                 out.push(Action::Input(self.cursor_event()));
             }
+        }
+    }
+
+    /// 长按到点之后：松开是右键；动了（超过防抖距离）就从按下的地方开始拖拽。
+    fn held(&mut self, mut f: Finger, t: &Touch, phase: Phase, out: &mut Vec<Action>) -> State {
+        if t.id != f.id {
+            return State::Held { f };
+        }
+        match phase {
+            Phase::Down => State::Held { f },
+            Phase::Move => {
+                let prev = f.last;
+                f.last = (t.x, t.y);
+                if f.moved_from_start() <= self.slop {
+                    return State::Held { f };
+                }
+                out.push(Action::Input(self.pointer_at(f.start)));
+                out.push(button(LEFT, true));
+                self.follow(prev, f.last, out);
+                State::Drag { f }
+            }
+            Phase::Up => {
+                self.click(RIGHT, f.start, out);
+                State::Idle
+            }
+            Phase::Cancel => State::Idle,
         }
     }
 
@@ -364,14 +406,7 @@ impl Gestures {
             Phase::Move => {
                 let prev = f.last;
                 f.last = (t.x, t.y);
-                let at = match self.mode {
-                    Mode::Direct => self.pointer_at(f.last),
-                    Mode::Trackpad => {
-                        self.nudge(prev, f.last);
-                        self.cursor_event()
-                    }
-                };
-                out.push(Action::Input(at));
+                self.follow(prev, f.last, out);
                 State::Drag { f }
             }
             Phase::Up | Phase::Cancel => {
@@ -379,6 +414,25 @@ impl Gestures {
                 State::Idle
             }
         }
+    }
+
+    /// 拖拽时指针跟着手指：触屏模式在手指处，鼠标模式光标跟着位移走。
+    fn follow(&mut self, prev: (f32, f32), now: (f32, f32), out: &mut Vec<Action>) {
+        match self.mode {
+            Mode::Direct => out.push(Action::Input(self.pointer_at(now))),
+            Mode::Trackpad => {
+                self.nudge(prev, now);
+                out.push(self.cursor_action());
+                out.push(Action::Input(self.cursor_event()));
+            }
+        }
+    }
+
+    /// 单击 `button`：触屏模式在 `at`（界面像素），鼠标模式在光标处。
+    fn click(&self, button_id: u8, at: (f32, f32), out: &mut Vec<Action>) {
+        out.push(Action::Input(self.pointer_at(at)));
+        out.push(button(button_id, true));
+        out.push(button(button_id, false));
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -403,15 +457,13 @@ impl Gestures {
         match (phase, which) {
             // 第三根手指：留给系统，这个手势作废（已经开始的滚动、缩放就停在那儿）
             (Phase::Down, None) => State::Done { left: 3 },
-            (Phase::Down, Some(_)) | (Phase::Move | Phase::Up | Phase::Cancel, None) => {
-                State::Two {
-                    a,
-                    b,
-                    what,
-                    dist,
-                    scroll,
-                }
-            }
+            (Phase::Down, Some(_)) | (Phase::Move | Phase::Up | Phase::Cancel, None) => State::Two {
+                a,
+                b,
+                what,
+                dist,
+                scroll,
+            },
             (Phase::Move, Some(first)) => {
                 let before = midpoint(a.last, b.last);
                 if first {
@@ -468,25 +520,27 @@ impl Gestures {
                 let quick = t.t_ms.saturating_sub(a.down_ms) <= TWO_FINGER_TAP_MS
                     && b.down_ms.saturating_sub(a.down_ms) <= TWO_FINGER_GAP_MS;
                 if phase == Phase::Up && what == Two::Undecided && quick {
-                    let at = match self.mode {
-                        Mode::Direct => self.pointer_at(midpoint(a.last, b.last)),
-                        Mode::Trackpad => self.cursor_event(),
-                    };
-                    out.push(Action::Input(at));
-                    out.push(button(RIGHT, true));
-                    out.push(button(RIGHT, false));
+                    self.click(RIGHT, midpoint(a.last, b.last), out);
                 }
                 State::Done { left: 1 }
             }
         }
     }
 
-    /// 触控板模式：光标跟着手指的位移走（按画面大小换算成比例，手指在画面上划过整个宽度 = 光标划过整个宽度）。
+    /// 鼠标模式：光标跟着手指的位移走（按画面大小换算成比例：手指在画面上划过整个宽度 = 光标划过整个宽度。
+    /// 画面放大后同样的手指位移光标走得少，就是“放大了更精细”）。
     fn nudge(&mut self, prev: (f32, f32), now: (f32, f32)) {
         let w = self.view.width.max(1.0);
         let h = self.view.height.max(1.0);
         self.cursor.0 = (self.cursor.0 + (now.0 - prev.0) / w).clamp(0.0, 1.0);
         self.cursor.1 = (self.cursor.1 + (now.1 - prev.1) / h).clamp(0.0, 1.0);
+    }
+
+    const fn cursor_action(&self) -> Action {
+        Action::Cursor {
+            x: self.cursor.0,
+            y: self.cursor.1,
+        }
     }
 
     fn cursor_event(&self) -> InputEvent {
@@ -496,7 +550,7 @@ impl Gestures {
         }
     }
 
-    /// 界面上的一点对应被控端屏幕的哪里（画面外的点贴到边上）。触控板模式下是光标的位置。
+    /// 界面上的一点对应被控端屏幕的哪里（画面外的点贴到边上）。鼠标模式下是光标的位置。
     fn pointer_at(&self, p: (f32, f32)) -> InputEvent {
         if self.mode == Mode::Trackpad {
             return self.cursor_event();
