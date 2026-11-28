@@ -643,6 +643,10 @@ pub struct Outcome {
     pub cross: Vec<CrossStats>,
     /// 分段路径每段的真值，按 A → B 的顺序；不是分段路径时为空。**不进指纹**。
     pub segments: Vec<SegmentTruth>,
+    /// 控制端收到的画面数据报字节数（含数据报头）。几对共享网络时只数这一对的。**不进指纹**。
+    pub received_bytes: u64,
+    /// 控制端第一次收到画面数据报的时刻（微秒，这一对的本地时间）；没收到为 `None`。**不进指纹**。
+    pub first_received_us: Option<u64>,
 }
 
 /// 两秒一个窗口（对账时比每个窗口发了多少字节，见 `a1-plan.md` 第 4 节）。

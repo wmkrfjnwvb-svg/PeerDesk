@@ -281,6 +281,8 @@ struct Pair<'a> {
     frames_left: u32,
     acc: Option<PhaseAcc>,
     outcome: Option<Finished>,
+    received_bytes: u64,
+    first_received: Option<Time>,
 }
 
 impl<'a> Pair<'a> {
@@ -412,6 +414,8 @@ impl<'a> Pair<'a> {
             frames_left: 0,
             acc: None,
             outcome: None,
+            received_bytes: 0,
+            first_received: None,
         })
     }
 
@@ -698,6 +702,7 @@ impl<'a> Pair<'a> {
         &mut self,
         net: &mut Shared<N>,
         to: usize,
+        size: usize,
         header: &Header,
         body: &[u8],
     ) -> Result<(), Error> {
@@ -743,6 +748,10 @@ impl<'a> Pair<'a> {
             return Ok(());
         }
         self.video_since_feedback = self.video_since_feedback.saturating_add(1);
+        self.received_bytes = self
+            .received_bytes
+            .saturating_add(u64::try_from(size).unwrap_or(u64::MAX));
+        self.first_received.get_or_insert(now);
         let receiving = self.profile.start();
         let got = self.stage.receive(&mut self.rx, now, header, body);
         self.profile.stop(
@@ -929,6 +938,8 @@ impl<'a> Pair<'a> {
                 })
                 .collect(),
             trace: std::mem::take(&mut self.trace),
+            received_bytes: self.received_bytes,
+            first_received_us: self.first_received.map(Time::micros),
         };
         if self.profile.on {
             use std::io::Write as _;
@@ -1050,11 +1061,12 @@ fn drive<N: Wire>(
             let Some(d) = net.pop() else {
                 break;
             };
+            let size = d.payload.bytes.len();
             let Ok((header, body)) = decode_datagram(&d.payload.bytes) else {
                 continue;
             };
             if let Some(p) = pairs.get_mut(d.payload.pair) {
-                p.deliver(&mut net, d.to, &header, body)?;
+                p.deliver(&mut net, d.to, size, &header, body)?;
             }
         }
     }
@@ -1062,4 +1074,153 @@ fn drive<N: Wire>(
         .into_iter()
         .filter_map(|mut p| p.outcome.take())
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
+    use super::*;
+    use peerdesk_core::path::{BottleneckConfig, Capacity, Delay, QueueLimit};
+
+    fn link(rate_bps: u64, delay_us: u64) -> DirConfig {
+        DirConfig {
+            bottleneck: BottleneckConfig {
+                capacity: Capacity::Constant { rate_bps },
+                limit: QueueLimit::delay(200_000),
+                ..BottleneckConfig::default()
+            },
+            delay: Delay::Fixed(delay_us),
+            ..DirConfig::default()
+        }
+    }
+
+    /// 额外延迟只加在那一对的包上，两个方向都加；额外延迟为 0 的那一对和里面的网络一样。
+    #[test]
+    fn extra_delay_is_per_pair() {
+        // 不限速：送达时刻只有传播延迟，好核对
+        let path: Path<Packet> = Path::new(
+            1,
+            PathConfig::symmetric(DirConfig {
+                delay: Delay::Fixed(1_000),
+                ..DirConfig::default()
+            }),
+        );
+        let mut net = Shared::new(path, vec![0, 7_000]);
+        let p = |pair| Packet {
+            pair,
+            bytes: vec![1],
+        };
+        net.send(0, 1, 100, p(0));
+        net.send(0, 1, 100, p(1));
+        net.send(1, 0, 100, p(1));
+        net.send(0, 1, 100, p(9)); // 没有这一对：不加
+        assert_eq!(net.in_flight(), 4);
+        let mut got = Vec::new();
+        while let Some(d) = net.pop() {
+            got.push((d.payload.pair, d.to, d.at.micros()));
+        }
+        assert_eq!(got.len(), 4);
+        assert!(got.contains(&(0, 1, 1_000)));
+        assert!(got.contains(&(9, 1, 1_000)));
+        assert!(got.contains(&(1, 1, 8_000)));
+        assert!(got.contains(&(1, 0, 8_000)));
+        assert!(
+            got.windows(2).all(|w| w[0].2 <= w[1].2),
+            "按到达先后：{got:?}"
+        );
+        assert_eq!(net.in_flight(), 0);
+        assert!(net.pop().is_none() && net.peek_time().is_none());
+        assert_eq!(net.stats().sent, 4);
+    }
+
+    fn pair(name: &str, frames: u32, start_us: u64, reverse: bool, extra: u64) -> PairSpec {
+        let mut s = Scenario::fixed(
+            name,
+            vec![Phase {
+                action: Action::Video,
+                frames,
+            }],
+        );
+        s.codec = CodecKind::Tile;
+        s.seed = 3 + start_us;
+        PairSpec {
+            scenario: s,
+            start_us,
+            reverse,
+            extra_delay_us: extra,
+        }
+    }
+
+    /// 两对共享一个 3 Mbps 的瓶颈，第二对晚 3 秒开始：两对都出画面、解码不出错，送达的字节之和不超过容量，
+    /// 第二对开始之前什么都没收到；反过来的一对（被控端在节点 1）也能跑。
+    #[test]
+    fn two_pairs_share_one_bottleneck() {
+        let m = MultiScenario {
+            network: NetworkPlan::Layout2(Box::new(Layout2 {
+                start: PathConfig::symmetric(link(3_000_000, 20_000)),
+                ..Layout2::default()
+            })),
+            seed: 5,
+            pairs: vec![
+                pair("first", 180, 0, false, 0),
+                pair("second", 90, 3_000_000, false, 10_000),
+            ],
+        };
+        let out = run_multi(&m).unwrap();
+        assert_eq!(out.len(), 2);
+        let (a, b) = (&out[0], &out[1]);
+        for o in [a, b] {
+            assert!(o.frames > 10 && o.first_picture_ms.is_some(), "{}", o.name);
+            assert_eq!(o.bad, 0, "{}：别人的包进来会解坏", o.name);
+            assert!(o.received_bytes > 0);
+        }
+        // 第二对的本地时间从它开始算：第一个包在开始之后才到（往返 20 ms + 额外 10 ms 起）
+        assert!(
+            b.first_received_us.unwrap() >= 30_000,
+            "{:?}",
+            b.first_received_us
+        );
+        // 6 秒 3 Mbps 最多 2.25 MB（含反馈方向，反馈走另一个方向不占这里）
+        let total = a.received_bytes + b.received_bytes;
+        assert!(total <= 3_000_000 / 8 * 6, "{total}");
+        assert_eq!(a.net, b.net, "共享网络的计数是合在一起的");
+
+        // 一对反过来：画面走反向
+        let rev = MultiScenario {
+            pairs: vec![pair("rev", 60, 0, true, 0)],
+            ..m
+        };
+        let r = run_multi(&rev).unwrap();
+        assert!(r[0].frames > 0 && r[0].first_picture_ms.is_some());
+        let st = r[0].path.unwrap();
+        assert!(st.sent > 0);
+    }
+
+    #[test]
+    fn empty_or_zero_frame_phases() {
+        let mut s = Scenario::fixed(
+            "zero",
+            vec![
+                Phase {
+                    action: Action::Idle,
+                    frames: 0,
+                },
+                Phase {
+                    action: Action::Typing,
+                    frames: 3,
+                },
+                Phase {
+                    action: Action::Idle,
+                    frames: 0,
+                },
+            ],
+        );
+        s.codec = CodecKind::Tile;
+        let o = run(&s).unwrap();
+        assert_eq!(o.phases.len(), 3);
+        assert_eq!(o.phases[0].frames_shown, 0);
+        let mut bad = s.clone();
+        bad.phases.clear();
+        assert!(run(&bad).is_err());
+    }
 }
