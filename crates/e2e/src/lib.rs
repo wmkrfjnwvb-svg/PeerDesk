@@ -1384,8 +1384,19 @@ fn summary_line(s: &Scenario, o: &Outcome, wall: std::time::Duration, sim: Time)
 
 /// 指纹文件里的一行：场景的身份（名字、尺寸、帧率、编码、估计器、种子、码率、开关）和结果的指纹。
 fn fingerprint_line(s: &Scenario, o: &Outcome) -> String {
+    // 字节模型和扰动只在不是默认值时写进身份：默认的行和加这两项之前逐字节相同，
+    // 用了别的模型的行也只多了身份里的字，哈希不变；同一个场景换模型跑，各行分得开。
+    let mut model = String::new();
+    if s.byte_model != ByteModelKind::Default {
+        model.push_str(" model-");
+        model.push_str(s.byte_model.name());
+    }
+    if s.byte_noise != ByteNoise::Default {
+        model.push_str(" noise-");
+        model.push_str(s.byte_noise.name());
+    }
     format!(
-        "{} {}x{} fps{} {} {} seed{} max{} start{} pace{} probe{}{} {:?} {:016x}\n",
+        "{} {}x{} fps{} {} {} seed{} max{} start{} pace{} probe{}{}{model} {:?} {:016x}\n",
         s.name,
         s.width,
         s.height,
