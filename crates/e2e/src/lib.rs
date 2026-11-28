@@ -12,6 +12,8 @@
 pub mod content;
 pub mod homes;
 pub mod report;
+mod session;
+pub use session::{run_multi, MultiScenario, Packet, PairSpec};
 pub mod timeline;
 pub mod world;
 
@@ -1307,7 +1309,7 @@ fn send_ready(
     pacer: &mut peerdesk_core::pacer::Pacer,
     tx: &mut MediaSender,
     pacing: bool,
-    net: &mut impl Network<Vec<u8>>,
+    net: &mut session::Tagged<'_, impl Network<Packet>>,
     now: Time,
     seq: &mut u32,
 ) -> Result<u64, Error> {
@@ -1325,7 +1327,7 @@ fn send_ready(
         let datagram = encode_datagram(&header, &o.body)?;
         let len = u64::try_from(datagram.len()).unwrap_or(u64::MAX);
         bytes = bytes.saturating_add(len);
-        net.send(HOST, VIEWER, datagram.len(), datagram);
+        net.send(datagram.len(), datagram);
     }
     Ok(bytes)
 }
@@ -1674,51 +1676,36 @@ impl Journal {
 }
 
 fn run_inner(s: &Scenario, record: bool) -> Result<(Outcome, Option<Vec<u8>>), Error> {
-    match &s.network {
-        NetworkPlan::Layout1(links) => session(s, record, Net::new(s.seed), links.clone()),
-        NetworkPlan::Layout2(plan) => {
-            let mut path = Path::new(s.seed, plan.start.clone());
-            for change in &plan.routes {
-                path.schedule_route_change(change.clone());
-            }
-            for (dir, spec) in &plan.cross {
-                let _ = path.add_cross(*dir, spec.clone());
-            }
-            session(s, record, path, plan.steps.clone())
-        }
-        NetworkPlan::Segmented(plan) => {
-            let mut net = Segmented::new(s.seed, plan.start.clone());
-            for change in &plan.routes {
-                net.schedule_route_change(change.clone());
-            }
-            let mut ids = Vec::new();
-            for (segment, dir, spec) in &plan.cross {
-                ids.push((*segment, net.add_cross(*segment, *dir, spec.clone())));
-            }
-            session(
-                s,
-                record,
-                SegmentedWire { net, cross: ids },
-                plan.steps.clone(),
-            )
-        }
-    }
+    let spec = session::Spec {
+        s,
+        start: Time::ZERO,
+        reverse: false,
+        extra: 0,
+    };
+    let mut done = session::with_network(&s.network, s.seed, &[spec], record)?;
+    let Some(one) = done.pop() else {
+        return Err(Error::InvalidArgument("会话没有结果"));
+    };
+    note_fingerprint(s, &one.outcome);
+    note_summary(s, &one.outcome, one.wall, one.end);
+    note_world(s);
+    Ok((one.outcome, one.recorded))
 }
 
 /// 分段路径加上交叉流量源的序号（每个源挂在哪一段、在那一段里是第几个），主循环用它取计数。
 struct SegmentedWire {
-    net: Segmented<Vec<u8>>,
+    net: Segmented<Packet>,
     cross: Vec<(Segment, usize)>,
 }
 
-impl Network<Vec<u8>> for SegmentedWire {
-    fn send(&mut self, from: usize, to: usize, size_bytes: usize, payload: Vec<u8>) {
+impl Network<Packet> for SegmentedWire {
+    fn send(&mut self, from: usize, to: usize, size_bytes: usize, payload: Packet) {
         self.net.send(from, to, size_bytes, payload);
     }
     fn peek_time(&self) -> Option<Time> {
         self.net.peek_time()
     }
-    fn pop(&mut self) -> Option<peerdesk_core::sim::Delivery<Vec<u8>>> {
+    fn pop(&mut self) -> Option<peerdesk_core::sim::Delivery<Packet>> {
         self.net.pop()
     }
     fn advance_to(&mut self, t: Time) {
@@ -1793,7 +1780,7 @@ impl Wire for SegmentedWire {
 }
 
 /// 主循环看网络的另一面：按场景的时间表换参数，和两样“仿真才知道的真值”。`Net` 和 `Path` 各实现一份。
-trait Wire: Network<Vec<u8>> {
+trait Wire: Network<Packet> {
     /// 时间表里的一项。
     type Step;
     /// 在这一帧开头换成这一项（布局 1 是 `set_link`，两个方向对称）。
@@ -1816,7 +1803,7 @@ trait Wire: Network<Vec<u8>> {
     }
 }
 
-impl Wire for Net<Vec<u8>> {
+impl Wire for Net<Packet> {
     type Step = Link;
     fn apply(&mut self, step: &Link) {
         self.set_link(HOST, VIEWER, *step);
@@ -1832,7 +1819,7 @@ impl Wire for Net<Vec<u8>> {
     }
 }
 
-impl Wire for Path<Vec<u8>> {
+impl Wire for Path<Packet> {
     type Step = PathStep;
     fn apply(&mut self, step: &PathStep) {
         self.set_dir(Dir::Forward, step.config.forward.clone());
@@ -1858,508 +1845,6 @@ impl Wire for Path<Vec<u8>> {
 
 /// “路径变了”事件交给两端的钩子。产品怎么反应（重新探测）是 B4 的事；A2-3 只保证事件按时刻送到这里，现在什么都不做。
 const fn route_changed(_tx: &mut MediaSender, _rx: &mut MediaReceiver, _at: Time) {}
-
-/// 一次会话：`net` 是这次用的网络，`steps` 是按时刻换参数的时间表。
-fn session<N: Wire>(
-    s: &Scenario,
-    record: bool,
-    mut net: N,
-    mut network: Vec<(u64, N::Step)>,
-) -> Result<(Outcome, Option<Vec<u8>>), Error> {
-    if s.fps == 0 || s.phases.is_empty() {
-        return Err(Error::InvalidArgument("帧率和阶段都不能为空"));
-    }
-    let interval = 1_000_000 / u64::from(s.fps);
-    let mut profile = Stopwatch::from_env();
-    let tag = Arc::new(AtomicU64::new(0));
-    let feed = ChangeFeed::default();
-    let (encoder, decoder) = s.codec.make(s, &tag, &feed)?;
-    // L1 在收包的当场解码；L0.5、L0 走控制端用的延后解码（解码器交给量尺里的 DecodeWorker）
-    let (mut stage, inline): (Box<dyn Stage>, Option<Box<dyn VideoDecoder>>) = match s.codec {
-        CodecKind::H264L0 => {
-            // 导出时间线要画一遍像素（有缓存）；它不算进会话的计时，单独报
-            let preparing = profile.start();
-            let timeline = timeline::Timeline::cached(s.width, s.height, s.seed, &s.phases)?;
-            profile.prepared = preparing.map(|t| t.elapsed()).unwrap_or_default();
-            (
-                Box::new(TimelineStage {
-                    timeline,
-                    next: 0,
-                    content: None,
-                    feed,
-                    worker: DecodeWorker::new(decoder),
-                    shown: None,
-                }),
-                None,
-            )
-        }
-        CodecKind::H264L05 => (
-            Box::new(DescribedStage {
-                desk: RealisticDesktop::new(s.width, s.height, s.seed)?,
-                feed,
-                version: 0,
-                tag,
-                worker: DecodeWorker::new(decoder),
-                shown: None,
-            }),
-            None,
-        ),
-        CodecKind::Tile | CodecKind::H264 => (
-            Box::new(PixelStage {
-                desk: RealisticDesktop::new(s.width, s.height, s.seed)?,
-                shown: None,
-            }),
-            Some(decoder),
-        ),
-    };
-    let wall = std::time::Instant::now();
-    let cfg = SenderConfig {
-        fps: s.fps,
-        start_bps: s.start_bps,
-        max_bps: s.max_bps,
-        profile: s.profile,
-        estimator: s.estimator,
-        policy: s.policy,
-        ..SenderConfig::default()
-    };
-    let mut tx = MediaSender::new(cfg, encoder);
-    let mut rx = match inline {
-        Some(decoder) => MediaReceiver::new(Time::ZERO, cfg.deadline_us, decoder),
-        None => MediaReceiver::detached(Time::ZERO, cfg.deadline_us),
-    };
-    rx.set_keyframe_grace(s.codec.is_h264());
-    rx.set_fec(s.fec);
-    tx.set_fec(s.fec);
-    // 网络控制器要到达报告时两端都打开（产品里由握手的 TRANSPORT_CC 决定）
-    tx.set_reports(true);
-    rx.set_reports(tx.reports());
-    // 静止时探测（产品里由握手的 PROBE_TRAIN 决定；新版本之间都打开）
-    tx.set_idle_probe(true);
-    tx.set_start_probe(s.start_probe);
-    tx.set_probe_ids(s.probe_ids);
-    rx.set_probe_ids(s.probe_ids);
-    network.sort_by_key(|(t, _)| *t);
-    let mut next_link = 0usize;
-    let mut route_changes = Vec::new();
-    // 分段路径每段正向排队：（时间加权的和 微秒·微秒，最大 微秒），按帧末采样
-    let mut seg_queue: Vec<(u128, u64)> = Vec::new();
-
-    // 每一帧的采集时间，按帧号。
-    let mut captured: Vec<Time> = vec![Time::ZERO];
-    let mut results = Vec::new();
-    let (mut seq, mut fb_seq) = (0u32, 0u32);
-    let mut overall_wait = 0u64;
-    let mut features = Vec::new();
-    let trace_events = s.trace;
-    let mut trace = Vec::new();
-    // 调试：每秒里因为哪个闸门没编帧（等关键帧、在途满、节奏器忙）
-    let mut gate = (0u32, 0u32, 0u32);
-    // 源画面变了、控制端还没看到新画面：从哪个时刻开始等的。
-    let mut waiting_since: Option<Time> = None;
-    // 会话开始到看到第一幅画面用了多久。
-    let mut first_picture: Option<u64> = None;
-    let mut first = true;
-    // 画面变了但还没编（在途数据满了）。
-    let mut pending = false;
-    let mut overall_freezes = 0u32;
-    let mut states = StateShare::default();
-    let mut counter = Counter::default();
-    let mut journal = record.then(|| Journal::new(s, tx.estimator()));
-
-    let mut now = Time::ZERO;
-    let mut next_feedback = Time(FEEDBACK_US);
-    // 上次反馈以来收到的画面包数、上次报告的 floor、上次反馈的时间（反馈节奏和产品一样，见 IDLE_FEEDBACK_US）
-    let mut video_since_feedback = 0u32;
-    let mut reported_floor = 0u32;
-    let mut last_feedback = Time::ZERO;
-    let mut next_tick = Time::ZERO;
-    let mut pacer = peerdesk_core::pacer::Pacer::new(Time(0));
-    let pacing = s.pacing;
-    for phase in &s.phases {
-        let mut acc = PhaseAcc::new(now);
-        // 阶段开始时画面已经清晰（例如上一阶段停下来之后补清晰了）。
-        let gauging = profile.start();
-        if stage.sharp() {
-            acc.sharp_at = Some(now);
-        }
-        profile.stop(Part::Gauge, gauging);
-        for _ in 0..phase.frames {
-            let tick_end = now.plus(interval);
-            // 被控端：这一帧。
-            while network.get(next_link).is_some_and(|(t, _)| Time(*t) <= now) {
-                if let Some((_, step)) = network.get(next_link) {
-                    net.apply(step);
-                }
-                next_link += 1;
-            }
-            // 第一帧总要发：控制端还什么都没有。
-            let rendering = profile.start();
-            let moved = stage.step(phase.action)?;
-            profile.stop(Part::Render, rendering);
-            let changed = moved || std::mem::take(&mut first);
-            if changed && waiting_since.is_none() {
-                waiting_since = Some(now);
-            }
-            pending |= changed;
-            // 和产品一样：画面变了就告诉发送端（编不编这一帧另说），判断画面是不是停下了
-            if changed {
-                tx.screen_changed(now);
-            }
-            // 在途数据超过上限，或上一帧还没发完（发送队列最多放一帧）：这一帧不编，
-            // 变化攒着，等发完、确认之后编最新的画面。
-            // 和产品一样每一轮都检查迟迟没有结论的帧（整个关键帧都被瓶颈丢掉时，接收端不知道有这一帧，
-            // 只能靠发送端超时判丢；只在编帧时检查的话，等关键帧时不编帧，就永远等下去）。
-            tx.expire_unacked(now);
-            if trace_events && (pending || tx.wants_frame()) && tx.due(now) {
-                if tx.key_pending() {
-                    gate.0 += 1;
-                } else if tx.in_flight_full(now) {
-                    gate.1 += 1;
-                } else if pacer.busy(tx.pacing_bps(pacing), 1_000_000 / u64::from(s.fps.max(1))) {
-                    gate.2 += 1;
-                }
-            }
-            let wanted = pending || tx.wants_frame();
-            let pacer_busy = pacer.busy(tx.pacing_bps(pacing), 1_000_000 / u64::from(s.fps.max(1)));
-            if tx.frame_gate(now, wanted, pacer_busy) {
-                let rtt = net.nominal_rtt_us();
-                let before = tx.stats();
-                let changed = std::mem::take(&mut pending);
-                let encoding = profile.start();
-                let out = stage.encode(&mut tx, now, changed, rtt)?;
-                counter.after(tx.rate_bps(), tx.fps());
-                profile.stop(Part::Encode, encoding);
-                if let Some(j) = journal.as_mut() {
-                    j.frame(now, &tx, before, changed);
-                }
-                let before = before.frames;
-                if tx.stats().frames != before {
-                    captured.push(now);
-                    if trace_events {
-                        let bytes: usize = out.iter().map(|o| o.body.len()).sum();
-                        if bytes > 4_000 {
-                            trace.push(format!(
-                                "[{:>6} ms] 大帧 {bytes} B（关键帧累计 {}），码率 {} kbps",
-                                now.micros() / 1000,
-                                tx.stats().keyframes,
-                                tx.rate_bps() / 1000
-                            ));
-                        }
-                    }
-                }
-                // 和产品一样经发送节奏控制发出（见 peerdesk_core::pacer）
-                pacer.push(out);
-                let sending = profile.start();
-                let wire = send_ready(&mut pacer, &mut tx, pacing, &mut net, now, &mut seq)?;
-                acc.bytes = acc.bytes.saturating_add(wire);
-                counter.sent(now, wire);
-                profile.stop(Part::Send, sending);
-            }
-            // 这一帧的时间内：投递数据报、发反馈。
-            loop {
-                let next = [
-                    net.peek_time(),
-                    net.next_event_time(),
-                    Some(next_feedback),
-                    Some(next_tick),
-                    pacer.next_due(now, tx.pacing_bps(pacing)),
-                ]
-                .into_iter()
-                .flatten()
-                .min()
-                .filter(|t| *t < tick_end);
-                let Some(when) = next else { break };
-                states.add(
-                    tx.rate_state(),
-                    net.backlog_us(HOST, VIEWER),
-                    when.since(now),
-                );
-                counter.held(tx.rate_bps(), when.since(now));
-                let moving = profile.start();
-                net.advance_to(when);
-                profile.stop(Part::Network, moving);
-                now = when;
-                let controlling = profile.start();
-                while let Some(event) = net.pop_event() {
-                    route_changes.push(event.at().micros());
-                    route_changed(&mut tx, &mut rx, event.at());
-                }
-                if next_tick <= now {
-                    tx.on_tick(now);
-                    counter.after(tx.rate_bps(), tx.fps());
-                    for cluster in tx.take_probes() {
-                        pacer.push_probe(cluster);
-                    }
-                    next_tick = now.plus(CC_TICK_US);
-                    if trace_events && now.micros() % 1_000_000 < CC_TICK_US {
-                        {
-                            let line = tx
-                                .controller_line()
-                                .unwrap_or_else(|| format!("码率 {} kbps", tx.rate_bps() / 1000));
-                            trace.push(format!(
-                                "[{:>6} ms] {line}；节奏器排队 {} B，在途 {} B；这一秒不编：等关键帧 {}、在途满 {}、节奏器忙 {}",
-                                now.micros() / 1000,
-                                pacer.queued_bytes(),
-                                tx.in_flight(),
-                                gate.0,
-                                gate.1,
-                                gate.2
-                            ));
-                            gate = (0, 0, 0);
-                            let st = tx.stats();
-                            trace.push(format!(
-                                "           发送端累计：帧 {}，关键帧 {}，判丢 {}，重传 {}（重传请求 {}，没到时间跳过 {}，原包没发 {}，超额没发 {}）",
-                                st.frames, st.keyframes, st.lost, st.retransmitted, st.nack_requests, st.resend_skipped, st.resend_unsent, st.resend_capped
-                            ));
-                        }
-                    }
-                }
-                profile.stop(Part::Control, controlling);
-                let sending = profile.start();
-                let wire = send_ready(&mut pacer, &mut tx, pacing, &mut net, now, &mut seq)?;
-                acc.bytes = acc.bytes.saturating_add(wire);
-                counter.sent(now, wire);
-                profile.stop(Part::Send, sending);
-                let controlling = profile.start();
-                let feedback_due = next_feedback <= now && {
-                    next_feedback = now.plus(FEEDBACK_US);
-                    let (floor, _) = rx.settle(now);
-                    let news =
-                        video_since_feedback > 0 || floor != reported_floor || rx.wants_nack(now);
-                    let due = news || now.since(last_feedback) >= IDLE_FEEDBACK_US;
-                    if due {
-                        video_since_feedback = 0;
-                        reported_floor = floor;
-                        last_feedback = now;
-                    }
-                    due
-                };
-                if feedback_due {
-                    let fb = rx.feedback_datagram(now);
-                    let header = Header {
-                        channel: Channel::Control,
-                        flags: 0,
-                        conn_id: 0,
-                        seq: fb_seq,
-                        send_time: now,
-                    };
-                    fb_seq = fb_seq.wrapping_add(1);
-                    let datagram = encode_datagram(&header, &fb)?;
-                    net.send(VIEWER, HOST, datagram.len(), datagram);
-                }
-                profile.stop(Part::Control, controlling);
-                loop {
-                    let moving = profile.start();
-                    let arrived = net
-                        .peek_time()
-                        .is_some_and(|t| t <= now)
-                        .then(|| net.pop())
-                        .flatten();
-                    let Some(d) = arrived else {
-                        profile.stop(Part::Network, moving);
-                        break;
-                    };
-                    let parsed = decode_datagram(&d.payload);
-                    profile.stop(Part::Network, moving);
-                    let Ok((header, body)) = parsed else {
-                        continue;
-                    };
-                    if d.to == HOST {
-                        // 反馈；顺便按请求重传丢了的分片。
-                        let controlling = profile.start();
-                        let again = tx.on_feedback_datagram(now, body).unwrap_or_default();
-                        counter.after(tx.rate_bps(), tx.fps());
-                        pacer.retain(|o| tx.wanted(o));
-                        pacer.push_front(again);
-                        profile.stop(Part::Control, controlling);
-                        let sending = profile.start();
-                        let wire =
-                            send_ready(&mut pacer, &mut tx, pacing, &mut net, now, &mut seq)?;
-                        acc.bytes = acc.bytes.saturating_add(wire);
-                        counter.sent(now, wire);
-                        profile.stop(Part::Send, sending);
-                        if trace_events {
-                            for e in tx.take_events() {
-                                trace.push(format!("[{:>6} ms] {e}", now.micros() / 1000));
-                            }
-                        }
-                        if let Some(obs) = tx.last_observation() {
-                            if let Some(j) = journal.as_mut() {
-                                j.feedback(now, &tx, &obs);
-                            }
-                            features.push(FeatureRow {
-                                t_ms: now.micros() / 1000,
-                                rate_bps: tx.rate_bps(),
-                                queue_us: obs.feedback.queue_delay_us,
-                                trend: obs.ext.trend_tenth_ms,
-                                train: obs.ext.train_bytes_per_s,
-                                loss: obs.feedback.loss_permille,
-                                recv: obs.feedback.recv_bytes_per_s,
-                                in_flight: obs.in_flight,
-                                true_rate_bps: net.true_rate_bps(),
-                                true_queue_packets: net.in_flight(),
-                                true_queue_us: net.backlog_us(HOST, VIEWER),
-                                state: tx.rate_state(),
-                            });
-                        }
-                        continue;
-                    }
-                    video_since_feedback = video_since_feedback.saturating_add(1);
-                    let receiving = profile.start();
-                    let got = stage.receive(&mut rx, now, &header, body);
-                    profile.stop(
-                        if got.is_some() {
-                            Part::Decode
-                        } else {
-                            Part::Reassemble
-                        },
-                        receiving,
-                    );
-                    let Some(frame_id) = got else {
-                        continue;
-                    };
-                    let at = captured
-                        .get(usize::try_from(frame_id).unwrap_or(usize::MAX))
-                        .copied()
-                        .unwrap_or(now);
-                    acc.latencies.push(now.since(at));
-                    acc.shown += 1;
-                    // 等待到“包含这次变化的画面”显示出来才算结束：采集时间早于变化的帧（例如变化之前编的补清晰帧
-                    // 还在路上）显示出来时，用户看到的还是旧画面。以前任何一帧显示就算结束，切换窗口时一个 100 KB 的帧
-                    // 要传 700 ms，前面一个补清晰帧先到，就只记了 169 ms（2026-11 微软轨迹 ms-09401 实测）。
-                    let done = waiting_since.filter(|since| at >= *since);
-                    if done.is_some() {
-                        waiting_since = None;
-                    }
-                    if let Some(since) = done {
-                        let wait = now.since(since);
-                        // 第一幅画面单独记（会话开始时的等待），不算卡顿。
-                        if first_picture.is_none() {
-                            first_picture = Some(wait);
-                        } else {
-                            acc.max_wait = acc.max_wait.max(wait);
-                            if wait > FREEZE_US {
-                                acc.freezes += 1;
-                                if trace_events {
-                                    trace.push(format!(
-                                        "[{:>6} ms] 冻结：画面在 {} ms 变了，等了 {} ms 才显示出来",
-                                        now.micros() / 1000,
-                                        since.micros() / 1000,
-                                        wait / 1000
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                    let gauging = profile.start();
-                    if acc.sharp_at.is_none() && stage.sharp() {
-                        acc.sharp_at = Some(now);
-                    }
-                    profile.stop(Part::Gauge, gauging);
-                }
-            }
-            states.add(
-                tx.rate_state(),
-                net.backlog_us(HOST, VIEWER),
-                tick_end.since(now),
-            );
-            counter.held(tx.rate_bps(), tick_end.since(now));
-            let moving = profile.start();
-            net.advance_to(tick_end);
-            profile.stop(Part::Network, moving);
-            now = tick_end;
-            let queues = net.segment_queues_us();
-            seg_queue.resize(queues.len(), (0, 0));
-            for ((sum, max), q) in seg_queue.iter_mut().zip(queues) {
-                *sum = sum.saturating_add(u128::from(q) * u128::from(interval));
-                *max = (*max).max(q);
-            }
-            if let Some(j) = journal.as_mut() {
-                j.second(now, tx.stats());
-            }
-        }
-        // 阶段结束时还在等（第一幅画面已经出来之后）：等到现在的时间也算进去。
-        if let Some(since) = waiting_since.filter(|_| first_picture.is_some()) {
-            let wait = now.since(since);
-            acc.max_wait = acc.max_wait.max(wait);
-            if wait > FREEZE_US && acc.max_wait == wait {
-                acc.freezes += 1;
-            }
-        }
-        let gauging = profile.start();
-        let (end_psnr, snapshot) = stage.snapshot();
-        profile.stop(Part::Gauge, gauging);
-        let duration = now.since(acc.start).max(1);
-        let mut sorted = acc.latencies.clone();
-        sorted.sort_unstable();
-        overall_wait = overall_wait.max(acc.max_wait);
-        overall_freezes += acc.freezes;
-        results.push(PhaseResult {
-            action: phase.action,
-            bytes: acc.bytes,
-            kbps: acc.bytes.saturating_mul(8_000) / duration,
-            frames_shown: acc.shown,
-            latency_ms: (ms(percentile(&sorted, 50)), ms(percentile(&sorted, 95))),
-            max_wait_ms: ms(acc.max_wait),
-            freezes: acc.freezes,
-            end_psnr,
-            sharp_ms: acc
-                .sharp_at
-                .filter(|_| phase.action == Action::Idle)
-                .map(|t| ms(t.since(acc.start))),
-            snapshot,
-        });
-    }
-    let (tx_stats, rx_stats) = (tx.stats(), rx.stats());
-    let sent_bytes = results.iter().map(|p| p.bytes).sum();
-    let recorded = journal.map(|j| j.finish(now, tx_stats));
-    let outcome = Outcome {
-        name: s.name.clone(),
-        codec: s.codec,
-        phases: results,
-        frames: tx_stats.frames,
-        keyframes: tx_stats.keyframes,
-        recoveries: tx_stats.lost,
-        skipped: rx_stats.skipped,
-        bad: rx_stats.bad,
-        net: net.stats(),
-        max_wait_ms: ms(overall_wait),
-        first_picture_ms: first_picture.map(ms),
-        freezes: overall_freezes,
-        retransmitted: tx_stats.retransmitted,
-        states,
-        probes: tx_stats.probes,
-        sent_bytes,
-        estimator: tx.estimator(),
-        features,
-        tally: counter.finish(now),
-        path: net.path_stats(),
-        route_changes,
-        cross: net.cross(),
-        segments: net
-            .segment_stats()
-            .into_iter()
-            .zip(&seg_queue)
-            .map(|(stats, (sum, max))| SegmentTruth {
-                stats,
-                // 和 ms() 同一个口径：微秒 → 毫秒
-                mean_queue_ms: *sum as f64 / now.micros().max(1) as f64 / 1000.0,
-                max_queue_ms: ms(*max),
-            })
-            .collect(),
-        trace,
-    };
-    if profile.on {
-        use std::io::Write as _;
-        // 测量输出走标准错误，一次写一整行（并行的测试不互相打断）
-        let line = profile.line(&s.name, wall.elapsed(), now);
-        let _ = writeln!(std::io::stderr().lock(), "{line}");
-    }
-    note_fingerprint(s, &outcome);
-    note_summary(s, &outcome, wall.elapsed(), now);
-    note_world(s);
-    Ok((outcome, recorded))
-}
 
 #[cfg(test)]
 mod tests {
@@ -2839,7 +2324,7 @@ mod tests {
 
     #[test]
     fn both_wires_report_the_nominal_truth() {
-        let mut net: Net<Vec<u8>> = Net::new(1);
+        let mut net: Net<Packet> = Net::new(1);
         // 还没有链路：按局域网（以前主循环里 link 的初值）
         assert_eq!(net.nominal_rtt_us(), 300 * 2 + 1_000);
         assert_eq!(net.true_rate_bps(), 0);
@@ -2851,7 +2336,7 @@ mod tests {
         assert_eq!(net.nominal_rtt_us(), 41_000);
         assert_eq!(net.true_rate_bps(), 4_000_000);
 
-        let mut path: Path<Vec<u8>> = Path::new(
+        let mut path: Path<Packet> = Path::new(
             1,
             PathConfig {
                 forward: dir(8_000_000, 20_000),
@@ -2866,7 +2351,15 @@ mod tests {
         });
         assert_eq!(path.nominal_rtt_us(), 3_000);
         assert_eq!(path.true_rate_bps(), 2_000_000);
-        path.send(HOST, VIEWER, 100, vec![0]);
+        path.send(
+            HOST,
+            VIEWER,
+            100,
+            Packet {
+                pair: 0,
+                bytes: vec![0],
+            },
+        );
         assert_eq!(path.stats().outage_dropped, 1, "up=false 切断");
     }
 
@@ -2935,7 +2428,7 @@ mod tests {
             o.cross[0]
         );
         assert!(o.cross[1].delivered_bytes > 0, "{:?}", o.cross[1]);
-        assert!(Net::<Vec<u8>>::new(1).cross().is_empty());
+        assert!(Net::<Packet>::new(1).cross().is_empty());
         assert!(o.frames > 0 && o.first_picture_ms.is_some());
         assert!(fingerprint_line(&s, &o).contains(" layout2 "));
         let mut one = s.clone();
