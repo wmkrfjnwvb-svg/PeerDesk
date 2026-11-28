@@ -264,6 +264,12 @@ impl Caps {
     /// 4:4:4 色度。
     pub const YUV444: Caps = Caps(1 << 3);
 
+    /// 帧上带输入序号（见 [`crate::reaction`]）：被控端随帧告诉控制端“这幅画面包含到第几个输入”，
+    /// 控制端据此量“操作到画面”。对端没有这一位时被控端不发，控制端用旧算法（操作后的下一幅画面）。
+    /// 用第 15 位：第 16–23 位用完了，24–26 是被控端的系统，27–31 在这个分支和其他分支上都占了（见 `PROBE_ID`）；
+    /// 第 4–15 位原本留给编码格式，一直没用过，协商同样是取交集，老版本没有这一位。
+    pub const INPUT_STAMP: Caps = Caps(1 << 15);
+
     // 第 16 位起是功能能力位。老版本不发这些位，协商后的交集里也就没有，对应功能自动关闭。
     /// 剪贴板同步。
     pub const CLIPBOARD: Caps = Caps(1 << 16);
@@ -326,7 +332,8 @@ impl Caps {
             | Self::VIEW_SIZE.0
             | Self::TRANSPORT_CC.0
             | Self::PROBE_TRAIN.0
-            | Self::PROBE_ID.0,
+            | Self::PROBE_ID.0
+            | Self::INPUT_STAMP.0,
     );
 
     /// 并集。

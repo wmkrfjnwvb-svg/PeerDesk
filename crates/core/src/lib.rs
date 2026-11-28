@@ -11,6 +11,7 @@
 //! - [`connect`] / [`probe`]：网络画像与直连方法规划、硬件档位。
 //! - [`region`] / [`cluster`]：区域优先的节点选择、服务端集群成员管理。
 //! - [`input`]：输入事件与冗余传输。
+//! - [`reaction`]：操作到画面的延迟怎么量（帧上带输入序号）。
 //! - [`file`]：文件传输协议与断点续传。
 //! - [`trace`]：业务链路追踪。
 //! - [`sim`] / [`scenario`]：确定性网络仿真与端到端场景。
@@ -47,6 +48,7 @@ pub mod paths;
 pub mod policy;
 pub mod probe;
 pub mod proto;
+pub mod reaction;
 pub mod record;
 pub mod region;
 pub mod relay;

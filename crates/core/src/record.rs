@@ -911,7 +911,10 @@ pub struct ViewFrame {
     pub present_us: u64,
 }
 
-/// 操作到画面的延迟：这一秒里“按下键或鼠标键，到下一幅画面显示”的统计。没有操作的秒不写。
+/// 操作到画面的延迟：这一秒里各次操作的统计。没有操作的秒不写。
+/// 会话的能力位（元数据里的 `caps`）有 [`crate::proto::Caps::INPUT_STAMP`] 时，是“发出按键、点击、打的字，
+/// 到显示第一幅带上它的画面”（见 [`crate::reaction`]）；没有时是旧算法“按下键或鼠标键，到下一幅画面显示”
+/// （有补清晰的帧在流时偏小）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Reaction {
     /// 这一秒的次数。
