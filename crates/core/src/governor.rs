@@ -22,6 +22,12 @@ const UP_AFTER_US: u64 = 1_500_000;
 /// 编出来的帧超过预算这么多倍算装不进。
 const OVER_BUDGET_TIMES: usize = 2;
 
+/// 画质让到这个 QP 还装不进预算，才让帧率（“画质 → 帧率 → 分辨率”，`docs/research/P-fps-bitrate.md` 第 9.1、10 节）。
+/// 临时值：屏幕内容编码标准（JCT-VC SCC）主观测试里最粗的一档是 QP 37（锚点 22/27/32/37，
+/// `docs/research/Q-redesign/industry-hw-refine-text.md` 2.1 节），再粗文字就不在标准考虑的范围里。
+/// M3（清晰度底线 QP_text）量出我们自己的数以后换掉。
+pub const QP_QUALITY_SPENT: u8 = 37;
+
 /// 帧率调节器。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FpsGovernor {
@@ -96,6 +102,9 @@ impl FpsGovernor {
     /// 帧间隔从这一帧**开始编**的时刻算（[`Self::on_start`]），不从编完算：从编完算的话，编一帧要 2–4 ms 时
     /// 下一拍离“编完”不到 90% 的帧间隔，每隔一拍就跳过一拍（实测 100 帧只编出 50 帧；1080p 软件编码
     /// 15 ms、30 帧时会掉到 15 帧）。没调用过 `on_start` 时按编完的时刻算。
+    ///
+    /// `qp` 是这一帧编码用的 QP（硬件编码器不知道为 `None`）：帧超过预算、但 QP 还没到 [`QP_QUALITY_SPENT`]，
+    /// 说明画质还有余地，先让码率控制把 QP 抬上去，不降帧率；不知道 QP 时照旧按大小判断。
     pub fn on_frame(
         &mut self,
         now: Time,
@@ -103,11 +112,12 @@ impl FpsGovernor {
         hardware: bool,
         size: usize,
         budget: usize,
+        qp: Option<u8>,
     ) -> u32 {
         let start = self.frame_start.take().unwrap_or(now);
         self.last_frame = Some(start);
         self.on_cpu(now, start, encode_us, hardware);
-        self.on_fit(now, size, budget);
+        self.on_fit(now, size, budget, qp);
         self.fps()
     }
 
@@ -139,8 +149,17 @@ impl FpsGovernor {
     }
 
     /// “装不进预算”信号：反应快（帧级），装得下一阵子再升。
-    fn on_fit(&mut self, now: Time, size: usize, budget: usize) {
-        let over = budget > 0 && size > budget.saturating_mul(OVER_BUDGET_TIMES);
+    fn on_fit(&mut self, now: Time, size: usize, budget: usize, qp: Option<u8>) {
+        let too_big = budget > 0 && size > budget.saturating_mul(OVER_BUDGET_TIMES);
+        // 画质还有余地（QP 没到头）时，装不进先由画质让：不算进降帧率（也不算进降分辨率），但也不算“装得下”
+        let quality_spent = qp.is_none_or(|q| q >= QP_QUALITY_SPENT);
+        if too_big && !quality_spent {
+            self.strained = 0;
+            self.calm_since = None;
+            self.overflow_since = None;
+            return;
+        }
+        let over = too_big;
         // 帧率到底了还装不进：记下从什么时候开始的（发送端据此决定是否降分辨率）
         if over && self.at_floor() {
             self.overflow_since.get_or_insert(now);
@@ -226,6 +245,74 @@ impl FpsGovernor {
 mod tests {
     use super::*;
 
+    /// 画质 → 帧率（#71 第 2 步，`P-fps-bitrate.md` 第 10 节）：帧超过预算 2 倍，但 QP 还没到头，先让画质，
+    /// 帧率不降、也不算进降分辨率的计时；QP 到了头还装不进，才降帧率。不知道 QP（硬件编码器）照旧按大小判断。
+    #[test]
+    fn frames_over_budget_lower_the_quality_before_the_frame_rate() {
+        let mut g = FpsGovernor::new(30);
+        let mut t = Time::ZERO;
+        // QP 30，画质还有余地：连着 10 帧超过预算 10 倍，帧率不动
+        for _ in 0..10 {
+            t = t.plus(100_000);
+            g.on_frame(t, 1_000, false, 10_000, 1_000, Some(30));
+        }
+        assert_eq!(g.fps(), 30, "画质还有余地，不让帧率");
+        assert_eq!(g.take_change(), None);
+        // QP 到头：连着 3 帧装不进，降一档
+        for _ in 0..DOWN_AFTER {
+            t = t.plus(100_000);
+            g.on_frame(t, 1_000, false, 10_000, 1_000, Some(QP_QUALITY_SPENT));
+        }
+        assert!(g.fps() < 30);
+        assert!(g.take_change().unwrap().contains("内容装不进预算"));
+        // 中间夹一帧 QP 没到头的：重新数（不是连着 3 帧画质让到头还装不进）
+        let fps = g.fps();
+        for qp in [
+            QP_QUALITY_SPENT,
+            QP_QUALITY_SPENT,
+            30,
+            QP_QUALITY_SPENT,
+            QP_QUALITY_SPENT,
+        ] {
+            t = t.plus(100_000);
+            g.on_frame(t, 1_000, false, 10_000, 1_000, Some(qp));
+        }
+        assert_eq!(g.fps(), fps);
+        // 画质有余地的超大帧也不算“装得下”：不会因此升档
+        let mut h = FpsGovernor::new(30);
+        let mut u = Time::ZERO;
+        for _ in 0..DOWN_AFTER {
+            u = u.plus(100_000);
+            h.on_frame(u, 1_000, false, 10_000, 1_000, None);
+        }
+        let low = h.fps();
+        assert!(low < 30);
+        for _ in 0..40 {
+            u = u.plus(100_000);
+            h.on_frame(u, 1_000, false, 10_000, 1_000, Some(20));
+        }
+        assert_eq!(h.fps(), low, "画质在让的时候不升帧率");
+    }
+
+    /// 帧率到底以后，画质还有余地的超大帧不算进“降分辨率”的计时（降分辨率是最后手段，画质要先让到头）。
+    #[test]
+    fn the_resolution_timer_waits_until_the_quality_is_spent() {
+        let mut g = FpsGovernor::new(30);
+        let mut t = Time::ZERO;
+        while !g.at_floor() {
+            t = t.plus(100_000);
+            g.on_frame(t, 1_000, false, 10_000, 1_000, None);
+        }
+        t = t.plus(200_000);
+        g.on_frame(t, 1_000, false, 10_000, 1_000, Some(QP_QUALITY_SPENT));
+        t = t.plus(1_000_000);
+        g.on_frame(t, 1_000, false, 10_000, 1_000, Some(QP_QUALITY_SPENT + 3));
+        assert!(g.overflowing_for(t) > 0);
+        t = t.plus(100_000);
+        g.on_frame(t, 1_000, false, 10_000, 1_000, Some(25));
+        assert_eq!(g.overflowing_for(t), 0, "画质还有余地：不算");
+    }
+
     #[test]
     fn overflow_at_the_floor_is_timed_for_the_resolution_decision() {
         let mut g = FpsGovernor::new(30);
@@ -234,19 +321,19 @@ mod tests {
         while !g.at_floor() {
             assert_eq!(g.overflowing_for(t), 0);
             t = t.plus(100_000);
-            g.on_frame(t, 1_000, false, 10_000, 1_000);
+            g.on_frame(t, 1_000, false, 10_000, 1_000, None);
         }
         assert_eq!(g.fps(), 5);
         t = t.plus(200_000);
-        g.on_frame(t, 1_000, false, 10_000, 1_000);
+        g.on_frame(t, 1_000, false, 10_000, 1_000, None);
         let since = t;
         t = t.plus(1_000_000);
-        g.on_frame(t, 1_000, false, 10_000, 1_000);
+        g.on_frame(t, 1_000, false, 10_000, 1_000, None);
         assert_eq!(g.overflowing_for(t), t.since(since));
         // 有一帧装得下：重新计时
-        g.on_frame(t.plus(200_000), 1_000, false, 500, 1_000);
+        g.on_frame(t.plus(200_000), 1_000, false, 500, 1_000, None);
         assert_eq!(g.overflowing_for(t.plus(300_000)), 0);
-        g.on_frame(t.plus(400_000), 1_000, false, 10_000, 1_000);
+        g.on_frame(t.plus(400_000), 1_000, false, 10_000, 1_000, None);
         assert!(g.overflowing_for(t.plus(500_000)) > 0);
         g.reset_overflow();
         assert_eq!(g.overflowing_for(t.plus(500_000)), 0);
@@ -271,7 +358,7 @@ mod tests {
             for _ in 0..90 {
                 g.on_start(t);
                 t = t.plus(222_000);
-                g.on_frame(t, encode_us, false, 1_000, 10_000);
+                g.on_frame(t, encode_us, false, 1_000, 10_000, None);
             }
             (g.fps(), g.take_change())
         };
@@ -285,7 +372,7 @@ mod tests {
         // 30 帧（33 ms 一拍），编一帧 15 ms：下一拍离开始 33 ms、离编完只有 18 ms，照样该编
         let mut g = FpsGovernor::new(30);
         g.on_start(Time::ZERO);
-        g.on_frame(Time(15_000), 15_000, false, 100, 1000);
+        g.on_frame(Time(15_000), 15_000, false, 100, 1000, None);
         assert!(g.due(Time(33_000)));
         assert!(!g.due(Time(20_000)));
     }
@@ -298,13 +385,13 @@ mod tests {
         let mut t = Time::ZERO;
         // 一个慢帧（关键帧、新开编码器）不降档：CPU 按 5 秒平均判断
         g.on_start(t);
-        g.on_frame(t, 50_000, false, 100, 1000);
+        g.on_frame(t, 50_000, false, 100, 1000, None);
         assert_eq!(g.fps(), 60);
         // 每帧编 20 ms，60 帧的间隔只有 16.7 ms（占用 120%）：两次检查都过载 → 降到 30，说明是 CPU
         while g.fps() == 60 {
             t = t.plus(16_667);
             g.on_start(t);
-            g.on_frame(t, 20_000, false, 100, 1000);
+            g.on_frame(t, 20_000, false, 100, 1000, None);
             assert!(t.micros() < 6_000_000, "5 秒左右就该降");
         }
         assert_eq!(g.fps(), 30);
@@ -318,14 +405,14 @@ mod tests {
         let mut h = Time::ZERO;
         for _ in 0..800 {
             h = h.plus(16_667);
-            hw.on_frame(h, 20_000, true, 100, 1000);
+            hw.on_frame(h, 20_000, true, 100, 1000, None);
         }
         assert_eq!(hw.fps(), 60);
         // 之后很轻松：等够升档等待（10 秒起）再一档档升回 60，不超过上限
         for _ in 0..3000 {
             t = t.plus(33_000);
             g.on_start(t);
-            g.on_frame(t, 1_000, false, 100, 1000);
+            g.on_frame(t, 1_000, false, 100, 1000, None);
         }
         assert_eq!(g.fps(), 60);
         assert!(g.take_change().unwrap().contains("CPU 轻松了"));
@@ -338,14 +425,14 @@ mod tests {
         let mut t = Time::ZERO;
         for _ in 0..30 {
             t = t.plus(100_000);
-            g.on_frame(t, 0, false, 50_000, 10_000);
+            g.on_frame(t, 0, false, 50_000, 10_000, None);
         }
         assert_eq!(g.fps(), 5);
         // 之后每秒只有 3 帧，都很轻松：每 1.5 秒升一档，10 秒内回到 60
         let start = t;
         while g.fps() < 60 {
             t = t.plus(333_000);
-            g.on_frame(t, 1_000, false, 100, 10_000);
+            g.on_frame(t, 1_000, false, 100, 10_000, None);
             assert!(t.since(start) < 12_000_000, "{} 帧", g.fps());
         }
     }
@@ -356,24 +443,24 @@ mod tests {
         let mut t = Time::ZERO;
         for _ in 0..30 {
             t = t.plus(100_000);
-            g.on_frame(t, 0, false, 50_000, 10_000);
+            g.on_frame(t, 0, false, 50_000, 10_000, None);
         }
         assert_eq!(g.fps(), 5, "一直装不进：降到最低一档");
         assert!(g.take_change().unwrap().contains("内容装不进预算"));
         // 偶尔超一点、又不算轻松：不升也不降
         for _ in 0..100 {
             t = t.plus(200_000);
-            g.on_frame(t, 0, false, 15_000, 10_000);
+            g.on_frame(t, 0, false, 15_000, 10_000, None);
         }
         assert_eq!(g.fps(), 5);
         // 上限不在档位里（例如 24）：从 24 开始，降到 20，升回 24
         let mut odd = FpsGovernor::new(24);
         for _ in 0..3 {
-            odd.on_frame(Time::ZERO, 0, false, 99, 10);
+            odd.on_frame(Time::ZERO, 0, false, 99, 10, None);
         }
         assert_eq!(odd.fps(), 20);
-        odd.on_frame(Time::ZERO, 0, false, 1, 10);
-        odd.on_frame(Time::ZERO.plus(UP_AFTER_US), 0, false, 1, 10);
+        odd.on_frame(Time::ZERO, 0, false, 1, 10, None);
+        odd.on_frame(Time::ZERO.plus(UP_AFTER_US), 0, false, 1, 10, None);
         assert_eq!(odd.fps(), 24);
         // 档位来自内容策略：例如高帧率的档位表，144 帧装不进时降到 120，而不是办公的档位
         let fast = ContentPolicy {
@@ -382,13 +469,13 @@ mod tests {
         };
         let mut game = FpsGovernor::with_policy(144, &fast);
         for _ in 0..3 {
-            game.on_frame(Time::ZERO, 0, false, 99, 10);
+            game.on_frame(Time::ZERO, 0, false, 99, 10, None);
         }
         assert_eq!(game.fps(), 120);
         // 预算为 0（不知道）时不算超
         let mut zero = FpsGovernor::new(30);
         for _ in 0..10 {
-            zero.on_frame(Time::ZERO, 0, false, 99, 0);
+            zero.on_frame(Time::ZERO, 0, false, 99, 0, None);
         }
         assert_eq!(zero.fps(), 30);
     }

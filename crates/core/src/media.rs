@@ -1559,6 +1559,7 @@ impl MediaSender {
             self.encode_hw,
             encoded.payload.len(),
             job.budget,
+            encoded.qp,
         );
         // 这一帧用掉了预算的八成以上：编码器是被码率卡着的（网络受限）
         if encoded.payload.len().saturating_mul(1000)
@@ -2465,6 +2466,7 @@ mod tests {
             Ok(Some(EncodedFrame {
                 payload: header.frame(&[0u8; 20_000]),
                 key: false,
+                qp: None,
             }))
         }
         fn on_feedback(&mut self, _floor: u32, _mask: u32) {}
@@ -2891,6 +2893,7 @@ mod tests {
             Ok(Some(EncodedFrame {
                 payload: header.frame(&body.into_vec()),
                 key,
+                qp: None,
             }))
         }
         fn on_feedback(&mut self, _floor: u32, _mask: u32) {}
@@ -4469,6 +4472,7 @@ mod tests {
             Ok(Some(EncodedFrame {
                 payload: header.frame(&[7u8; 10]),
                 key,
+                qp: None,
             }))
         }
         fn on_feedback(&mut self, _floor: u32, _mask: u32) {}
