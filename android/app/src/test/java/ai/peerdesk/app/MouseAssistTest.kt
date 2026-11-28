@@ -15,8 +15,9 @@ class MouseAssistTest {
     /** 放在容器正中间偏下。 */
     private val m = vmouseLayout(cw, ch, 0.5f, 0.7f, sizes)
 
-    @Test fun tipIsTopCenterOfTheMouse() {
-        assertEquals(450f + 50f, m.tipX, 0.01f)           // (1000-100)*0.5 + 100/2
+    @Test fun tipIsAboveTheLeftButtonCenter() {
+        assertEquals(450f + 25f, m.tipX, 0.01f)           // (1000-100)*0.5 + 100/4
+        assertEquals(m.left.left + m.left.width / 2, m.tipX, 0.01f)
         assertEquals((600f - 180f) * 0.7f, m.tipY, 0.01f) // 顶边
     }
 
@@ -123,7 +124,8 @@ class MouseAssistTest {
         var res = route(r, MotionEvent.ACTION_POINTER_DOWN, 1, Triple(1, lx, ly), Triple(2, 5f, 5f))
         assertEquals(listOf(TouchOp(2, TouchPhase.DOWN, 5f, 5f)), res.touches)
         res = route(r, MotionEvent.ACTION_MOVE, 0, Triple(1, lx, ly), Triple(2, 9f, 9f))
-        assertEquals(listOf(TouchOp(2, TouchPhase.MOVE, 9f, 9f)), res.touches)
+        assertEquals(listOf(TouchOp(2, TouchPhase.MOVE, 9f, 9f)), res.moves)
+        assertTrue(res.touches.isEmpty())
         assertTrue(res.mouse.isEmpty())
     }
 
@@ -208,5 +210,26 @@ class MouseAssistTest {
         val top = vmouseLayout(cw, ch, 0.5f, 0f, sizes)
         assertEquals(0f, top.tipY, 0.01f)
         assertTrue(top.tipX in 0f..cw)
+    }
+
+    @Test fun moveOfAllForwardedFingersComesTogether() {
+        val r = TouchRouter().also { it.hitTest = null }
+        route(r, MotionEvent.ACTION_DOWN, 0, Triple(1, 10f, 10f))
+        route(r, MotionEvent.ACTION_POINTER_DOWN, 1, Triple(1, 10f, 10f), Triple(2, 50f, 50f))
+        val res = route(r, MotionEvent.ACTION_MOVE, 0, Triple(1, 12f, 11f), Triple(2, 48f, 52f))
+        assertTrue("MOVE 不走逐根的 touch", res.touches.isEmpty())
+        assertEquals(listOf(TouchOp(1, TouchPhase.MOVE, 12f, 11f), TouchOp(2, TouchPhase.MOVE, 48f, 52f)), res.moves)
+        val up = route(r, MotionEvent.ACTION_POINTER_UP, 1, Triple(1, 12f, 11f), Triple(2, 48f, 52f))
+        assertEquals(listOf(TouchOp(2, TouchPhase.UP, 48f, 52f)), up.touches)
+        assertTrue(up.moves.isEmpty())
+    }
+
+    @Test fun mouseFingerIsLeftOutOfTheMoves() {
+        val r = expandedRouter()
+        route(r, MotionEvent.ACTION_DOWN, 0, Triple(1, lx, ly))
+        route(r, MotionEvent.ACTION_POINTER_DOWN, 1, Triple(1, lx, ly), Triple(2, 5f, 5f))
+        val res = route(r, MotionEvent.ACTION_MOVE, 0, Triple(1, lx + 3f, ly), Triple(2, 9f, 9f))
+        assertEquals(listOf(TouchOp(2, TouchPhase.MOVE, 9f, 9f)), res.moves)
+        assertEquals(listOf<MouseEvent>(MouseEvent.Move(3f, 0f)), res.mouse)
     }
 }

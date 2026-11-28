@@ -3,6 +3,7 @@ package ai.peerdesk.app
 import android.app.Activity
 import android.content.Context
 import android.view.KeyEvent
+import android.os.SystemClock
 import android.view.HapticFeedbackConstants
 import android.view.View
 import android.view.ViewConfiguration
@@ -36,7 +37,10 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.withFrameMillis
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -67,7 +71,10 @@ import androidx.compose.ui.unit.IntOffset
 import kotlin.math.roundToInt
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /** 手指按着时每隔多久调一次 tick（长按拖拽靠它）。 */
 private const val TICK_MS = 50L
@@ -80,8 +87,17 @@ fun SessionScreen(ui: UiState, vm: PeerDeskViewModel) {
     val notchPx = with(density) { 40.dp.toPx() }
     var pressed by remember { mutableStateOf(false) }
     var keyCatcher by remember { mutableStateOf<KeyCatcherView?>(null) }
-    val imeVisible = WindowInsets.ime.getBottom(density) > 0
+    val imeBottom = WindowInsets.ime.getBottom(density)
+    val imeVisible = imeBottom > 0
     val hostView = LocalView.current
+    val scope = rememberCoroutineScope()
+    val exportTitle = stringResource(R.string.trace_share_title)
+    // 快捷键栏在键盘上方，可见区域的下沿是它的顶
+    var barH by remember { mutableIntStateOf(0) }
+    LaunchedEffect(density) { vm.density = density.density }
+    LaunchedEffect(imeBottom, barH, ui.containerH) {
+        vm.onImeChanged(if (imeBottom > 0 && ui.containerH > 0f) ui.containerH - imeBottom - barH else null)
+    }
     // 大鼠标的尺寸：宽 96 dp、本体高 150 dp，上面一条 30 dp 放箭头和关闭按钮，小图标 48 dp
     LaunchedEffect(density) {
         with(density) {
@@ -128,7 +144,11 @@ fun SessionScreen(ui: UiState, vm: PeerDeskViewModel) {
                         onDestroyed = { vm.onBackground() },
                     )
                 },
-                update = { it.place(ui.rect) },
+                update = {
+                    // 布局尺寸固定为缩放 1 倍的完整放下大小，缩放平移（和键盘顶起）靠 View 变换
+                    val (bw, bh) = fitSize(ui.containerW, ui.containerH, ui.aspect)
+                    it.place(ui.shownRect, bw, bh)
+                },
             )
             // 触摸层盖在整个会话页上
             AndroidView(
@@ -137,13 +157,15 @@ fun SessionScreen(ui: UiState, vm: PeerDeskViewModel) {
                     TouchLayerView(
                         c,
                         tapSlopPx = slopPx,
-                        onTouches = { ops, t -> vm.forwardTouch(ops, t) },
+                        onTouches = { ops, mv, t -> vm.forwardTouch(ops, mv, t) },
+                        onRaw = vm::recordMotion,
                         onPressed = { pressed = it },
                         onMouse = vm::onMouseEvent,
                     )
                 },
                 update = {
-                    it.onTouches = { ops, t -> vm.forwardTouch(ops, t) }
+                    it.onTouches = { ops, mv, t -> vm.forwardTouch(ops, mv, t) }
+                    it.onRaw = vm::recordMotion
                     it.onPressed = { p -> pressed = p }
                     it.onMouse = vm::onMouseEvent
                     // 大鼠标（或小鼠标）上的手指不转发给 touch，其余手指都转发
@@ -156,6 +178,8 @@ fun SessionScreen(ui: UiState, vm: PeerDeskViewModel) {
             )
             if (ui.mouseExpanded && vmouse != null) VirtualMouse(vmouse, ui.buttonsDown)
             else if (!ui.mouseExpanded && miniBox != null) MiniMouse(miniBox)
+            // 点击水波盖在最上面，不接收触摸
+            if (ui.ripples.isNotEmpty()) RippleLayer(ui.ripples, onIdle = vm::pruneRipples)
         }
 
         if (!ui.connected && ui.quality == null) {
@@ -166,7 +190,14 @@ fun SessionScreen(ui: UiState, vm: PeerDeskViewModel) {
             )
         }
 
-        Toolbar(ui, vm, imeVisible, onKeyboard = {
+        Toolbar(ui, vm, imeVisible, onExport = {
+            // 先在主线程取文本（记录是内存里的），写文件放后台，再弹出系统分享
+            val text = vm.traceText()
+            scope.launch {
+                val uri = withContext(Dispatchers.IO) { writeTraceFile(ctx, text) }
+                ctx.startActivity(shareTraceIntent(uri, exportTitle))
+            }
+        }, onKeyboard = {
             val v = keyCatcher
             val window = (ctx as? Activity)?.window
             if (v != null && window != null) {
@@ -195,14 +226,14 @@ fun SessionScreen(ui: UiState, vm: PeerDeskViewModel) {
         if (imeVisible) {
             ShortcutBar(
                 ui, vm,
-                Modifier.align(Alignment.BottomCenter).imePadding(),
+                Modifier.align(Alignment.BottomCenter).imePadding().onSizeChanged { barH = it.height },
             )
         }
     }
 }
 
 @Composable
-private fun Toolbar(ui: UiState, vm: PeerDeskViewModel, imeVisible: Boolean, onKeyboard: () -> Unit) {
+private fun Toolbar(ui: UiState, vm: PeerDeskViewModel, imeVisible: Boolean, onExport: () -> Unit, onKeyboard: () -> Unit) {
     Box(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Top + WindowInsetsSides.Horizontal))) {
         if (!ui.toolbarVisible) {
             TextButton(
@@ -230,6 +261,11 @@ private fun Toolbar(ui: UiState, vm: PeerDeskViewModel, imeVisible: Boolean, onK
                     selected = imeVisible,
                     onClick = onKeyboard,
                     label = { Text(stringResource(R.string.toolbar_keyboard)) },
+                )
+                FilterChip(
+                    selected = false,
+                    onClick = onExport,
+                    label = { Text(stringResource(R.string.toolbar_export_trace)) },
                 )
                 TextButton(onClick = vm::toggleToolbar) {
                     Text(stringResource(R.string.toolbar_hide), color = Color.White)
@@ -373,7 +409,9 @@ private fun VirtualMouse(m: VMouse, down: Set<Int>) {
         drawLine(Color.White, Offset(cx - 4 * u, cy + 4 * u), Offset(cx + 4 * u, cy - 4 * u), 1.8f * u)
         // 箭头光标，尖对准 (tipX, tipY)
         translate(m.tipX, m.tipY) {
-            scale(u * 1.2f, u * 1.2f, pivot = Offset.Zero) {
+            // 按住任意一个键时箭头缩到 0.8 倍（围着尖缩），像点击时光标变小
+            val k = if (down.isNotEmpty()) ARROW_PRESSED_SCALE else 1f
+            scale(u * 1.2f * k, u * 1.2f * k, pivot = Offset.Zero) {
                 val p = arrowPath()
                 drawPath(p, Color.White)
                 drawPath(p, Color.Black, style = Stroke(width = 1.2f))
@@ -389,6 +427,40 @@ private fun VirtualMouse(m: VMouse, down: Set<Int>) {
         Box(Modifier.at(m.right).semantics { contentDescription = rightDesc })
         Box(Modifier.at(m.body).semantics { contentDescription = bodyDesc })
         Box(Modifier.at(m.close).semantics { contentDescription = closeDesc })
+    }
+}
+
+/** 点击水波：左键一圈实心加描边，右键双圈。不接收触摸。 */
+@Composable
+private fun RippleLayer(ripples: List<Ripple>, onIdle: () -> Unit) {
+    var now by remember { mutableStateOf(SystemClock.uptimeMillis()) }
+    LaunchedEffect(ripples) {
+        while (true) {
+            withFrameMillis { now = SystemClock.uptimeMillis() }
+            if (ripples.all { isExpired(it, now) }) {
+                onIdle()
+                break
+            }
+        }
+    }
+    val d = LocalDensity.current.density
+    Canvas(Modifier.fillMaxSize()) {
+        for (r in ripples) {
+            if (isExpired(r, now)) continue
+            val p = rippleProgress(r, now)
+            val radius = rippleRadiusDp(p) * d
+            val a = rippleAlpha(p)
+            val c = Offset(r.x, r.y)
+            if (r.button == 1) {
+                val color = Color(0xFFFFB74D)
+                drawCircle(color.copy(alpha = (a * 2f).coerceAtMost(1f)), radius, c, style = Stroke(2f * d))
+                drawCircle(color.copy(alpha = (a * 2f).coerceAtMost(1f)), radius * 0.6f, c, style = Stroke(2f * d))
+            } else {
+                val color = Color(0xFF4DA3FF)
+                drawCircle(color.copy(alpha = a), radius, c)
+                drawCircle(color.copy(alpha = (a * 1.5f).coerceAtMost(1f)), radius, c, style = Stroke(1.5f * d))
+            }
+        }
     }
 }
 

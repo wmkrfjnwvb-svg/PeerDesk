@@ -12,10 +12,17 @@ import android.view.inputmethod.BaseInputConnection
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputConnection
 import android.widget.FrameLayout
+import kotlin.math.roundToInt
 
 /**
- * 远程画面的承载：一个裁剪的 FrameLayout，里面放 SurfaceView，靠改它的尺寸和边距来缩放、平移。
- * 不用 scaleX/translation：SurfaceView 的画面不随 View 变换缩放（MediaCodec 直接解到它的 Surface 上，由系统合成）。
+ * 远程画面的承载：一个裁剪的 FrameLayout，里面放 SurfaceView。
+ *
+ * 缩放和平移用 View 变换：SurfaceView 的布局尺寸固定在“缩放 1 倍时完整放下”的大小（取整），
+ * 只在容器尺寸或画面宽高比变化时才改；每次画面矩形变化只设 pivot=(0,0)、scaleX/scaleY、translationX/Y。
+ * 依据：Android 官方文档说 N（API 24）起 SurfaceView 的窗口位置和其他 View 的渲染同步更新，
+ * 平移、缩放 SurfaceView 不会产生渲染瑕疵；minSdk 是 29，所以都适用。
+ * （旧做法每一帧改布局宽高，left 和 width 各自取整，会有 1 像素抖动，捏合时很明显。）
+ * 父容器的裁剪保留：放大后超出容器的部分被裁掉。
  */
 class RemoteSurfaceLayout(
     context: Context,
@@ -32,23 +39,32 @@ class RemoteSurfaceLayout(
             override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) = Unit
             override fun surfaceDestroyed(holder: SurfaceHolder) = onDestroyed()
         })
+        surfaceView.pivotX = 0f
+        surfaceView.pivotY = 0f
         addView(surfaceView, LayoutParams(1, 1))
     }
 
-    /** 把 SurfaceView 放到界面坐标的这个矩形（可以超出容器，超出的部分被裁掉）。 */
-    fun place(rect: ViewRect) {
+    /**
+     * 画面矩形（界面坐标，已算上缩放、平移、键盘顶起）变了就调。
+     * [baseW]、[baseH] 是缩放 1 倍时的完整放下尺寸（浮点），取整后作为布局尺寸；缩放倍数按取整后的宽度算。
+     */
+    fun place(rect: ViewRect, baseW: Float, baseH: Float) {
+        val w = baseW.roundToInt().coerceAtLeast(1)
+        val h = baseH.roundToInt().coerceAtLeast(1)
         val lp = surfaceView.layoutParams as LayoutParams
-        val w = rect.width.toInt().coerceAtLeast(1)
-        val h = rect.height.toInt().coerceAtLeast(1)
-        val l = rect.left.toInt()
-        val t = rect.top.toInt()
-        if (lp.width != w || lp.height != h || lp.leftMargin != l || lp.topMargin != t) {
+        if (lp.width != w || lp.height != h || lp.leftMargin != 0 || lp.topMargin != 0) {
             lp.width = w
             lp.height = h
-            lp.leftMargin = l
-            lp.topMargin = t
+            lp.leftMargin = 0
+            lp.topMargin = 0
             surfaceView.layoutParams = lp
         }
+        val sx = (rect.width / w).coerceAtLeast(0.001f)
+        val sy = (rect.height / h).coerceAtLeast(0.001f)
+        if (surfaceView.scaleX != sx) surfaceView.scaleX = sx
+        if (surfaceView.scaleY != sy) surfaceView.scaleY = sy
+        if (surfaceView.translationX != rect.left) surfaceView.translationX = rect.left
+        if (surfaceView.translationY != rect.top) surfaceView.translationY = rect.top
     }
 }
 
@@ -60,7 +76,9 @@ class RemoteSurfaceLayout(
 class TouchLayerView(
     context: Context,
     tapSlopPx: Float,
-    var onTouches: (List<TouchOp>, Long) -> Unit,
+    var onTouches: (List<TouchOp>, List<TouchOp>, Long) -> Unit,
+    /** 原始 MotionEvent（手势记录用）：时间、actionMasked、actionIndex、所有手指。 */
+    var onRaw: (Long, Int, Int, IntArray, FloatArray, FloatArray) -> Unit,
     var onPressed: (Boolean) -> Unit,
     var onMouse: (MouseEvent) -> Unit,
 ) : View(context) {
@@ -71,9 +89,10 @@ class TouchLayerView(
         val ids = IntArray(n) { e.getPointerId(it) }
         val xs = FloatArray(n) { e.getX(it) }
         val ys = FloatArray(n) { e.getY(it) }
+        onRaw(e.eventTime, e.actionMasked, e.actionIndex, ids, xs, ys)
         val r = router.route(e.actionMasked, e.actionIndex, ids, xs, ys)
         r.mouse.forEach(onMouse)
-        if (r.touches.isNotEmpty()) onTouches(r.touches, e.eventTime)
+        if (r.touches.isNotEmpty() || r.moves.isNotEmpty()) onTouches(r.touches, r.moves, e.eventTime)
         when (e.actionMasked) {
             MotionEvent.ACTION_DOWN -> onPressed(true)
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> onPressed(false)

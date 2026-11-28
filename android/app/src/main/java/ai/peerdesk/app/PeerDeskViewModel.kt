@@ -7,6 +7,8 @@ import android.view.Surface
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -52,6 +54,14 @@ data class UiState(
     val miniFy: Float = MINI_DEFAULT_FY,
     /** 大小鼠标的像素尺寸，界面按 dp 换算后设置；没设置前不画。 */
     val mouseSizes: MouseSizes? = null,
+    /** 点击水波（界面画，过期的会被清掉）。 */
+    val ripples: List<Ripple> = emptyList(),
+    /** 输入位置 = 最后一次左键点击在画面矩形里的比例位置（跟着缩放平移走）。 */
+    val inputPoint: Pair<Float, Float>? = null,
+    /** 软键盘弹出时可见区域的下沿（键盘顶，或快捷键栏顶）；键盘没弹出为 null。 */
+    val imeVisibleBottom: Float? = null,
+    /** 画面被软键盘向上顶起的距离（像素，>= 0）。 */
+    val imeShift: Float = 0f,
     val toolbarVisible: Boolean = true,
     val locked: Set<ModKey> = emptySet(),
 
@@ -62,7 +72,10 @@ data class UiState(
 ) {
     val peerOs: PeerOs get() = peer?.os ?: PeerOs.Unknown
     val aspect: Float get() = aspectOf(quality?.width ?: 0, quality?.height ?: 0)
+    /** 没有被键盘顶起时画面的矩形（缩放、平移的计算都以它为准）。 */
     val rect: ViewRect get() = rectOf(view, containerW, containerH, aspect)
+    /** 实际显示的矩形：向上顶起 [imeShift]。SurfaceView 的位置和 setView 都用它。 */
+    val shownRect: ViewRect get() = rect.copy(top = rect.top - imeShift)
     val vmouse: VMouse?
         get() = mouseSizes?.let { vmouseLayout(containerW, containerH, mouseFx, mouseFy, it) }
     val miniBox: PxBox?
@@ -95,6 +108,14 @@ class PeerDeskViewModel(app: Application) : AndroidViewModel(app) {
     /** 手势识别说“长按到点了”：界面收到后震一下。 */
     private val _haptics = MutableSharedFlow<Unit>(extraBufferCapacity = 4)
     val haptics: SharedFlow<Unit> = _haptics.asSharedFlow()
+
+    /** 屏幕密度（界面设置），换算 dp 的边距用。 */
+    @Volatile var density: Float = 1f
+
+    /** 最近 120 秒的原始触摸记录，导出给开发者看真机上的问题。 */
+    val trace = GestureTrace()
+
+    private var nextRippleId = 0L
 
     @Volatile private var session: NativeSession? = null
     private val bar = ShortcutBarState()
@@ -147,6 +168,10 @@ class PeerDeskViewModel(app: Application) : AndroidViewModel(app) {
         }
         val ns = NativeSession(h)
         pushedRect = null
+        pushedHint = null
+        hint.reset()
+        trace.clear()
+        trace.addContainer(SystemClock.uptimeMillis(), s.containerW, s.containerH)
         session = ns
         pushView()
         viewModelScope.launch(Dispatchers.IO) { eventLoop(ns) }
@@ -237,14 +262,37 @@ class PeerDeskViewModel(app: Application) : AndroidViewModel(app) {
     // —— 触控和画面 ——
 
     fun onContainerSize(w: Float, h: Float) {
+        if (w != _ui.value.containerW || h != _ui.value.containerH) trace.addContainer(SystemClock.uptimeMillis(), w, h)
         _ui.update { it.copy(containerW = w, containerH = h, view = clampState(it.view, w, h, it.aspect)) }
         pushView()
     }
 
-    fun forwardTouch(ops: List<TouchOp>, tMs: Long) {
+    /** 触摸层交来的：按下/抬起/取消逐根走 touch，同一个 ACTION_MOVE 里所有手指的移动一起走 moves。 */
+    fun forwardTouch(touches: List<TouchOp>, moves: List<TouchOp>, tMs: Long) {
         val ns = session ?: return
-        val viewOps = ops.flatMap { parseViewOps(ns.touch(it.id, it.phase, it.x, it.y, tMs)) }
-        applyViewOps(viewOps)
+        val ops = ArrayList<ViewOp>()
+        touches.forEach { ops += parseViewOps(ns.touch(it.id, it.phase, it.x, it.y, tMs)) }
+        if (moves.isNotEmpty()) {
+            ops += parseViewOps(
+                ns.moves(
+                    IntArray(moves.size) { moves[it].id },
+                    FloatArray(moves.size) { moves[it].x },
+                    FloatArray(moves.size) { moves[it].y },
+                    tMs,
+                ),
+            )
+        }
+        applyViewOps(ops)
+    }
+
+    /** 记录一个原始 MotionEvent（导出手势记录用）。 */
+    fun recordMotion(t: Long, action: Int, index: Int, ids: IntArray, xs: FloatArray, ys: FloatArray) =
+        trace.addMotion(t, action, index, ids, xs, ys)
+
+    /** 手势记录的 JSON Lines 文本（头部带密度和容器尺寸）。 */
+    fun traceText(): String {
+        val s = _ui.value
+        return trace.toJsonLines(density, s.containerW, s.containerH)
     }
 
     fun tick() {
@@ -255,26 +303,96 @@ class PeerDeskViewModel(app: Application) : AndroidViewModel(app) {
     private fun applyViewOps(ops: List<ViewOp>) {
         if (ops.isEmpty()) return
         if (ops.any { it == ViewOp.Haptic }) _haptics.tryEmit(Unit)
-        _ui.update { it.copy(view = applyOps(it.view, ops, it.containerW, it.containerH, it.aspect)) }
+        val taps = ops.filterIsInstance<ViewOp.Tap>()
+        // 点击坐标是动作发生时的屏幕坐标，输入位置按变换之前显示的矩形换算
+        val before = _ui.value.shownRect
+        _ui.update { it.copy(view = applyOps(it.view, ops, it.containerW, it.containerH, it.aspect, it.imeShift)) }
+        taps.forEach { addRippleAt(it.x, it.y, it.button); if (it.button == 0) setInputPoint(before, it.x, it.y) }
         pushView()
     }
 
-    /** 上次告诉核心的画面矩形；没变就不再发（每个质量事件、长按震动都会走到 [pushView]）。 */
-    private var pushedRect: ViewRect? = null
+    // —— 点击水波 ——
 
-    /** 把画面矩形告诉核心（布局、缩放、平移变了都要调）。矩形没变什么也不做。 */
+    private fun addRippleAt(x: Float, y: Float, button: Int) {
+        val now = SystemClock.uptimeMillis()
+        val r = Ripple(nextRippleId++, x, y, button, now)
+        _ui.update { it.copy(ripples = addRipple(it.ripples, r, now)) }
+    }
+
+    /** 界面画完最后一个水波后清理。 */
+    fun pruneRipples() {
+        val now = SystemClock.uptimeMillis()
+        _ui.update { if (it.ripples.isEmpty()) it else it.copy(ripples = pruneRipples(it.ripples, now)) }
+    }
+
+    // —— 软键盘和输入位置 ——
+
+    /** 记住输入位置（最后一次左键点击）。键盘在时按“新输入位置”的规则重算顶起量。 */
+    private fun setInputPoint(shown: ViewRect, x: Float, y: Float) {
+        val fr = toFraction(shown, x, y) ?: return
+        _ui.update { s ->
+            val bottom = s.imeVisibleBottom
+            val shift = if (bottom == null) s.imeShift else {
+                imeShiftOnNewPoint(s.imeShift, inputPointY(s.rect, fr.second), bottom, 48f * density, 16f * density)
+            }
+            s.copy(inputPoint = fr, imeShift = shift)
+        }
+    }
+
+    /**
+     * 界面报告键盘状态：visibleBottom 是可见区域的下沿（键盘顶，有快捷键栏时是它的顶），键盘没弹出传 null。
+     * 弹出时顶起量按 [imeShiftOnOpen]，之后（键盘高度变化）按 [imeShiftOnNewPoint]，关闭回 0。
+     */
+    fun onImeChanged(visibleBottom: Float?) {
+        _ui.update { s ->
+            if (visibleBottom == null) return@update if (s.imeVisibleBottom == null && s.imeShift == 0f) s
+            else s.copy(imeVisibleBottom = null, imeShift = 0f)
+            val p = s.inputPoint
+            val shift = if (p == null) 0f else {
+                val y = inputPointY(s.rect, p.second)
+                if (s.imeVisibleBottom == null) imeShiftOnOpen(y, visibleBottom, 48f * density)
+                else imeShiftOnNewPoint(s.imeShift, y, visibleBottom, 48f * density, 16f * density)
+            }
+            s.copy(imeVisibleBottom = visibleBottom, imeShift = shift)
+        }
+        pushView()
+    }
+
+    /** 上次告诉核心的画面矩形和尺寸提示；没变就不再发（每个质量事件、长按震动都会走到 [pushView]）。 */
+    private var pushedRect: ViewRect? = null
+    private var pushedHint: Pair<Int, Int>? = null
+    private var hintJob: Job? = null
+    private val hint = SizeHintDebouncer(HINT_DELAY_MS) { SystemClock.uptimeMillis() }
+
+    /**
+     * 把画面矩形告诉核心（布局、缩放、平移、键盘顶起变了都要调）。
+     * 矩形每次变化都发（触点换算要用）；编码尺寸提示（viewW/viewH）防抖，最后一次变化后 300 ms 才更新，
+     * 之前一直用上一次的值（见 [SizeHintDebouncer]）。矩形和提示都没变什么也不做。
+     */
+    @Synchronized
     private fun pushView() {
         val ns = session ?: return
         val s = _ui.value
         if (s.containerW <= 0f || s.containerH <= 0f) return
-        val rect = s.rect
-        if (rect == pushedRect) return
-        pushedRect = rect
+        val rect = s.shownRect
         // 被控端按“画面画出来有多大”编码：放大时画面变大，字也要跟着清楚（被控端按自己的原始分辨率封顶）
-        ns.setView(rect, rect.width.toInt(), rect.height.toInt())
+        val size = hint.submit(rect.width.toInt(), rect.height.toInt())
+        val rectChanged = rect != pushedRect
+        if (!rectChanged && size == pushedHint) return
+        pushedRect = rect
+        pushedHint = size
+        if (rectChanged) trace.addRect(SystemClock.uptimeMillis(), rect)
+        ns.setView(rect, size.first, size.second)
         // 画面缩放、平移、布局变了，同一个箭头尖对应的远程位置也变了：大鼠标展开着就重新对一次。
         // 只在矩形变了时做：否则触屏拖拽（按着左键）中途来一个质量事件，选区会跳到箭头尖。
-        pointAtTip(ns, s)
+        if (rectChanged) pointAtTip(ns, s)
+        if (hint.hasPending()) {
+            hintJob?.cancel()
+            hintJob = viewModelScope.launch {
+                delay(HINT_DELAY_MS + 20)
+                pushView()
+            }
+        }
     }
 
     private fun pointAtTip(ns: NativeSession? = session, s: UiState = _ui.value) {
@@ -292,6 +410,11 @@ class PeerDeskViewModel(app: Application) : AndroidViewModel(app) {
             is MouseEvent.ButtonDown -> {
                 pointAtTip() // 先把光标放到箭头尖，再按键
                 mouseButton(e.index, true)
+                // 按下时尖上冒一个水波；左键按下的位置也是输入位置
+                _ui.value.vmouse?.let { m ->
+                    addRippleAt(m.tipX, m.tipY, e.index)
+                    if (e.index == 0) setInputPoint(_ui.value.shownRect, m.tipX, m.tipY)
+                }
             }
             is MouseEvent.ButtonUp -> mouseButton(e.index, false)
             is MouseEvent.Move -> {
@@ -403,5 +526,7 @@ class PeerDeskViewModel(app: Application) : AndroidViewModel(app) {
         private const val KEY_CODE = "code"
         private const val KEY_PASSWORD = "password-sealed"
         private const val STOP_GRACE_MS = 3000L
+        /** 编码尺寸提示在最后一次变化后等这么久才更新。 */
+        const val HINT_DELAY_MS = 300L
     }
 }

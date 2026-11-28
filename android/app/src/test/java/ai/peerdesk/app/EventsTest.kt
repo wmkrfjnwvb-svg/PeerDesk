@@ -67,4 +67,12 @@ class EventsTest {
         val ops = parseViewOps("""[{"type":"haptic"},{"type":"cursor","x":0.25,"y":0.75},{"type":"pan","dx":1,"dy":2}]""")
         assertEquals(listOf(ViewOp.Haptic, ViewOp.Pan(1f, 2f)), ops)
     }
+
+    @Test fun tapOps() {
+        val ops = parseViewOps("""[{"type":"tap","x":120.5,"y":300,"button":1},{"type":"tap","x":1,"y":2,"button":0},{"type":"zoom","factor":1.1,"cx":1,"cy":2},{"type":"pan","dx":3,"dy":4}]""")
+        assertEquals(
+            listOf(ViewOp.Tap(120.5f, 300f, 1), ViewOp.Tap(1f, 2f, 0), ViewOp.Zoom(1.1f, 1f, 2f), ViewOp.Pan(3f, 4f)),
+            ops,
+        )
+    }
 }
