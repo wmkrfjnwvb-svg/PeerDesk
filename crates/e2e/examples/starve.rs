@@ -117,6 +117,20 @@ fn sweep(case: peerdesk_e2e::rfc8867::Case, t0: u64, t1: u64) {
             "一直在播的视频"
         }
     );
+    // 视频通话的帧内排开倍数（千分比）换成 STARVE_PACE（0 是整帧同时发）
+    if let Some(pace) = std::env::var("STARVE_PACE")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+    {
+        if let peerdesk_e2e::NetworkPlan::Layout2(plan) = &mut base.multi.network {
+            for (_, c) in &mut plan.cross {
+                if let peerdesk_core::path::CrossSpec::Frames { pace_permille, .. } = c {
+                    *pace_permille = pace;
+                }
+            }
+        }
+        let _ = writeln!(out, "视频通话帧内排开 {pace}‰");
+    }
     for (i, p) in base.multi.pairs.iter_mut().enumerate() {
         if enc {
             p.scenario.encode_time = EncodeTime::Openh264Office {
@@ -132,8 +146,10 @@ fn sweep(case: peerdesk_e2e::rfc8867::Case, t0: u64, t1: u64) {
     let start = base.multi.pairs.first().map_or(0, |p| p.start_us);
     for d in (0..=30).step_by(3) {
         let mut c = base.clone();
+        // 两路时挪第 2 路；只有一路时（例如 pd-video-call）挪它自己，相对的是交叉流的帧时钟
+        let shifted = usize::from(c.multi.pairs.len() > 1);
         for (i, p) in c.multi.pairs.iter_mut().enumerate() {
-            p.start_us = start + if i == 1 { d * 1000 } else { 0 };
+            p.start_us = start + if i == shifted { d * 1000 } else { 0 };
         }
         match run_multi(&c.multi) {
             Ok(o) => {
