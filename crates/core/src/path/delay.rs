@@ -48,6 +48,39 @@ impl Default for Delay {
 }
 
 impl Delay {
+    /// `t` 时刻名义上的单程延迟（微秒），不抽随机数：固定的就是它，按计划阶跃的是 `t` 时生效的那一项，
+    /// 周期性的在第一次重配置之前是 `initial_us`、之后是上下限的中点（每个周期实际抽到多少只有包碰上才知道）。
+    /// 给仿真主循环当“名义往返”的依据（和 `Net` 里取 `Link::delay_us` 一样），不影响任何一个包。
+    #[must_use]
+    pub fn nominal_us(&self, t: Time) -> u64 {
+        match self {
+            Delay::Fixed(d) => *d,
+            Delay::Steps { initial_us, steps } => {
+                steps
+                    .iter()
+                    .filter(|(at, _)| *at <= t)
+                    .fold((None, *initial_us), |(best, cur), (at, d)| match best {
+                        Some(b) if b > *at => (best, cur),
+                        Some(_) | None => (Some(*at), *d),
+                    })
+                    .1
+            }
+            Delay::Periodic {
+                initial_us,
+                period_us,
+                phase_us,
+                low_us,
+                high_us,
+            } => {
+                if *period_us == 0 || t.micros() < *phase_us {
+                    *initial_us
+                } else {
+                    low_us.midpoint(*high_us)
+                }
+            }
+        }
+    }
+
     /// 会不会改变包的先后（需要保序）。
     const fn steps_over_time(&self) -> bool {
         match self {
@@ -69,17 +102,7 @@ impl DelayState {
     /// `t` 时刻离开瓶颈的包的传播延迟（微秒），已经保序：返回的到达时刻不会早于上一个包。
     pub fn arrival(&mut self, delay: &Delay, rng: &mut LayerRng, t: Time) -> Time {
         let d = match delay {
-            Delay::Fixed(d) => *d,
-            Delay::Steps { initial_us, steps } => {
-                steps
-                    .iter()
-                    .filter(|(at, _)| *at <= t)
-                    .fold((None, *initial_us), |(best, cur), (at, d)| match best {
-                        Some(b) if b > *at => (best, cur),
-                        Some(_) | None => (Some(*at), *d),
-                    })
-                    .1
-            }
+            Delay::Fixed(_) | Delay::Steps { .. } => delay.nominal_us(t),
             Delay::Periodic {
                 initial_us,
                 period_us,

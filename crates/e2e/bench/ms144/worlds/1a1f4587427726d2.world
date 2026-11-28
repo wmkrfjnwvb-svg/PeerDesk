@@ -1,0 +1,431 @@
+# PeerDesk 世界文件：一次仿真会话的全部输入（格式见 crates/e2e/src/world.rs）。
+# 文件名是内容哈希；结果只由这里的内容决定，不受环境变量影响。
+world 1
+name ms-02560
+width 1280
+height 720
+fps 30
+codec h264
+byte_model default
+rng_layout 1
+seed 7
+estimator v1
+profile wireless
+policy office
+start_bps 1000000
+max_bps 30000000
+pacing 0
+fec rs
+start_probe 1
+probe_ids 1
+phases 22
+phase.0 action=idle frames=30
+phase.1 action=typing frames=90
+phase.2 action=idle frames=30
+phase.3 action=scrolling frames=60
+phase.4 action=idle frames=30
+phase.5 action=dragging frames=60
+phase.6 action=idle frames=30
+phase.7 action=switching frames=15
+phase.8 action=idle frames=30
+phase.9 action=video frames=90
+phase.10 action=idle frames=30
+phase.11 action=idle frames=30
+phase.12 action=typing frames=90
+phase.13 action=idle frames=30
+phase.14 action=scrolling frames=60
+phase.15 action=idle frames=30
+phase.16 action=dragging frames=60
+phase.17 action=idle frames=30
+phase.18 action=switching frames=15
+phase.19 action=idle frames=30
+phase.20 action=video frames=90
+phase.21 action=idle frames=30
+links 387
+link.0 at=0 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=81 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.1 at=60000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=92 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.2 at=180000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=116 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.3 at=240000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=105 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.4 at=300000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=111 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.5 at=360000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=110 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.6 at=420000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=93 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.7 at=480000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=98 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.8 at=600000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=85 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.9 at=720000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=81 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.10 at=900000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=92 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.11 at=960000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=104 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.12 at=1020000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=116 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.13 at=1080000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=108 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.14 at=1140000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=110 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.15 at=1260000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=81 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.16 at=1380000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=98 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.17 at=1500000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=81 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.18 at=1800000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=92 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.19 at=1860000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=116 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.20 at=1920000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=105 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.21 at=1980000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=113 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.22 at=2040000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=110 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.23 at=2100000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=100 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.24 at=2160000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=98 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.25 at=2280000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=90 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.26 at=2340000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=81 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.27 at=2580000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=92 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.28 at=2640000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=99 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.29 at=2700000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=116 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.30 at=2760000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=106 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.31 at=2820000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=110 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.32 at=2940000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=81 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.33 at=3060000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=98 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.34 at=3180000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=81 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.35 at=3420000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=92 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.36 at=3480000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=116 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.37 at=3540000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=113 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.38 at=3600000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=119 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.39 at=3660000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=110 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.40 at=3840000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=91 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.41 at=3900000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=98 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.42 at=4020000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=81 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.43 at=4260000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=92 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.44 at=4320000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=116 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.45 at=4440000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=105 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.46 at=4500000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=121 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.47 at=4560000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=110 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.48 at=4620000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=107 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.49 at=4680000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=98 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.50 at=4860000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=81 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.51 at=5100000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=92 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.52 at=5220000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=116 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.53 at=5280000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=105 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.54 at=5340000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=110 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.55 at=5460000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=89 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.56 at=5520000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=98 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.57 at=5640000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=84 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.58 at=5700000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=81 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.59 at=5940000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=92 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.60 at=6000000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=105 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.61 at=6060000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=116 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.62 at=6120000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=114 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.63 at=6180000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=110 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.64 at=6360000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=87 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.65 at=6420000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=98 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.66 at=6540000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=81 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.67 at=6780000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=92 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.68 at=6840000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=116 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.69 at=6960000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=105 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.70 at=7020000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=121 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.71 at=7080000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=110 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.72 at=7200000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=98 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.73 at=7380000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=81 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.74 at=7620000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=91 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.75 at=7680000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=101 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.76 at=7740000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=116 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.77 at=7800000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=110 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.78 at=8040000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=86 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.79 at=8100000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=98 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.80 at=8220000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=81 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.81 at=8460000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=92 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.82 at=8520000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=116 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.83 at=8580000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=105 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.84 at=8700000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=122 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.85 at=8760000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=110 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.86 at=8820000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=105 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.87 at=8880000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=98 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.88 at=9000000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=92 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.89 at=9060000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=81 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.90 at=9300000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=87 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.91 at=9360000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=95 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.92 at=9420000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=116 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.93 at=9480000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=105 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.94 at=9540000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=110 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.95 at=9660000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=81 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.96 at=9720000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=98 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.97 at=9900000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=81 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.98 at=10140000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=92 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.99 at=10200000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=113 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.100 at=10260000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=116 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.101 at=10320000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=115 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.102 at=10380000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=110 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.103 at=10560000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=91 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.104 at=10620000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=98 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.105 at=10740000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=81 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.106 at=10980000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=92 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.107 at=11100000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=116 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.108 at=11160000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=105 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.109 at=11220000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=116 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.110 at=11280000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=110 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.111 at=11340000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=99 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.112 at=11400000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=98 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.113 at=11520000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=94 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.114 at=11580000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=81 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.115 at=11820000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=87 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.116 at=11880000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=93 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.117 at=11940000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=116 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.118 at=12000000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=105 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.119 at=12060000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=110 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.120 at=12180000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=81 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.121 at=12240000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=98 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.122 at=12420000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=81 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.123 at=12660000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=92 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.124 at=12720000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=115 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.125 at=12780000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=114 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.126 at=12840000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=120 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.127 at=12960000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=110 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.128 at=13080000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=97 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.129 at=13140000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=98 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.130 at=13260000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=81 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.131 at=13560000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=92 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.132 at=13620000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=116 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.133 at=13680000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=105 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.134 at=13740000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=110 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.135 at=13860000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=83 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.136 at=13920000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=98 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.137 at=14100000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=81 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.138 at=14340000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=92 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.139 at=14400000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=116 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.140 at=14460000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=107 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.141 at=14520000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=123 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.142 at=14640000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=110 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.143 at=14760000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=98 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.144 at=14940000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=81 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.145 at=15240000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=92 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.146 at=15300000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=116 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.147 at=15360000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=105 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.148 at=15420000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=110 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.149 at=15540000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=91 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.150 at=15600000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=98 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.151 at=15720000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=84 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.152 at=15840000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=81 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.153 at=16020000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=92 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.154 at=16080000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=111 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.155 at=16140000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=116 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.156 at=16200000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=115 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.157 at=16260000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=110 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.158 at=16440000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=91 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.159 at=16500000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=98 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.160 at=16620000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=81 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.161 at=16920000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=92 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.162 at=16980000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=116 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.163 at=17040000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=105 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.164 at=17100000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=110 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.165 at=17220000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=89 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.166 at=17280000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=98 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.167 at=17400000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=81 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.168 at=17700000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=92 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.169 at=17820000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=116 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.170 at=17880000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=105 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.171 at=17940000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=110 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.172 at=18060000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=88 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.173 at=18120000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=98 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.174 at=18300000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=81 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.175 at=18540000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=92 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.176 at=18600000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=114 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.177 at=18660000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=116 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.178 at=18720000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=118 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.179 at=18780000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=110 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.180 at=18960000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=91 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.181 at=19020000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=98 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.182 at=19140000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=81 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.183 at=19380000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=92 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.184 at=19440000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=116 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.185 at=19560000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=105 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.186 at=19620000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=116 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.187 at=19680000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=110 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.188 at=19740000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=103 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.189 at=19800000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=98 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.190 at=19920000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=90 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.191 at=19980000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=81 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.192 at=20220000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=92 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.193 at=20280000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=98 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.194 at=20340000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=116 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.195 at=20400000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=105 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.196 at=20460000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=110 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.197 at=20580000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=81 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.198 at=20700000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=98 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.199 at=20820000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=81 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.200 at=21060000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=92 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.201 at=21120000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=116 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.202 at=21240000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=105 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.203 at=21300000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=122 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.204 at=21360000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=110 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.205 at=21480000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=98 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.206 at=21660000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=81 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.207 at=21900000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=83 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.208 at=21960000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=92 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.209 at=22020000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=116 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.210 at=22080000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=105 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.211 at=22140000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=110 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.212 at=22260000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=81 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.213 at=22320000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=98 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.214 at=22500000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=81 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.215 at=22740000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=92 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.216 at=22800000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=116 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.217 at=22860000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=114 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.218 at=22920000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=118 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.219 at=22980000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=110 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.220 at=23160000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=91 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.221 at=23220000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=98 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.222 at=23340000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=81 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.223 at=23580000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=92 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.224 at=23640000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=116 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.225 at=23760000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=105 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.226 at=23820000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=123 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.227 at=23880000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=110 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.228 at=23940000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=105 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.229 at=24000000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=98 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.230 at=24120000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=96 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.231 at=24180000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=81 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.232 at=24480000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=92 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.233 at=24540000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=116 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.234 at=24600000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=105 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.235 at=24660000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=110 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.236 at=24780000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=88 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.237 at=24840000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=98 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.238 at=24960000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=81 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.239 at=25260000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=92 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.240 at=25320000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=103 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.241 at=25380000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=116 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.242 at=25440000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=105 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.243 at=25500000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=110 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.244 at=25620000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=81 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.245 at=25680000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=98 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.246 at=25800000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=85 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.247 at=25920000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=81 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.248 at=26100000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=91 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.249 at=26160000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=93 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.250 at=26220000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=116 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.251 at=26280000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=105 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.252 at=26340000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=110 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.253 at=26460000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=81 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.254 at=26520000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=98 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.255 at=26700000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=81 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.256 at=26940000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=92 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.257 at=27000000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=116 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.258 at=27060000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=110 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.259 at=27120000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=123 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.260 at=27240000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=110 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.261 at=27360000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=94 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.262 at=27420000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=98 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.263 at=27540000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=81 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.264 at=27780000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=92 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.265 at=27900000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=116 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.266 at=27960000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=105 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.267 at=28020000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=117 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.268 at=28080000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=110 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.269 at=28140000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=101 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.270 at=28200000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=98 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.271 at=28320000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=90 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.272 at=28380000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=81 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.273 at=28620000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=88 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.274 at=28680000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=92 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.275 at=28740000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=116 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.276 at=28800000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=105 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.277 at=28860000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=110 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.278 at=28980000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=81 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.279 at=29040000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=98 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.280 at=29220000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=81 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.281 at=29460000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=92 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.282 at=29520000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=115 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.283 at=29580000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=111 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.284 at=29640000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=123 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.285 at=29760000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=110 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.286 at=29880000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=97 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.287 at=29940000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=98 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.288 at=30060000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=81 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.289 at=30300000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=84 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.290 at=30360000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=92 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.291 at=30420000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=116 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.292 at=30480000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=105 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.293 at=30540000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=110 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.294 at=30660000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=95 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.295 at=30720000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=98 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.296 at=30840000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=82 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.297 at=30960000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=81 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.298 at=31140000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=92 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.299 at=31200000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=105 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.300 at=31260000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=116 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.301 at=31320000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=106 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.302 at=31380000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=110 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.303 at=31560000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=81 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.304 at=31620000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=98 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.305 at=31740000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=81 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.306 at=31980000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=92 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.307 at=32100000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=116 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.308 at=32160000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=105 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.309 at=32220000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=112 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.310 at=32280000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=110 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.311 at=32340000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=97 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.312 at=32400000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=98 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.313 at=32520000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=90 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.314 at=32580000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=81 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.315 at=32820000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=88 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.316 at=32880000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=97 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.317 at=32940000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=116 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.318 at=33000000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=105 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.319 at=33060000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=110 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.320 at=33180000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=81 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.321 at=33300000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=98 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.322 at=33420000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=81 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.323 at=33660000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=92 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.324 at=33720000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=116 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.325 at=33780000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=107 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.326 at=33900000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=123 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.327 at=33960000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=110 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.328 at=34020000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=104 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.329 at=34080000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=98 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.330 at=34200000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=94 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.331 at=34260000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=81 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.332 at=34500000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=92 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.333 at=34560000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=101 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.334 at=34620000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=116 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.335 at=34680000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=108 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.336 at=34740000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=110 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.337 at=34920000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=84 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.338 at=34980000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=98 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.339 at=35100000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=81 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.340 at=35340000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=92 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.341 at=35400000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=116 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.342 at=35520000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=105 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.343 at=35580000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=110 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.344 at=35760000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=93 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.345 at=35820000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=98 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.346 at=35940000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=81 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.347 at=36180000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=92 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.348 at=36300000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=116 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.349 at=36360000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=105 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.350 at=36420000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=115 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.351 at=36480000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=110 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.352 at=36540000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=100 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.353 at=36600000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=98 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.354 at=36720000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=89 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.355 at=36780000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=81 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.356 at=37020000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=92 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.357 at=37080000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=102 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.358 at=37140000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=116 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.359 at=37200000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=107 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.360 at=37260000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=110 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.361 at=37440000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=83 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.362 at=37500000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=98 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.363 at=37620000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=81 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.364 at=37860000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=92 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.365 at=37920000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=116 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.366 at=38040000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=105 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.367 at=38100000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=118 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.368 at=38160000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=110 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.369 at=38220000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=105 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.370 at=38280000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=98 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.371 at=38400000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=95 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.372 at=38460000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=81 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.373 at=38700000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=86 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.374 at=38760000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=95 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.375 at=38820000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=116 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.376 at=38880000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=105 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.377 at=38940000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=110 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.378 at=39120000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=81 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.379 at=39180000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=98 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.380 at=39300000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=81 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.381 at=39540000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=92 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.382 at=39600000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=116 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.383 at=39720000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=105 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.384 at=39780000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=119 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.385 at=39840000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=110 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-
+link.386 at=39900000 delay_us=25000 jitter_us=3000 fifo_jitter=0 batch_us=0 loss_permille=99 rate_bps=8000000 max_queue_us=200000 up=1 spikes=- doze=- busy=-

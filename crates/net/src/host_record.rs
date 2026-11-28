@@ -371,6 +371,7 @@ mod tests {
             Some(EncodedFrame {
                 payload: vec![0; 12],
                 key: true,
+                qp: None,
             }),
             false,
         ));

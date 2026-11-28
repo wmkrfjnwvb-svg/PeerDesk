@@ -57,6 +57,7 @@ impl VideoEncoder for SizedEncoder {
         Ok(Some(EncodedFrame {
             payload: header.frame(&body),
             key,
+            qp: None,
         }))
     }
     fn on_feedback(&mut self, _floor: u32, _mask: u32) {}

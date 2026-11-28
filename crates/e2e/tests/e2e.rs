@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use peerdesk_core::adaptive::Profile;
 use peerdesk_core::sim::{Busy, Doze, Link, Spikes};
 use peerdesk_e2e::report::{markdown, save, TABLE_HEADER};
-use peerdesk_e2e::{run, Action, CodecKind, EstimatorKind, Outcome, Phase, Scenario};
+use peerdesk_e2e::{run, Action, CodecKind, EstimatorKind, NetworkPlan, Outcome, Phase, Scenario};
 
 fn out_dir() -> PathBuf {
     std::env::var_os("PEERDESK_E2E_OUT").map_or_else(
@@ -180,7 +180,7 @@ fn bandwidth_steps() {
         ..Link::lan()
     };
     let s = Scenario {
-        network: vec![(0, at(20)), (4_000_000, at(3)), (8_000_000, at(20))],
+        network: NetworkPlan::Layout1(vec![(0, at(20)), (4_000_000, at(3)), (8_000_000, at(20))]),
         ..Scenario::new(
             "bandwidth-steps",
             vec![
@@ -206,7 +206,7 @@ fn sudden_drop() {
         ..full
     };
     let s = Scenario {
-        network: vec![(0, full), (3_000_000, low), (5_000_000, full)],
+        network: NetworkPlan::Layout1(vec![(0, full), (3_000_000, low), (5_000_000, full)]),
         profile: Profile::WIRELESS,
         ..Scenario::new(
             "sudden-drop",
@@ -220,7 +220,7 @@ fn sudden_drop() {
 #[test]
 fn office_on_cellular() {
     compare(&Scenario {
-        network: vec![(0, Link::cellular())],
+        network: NetworkPlan::Layout1(vec![(0, Link::cellular())]),
         profile: Profile::CELLULAR,
         start_bps: 2_000_000,
         ..Scenario::new("office-cellular", office())
@@ -231,13 +231,13 @@ fn office_on_cellular() {
 #[test]
 fn fast_ramp_on_a_fat_link() {
     compare(&Scenario {
-        network: vec![(
+        network: NetworkPlan::Layout1(vec![(
             0,
             Link {
                 rate_bps: Some(50_000_000),
                 ..Link::lan()
             },
-        )],
+        )]),
         start_bps: 500_000,
         ..Scenario::new(
             "fast-ramp",
@@ -253,7 +253,7 @@ fn start_is_sharp_quickly_on_a_fat_link_with_a_big_screen() {
     let o = run(&Scenario {
         width: 2880,
         height: 1800,
-        network: vec![(
+        network: NetworkPlan::Layout1(vec![(
             0,
             Link {
                 rate_bps: Some(30_000_000),
@@ -277,7 +277,7 @@ fn start_is_sharp_quickly_on_a_fat_link_with_a_big_screen() {
                 }),
                 ..Link::lan()
             },
-        )],
+        )]),
         ..Scenario::new(
             "big-screen-start",
             vec![
@@ -335,7 +335,7 @@ fn wifi_light_activity(name: &str) -> Scenario {
     Scenario {
         width: 2880,
         height: 1800,
-        network: vec![(
+        network: NetworkPlan::Layout1(vec![(
             0,
             Link {
                 rate_bps: Some(30_000_000),
@@ -358,7 +358,7 @@ fn wifi_light_activity(name: &str) -> Scenario {
                 }),
                 ..Link::lan()
             },
-        )],
+        )]),
         ..Scenario::new(
             name,
             // 轻操作（指针每帧动一点）20 秒，中间切一次窗口、打字、滚动
@@ -417,6 +417,135 @@ fn light_activity_on_wifi_keeps_the_rate() {
     );
 }
 
+/// 真实用户日志的操作节奏（回归，`docs/research/P-fps-bitrate.md` M1、W3）。
+///
+/// 2026-11-27 三份日志（Mac 公网 Wi-Fi、两台 Windows 局域网 Wi-Fi）：大部分时间静止或只有零星小帧，突然来一个大帧
+/// （切窗口、滚动），又停下。链路没有丢包、容量远高于要发的量，排队读数平时 0–5 ms、每秒有一两份 12–28 ms。
+/// 修之前：大帧一出来状态切回“跟踪”，碰上一份 12 ms 以上的读数就按“送达速率 × 0.85”降，而那时的送达速率只是
+/// 静止时要发的量——46 分钟里降到 1 Mbps 以下 317 次，降帧率 82 次里 67 次跟在后面；局域网上画面因此变糊。
+/// 这里按那个节奏重放：静止 → 切窗口 → 指针 → 打字 → 静止 → 滚动 → 指针，重复 4 遍，局域网 Wi-Fi（往返 16 ms）。
+fn real_log_rhythm(name: &str) -> Scenario {
+    let mut phases = Vec::new();
+    for _ in 0..4 {
+        phases.extend([
+            phase(Action::Idle, 90),
+            // 切过去马上接着动鼠标、打字：大帧之后紧跟着零星小帧（日志里降码率就发生在这种时候）
+            phase(Action::Switching, 6),
+            phase(Action::Pointer, 150),
+            phase(Action::Typing, 90),
+            phase(Action::Idle, 60),
+            phase(Action::Scrolling, 60),
+            phase(Action::Pointer, 120),
+        ]);
+    }
+    Scenario {
+        network: NetworkPlan::Layout1(vec![(
+            0,
+            Link {
+                rate_bps: Some(50_000_000),
+                delay_us: 8_000,
+                jitter_us: 1_000,
+                fifo_jitter: true,
+                doze: Some(Doze {
+                    idle_us: 50_000,
+                    wake_us: 25_000,
+                }),
+                // 按日志的排队读数标定：中位 3 ms，95% 分位 13–20 ms，每秒有机会碰上一次十几到二十几毫秒的尖峰
+                spikes: Some(Spikes {
+                    every_us: 700_000,
+                    length_us: 30_000,
+                    max_us: 28_000,
+                }),
+                busy: Some(Busy {
+                    every_us: 500_000,
+                    length_us: 20_000,
+                }),
+                ..Link::lan()
+            },
+        )]),
+        trace: true,
+        // 和产品一样 60 帧：每帧预算减半，滚动、切窗口的帧顶着预算，状态才会像日志里那样频繁回到“跟踪”
+        fps: 60,
+        // 日志里是 2880×1800、上限 30 Mbps；这里画面小 5.6 倍（省仿真时间），上限按像素数折算，
+        // 帧和预算的比例才和日志里差不多（预算 24–50 KB，大帧 100 KB 以上）
+        max_bps: 6_000_000,
+        ..Scenario::new(name, phases)
+    }
+}
+
+/// 一行“降码率 A → B kbps”里的两个数。
+fn cut_of(line: &str) -> Option<(u64, u64)> {
+    let rest = line.split("降码率 ").nth(1)?;
+    let mut parts = rest.split(' ');
+    let from = parts.next()?.parse().ok()?;
+    let to = parts.nth(1)?.parse().ok()?;
+    Some((from, to))
+}
+
+#[test]
+fn real_log_rhythm_keeps_the_rate_and_the_frame_rate() {
+    let o = run(&real_log_rhythm("real-log-rhythm")).unwrap();
+    finish(&o);
+    gates(&o);
+    // 链路没有拥塞：不该有“趋势正常”却把码率砍掉一半以上的降码率（修之前这个场景里有十几次）
+    let deep: Vec<&String> = o
+        .trace
+        .iter()
+        .filter(|l| l.contains("趋势正常"))
+        .filter(|l| cut_of(l).is_some_and(|(from, to)| to.saturating_mul(2) < from))
+        .collect();
+    gate(
+        &o,
+        "没有拥塞证据时不把码率砍掉一半以上",
+        deep.len() <= 1,
+        &format!(
+            "{} 次：{:?}",
+            deep.len(),
+            deep.iter().take(3).collect::<Vec<_>>()
+        ),
+    );
+    let mut after: Vec<u64> = o
+        .features
+        .iter()
+        .filter(|f| f.t_ms >= 2_000)
+        .map(|f| f.rate_bps)
+        .collect();
+    after.sort_unstable();
+    let min = after.first().copied().unwrap_or(0);
+    let p5 = after.get(after.len() / 20).copied().unwrap_or(0);
+    // 调试构建的画面小（DEFAULT_SIZE），内容本身用不到 3 Mbps：码率停在应用受限，不是被抖动打下去。
+    // 2026-11-28 实测：发布构建 2 秒后 5% 分位过 3000；调试构建最低和 5% 分位都是 2331 kbps，应用受限 94.6%，
+    // 没有一次降码率。调试构建的线按实测留一成五的余量。
+    let p5_floor: u64 = if cfg!(debug_assertions) {
+        2_000_000
+    } else {
+        3_000_000
+    };
+    gate(
+        &o,
+        "码率不被 Wi-Fi 的抖动打下去",
+        min >= 1_000_000 && p5 >= p5_floor,
+        &format!(
+            "2 秒之后最低 {} kbps、5% 分位 {} kbps（链路 50000 kbps、上限 6000，要求不低于 1000 和 {}）",
+            min / 1000,
+            p5 / 1000,
+            p5_floor / 1000
+        ),
+    );
+    // 帧率档位不来回跳：链路宽，内容装得进预算
+    let steps = o
+        .trace
+        .iter()
+        .filter(|l| l.contains("内容装不进预算"))
+        .count();
+    gate(
+        &o,
+        "帧率不因为码率误降而降档",
+        steps <= 1,
+        &format!("降档 {steps} 次"),
+    );
+}
+
 // ---- 运行中探测的四个场景（状态机第 2 步）----
 
 /// 一条不乱序、往返 30 ms 的链路。
@@ -445,7 +574,7 @@ fn rate_at(o: &Outcome, t_ms: u64) -> u64 {
 fn a_false_cut_while_app_limited_is_verified_and_undone() {
     let base = steady_link(30_000_000);
     let o = run(&Scenario {
-        network: vec![
+        network: NetworkPlan::Layout1(vec![
             (0, base),
             (
                 6_000_000,
@@ -455,7 +584,7 @@ fn a_false_cut_while_app_limited_is_verified_and_undone() {
                 },
             ),
             (6_300_000, base),
-        ],
+        ]),
         trace: true,
         ..Scenario::new(
             "false-cut",
@@ -502,10 +631,10 @@ fn a_false_cut_while_app_limited_is_verified_and_undone() {
 #[test]
 fn a_real_drop_during_light_activity_is_followed_without_bouncing_back() {
     let o = run(&Scenario {
-        network: vec![
+        network: NetworkPlan::Layout1(vec![
             (0, steady_link(30_000_000)),
             (6_000_000, steady_link(3_000_000)),
-        ],
+        ]),
         // 固定 720p：调试构建默认的小画面切窗口只有十几 KB，3 Mbps 也装得下，就没有“真实流量”这个证据了
         width: 1280,
         height: 720,
@@ -548,7 +677,7 @@ fn a_real_drop_during_light_activity_is_followed_without_bouncing_back() {
 #[test]
 fn no_run_probes_on_a_narrow_link() {
     let o = run(&Scenario {
-        network: vec![(0, steady_link(1_000_000))],
+        network: NetworkPlan::Layout1(vec![(0, steady_link(1_000_000))]),
         ..Scenario::new(
             "narrow-light",
             vec![phase(Action::Idle, 30), phase(Action::Pointer, 600)],
@@ -574,7 +703,7 @@ fn no_run_probes_on_a_narrow_link() {
 #[test]
 fn periodic_probes_climb_during_a_minute_of_light_activity() {
     let scenario = Scenario {
-        network: vec![(0, steady_link(30_000_000))],
+        network: NetworkPlan::Layout1(vec![(0, steady_link(30_000_000))]),
         start_probe: false,
         trace: true,
         ..Scenario::new(
@@ -595,17 +724,21 @@ fn periodic_probes_climb_during_a_minute_of_light_activity() {
         .filter_map(|l| l.get(1..7).and_then(|t| t.trim().parse::<u64>().ok()))
         .max()
         .unwrap_or(0);
+    // 起步之后（第一阵流量发完，2 秒时）码率还不到 15 Mbps，才需要周期探测把它探上去。#71 第 2 步之前，第一阵流量
+    // 收尾时会按送达速率误降到几 Mbps，非探不可；不再误降以后起步就到了，不要求探（探了也每轮都要有结论）。
+    let after_start = rate_at(&o, 2_000);
     gate(
         &o,
-        "轻操作时周期探测把码率探上去，每轮都有结论，到了就不再探",
-        p.run_sent >= 3
+        "轻操作时码率到得了位（起步没到就靠周期探测），每轮探测都有结论，到了就不再探",
+        (p.run_sent >= 3 || after_start >= 15_000_000)
             && verdicts >= p.run_sent
             && verdicts - p.run_sent <= p.run_verdicts[3]
             && end >= 15_000_000
             && last_probe_ms < 45_000,
         &format!(
-            "发出 {} 轮，结论 {verdicts} 个（证实 {}、否定 {}、超时 {}、中止 {}）；码率 1000 → {} kbps；\
+            "起步之后 {} kbps；发出 {} 轮，结论 {verdicts} 个（证实 {}、否定 {}、超时 {}、中止 {}）；码率 1000 → {} kbps；\
              最后一轮在 {last_probe_ms} ms；探测 {} 字节，占 {}‰",
+            after_start / 1000,
             p.run_sent,
             p.run_verdicts[0],
             p.run_verdicts[1],
@@ -637,7 +770,7 @@ fn periodic_probes_climb_during_a_minute_of_light_activity() {
 #[test]
 fn random_loss_without_congestion() {
     compare(&Scenario {
-        network: vec![(
+        network: NetworkPlan::Layout1(vec![(
             0,
             Link {
                 delay_us: 3_000,
@@ -646,7 +779,7 @@ fn random_loss_without_congestion() {
                 rate_bps: Some(30_000_000),
                 ..Link::lan()
             },
-        )],
+        )]),
         profile: Profile::WIRELESS,
         ..Scenario::new(
             "random-loss",
@@ -660,7 +793,7 @@ fn random_loss_without_congestion() {
 #[test]
 fn random_loss_on_a_link_that_looked_stable() {
     compare(&Scenario {
-        network: vec![(
+        network: NetworkPlan::Layout1(vec![(
             0,
             Link {
                 delay_us: 10_000,
@@ -669,7 +802,7 @@ fn random_loss_on_a_link_that_looked_stable() {
                 rate_bps: Some(30_000_000),
                 ..Link::lan()
             },
-        )],
+        )]),
         profile: Profile::STABLE,
         ..Scenario::new(
             "lossy-stable",
@@ -686,14 +819,14 @@ fn random_loss_on_a_link_that_looked_stable() {
 #[test]
 fn video_on_a_narrow_link() {
     compare(&Scenario {
-        network: vec![(
+        network: NetworkPlan::Layout1(vec![(
             0,
             Link {
                 rate_bps: Some(1_500_000),
                 delay_us: 15_000,
                 ..Link::lan()
             },
-        )],
+        )]),
         start_bps: 1_000_000,
         ..Scenario::new(
             "narrow-video",
@@ -726,7 +859,7 @@ fn office_on_a_varying_cellular_link() {
         })
         .collect();
     compare(&Scenario {
-        network,
+        network: NetworkPlan::Layout1(network),
         profile: Profile::CELLULAR,
         start_bps: 2_000_000,
         ..Scenario::new("varying-cellular", office())
@@ -739,7 +872,7 @@ fn office_on_a_varying_cellular_link() {
 #[test]
 fn typing_on_a_very_narrow_link() {
     compare(&Scenario {
-        network: vec![(
+        network: NetworkPlan::Layout1(vec![(
             0,
             Link {
                 rate_bps: Some(400_000),
@@ -747,7 +880,7 @@ fn typing_on_a_very_narrow_link() {
                 max_queue_us: 200_000,
                 ..Link::lan()
             },
-        )],
+        )]),
         ..Scenario::new(
             "very-narrow",
             vec![phase(Action::Typing, 120), phase(Action::Idle, 60)],
@@ -770,7 +903,7 @@ fn link_drops_while_idle() {
         ..fast
     };
     compare(&Scenario {
-        network: vec![(0, fast), (3_500_000, slow)],
+        network: NetworkPlan::Layout1(vec![(0, fast), (3_500_000, slow)]),
         ..Scenario::new(
             "drop-while-idle",
             vec![
@@ -797,7 +930,7 @@ fn link_improves_while_idle() {
         ..slow
     };
     compare(&Scenario {
-        network: vec![(0, slow), (3_500_000, fast)],
+        network: NetworkPlan::Layout1(vec![(0, slow), (3_500_000, fast)]),
         start_bps: 1_000_000,
         ..Scenario::new(
             "rise-while-idle",

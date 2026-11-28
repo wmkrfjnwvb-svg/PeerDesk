@@ -3,7 +3,7 @@
 
 use peerdesk_core::adaptive::Profile;
 use peerdesk_core::sim::Link;
-use peerdesk_e2e::{run, Action, EstimatorKind, Phase, Scenario};
+use peerdesk_e2e::{run, Action, EstimatorKind, NetworkPlan, Phase, Scenario};
 
 #[test]
 #[ignore = "测量用，手动运行：cargo test -p peerdesk-e2e --test loss_sweep -- --ignored --nocapture"]
@@ -15,7 +15,7 @@ fn loss_sweep() {
         {
             let estimator = EstimatorKind::ClassicV1;
             let o = run(&Scenario {
-                network: vec![(
+                network: NetworkPlan::Layout1(vec![(
                     0,
                     Link {
                         delay_us: 25_000,
@@ -24,7 +24,7 @@ fn loss_sweep() {
                         rate_bps: Some(20_000_000),
                         ..Link::lan()
                     },
-                )],
+                )]),
                 // 真实会话里往返短时选的是“稳定”画像（不带纠错），实测如此
                 profile: std::env::var("PEERDESK_PROFILE").map_or(Profile::STABLE, |v| {
                     if v == "wireless" {

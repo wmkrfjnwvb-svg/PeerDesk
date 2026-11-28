@@ -78,10 +78,13 @@ mod dir;
 mod loss;
 mod policer;
 pub mod rng;
+pub mod segments;
 pub mod tcp;
 
 #[cfg(test)]
 mod cross_tests;
+#[cfg(test)]
+mod segment_tests;
 #[cfg(test)]
 mod testkit;
 #[cfg(test)]
@@ -89,7 +92,7 @@ mod tests;
 
 use std::collections::{BTreeMap, VecDeque};
 
-use crate::sim::Delivery;
+use crate::sim::{Delivery, NetStats, Network};
 use crate::Time;
 
 pub use bottleneck::{Aqm, Bottleneck, BottleneckConfig, Capacity, QueueLimit, Trace, Verdict};
@@ -181,7 +184,7 @@ pub struct PathStats {
     pub lost: u64,
     /// 没有对应方向的包数（只在总计里）。
     pub unroutable: u64,
-    /// 注入瓶颈的交叉流量包数。
+    /// 经 [`Path::inject_cross`] 注入瓶颈的交叉流量包数（`add_cross` 挂的源各自计数，见 [`Path::cross_stats`]）。
     pub cross_sent: u64,
     /// 其中被丢尾或 CoDel 丢掉的。
     pub cross_dropped: u64,
@@ -436,6 +439,12 @@ impl<T> Path<T> {
         index
     }
 
+    /// 挂了几个交叉流量源（序号是 `0..这个数`）。
+    #[must_use]
+    pub fn cross_sources(&self) -> usize {
+        self.sources.len()
+    }
+
     /// 交叉流量源的计数（序号不存在时全 0）。
     #[must_use]
     pub fn cross_stats(&self, id: usize) -> CrossStats {
@@ -531,5 +540,56 @@ impl<T> Path<T> {
     #[must_use]
     pub fn backlog_us(&self, from: usize, to: usize) -> u64 {
         Dir::from_nodes(from, to).map_or(0, |dir| self.dir(dir).bottleneck().backlog_us(self.now))
+    }
+}
+
+impl PathStats {
+    /// 折算成 `Net` 的口径：`lost` 是中断、限速器、丢包层三样之和，`queue_dropped` 是丢尾加 CoDel。
+    /// 交叉流量不算（`Net` 没有交叉流量）。
+    #[must_use]
+    pub const fn net(&self) -> NetStats {
+        NetStats {
+            sent: self.sent,
+            delivered: self.delivered,
+            lost: self
+                .outage_dropped
+                .saturating_add(self.policed)
+                .saturating_add(self.lost),
+            queue_dropped: self.queue_dropped.saturating_add(self.aqm_dropped),
+            unroutable: self.unroutable,
+        }
+    }
+}
+
+impl<T> Network<T> for Path<T> {
+    fn send(&mut self, from: usize, to: usize, size_bytes: usize, payload: T) {
+        Path::send(self, from, to, size_bytes, payload);
+    }
+    fn peek_time(&self) -> Option<Time> {
+        Path::peek_time(self)
+    }
+    fn pop(&mut self) -> Option<Delivery<T>> {
+        Path::pop(self)
+    }
+    fn advance_to(&mut self, t: Time) {
+        Path::advance_to(self, t);
+    }
+    fn in_flight(&self) -> usize {
+        Path::in_flight(self)
+    }
+    fn backlog_us(&self, from: usize, to: usize) -> u64 {
+        Path::backlog_us(self, from, to)
+    }
+    fn stats(&self) -> NetStats {
+        Path::stats(self).net()
+    }
+    fn path_stats(&self) -> Option<PathStats> {
+        Some(Path::stats(self))
+    }
+    fn next_event_time(&self) -> Option<Time> {
+        Path::next_event_time(self)
+    }
+    fn pop_event(&mut self) -> Option<PathEvent> {
+        Path::pop_event(self)
     }
 }

@@ -10,6 +10,7 @@
 //! 同一个场景同一个种子，结果逐字节相同，可以放进 CI 当回归门槛。
 
 pub mod content;
+pub mod homes;
 pub mod report;
 pub mod timeline;
 pub mod world;
@@ -22,11 +23,15 @@ pub use peerdesk_core::estimator::RateState;
 use peerdesk_core::frame::{Described, Picture};
 pub use peerdesk_core::media::ProbeStats;
 use peerdesk_core::media::{DecodeWorker, MediaReceiver, MediaSender, SenderConfig, SenderStats};
+use peerdesk_core::path::segments::{Segment, SegmentRoute, Segmented, SegmentedConfig};
+use peerdesk_core::path::{
+    CrossSpec, CrossStats, Dir, DirConfig, Path, PathConfig, PathStats, RouteChange,
+};
 pub use peerdesk_core::policy::ContentPolicy;
 use peerdesk_core::proto::{decode_datagram, encode_datagram, Channel, Header};
 use peerdesk_core::record::{self, Meta, Record, Role, Sink};
 use peerdesk_core::screen::Screen;
-use peerdesk_core::sim::{Link, Net, NetStats};
+use peerdesk_core::sim::{Link, Net, NetStats, Network};
 use peerdesk_core::time::Time;
 use peerdesk_core::video::{TileDecoder, TileEncoder, VideoDecoder, VideoEncoder};
 use peerdesk_media::fake::{
@@ -352,8 +357,8 @@ pub struct Scenario {
     pub codec: CodecKind,
     /// 依次执行的阶段。
     pub phases: Vec<Phase>,
-    /// 网络：从某个时刻（微秒）起换成某条链路。第一项应当从 0 开始。
-    pub network: Vec<(u64, Link)>,
+    /// 网络：随机数布局 1（老的 `Net`）或布局 2（分层的 `Path`），见 [`NetworkPlan`]。
+    pub network: NetworkPlan,
     /// 网络画像。
     pub profile: Profile,
     /// 起始码率。
@@ -410,7 +415,7 @@ impl Scenario {
             fps: 30,
             codec: CodecKind::H264,
             phases,
-            network: vec![(0, Link::lan())],
+            network: NetworkPlan::Layout1(vec![(0, Link::lan())]),
             profile: Profile::STABLE,
             start_bps: ContentPolicy::OFFICE.start_bps,
             max_bps: 30_000_000,
@@ -426,6 +431,135 @@ impl Scenario {
             byte_noise: ByteNoise::Default,
         }
     }
+}
+
+/// 场景的网络，按随机数布局分（`docs/research/Q-redesign/a2-plan.md` 第 2、8 节）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NetworkPlan {
+    /// 布局 1：老的 `Net`，从某个时刻（微秒）起换成某条链路，两个方向对称。第一项应当从 0 开始。
+    /// 现有场景和 144 次基线都用它，结果逐字节不变。
+    Layout1(Vec<(u64, Link)>),
+    /// 布局 2：分层的路径模型 [`Path`]，每层一条随机数流，两个方向可以不同。
+    Layout2(Box<Layout2>),
+    /// 布局 2 的分段路径：两端之间五段（A 局域网、A 出口、公网、B 出口、B 局域网），每段一个 `Path`，
+    /// 见 `peerdesk_core::path::segments`。
+    Segmented(Box<SegmentedPlan>),
+}
+
+impl NetworkPlan {
+    /// 随机数布局号（世界文件里的 `rng_layout`）。
+    #[must_use]
+    pub const fn layout(&self) -> u32 {
+        match self {
+            NetworkPlan::Layout1(_) => 1,
+            NetworkPlan::Layout2(_) | NetworkPlan::Segmented(_) => 2,
+        }
+    }
+
+    /// 指纹行身份里的网络部分：布局 1 是空的（和加布局 2 之前逐字节相同），布局 2 是 ` layout2`，分段是 ` layout2-segments`。
+    #[must_use]
+    pub const fn identity(&self) -> &'static str {
+        match self {
+            NetworkPlan::Layout1(_) => "",
+            NetworkPlan::Layout2(_) => " layout2",
+            NetworkPlan::Segmented(_) => " layout2-segments",
+        }
+    }
+
+    /// 把布局 1 的链路搬到布局 2（A2-3 对照用）：每一项按 `DirConfig::from_link` 转成两个方向相同的参数，
+    /// 在同样的时刻换（[`PathStep`]，不发“路径变了”事件，和 `set_link` 一样），`Link::up` 搬成接通或切断。
+    /// `loss_first` 把丢包放回瓶颈之前（`Net` 的位置）。已经是布局 2 的原样返回。
+    ///
+    /// 和布局 1 仍然不同的地方：随机数（每层一条流）、容量误差按纳秒记、尖峰和接收端忙的时间表从换参数的时刻起算；
+    /// 第一项不从 0 开始时，布局 1 在那之前没有链路（包全算 `unroutable`），布局 2 在那之前用第一项的参数。
+    #[must_use]
+    pub fn to_layout2(&self, loss_first: bool) -> NetworkPlan {
+        let NetworkPlan::Layout1(links) = self else {
+            return self.clone();
+        };
+        let cfg = |l: &Link| {
+            PathConfig::symmetric(DirConfig {
+                loss_before_bottleneck: loss_first,
+                ..DirConfig::from_link(l)
+            })
+        };
+        let first = links.first().map_or_else(Link::lan, |(_, l)| *l);
+        NetworkPlan::Layout2(Box::new(Layout2 {
+            start: cfg(&first),
+            steps: links
+                .iter()
+                .map(|(at, l)| {
+                    (
+                        *at,
+                        PathStep {
+                            config: cfg(l),
+                            up: l.up,
+                        },
+                    )
+                })
+                .collect(),
+            routes: Vec::new(),
+            cross: Vec::new(),
+        }))
+    }
+}
+
+/// 布局 2 的网络。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Layout2 {
+    /// 起始的参数（两个方向各一份）。
+    pub start: PathConfig,
+    /// 从某个时刻（微秒）起立即换参数：和布局 1 的换链路一样在那一帧开头换，不中断、不发事件
+    /// （容量按轨迹变这类“同一条路的参数变了”）。换路用 [`Self::routes`]。
+    pub steps: Vec<(u64, PathStep)>,
+    /// 按计划的中断和换路（`Path::schedule_route_change`）；带新参数的在恢复时刻发一次“路径变了”事件。
+    pub routes: Vec<RouteChange>,
+    /// 交叉流量：挂在哪个方向的瓶颈上（正向是被控端到控制端，画面走的方向），什么源。
+    pub cross: Vec<(Dir, CrossSpec)>,
+}
+
+/// 分段路径的网络（布局 2）。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SegmentedPlan {
+    /// 五段起始的参数。
+    pub start: SegmentedConfig,
+    /// 从某个时刻（微秒）起立即换一段的参数（不中断、不发事件）。
+    pub steps: Vec<(u64, SegmentStep)>,
+    /// 按计划的中断和换路（可以同时涉及几段，带新参数的在恢复时刻发一次“路径变了”）。
+    pub routes: Vec<SegmentRoute>,
+    /// 交叉流量：挂在哪一段、哪个方向（正向是 A → B）的瓶颈上，什么源。
+    pub cross: Vec<(Segment, Dir, CrossSpec)>,
+}
+
+/// 分段路径的一次立即换参数。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SegmentStep {
+    /// 换哪一段。
+    pub segment: Segment,
+    /// 这一段两个方向的新参数。
+    pub config: PathConfig,
+    /// 这一段接通还是切断。
+    pub up: bool,
+}
+
+/// 分段路径一段的真值（不进指纹）。
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct SegmentTruth {
+    /// 这一段的计数（主流量和探测都在里面）。
+    pub stats: PathStats,
+    /// 正向（A → B）瓶颈排队的时间平均（毫秒，按帧末采样）。
+    pub mean_queue_ms: f64,
+    /// 正向瓶颈排队的最大值（毫秒，按帧末采样）。
+    pub max_queue_ms: f64,
+}
+
+/// 布局 2 的一次立即换参数。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PathStep {
+    /// 两个方向的新参数。
+    pub config: PathConfig,
+    /// 接通还是切断（`Path::set_up`，对应 `Link::up`）。
+    pub up: bool,
 }
 
 /// 一个阶段的结果。
@@ -499,6 +633,14 @@ pub struct Outcome {
     /// 对账用的几样（见 [`Tally`]）。**不进指纹**：它们只是把会话里已经发生的事多数了一遍，加它们不改变任何行为，
     /// 指纹基准因此逐字节不变。
     pub tally: Tally,
+    /// 布局 2 的细分计数（中断、限速器、丢尾、CoDel、丢包层、交叉流量各多少）；布局 1 没有。**不进指纹**。
+    pub path: Option<PathStats>,
+    /// “路径变了”事件送到两端的时刻（微秒），按先后。布局 1 没有事件。**不进指纹**。
+    pub route_changes: Vec<u64>,
+    /// 布局 2 每个交叉流量源的计数，按 [`Layout2::cross`]（或 [`SegmentedPlan::cross`]）的顺序。**不进指纹**。
+    pub cross: Vec<CrossStats>,
+    /// 分段路径每段的真值，按 A → B 的顺序；不是分段路径时为空。**不进指纹**。
+    pub segments: Vec<SegmentTruth>,
 }
 
 /// 两秒一个窗口（对账时比每个窗口发了多少字节，见 `a1-plan.md` 第 4 节）。
@@ -1165,7 +1307,7 @@ fn send_ready(
     pacer: &mut peerdesk_core::pacer::Pacer,
     tx: &mut MediaSender,
     pacing: bool,
-    net: &mut Net<Vec<u8>>,
+    net: &mut impl Network<Vec<u8>>,
     now: Time,
     seq: &mut u32,
 ) -> Result<u64, Error> {
@@ -1395,6 +1537,8 @@ fn fingerprint_line(s: &Scenario, o: &Outcome) -> String {
         model.push_str(" noise-");
         model.push_str(s.byte_noise.name());
     }
+    // 布局 2 同理：布局 1 的行逐字节不变，布局 2 的行身份里多一个 layout2
+    model.push_str(s.network.identity());
     format!(
         "{} {}x{} fps{} {} {} seed{} max{} start{} pace{} probe{}{}{model} {:?} {:016x}\n",
         s.name,
@@ -1530,6 +1674,198 @@ impl Journal {
 }
 
 fn run_inner(s: &Scenario, record: bool) -> Result<(Outcome, Option<Vec<u8>>), Error> {
+    match &s.network {
+        NetworkPlan::Layout1(links) => session(s, record, Net::new(s.seed), links.clone()),
+        NetworkPlan::Layout2(plan) => {
+            let mut path = Path::new(s.seed, plan.start.clone());
+            for change in &plan.routes {
+                path.schedule_route_change(change.clone());
+            }
+            for (dir, spec) in &plan.cross {
+                let _ = path.add_cross(*dir, spec.clone());
+            }
+            session(s, record, path, plan.steps.clone())
+        }
+        NetworkPlan::Segmented(plan) => {
+            let mut net = Segmented::new(s.seed, plan.start.clone());
+            for change in &plan.routes {
+                net.schedule_route_change(change.clone());
+            }
+            let mut ids = Vec::new();
+            for (segment, dir, spec) in &plan.cross {
+                ids.push((*segment, net.add_cross(*segment, *dir, spec.clone())));
+            }
+            session(
+                s,
+                record,
+                SegmentedWire { net, cross: ids },
+                plan.steps.clone(),
+            )
+        }
+    }
+}
+
+/// 分段路径加上交叉流量源的序号（每个源挂在哪一段、在那一段里是第几个），主循环用它取计数。
+struct SegmentedWire {
+    net: Segmented<Vec<u8>>,
+    cross: Vec<(Segment, usize)>,
+}
+
+impl Network<Vec<u8>> for SegmentedWire {
+    fn send(&mut self, from: usize, to: usize, size_bytes: usize, payload: Vec<u8>) {
+        self.net.send(from, to, size_bytes, payload);
+    }
+    fn peek_time(&self) -> Option<Time> {
+        self.net.peek_time()
+    }
+    fn pop(&mut self) -> Option<peerdesk_core::sim::Delivery<Vec<u8>>> {
+        self.net.pop()
+    }
+    fn advance_to(&mut self, t: Time) {
+        self.net.advance_to(t);
+    }
+    fn in_flight(&self) -> usize {
+        self.net.in_flight()
+    }
+    fn backlog_us(&self, from: usize, to: usize) -> u64 {
+        self.net.backlog_us(from, to)
+    }
+    fn stats(&self) -> NetStats {
+        self.net.stats()
+    }
+    fn next_event_time(&self) -> Option<Time> {
+        self.net.next_event_time()
+    }
+    fn pop_event(&mut self) -> Option<peerdesk_core::path::PathEvent> {
+        self.net.pop_event()
+    }
+}
+
+impl Wire for SegmentedWire {
+    type Step = SegmentStep;
+    fn apply(&mut self, step: &SegmentStep) {
+        self.net
+            .set_dir(step.segment, Dir::Forward, step.config.forward.clone());
+        self.net
+            .set_dir(step.segment, Dir::Reverse, step.config.reverse.clone());
+        self.net.set_up(step.segment, step.up);
+    }
+    /// 五段两个方向的名义传播延迟之和，加 1 ms。
+    fn nominal_rtt_us(&self) -> u64 {
+        let now = self.net.now();
+        Segment::ALL
+            .iter()
+            .flat_map(|s| Dir::BOTH.map(|d| (*s, d)))
+            .map(|(s, d)| self.net.segment(s).dir(d).config().delay.nominal_us(now))
+            .fold(1_000u64, u64::saturating_add)
+    }
+    /// 正向五段里最窄的容量（不限速的段不算；都不限速为 0）。
+    fn true_rate_bps(&self) -> u64 {
+        let now = self.net.now();
+        Segment::ALL
+            .iter()
+            .map(|s| {
+                self.net
+                    .segment(*s)
+                    .dir(Dir::Forward)
+                    .bottleneck()
+                    .rate_at(now)
+            })
+            .filter(|r| *r > 0)
+            .min()
+            .unwrap_or(0)
+    }
+    fn cross(&self) -> Vec<CrossStats> {
+        self.cross
+            .iter()
+            .map(|(s, id)| self.net.segment(*s).cross_stats(*id))
+            .collect()
+    }
+    fn segment_queues_us(&self) -> Vec<u64> {
+        Segment::ALL
+            .iter()
+            .map(|s| self.net.segment(*s).backlog_us(HOST, VIEWER))
+            .collect()
+    }
+    fn segment_stats(&self) -> Vec<PathStats> {
+        self.net.segment_stats()
+    }
+}
+
+/// 主循环看网络的另一面：按场景的时间表换参数，和两样“仿真才知道的真值”。`Net` 和 `Path` 各实现一份。
+trait Wire: Network<Vec<u8>> {
+    /// 时间表里的一项。
+    type Step;
+    /// 在这一帧开头换成这一项（布局 1 是 `set_link`，两个方向对称）。
+    fn apply(&mut self, step: &Self::Step);
+    /// 名义往返（微秒），交给编码那一步（和以前一样是两个方向的传播延迟加 1 ms）。
+    fn nominal_rtt_us(&self) -> u64;
+    /// 正向瓶颈现在名义上的容量（比特每秒，不限速为 0），填特征行的真值。
+    fn true_rate_bps(&self) -> u64;
+    /// 每个交叉流量源的计数（布局 1 没有交叉流量）。
+    fn cross(&self) -> Vec<CrossStats> {
+        Vec::new()
+    }
+    /// 分段路径每段正向瓶颈现在的排队（微秒）；不是分段路径时为空。
+    fn segment_queues_us(&self) -> Vec<u64> {
+        Vec::new()
+    }
+    /// 分段路径每段的计数；不是分段路径时为空。
+    fn segment_stats(&self) -> Vec<PathStats> {
+        Vec::new()
+    }
+}
+
+impl Wire for Net<Vec<u8>> {
+    type Step = Link;
+    fn apply(&mut self, step: &Link) {
+        self.set_link(HOST, VIEWER, *step);
+    }
+    // 还没有链路时按局域网算（和以前主循环里 `link` 的初值一样）
+    fn nominal_rtt_us(&self) -> u64 {
+        let link = self.link(HOST, VIEWER).unwrap_or_else(Link::lan);
+        link.delay_us.saturating_mul(2).saturating_add(1_000)
+    }
+    fn true_rate_bps(&self) -> u64 {
+        let link = self.link(HOST, VIEWER).unwrap_or_else(Link::lan);
+        link.rate_bps.unwrap_or(0)
+    }
+}
+
+impl Wire for Path<Vec<u8>> {
+    type Step = PathStep;
+    fn apply(&mut self, step: &PathStep) {
+        self.set_dir(Dir::Forward, step.config.forward.clone());
+        self.set_dir(Dir::Reverse, step.config.reverse.clone());
+        self.set_up(step.up);
+    }
+    fn nominal_rtt_us(&self) -> u64 {
+        let now = self.now();
+        let one = |dir| self.dir(dir).config().delay.nominal_us(now);
+        one(Dir::Forward)
+            .saturating_add(one(Dir::Reverse))
+            .saturating_add(1_000)
+    }
+    fn true_rate_bps(&self) -> u64 {
+        self.dir(Dir::Forward).bottleneck().rate_at(self.now())
+    }
+    fn cross(&self) -> Vec<CrossStats> {
+        (0..self.cross_sources())
+            .map(|i| self.cross_stats(i))
+            .collect()
+    }
+}
+
+/// “路径变了”事件交给两端的钩子。产品怎么反应（重新探测）是 B4 的事；A2-3 只保证事件按时刻送到这里，现在什么都不做。
+const fn route_changed(_tx: &mut MediaSender, _rx: &mut MediaReceiver, _at: Time) {}
+
+/// 一次会话：`net` 是这次用的网络，`steps` 是按时刻换参数的时间表。
+fn session<N: Wire>(
+    s: &Scenario,
+    record: bool,
+    mut net: N,
+    mut network: Vec<(u64, N::Step)>,
+) -> Result<(Outcome, Option<Vec<u8>>), Error> {
     if s.fps == 0 || s.phases.is_empty() {
         return Err(Error::InvalidArgument("帧率和阶段都不能为空"));
     }
@@ -1602,11 +1938,11 @@ fn run_inner(s: &Scenario, record: bool) -> Result<(Outcome, Option<Vec<u8>>), E
     tx.set_start_probe(s.start_probe);
     tx.set_probe_ids(s.probe_ids);
     rx.set_probe_ids(s.probe_ids);
-    let mut net: Net<Vec<u8>> = Net::new(s.seed);
-    let mut network = s.network.clone();
     network.sort_by_key(|(t, _)| *t);
     let mut next_link = 0usize;
-    let mut link = Link::lan();
+    let mut route_changes = Vec::new();
+    // 分段路径每段正向排队：（时间加权的和 微秒·微秒，最大 微秒），按帧末采样
+    let mut seg_queue: Vec<(u128, u64)> = Vec::new();
 
     // 每一帧的采集时间，按帧号。
     let mut captured: Vec<Time> = vec![Time::ZERO];
@@ -1651,9 +1987,8 @@ fn run_inner(s: &Scenario, record: bool) -> Result<(Outcome, Option<Vec<u8>>), E
             let tick_end = now.plus(interval);
             // 被控端：这一帧。
             while network.get(next_link).is_some_and(|(t, _)| Time(*t) <= now) {
-                if let Some((_, l)) = network.get(next_link) {
-                    link = *l;
-                    net.set_link(HOST, VIEWER, link);
+                if let Some((_, step)) = network.get(next_link) {
+                    net.apply(step);
                 }
                 next_link += 1;
             }
@@ -1687,7 +2022,7 @@ fn run_inner(s: &Scenario, record: bool) -> Result<(Outcome, Option<Vec<u8>>), E
             let wanted = pending || tx.wants_frame();
             let pacer_busy = pacer.busy(tx.pacing_bps(pacing), 1_000_000 / u64::from(s.fps.max(1)));
             if tx.frame_gate(now, wanted, pacer_busy) {
-                let rtt = link.delay_us.saturating_mul(2).saturating_add(1_000);
+                let rtt = net.nominal_rtt_us();
                 let before = tx.stats();
                 let changed = std::mem::take(&mut pending);
                 let encoding = profile.start();
@@ -1724,6 +2059,7 @@ fn run_inner(s: &Scenario, record: bool) -> Result<(Outcome, Option<Vec<u8>>), E
             loop {
                 let next = [
                     net.peek_time(),
+                    net.next_event_time(),
                     Some(next_feedback),
                     Some(next_tick),
                     pacer.next_due(now, tx.pacing_bps(pacing)),
@@ -1744,6 +2080,10 @@ fn run_inner(s: &Scenario, record: bool) -> Result<(Outcome, Option<Vec<u8>>), E
                 profile.stop(Part::Network, moving);
                 now = when;
                 let controlling = profile.start();
+                while let Some(event) = net.pop_event() {
+                    route_changes.push(event.at().micros());
+                    route_changed(&mut tx, &mut rx, event.at());
+                }
                 if next_tick <= now {
                     tx.on_tick(now);
                     counter.after(tx.rate_bps(), tx.fps());
@@ -1856,7 +2196,7 @@ fn run_inner(s: &Scenario, record: bool) -> Result<(Outcome, Option<Vec<u8>>), E
                                 loss: obs.feedback.loss_permille,
                                 recv: obs.feedback.recv_bytes_per_s,
                                 in_flight: obs.in_flight,
-                                true_rate_bps: link.rate_bps.unwrap_or(0),
+                                true_rate_bps: net.true_rate_bps(),
                                 true_queue_packets: net.in_flight(),
                                 true_queue_us: net.backlog_us(HOST, VIEWER),
                                 state: tx.rate_state(),
@@ -1900,6 +2240,14 @@ fn run_inner(s: &Scenario, record: bool) -> Result<(Outcome, Option<Vec<u8>>), E
                             acc.max_wait = acc.max_wait.max(wait);
                             if wait > FREEZE_US {
                                 acc.freezes += 1;
+                                if trace_events {
+                                    trace.push(format!(
+                                        "[{:>6} ms] 冻结：画面在 {} ms 变了，等了 {} ms 才显示出来",
+                                        now.micros() / 1000,
+                                        since.micros() / 1000,
+                                        wait / 1000
+                                    ));
+                                }
                             }
                         }
                     }
@@ -1920,6 +2268,12 @@ fn run_inner(s: &Scenario, record: bool) -> Result<(Outcome, Option<Vec<u8>>), E
             net.advance_to(tick_end);
             profile.stop(Part::Network, moving);
             now = tick_end;
+            let queues = net.segment_queues_us();
+            seg_queue.resize(queues.len(), (0, 0));
+            for ((sum, max), q) in seg_queue.iter_mut().zip(queues) {
+                *sum = sum.saturating_add(u128::from(q) * u128::from(interval));
+                *max = (*max).max(q);
+            }
             if let Some(j) = journal.as_mut() {
                 j.second(now, tx.stats());
             }
@@ -1979,6 +2333,20 @@ fn run_inner(s: &Scenario, record: bool) -> Result<(Outcome, Option<Vec<u8>>), E
         estimator: tx.estimator(),
         features,
         tally: counter.finish(now),
+        path: net.path_stats(),
+        route_changes,
+        cross: net.cross(),
+        segments: net
+            .segment_stats()
+            .into_iter()
+            .zip(&seg_queue)
+            .map(|(stats, (sum, max))| SegmentTruth {
+                stats,
+                // 和 ms() 同一个口径：微秒 → 毫秒
+                mean_queue_ms: *sum as f64 / now.micros().max(1) as f64 / 1000.0,
+                max_queue_ms: ms(*max),
+            })
+            .collect(),
         trace,
     };
     if profile.on {
@@ -2167,14 +2535,14 @@ mod tests {
         s.trace = true;
         s.estimator = EstimatorKind::GccV1;
         s.start_bps = 500_000;
-        s.network = vec![(
+        s.network = NetworkPlan::Layout1(vec![(
             0,
             Link {
                 rate_bps: Some(1_000_000),
                 delay_us: 20_000,
                 ..Link::lan()
             },
-        )];
+        )]);
         let o = run(&s).unwrap();
         assert!(o.first_picture_ms.is_some());
     }
@@ -2189,7 +2557,7 @@ mod tests {
             }],
         );
         // 第 200 ms 起断开 500 ms 再恢复：中间画面停住，算一次超过 200 ms 的冻结
-        s.network = vec![
+        s.network = NetworkPlan::Layout1(vec![
             (0, Link::lan()),
             (
                 200_000,
@@ -2199,7 +2567,7 @@ mod tests {
                 },
             ),
             (700_000, Link::lan()),
-        ];
+        ]);
         let o = run(&s).unwrap();
         assert!(o.freezes >= 1, "{}", o.freezes);
         assert!(o.max_wait_ms >= 400.0, "{}", o.max_wait_ms);
@@ -2401,7 +2769,7 @@ mod tests {
             ],
         );
         // 第 100 ms 起链路断开：画面停住，阶段结束时还在等
-        s.network = vec![
+        s.network = NetworkPlan::Layout1(vec![
             (0, Link::lan()),
             (
                 100_000,
@@ -2410,9 +2778,168 @@ mod tests {
                     ..Link::lan()
                 },
             ),
-        ];
+        ]);
         let o = run(&s).unwrap();
         assert_eq!(o.phases.len(), 2);
         assert!(o.phases.iter().all(|p| p.frames_shown < 10));
+    }
+
+    fn dir(rate_bps: u64, delay_us: u64) -> DirConfig {
+        DirConfig {
+            bottleneck: peerdesk_core::path::BottleneckConfig {
+                capacity: peerdesk_core::path::Capacity::Constant { rate_bps },
+                ..peerdesk_core::path::BottleneckConfig::default()
+            },
+            delay: peerdesk_core::path::Delay::Fixed(delay_us),
+            ..DirConfig::default()
+        }
+    }
+
+    #[test]
+    fn layout1_converts_to_layout2_step_by_step() {
+        let links = vec![
+            (0, Link::wifi()),
+            (
+                500_000,
+                Link {
+                    up: false,
+                    ..Link::lan()
+                },
+            ),
+        ];
+        let plan = NetworkPlan::Layout1(links);
+        assert_eq!(plan.layout(), 1);
+        let NetworkPlan::Layout2(two) = plan.to_layout2(true) else {
+            panic!("应当是布局 2");
+        };
+        assert_eq!(two.start.forward, two.start.reverse);
+        assert!(two.start.forward.loss_before_bottleneck);
+        assert_eq!(
+            two.start.forward.noise.jitter_us,
+            Link::wifi().jitter_us,
+            "按 from_link 搬"
+        );
+        assert_eq!(two.steps.len(), 2);
+        assert_eq!(two.steps[0].0, 0);
+        assert!(two.steps[0].1.up && !two.steps[1].1.up);
+        assert_eq!(two.steps[1].0, 500_000);
+        assert!(two.routes.is_empty() && two.cross.is_empty());
+        let again = NetworkPlan::Layout2(two.clone());
+        assert_eq!(again.layout(), 2);
+        assert_eq!(again.to_layout2(false), again, "已经是布局 2 的原样返回");
+        // 没有链路：起始按局域网
+        let NetworkPlan::Layout2(empty) = NetworkPlan::Layout1(Vec::new()).to_layout2(false) else {
+            panic!("应当是布局 2");
+        };
+        assert_eq!(
+            empty.start,
+            PathConfig::symmetric(DirConfig::from_link(&Link::lan()))
+        );
+    }
+
+    #[test]
+    fn both_wires_report_the_nominal_truth() {
+        let mut net: Net<Vec<u8>> = Net::new(1);
+        // 还没有链路：按局域网（以前主循环里 link 的初值）
+        assert_eq!(net.nominal_rtt_us(), 300 * 2 + 1_000);
+        assert_eq!(net.true_rate_bps(), 0);
+        net.apply(&Link {
+            delay_us: 20_000,
+            rate_bps: Some(4_000_000),
+            ..Link::lan()
+        });
+        assert_eq!(net.nominal_rtt_us(), 41_000);
+        assert_eq!(net.true_rate_bps(), 4_000_000);
+
+        let mut path: Path<Vec<u8>> = Path::new(
+            1,
+            PathConfig {
+                forward: dir(8_000_000, 20_000),
+                reverse: dir(1_000_000, 5_000),
+            },
+        );
+        assert_eq!(path.nominal_rtt_us(), 26_000, "两个方向各算各的");
+        assert_eq!(path.true_rate_bps(), 8_000_000, "正向的容量");
+        path.apply(&PathStep {
+            config: PathConfig::symmetric(dir(2_000_000, 1_000)),
+            up: false,
+        });
+        assert_eq!(path.nominal_rtt_us(), 3_000);
+        assert_eq!(path.true_rate_bps(), 2_000_000);
+        path.send(HOST, VIEWER, 100, vec![0]);
+        assert_eq!(path.stats().outage_dropped, 1, "up=false 切断");
+    }
+
+    /// 验收第 3 条的机制部分：两个方向参数不同、一次换路、一次纯中断、一条定速背景流、一条长 TCP，会话能跑完，
+    /// “路径变了”只在换路恢复的时刻送到一次（纯中断不发），布局 2 的计数折算进 `net`。
+    #[test]
+    fn a_layout2_session_with_a_route_change_and_cross_traffic() {
+        let p = |action, frames| Phase { action, frames };
+        let mut s = Scenario::fixed(
+            "layout2",
+            vec![
+                p(Action::Typing, 30),
+                p(Action::Idle, 30),
+                p(Action::Typing, 30),
+            ],
+        );
+        s.codec = CodecKind::Tile;
+        s.network = NetworkPlan::Layout2(Box::new(Layout2 {
+            start: PathConfig {
+                forward: dir(8_000_000, 20_000),
+                reverse: dir(1_000_000, 5_000),
+            },
+            steps: Vec::new(),
+            routes: vec![
+                RouteChange {
+                    at: Time(1_000_000),
+                    down_us: 200_000,
+                    new: Some(PathConfig::symmetric(dir(3_000_000, 40_000))),
+                },
+                RouteChange {
+                    at: Time(2_500_000),
+                    down_us: 100_000,
+                    new: None,
+                },
+            ],
+            cross: vec![
+                (
+                    Dir::Forward,
+                    CrossSpec::Cbr {
+                        rate_bps: 2_000_000,
+                        packet_bytes: 1_200,
+                        start: Time::ZERO,
+                        stop: Some(Time(1_000_000)),
+                    },
+                ),
+                (
+                    Dir::Forward,
+                    CrossSpec::Tcp {
+                        cfg: peerdesk_core::path::TcpConfig::default(),
+                        start: Time(1_500_000),
+                        bytes: None,
+                    },
+                ),
+            ],
+        }));
+        let o = run(&s).unwrap();
+        assert_eq!(o.route_changes, vec![1_200_000]);
+        let path = o.path.unwrap();
+        assert_eq!(o.net, path.net());
+        assert!(path.outage_dropped > 0, "两次中断都有包丢");
+        assert_eq!(o.cross.len(), 2);
+        // 定速流 1 秒 2 Mbps、1200 字节一个包：约 208 个
+        assert!(
+            (200..=210).contains(&o.cross[0].sent_packets),
+            "{:?}",
+            o.cross[0]
+        );
+        assert!(o.cross[1].delivered_bytes > 0, "{:?}", o.cross[1]);
+        assert!(Net::<Vec<u8>>::new(1).cross().is_empty());
+        assert!(o.frames > 0 && o.first_picture_ms.is_some());
+        assert!(fingerprint_line(&s, &o).contains(" layout2 "));
+        let mut one = s.clone();
+        one.network = NetworkPlan::Layout1(vec![(0, Link::lan())]);
+        assert!(!fingerprint_line(&one, &o).contains(" layout2 "));
     }
 }

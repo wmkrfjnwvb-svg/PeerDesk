@@ -1051,7 +1051,7 @@ impl H264Encoder {
             if !self.hw_sent.is_empty() {
                 return Ok(match self.poll_hardware() {
                     Hw::Frame(data, key, fresh) if !data.is_empty() => {
-                        Some(self.finish(&data, key, size, false, fresh))
+                        Some(self.finish(&data, key, size, false, fresh, None))
                     }
                     Hw::Frame(..) | Hw::Pending | Hw::Off => None,
                 });
@@ -1091,7 +1091,7 @@ impl H264Encoder {
         match hw {
             Hw::Frame(data, key, fresh_hw) if !data.is_empty() => {
                 self.timing.convert_us = self.convert_us.saturating_sub(self.timing.scale_us);
-                return Ok(Some(self.finish(&data, key, size, changed, fresh_hw)));
+                return Ok(Some(self.finish(&data, key, size, changed, fresh_hw, None)));
             }
             // 还没编好，或编码器丢了这一帧：这一次没有帧发（之后再取）
             Hw::Frame(..) | Hw::Pending => {
@@ -1243,7 +1243,14 @@ impl H264Encoder {
             pixels,
         );
         self.soft_converged = Some(self.qp.converged());
-        Ok(Some(self.finish(&data, key, size, changed, fresh)))
+        Ok(Some(self.finish(
+            &data,
+            key,
+            size,
+            changed,
+            fresh,
+            Some(qp),
+        )))
     }
 
     /// 画面没变时取硬件攒着的帧；停了一阵还取不到，让编码器交出来。
@@ -1274,6 +1281,7 @@ impl H264Encoder {
         size: (u16, u16),
         changed: bool,
         fresh: bool,
+        qp: Option<u8>,
     ) -> EncodedFrame {
         if key {
             // 为什么出了关键帧：要求的原因，或者第一帧 / 尺寸变了，或者编码器自己出的
@@ -1305,6 +1313,7 @@ impl H264Encoder {
         EncodedFrame {
             payload: header.frame(data),
             key,
+            qp,
         }
     }
 
