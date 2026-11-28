@@ -76,9 +76,12 @@ fn main() {
         let mut frames: Vec<(u64, &peerdesk_core::record::Frame)> = rec
             .entries
             .iter()
-            .filter_map(|e| match &e.record {
-                Record::Frame(f) => Some((e.at_us, f)),
-                _ => None,
+            .filter_map(|e| {
+                if let Record::Frame(f) = &e.record {
+                    Some((e.at_us, f))
+                } else {
+                    None
+                }
             })
             .collect();
         frames.sort_by_key(|(t, _)| *t);
@@ -114,7 +117,10 @@ fn main() {
         // 出发间隔；连着编的帧（间隔不超过 1.5 个周期）的 |间隔 − 周期|（逐帧的出发抖动，不累积时钟漂移）
         let gaps: Vec<u64> = frames
             .windows(2)
-            .map(|w| w[1].0.saturating_sub(w[0].0))
+            .map(|w| match w {
+                [a, b] => b.0.saturating_sub(a.0),
+                _ => 0,
+            })
             .collect();
         let _ = writeln!(out, "出发间隔：{}", quantiles(gaps.clone()));
         let jitter: Vec<u64> = gaps
@@ -134,7 +140,10 @@ fn main() {
             .collect();
         let cgaps: Vec<u64> = captured
             .windows(2)
-            .map(|w| w[1].saturating_sub(w[0]))
+            .map(|w| match w {
+                [a, b] => b.saturating_sub(*a),
+                _ => 0,
+            })
             .collect();
         let _ = writeln!(out, "采集间隔：{}", quantiles(cgaps));
         let ago: Vec<u64> = frames
