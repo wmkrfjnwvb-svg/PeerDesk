@@ -62,7 +62,14 @@ data class UiState(
  */
 class PeerDeskViewModel(app: Application) : AndroidViewModel(app) {
     private val prefs = app.getSharedPreferences("peerdesk", Context.MODE_PRIVATE)
-    private val _ui = MutableStateFlow(UiState(server = prefs.getString(KEY_SERVER, "") ?: ""))
+    private val _ui = MutableStateFlow(
+        UiState(
+            server = prefs.getString(KEY_SERVER, "") ?: "",
+            code = prefs.getString(KEY_CODE, "") ?: "",
+            // 记住的密码是加密存的（见 SecretStore），解不开就当没记住
+            password = prefs.getString(KEY_PASSWORD, null)?.let(SecretStore::decrypt) ?: "",
+        ),
+    )
     val ui: StateFlow<UiState> = _ui.asStateFlow()
 
     @Volatile private var session: NativeSession? = null
@@ -81,7 +88,13 @@ class PeerDeskViewModel(app: Application) : AndroidViewModel(app) {
     /** 点 Connect：记住服务器地址，进会话页（真正连接在 SurfaceView 创建后）。 */
     fun connect() {
         val s = _ui.value
-        prefs.edit().putString(KEY_SERVER, s.server.trim()).apply()
+        // 记住服务器、设备码和密码（密码加密后再存），下次不用重输
+        val sealed = s.password.takeIf { it.isNotEmpty() }?.let(SecretStore::encrypt)
+        prefs.edit()
+            .putString(KEY_SERVER, s.server.trim())
+            .putString(KEY_CODE, s.code)
+            .apply { if (sealed != null) putString(KEY_PASSWORD, sealed) else remove(KEY_PASSWORD) }
+            .apply()
         _ui.update {
             it.copy(
                 phase = Phase.Session, notice = null, connected = false, route = Route.Unknown,
@@ -139,7 +152,7 @@ class PeerDeskViewModel(app: Application) : AndroidViewModel(app) {
         _ui.update {
             it.copy(
                 phase = Phase.Connect, notice = notice, connected = false, quality = null,
-                peer = null, reconnecting = null, coreNotice = null, password = "",
+                peer = null, reconnecting = null, coreNotice = null,
             )
         }
     }
@@ -272,6 +285,8 @@ class PeerDeskViewModel(app: Application) : AndroidViewModel(app) {
 
     companion object {
         private const val KEY_SERVER = "server"
+        private const val KEY_CODE = "code"
+        private const val KEY_PASSWORD = "password-sealed"
         private const val STOP_GRACE_MS = 3000L
     }
 }

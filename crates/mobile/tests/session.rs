@@ -307,6 +307,23 @@ fn a_target_that_cannot_be_resolved_ends_with_the_reason() {
 }
 
 #[test]
+fn handles_survive_tagged_pointers() {
+    use peerdesk_mobile::{addr_from_handle, handle_from_addr};
+    // Android 11 起堆指针最高字节带标记：当无符号数大于 i64::MAX，也要原样往返
+    for addr in [0x7f12_3456_7890_usize, 0xb400_0078_1234_5670, usize::MAX] {
+        let h = handle_from_addr(addr);
+        assert_ne!(h, 0);
+        assert_eq!(addr_from_handle(h), Some(addr), "{addr:#x}");
+    }
+    assert!(
+        handle_from_addr(0xb400_0078_1234_5670) < 0,
+        "带标记的地址是负的 long，Kotlin 只拿 0 当失败"
+    );
+    assert_eq!(handle_from_addr(0), 0);
+    assert_eq!(addr_from_handle(0), None);
+}
+
+#[test]
 fn device_targets_are_parsed_with_reasons() {
     let ViewTarget::Device { server, .. } = device_target("127.0.0.1", "123 456 789").unwrap()
     else {

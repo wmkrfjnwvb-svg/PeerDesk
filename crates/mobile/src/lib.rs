@@ -401,6 +401,23 @@ impl Drop for Session {
     }
 }
 
+/// 句柄（堆上对象的地址）换成交给 Java 的 `long`：按位原样放进去，不当数值换算。
+///
+/// 为什么不用 `i64::try_from`：Android 11 起堆指针的最高字节带标记（Scudo 的 pointer tagging，例如 `0xb4…`），
+/// 当成无符号数大于 `i64::MAX`，换算会失败（第一版就是因此返回 0，界面报“显示界面不可用”）。
+#[must_use]
+pub fn handle_from_addr(addr: usize) -> i64 {
+    let bits = u64::try_from(addr).unwrap_or(0);
+    i64::from_ne_bytes(bits.to_ne_bytes())
+}
+
+/// [`handle_from_addr`] 的反过程。0 是“没有句柄”，返回 `None`。
+#[must_use]
+pub fn addr_from_handle(handle: i64) -> Option<usize> {
+    let bits = u64::from_ne_bytes(handle.to_ne_bytes());
+    usize::try_from(bits).ok().filter(|&a| a != 0)
+}
+
 /// 手势状态机的输出：输入事件发给被控端，缩放、平移交回界面（一行 JSON 数组，没有就是 `None`）。
 pub fn apply(session: &Session, actions: Vec<gesture::Action>) -> Option<String> {
     let mut view = Vec::new();

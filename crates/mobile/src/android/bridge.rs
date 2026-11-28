@@ -19,7 +19,10 @@ use peerdesk_net::NetError;
 
 use super::codec::SurfaceDecoder;
 use crate::gesture::{Gestures, Mode, Phase, Touch, View};
-use crate::{apply, device_target, keymap, DecoderFactory, ScreenSink, Session, SinkFactory};
+use crate::{
+    addr_from_handle, apply, device_target, handle_from_addr, keymap, DecoderFactory, ScreenSink,
+    Session, SinkFactory,
+};
 
 /// 一次访问在 Kotlin 那边的句柄背后的东西。
 struct Handle {
@@ -45,7 +48,7 @@ fn new_string(env: &mut JNIEnv<'_>, s: Option<String>) -> jstring {
 
 /// 句柄换回引用。0 或不对齐的地址是 `None`。
 fn handle<'a>(h: jlong) -> Option<&'a Handle> {
-    let addr = usize::try_from(h).ok().filter(|&a| a != 0)?;
+    let addr = addr_from_handle(h)?;
     // SAFETY: 非零的句柄只来自 `start` 里的 `Box::into_raw`，Kotlin 保证 `free` 之后不再传它（见文件开头）；
     // `Handle` 里的东西都能跨线程用（会话的事件队列在锁里、手势在锁里）。
     unsafe { (addr as *const Handle).as_ref() }
@@ -103,7 +106,7 @@ pub extern "system" fn Java_ai_peerdesk_app_Native_start<'local>(
         session,
         gestures: Mutex::new(Gestures::new(Mode::Direct, view, slop, notch)),
     });
-    jlong::try_from(Box::into_raw(handle) as usize).unwrap_or(0)
+    handle_from_addr(Box::into_raw(handle) as usize)
 }
 
 /// 取下一个事件（一行 JSON），最多等 `timeout_ms`；没有就是 null。
@@ -286,7 +289,7 @@ pub extern "system" fn Java_ai_peerdesk_app_Native_free<'local>(
     _class: JClass<'local>,
     h: jlong,
 ) {
-    let Some(addr) = usize::try_from(h).ok().filter(|&a| a != 0) else {
+    let Some(addr) = addr_from_handle(h) else {
         return;
     };
     // SAFETY: 同 `handle`：地址来自 `start` 的 `Box::into_raw`，Kotlin 保证只放一次、放了不再用。

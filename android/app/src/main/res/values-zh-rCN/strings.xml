@@ -40,4 +40,6 @@
     <string name="key_alt">Alt</string>
     <string name="key_win">Win</string>
     <string name="key_cmd">Cmd</string>
+    <string name="connect_show_password">显示密码</string>
+    <string name="connect_hide_password">隐藏密码</string>
 </resources>
