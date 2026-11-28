@@ -276,7 +276,7 @@ fn build(
                 seed * 16 + i as u64,
                 &network,
             ),
-            start_us: f.start_us,
+            start_us: f.start_us + frame_phase(seed, i),
             reverse: f.reverse,
             extra_delay_us: extra_delay_us.get(i).copied().unwrap_or(0),
         })
@@ -296,6 +296,25 @@ fn build(
         long_tcp,
         tcp,
     }
+}
+
+/// 每一路帧时钟的相位：开始时刻加上 [0, 一帧间隔) 里的一个确定的偏移（由种子和第几路定）。
+///
+/// 没有它时，各路都是 30 帧每秒、开始时刻差整数秒，帧时钟完全对齐；全局循环在同一时刻总是先让前面的那一路编码、发出，
+/// 后面那一路的每一帧都排在它后面，看到的排队系统性更高（3 个种子的开发那一轮里，5.2 两路同时开始，每次都是第 1 路赢，
+/// 第 2 路的单程延迟中位总是多 8 ms）。真实里两路的帧不会对齐到同一微秒。
+fn frame_phase(seed: u64, i: usize) -> u64 {
+    // SplitMix64 的一步，足够把（种子，路）打散
+    let mut z = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(
+        u64::try_from(i)
+            .unwrap_or(0)
+            .wrapping_add(1)
+            .wrapping_mul(0xBF58_476D_1CE4_E5B9),
+    );
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    z % (1_000_000 / u64::from(FPS))
 }
 
 fn flow(start_s: u64, end_s: u64) -> MediaFlow {
@@ -1155,7 +1174,20 @@ mod tests {
         let c5 = case_5_5(1);
         let extra: Vec<u64> = c5.multi.pairs.iter().map(|p| p.extra_delay_us).collect();
         assert_eq!(extra, vec![10_000, 25_000, 50_000, 100_000, 150_000]);
-        assert_eq!(c5.multi.pairs[4].start_us, 40_000_000);
+        // 开始时刻加了 [0, 一帧) 的相位
+        let start = c5.multi.pairs[4].start_us;
+        assert!((40_000_000..40_033_333).contains(&start), "{start}");
+        let phases: Vec<u64> = c5
+            .multi
+            .pairs
+            .iter()
+            .map(|p| p.start_us % 1_000_000)
+            .collect();
+        assert!(
+            phases.windows(2).any(|w| w[0] != w[1]),
+            "各路相位不同：{phases:?}"
+        );
+        assert_eq!(frame_phase(3, 1), frame_phase(3, 1));
         // 5.6：长 TCP 一条、队列两档
         let c6 = case_5_6(1_000, 1);
         assert_eq!((c6.long_tcp.clone(), c6.tcp.clone()), (vec![0], vec![0]));
