@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use peerdesk_core::adaptive::Profile;
 use peerdesk_core::sim::{Busy, Doze, Link, Spikes};
 use peerdesk_e2e::report::{markdown, save, TABLE_HEADER};
-use peerdesk_e2e::{run, Action, CodecKind, EstimatorKind, Outcome, Phase, Scenario};
+use peerdesk_e2e::{run, Action, CodecKind, EstimatorKind, NetworkPlan, Outcome, Phase, Scenario};
 
 fn out_dir() -> PathBuf {
     std::env::var_os("PEERDESK_E2E_OUT").map_or_else(
@@ -180,7 +180,7 @@ fn bandwidth_steps() {
         ..Link::lan()
     };
     let s = Scenario {
-        network: vec![(0, at(20)), (4_000_000, at(3)), (8_000_000, at(20))],
+        network: NetworkPlan::Layout1(vec![(0, at(20)), (4_000_000, at(3)), (8_000_000, at(20))]),
         ..Scenario::new(
             "bandwidth-steps",
             vec![
@@ -206,7 +206,7 @@ fn sudden_drop() {
         ..full
     };
     let s = Scenario {
-        network: vec![(0, full), (3_000_000, low), (5_000_000, full)],
+        network: NetworkPlan::Layout1(vec![(0, full), (3_000_000, low), (5_000_000, full)]),
         profile: Profile::WIRELESS,
         ..Scenario::new(
             "sudden-drop",
@@ -220,7 +220,7 @@ fn sudden_drop() {
 #[test]
 fn office_on_cellular() {
     compare(&Scenario {
-        network: vec![(0, Link::cellular())],
+        network: NetworkPlan::Layout1(vec![(0, Link::cellular())]),
         profile: Profile::CELLULAR,
         start_bps: 2_000_000,
         ..Scenario::new("office-cellular", office())
@@ -231,13 +231,13 @@ fn office_on_cellular() {
 #[test]
 fn fast_ramp_on_a_fat_link() {
     compare(&Scenario {
-        network: vec![(
+        network: NetworkPlan::Layout1(vec![(
             0,
             Link {
                 rate_bps: Some(50_000_000),
                 ..Link::lan()
             },
-        )],
+        )]),
         start_bps: 500_000,
         ..Scenario::new(
             "fast-ramp",
@@ -253,7 +253,7 @@ fn start_is_sharp_quickly_on_a_fat_link_with_a_big_screen() {
     let o = run(&Scenario {
         width: 2880,
         height: 1800,
-        network: vec![(
+        network: NetworkPlan::Layout1(vec![(
             0,
             Link {
                 rate_bps: Some(30_000_000),
@@ -277,7 +277,7 @@ fn start_is_sharp_quickly_on_a_fat_link_with_a_big_screen() {
                 }),
                 ..Link::lan()
             },
-        )],
+        )]),
         ..Scenario::new(
             "big-screen-start",
             vec![
@@ -335,7 +335,7 @@ fn wifi_light_activity(name: &str) -> Scenario {
     Scenario {
         width: 2880,
         height: 1800,
-        network: vec![(
+        network: NetworkPlan::Layout1(vec![(
             0,
             Link {
                 rate_bps: Some(30_000_000),
@@ -358,7 +358,7 @@ fn wifi_light_activity(name: &str) -> Scenario {
                 }),
                 ..Link::lan()
             },
-        )],
+        )]),
         ..Scenario::new(
             name,
             // 轻操作（指针每帧动一点）20 秒，中间切一次窗口、打字、滚动
@@ -445,7 +445,7 @@ fn rate_at(o: &Outcome, t_ms: u64) -> u64 {
 fn a_false_cut_while_app_limited_is_verified_and_undone() {
     let base = steady_link(30_000_000);
     let o = run(&Scenario {
-        network: vec![
+        network: NetworkPlan::Layout1(vec![
             (0, base),
             (
                 6_000_000,
@@ -455,7 +455,7 @@ fn a_false_cut_while_app_limited_is_verified_and_undone() {
                 },
             ),
             (6_300_000, base),
-        ],
+        ]),
         trace: true,
         ..Scenario::new(
             "false-cut",
@@ -502,10 +502,10 @@ fn a_false_cut_while_app_limited_is_verified_and_undone() {
 #[test]
 fn a_real_drop_during_light_activity_is_followed_without_bouncing_back() {
     let o = run(&Scenario {
-        network: vec![
+        network: NetworkPlan::Layout1(vec![
             (0, steady_link(30_000_000)),
             (6_000_000, steady_link(3_000_000)),
-        ],
+        ]),
         // 固定 720p：调试构建默认的小画面切窗口只有十几 KB，3 Mbps 也装得下，就没有“真实流量”这个证据了
         width: 1280,
         height: 720,
@@ -548,7 +548,7 @@ fn a_real_drop_during_light_activity_is_followed_without_bouncing_back() {
 #[test]
 fn no_run_probes_on_a_narrow_link() {
     let o = run(&Scenario {
-        network: vec![(0, steady_link(1_000_000))],
+        network: NetworkPlan::Layout1(vec![(0, steady_link(1_000_000))]),
         ..Scenario::new(
             "narrow-light",
             vec![phase(Action::Idle, 30), phase(Action::Pointer, 600)],
@@ -574,7 +574,7 @@ fn no_run_probes_on_a_narrow_link() {
 #[test]
 fn periodic_probes_climb_during_a_minute_of_light_activity() {
     let scenario = Scenario {
-        network: vec![(0, steady_link(30_000_000))],
+        network: NetworkPlan::Layout1(vec![(0, steady_link(30_000_000))]),
         start_probe: false,
         trace: true,
         ..Scenario::new(
@@ -637,7 +637,7 @@ fn periodic_probes_climb_during_a_minute_of_light_activity() {
 #[test]
 fn random_loss_without_congestion() {
     compare(&Scenario {
-        network: vec![(
+        network: NetworkPlan::Layout1(vec![(
             0,
             Link {
                 delay_us: 3_000,
@@ -646,7 +646,7 @@ fn random_loss_without_congestion() {
                 rate_bps: Some(30_000_000),
                 ..Link::lan()
             },
-        )],
+        )]),
         profile: Profile::WIRELESS,
         ..Scenario::new(
             "random-loss",
@@ -660,7 +660,7 @@ fn random_loss_without_congestion() {
 #[test]
 fn random_loss_on_a_link_that_looked_stable() {
     compare(&Scenario {
-        network: vec![(
+        network: NetworkPlan::Layout1(vec![(
             0,
             Link {
                 delay_us: 10_000,
@@ -669,7 +669,7 @@ fn random_loss_on_a_link_that_looked_stable() {
                 rate_bps: Some(30_000_000),
                 ..Link::lan()
             },
-        )],
+        )]),
         profile: Profile::STABLE,
         ..Scenario::new(
             "lossy-stable",
@@ -686,14 +686,14 @@ fn random_loss_on_a_link_that_looked_stable() {
 #[test]
 fn video_on_a_narrow_link() {
     compare(&Scenario {
-        network: vec![(
+        network: NetworkPlan::Layout1(vec![(
             0,
             Link {
                 rate_bps: Some(1_500_000),
                 delay_us: 15_000,
                 ..Link::lan()
             },
-        )],
+        )]),
         start_bps: 1_000_000,
         ..Scenario::new(
             "narrow-video",
@@ -726,7 +726,7 @@ fn office_on_a_varying_cellular_link() {
         })
         .collect();
     compare(&Scenario {
-        network,
+        network: NetworkPlan::Layout1(network),
         profile: Profile::CELLULAR,
         start_bps: 2_000_000,
         ..Scenario::new("varying-cellular", office())
@@ -739,7 +739,7 @@ fn office_on_a_varying_cellular_link() {
 #[test]
 fn typing_on_a_very_narrow_link() {
     compare(&Scenario {
-        network: vec![(
+        network: NetworkPlan::Layout1(vec![(
             0,
             Link {
                 rate_bps: Some(400_000),
@@ -747,7 +747,7 @@ fn typing_on_a_very_narrow_link() {
                 max_queue_us: 200_000,
                 ..Link::lan()
             },
-        )],
+        )]),
         ..Scenario::new(
             "very-narrow",
             vec![phase(Action::Typing, 120), phase(Action::Idle, 60)],
@@ -770,7 +770,7 @@ fn link_drops_while_idle() {
         ..fast
     };
     compare(&Scenario {
-        network: vec![(0, fast), (3_500_000, slow)],
+        network: NetworkPlan::Layout1(vec![(0, fast), (3_500_000, slow)]),
         ..Scenario::new(
             "drop-while-idle",
             vec![
@@ -797,7 +797,7 @@ fn link_improves_while_idle() {
         ..slow
     };
     compare(&Scenario {
-        network: vec![(0, slow), (3_500_000, fast)],
+        network: NetworkPlan::Layout1(vec![(0, slow), (3_500_000, fast)]),
         start_bps: 1_000_000,
         ..Scenario::new(
             "rise-while-idle",

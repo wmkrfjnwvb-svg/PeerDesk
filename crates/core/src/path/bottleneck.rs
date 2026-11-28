@@ -229,6 +229,32 @@ impl Bottleneck {
         &self.cfg
     }
 
+    /// `now` 时刻名义上的容量（比特每秒）：匀速、泊松是参数里的速率，轨迹是 `now` 落在的那一段，不限速是 0
+    /// （和 `Net` 的特征行一样：`rate_bps` 为 `None` 时记 0）。这是仿真才知道的真值，只给特征行和诊断用。
+    #[must_use]
+    pub fn rate_at(&self, now: Time) -> u64 {
+        match &self.cfg.capacity {
+            Capacity::Unlimited => 0,
+            Capacity::Constant { rate_bps } | Capacity::Poisson { rate_bps, .. } => *rate_bps,
+            Capacity::Trace(t) => {
+                let total = self.trace_ends_ns.last().copied().unwrap_or(0);
+                let mut since = now
+                    .micros()
+                    .saturating_mul(NS)
+                    .saturating_sub(self.origin_ns);
+                if t.repeat && total > 0 {
+                    since %= total;
+                }
+                let i = self.trace_ends_ns.partition_point(|end| *end <= since);
+                // 走完了（不重复）：最后一段一直保持；时长 0 的段被跳过，partition_point 不会停在它上面
+                t.segments
+                    .get(i)
+                    .or_else(|| t.segments.last())
+                    .map_or(0, |(_, rate)| *rate)
+            }
+        }
+    }
+
     /// CoDel 的状态（没开 CoDel 时为 `None`），测试和诊断用。
     #[must_use]
     pub const fn codel(&self) -> Option<&Codel> {

@@ -11,7 +11,7 @@ use peerdesk_core::adaptive::Profile;
 use peerdesk_core::record::{BlockWriter, EndReason, FrameClass, Kind, Recording};
 use peerdesk_core::screen::Screen;
 use peerdesk_core::sim::Link;
-use peerdesk_e2e::{run, run_recorded, Action, Outcome, Phase, Scenario};
+use peerdesk_e2e::{run, run_recorded, Action, NetworkPlan, Outcome, Phase, Scenario};
 
 fn phase(action: Action, frames: u32) -> Phase {
     Phase { action, frames }
@@ -45,11 +45,11 @@ fn scenarios() -> Vec<Scenario> {
     vec![
         Scenario::new("office-lan", office()),
         Scenario {
-            network: vec![
+            network: NetworkPlan::Layout1(vec![
                 (0, steady(20)),
                 (4_000_000, steady(3)),
                 (8_000_000, steady(20)),
-            ],
+            ]),
             ..Scenario::new(
                 "bandwidth-steps",
                 vec![
@@ -61,7 +61,7 @@ fn scenarios() -> Vec<Scenario> {
             )
         },
         Scenario {
-            network: vec![
+            network: NetworkPlan::Layout1(vec![
                 (0, full),
                 (
                     3_000_000,
@@ -71,7 +71,7 @@ fn scenarios() -> Vec<Scenario> {
                     },
                 ),
                 (5_000_000, full),
-            ],
+            ]),
             profile: Profile::WIRELESS,
             ..Scenario::new(
                 "sudden-drop",
@@ -79,13 +79,13 @@ fn scenarios() -> Vec<Scenario> {
             )
         },
         Scenario {
-            network: vec![(0, Link::cellular())],
+            network: NetworkPlan::Layout1(vec![(0, Link::cellular())]),
             profile: Profile::CELLULAR,
             start_bps: 2_000_000,
             ..Scenario::new("office-cellular", office())
         },
         Scenario {
-            network: vec![(
+            network: NetworkPlan::Layout1(vec![(
                 0,
                 Link {
                     delay_us: 3_000,
@@ -94,7 +94,7 @@ fn scenarios() -> Vec<Scenario> {
                     rate_bps: Some(30_000_000),
                     ..Link::lan()
                 },
-            )],
+            )]),
             profile: Profile::WIRELESS,
             ..Scenario::new(
                 "random-loss",

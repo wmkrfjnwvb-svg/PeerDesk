@@ -1,9 +1,11 @@
 //! 批量运行器（只在本地跑，不进 CI、不进安装包）：输入一批世界文件（[`peerdesk_e2e::world`]），并行跑，
 //! 每个会话输出一行 CSV。
 //!
-//! 用法：`batch [--jobs N] [--out 文件.csv] [--codec 名字] [--byte-model 名字] [--byte-noise 名字] <世界文件或目录>...`
+//! 用法：`batch [--jobs N] [--out 文件.csv] [--codec 名字] [--byte-model 名字] [--byte-noise 名字] [--layout 2|2-loss-first] <世界文件或目录>...`
 //! - `--codec`、`--byte-model`、`--byte-noise`：把读进来的每个世界换一档再跑（世界文件本身不改）。三档对账时用同一批
 //!   L1 的世界文件跑出 L0.5、L0 的各种配置；`session` 列是不随这三样变的会话身份，汇总脚本（`scripts/a1-reconcile.py`）靠它对上。
+//! - `--layout`：把布局 1 的世界按 `NetworkPlan::to_layout2` 换成布局 2 再跑（A2-3 的对照）；`2-loss-first` 把丢包放回瓶颈之前。
+//!   换了档的世界哈希会变，`source_hash` 列是读进来的文件的哈希，布局 1 和布局 2 的两份 CSV 按它配对。
 //! - 目录：取其中所有 `*.world`（不递归），按文件名排序；参数里的顺序保留。
 //! - 输出按输入顺序，不按完成顺序（同一批输入每次输出的行顺序相同）。默认写标准输出，`--out` 写文件。
 //! - `--jobs`：并行的线程数，默认是机器的核数。
@@ -91,6 +93,9 @@ fn header() -> String {
             "fps_changes",
             "window_bytes",
             "fingerprint",
+            // A2-3 加的：随机数布局，读进来的文件的哈希（换档之前）
+            "rng_layout",
+            "source_hash",
             "error",
         ]
         .map(str::to_owned),
@@ -130,7 +135,7 @@ fn rate_percentiles(o: &Outcome) -> (u64, u64) {
     (at(500), at(50))
 }
 
-fn row(world: &World, o: &Outcome, wall_ms: f64) -> String {
+fn row(world: &World, o: &Outcome, wall_ms: f64, source: &str) -> String {
     let (p50, p5) = rate_percentiles(o);
     let sharp: Vec<String> = o
         .phases
@@ -204,6 +209,8 @@ fn row(world: &World, o: &Outcome, wall_ms: f64) -> String {
             .collect::<Vec<_>>()
             .join(";"),
         format!("{:016x}", fingerprint(o)),
+        world.scenario.network.layout().to_string(),
+        source.to_owned(),
         String::new(),
     ]);
     cols.join(",")
@@ -222,6 +229,7 @@ fn error_row(label: &str, why: &str) -> String {
 
 fn run_one(path: &Path, tier: &Tier) -> Result<String, String> {
     let world = World::load(path).map_err(|e| e.to_string())?;
+    let source = world.hash.clone();
     let world = if tier.is_set() {
         world
             .retiered(tier.codec, tier.byte_model, tier.byte_noise)
@@ -229,12 +237,19 @@ fn run_one(path: &Path, tier: &Tier) -> Result<String, String> {
     } else {
         world
     };
+    let world = match tier.layout2 {
+        Some(loss_first) => world
+            .with_layout2(loss_first)
+            .map_err(|e| format!("{}：换布局失败：{e}", world.hash))?,
+        None => world,
+    };
     let started = Instant::now();
     let outcome = world.run().map_err(|e| format!("{}：{e}", world.hash))?;
     Ok(row(
         &world,
         &outcome,
         started.elapsed().as_secs_f64() * 1000.0,
+        &source,
     ))
 }
 
@@ -263,6 +278,8 @@ struct Tier {
     codec: Option<CodecKind>,
     byte_model: Option<ByteModelKind>,
     byte_noise: Option<ByteNoise>,
+    /// 换成布局 2：`Some(丢包在瓶颈之前)`。
+    layout2: Option<bool>,
 }
 
 impl Tier {
@@ -321,6 +338,14 @@ fn parse_args() -> Result<Options, String> {
                         .ok_or(format!("--byte-noise {v:?} 不认识（default、within、off）"))?,
                 );
             }
+            "--layout" => {
+                let v = named("--layout", args.next())?;
+                tier.layout2 = Some(match v.as_str() {
+                    "2" => false,
+                    "2-loss-first" => true,
+                    _ => return Err(format!("--layout {v:?} 不认识（2、2-loss-first）")),
+                });
+            }
             "--help" | "-h" => return Err(String::new()),
             flag if flag.starts_with("--") => return Err(format!("不认识的参数 {flag}")),
             path => inputs.push(PathBuf::from(path)),
@@ -365,8 +390,8 @@ fn main() -> ExitCode {
             }
             let _ = writeln!(
                 std::io::stderr(),
-                "用法：batch [--jobs N] [--out 文件.csv] [--codec 名字] [--byte-model 名字] [--byte-noise 名字] <世界文件或目录>...\n\
-                 后三个参数把读进来的每个世界换一档再跑（对账用），世界文件本身不改"
+                "用法：batch [--jobs N] [--out 文件.csv] [--codec 名字] [--byte-model 名字] [--byte-noise 名字] [--layout 2|2-loss-first] <世界文件或目录>...\n\
+                 后四个参数把读进来的每个世界换一档再跑（对账用），世界文件本身不改"
             );
             return ExitCode::from(2);
         }

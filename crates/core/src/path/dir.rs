@@ -24,11 +24,16 @@ pub struct DirConfig {
     pub noise: Noise,
     /// 第 7 层：接收端。
     pub receiver: Receiver,
+    /// 丢包层挪到瓶颈之前（和 `Net` 一样：丢掉的包不占容量）。只用来和布局 1 对照（A2-3 验收），
+    /// 量“丢包挪到瓶颈之后”带来的差别；真实的 Wi-Fi、蜂窝丢包占过信道，新场景不要打开。
+    /// 交叉流（TCP 的数据和确认）也跟着挪，一个方向上的丢包只有一个位置。
+    pub loss_before_bottleneck: bool,
 }
 
 impl DirConfig {
     /// 把 `sim::Link` 的各个字段搬到对应的层上（A2-3 用它把布局 1 的参数转成布局 2）。
-    /// 差别：丢包在瓶颈之后；`Link::up` 不搬（中断用 `Path::set_up` 或 `RouteChange`）；没有 CoDel、字节上限、限速器。
+    /// 差别：丢包在瓶颈之后（要和 `Net` 一样放在之前，另设 [`Self::loss_before_bottleneck`]）；
+    /// `Link::up` 不搬（中断用 `Path::set_up` 或 `RouteChange`）；没有 CoDel、字节上限、限速器。
     #[must_use]
     pub fn from_link(link: &Link) -> Self {
         Self {
@@ -61,6 +66,7 @@ impl DirConfig {
                 busy: link.busy,
                 batch_us: link.batch_us,
             },
+            loss_before_bottleneck: false,
         }
     }
 }
@@ -206,6 +212,10 @@ impl DirState {
     /// 丢包用流自己的随机数和状态（`lane`），不动主流量的流。
     pub fn cross_transit(&mut self, lane: &mut Lane, at: Time, size_bytes: u64) -> Transit {
         let draw = self.cfg.loss.enabled().then(|| lane.rng.next_u64());
+        let early = self.cfg.loss_before_bottleneck;
+        if early && draw.is_some_and(|d| lane.loss.lost(self.cfg.loss, d)) {
+            return Transit::Lost;
+        }
         let done = match self
             .bottleneck
             .arrive(&mut self.rng_bottleneck, at, size_bytes)
@@ -214,7 +224,7 @@ impl DirState {
             Verdict::TailDropped | Verdict::AqmDropped => return Transit::QueueDropped,
         };
         let wait_us = self.bottleneck.last_wait_us();
-        if let Some(d) = draw {
+        if let Some(d) = draw.filter(|_| !early) {
             if lane.loss.lost(self.cfg.loss, d) {
                 return Transit::Lost;
             }
@@ -278,6 +288,11 @@ impl DirState {
         if !up {
             return Outcome::Outage;
         }
+        // 对照用：丢包在瓶颈之前（`loss_before_bottleneck`，`Net` 的位置）
+        let early = self.cfg.loss_before_bottleneck;
+        if early && loss_draw.is_some_and(|d| self.loss.lost(self.cfg.loss, d)) {
+            return Outcome::Lost;
+        }
         // 2 限速器
         if let (Some(p), Some(state)) = (self.cfg.policer.as_ref(), self.policer.as_mut()) {
             if !state.admit(p, now, size_bytes) {
@@ -294,7 +309,7 @@ impl DirState {
             Verdict::AqmDropped => return Outcome::AqmDropped,
         };
         // 4 丢包（丢掉的包已经占过容量）
-        if let Some(draw) = loss_draw {
+        if let Some(draw) = loss_draw.filter(|_| !early) {
             if self.loss.lost(self.cfg.loss, draw) {
                 return Outcome::Lost;
             }

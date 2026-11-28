@@ -1006,6 +1006,7 @@ fn full_config() -> DirConfig {
             }),
             batch_us: 4_000,
         },
+        loss_before_bottleneck: false,
     }
 }
 
@@ -1553,4 +1554,282 @@ fn draws_are_counted_per_layer() {
         ),
         (10, 10, 0, 0)
     );
+}
+
+// ---------------------------------------------------------------- A2-3：Network 接口、对照开关、名义值
+
+/// 通过 `Network` 接口跑一遍：t=0 起每 1 ms 发一个 1250 字节的包，正反两个方向交替，最后全部取完。
+fn drive<N: Network<u32>>(n: &mut N, packets: u32) -> (Vec<Delivery<u32>>, NetStats, u64) {
+    let mut backlog = 0;
+    for i in 0..packets {
+        n.advance_to(Time(u64::from(i) * 1000));
+        let (from, to) = if i % 2 == 0 { (0, 1) } else { (1, 0) };
+        n.send(from, to, 1250, i);
+        backlog = backlog.max(n.backlog_us(0, 1));
+    }
+    n.send(0, 7, 10, 999);
+    let mut got = Vec::new();
+    while n.peek_time().is_some() {
+        assert!(n.in_flight() > 0);
+        got.extend(n.pop());
+    }
+    assert_eq!(n.in_flight(), 0);
+    assert!(n.pop().is_none());
+    (got, n.stats(), backlog)
+}
+
+#[test]
+fn network_trait_is_the_inherent_methods() {
+    let link = Link {
+        rate_bps: Some(5_000_000),
+        loss_permille: 100,
+        ..Link::wifi()
+    };
+    let mut direct: Net<u32> = Net::new(3);
+    let mut via: Net<u32> = Net::new(3);
+    direct.set_link(0, 1, link);
+    via.set_link(0, 1, link);
+    // 直接调用（不经过接口）
+    let mut want = Vec::new();
+    for i in 0..60u32 {
+        direct.advance_to(Time(u64::from(i) * 1000));
+        let (from, to) = if i % 2 == 0 { (0, 1) } else { (1, 0) };
+        direct.send(from, to, 1250, i);
+    }
+    direct.send(0, 7, 10, 999);
+    while let Some(d) = direct.pop() {
+        want.push(d);
+    }
+    let (got, stats, backlog) = drive(&mut via, 60);
+    assert_eq!(got, want);
+    assert_eq!(stats, direct.stats());
+    assert_eq!(stats.unroutable, 1);
+    assert!(backlog > 0, "5 Mbps 上每毫秒 1250 字节会排队");
+    assert_eq!(Network::path_stats(&via), None);
+    assert_eq!(Network::next_event_time(&via), None);
+    assert_eq!(Network::pop_event(&mut via), None);
+    assert_eq!(via.link(0, 1), Some(link));
+    assert_eq!(via.link(1, 2), None);
+
+    // Path 经过接口和直接调用一样，计数按 Net 的口径折算
+    let cfg = PathConfig::symmetric(DirConfig::from_link(&link));
+    let mut p: P = Path::new(3, cfg.clone());
+    let mut q: P = Path::new(3, cfg);
+    let (got, stats, _) = drive(&mut p, 60);
+    let mut want = Vec::new();
+    for i in 0..60u32 {
+        q.advance_to(Time(u64::from(i) * 1000));
+        let (from, to) = if i % 2 == 0 { (0, 1) } else { (1, 0) };
+        q.send(from, to, 1250, i);
+    }
+    q.send(0, 7, 10, 999);
+    while let Some(d) = q.pop() {
+        want.push(d);
+    }
+    assert_eq!(got, want);
+    assert_eq!(stats, q.stats().net());
+    assert_eq!(Network::path_stats(&p), Some(q.stats()));
+    assert_eq!(stats.sent, 60);
+    assert_eq!(stats.unroutable, 1);
+    assert_eq!(stats.delivered + stats.lost + stats.queue_dropped, 60);
+}
+
+#[test]
+fn path_stats_fold_into_the_net_columns() {
+    let s = PathStats {
+        sent: 100,
+        delivered: 70,
+        outage_dropped: 3,
+        policed: 4,
+        queue_dropped: 5,
+        aqm_dropped: 6,
+        lost: 7,
+        unroutable: 2,
+        cross_sent: 50,
+        cross_dropped: 9,
+    };
+    assert_eq!(
+        s.net(),
+        NetStats {
+            sent: 100,
+            delivered: 70,
+            lost: 14,
+            queue_dropped: 11,
+            unroutable: 2,
+        }
+    );
+}
+
+#[test]
+fn route_change_event_goes_through_the_trait() {
+    let mut p: P = Path::new(1, PathConfig::default());
+    p.schedule_route_change(RouteChange {
+        at: Time(1_000),
+        down_us: 500,
+        new: Some(PathConfig::symmetric(DirConfig {
+            delay: Delay::Fixed(7_000),
+            ..DirConfig::default()
+        })),
+    });
+    assert_eq!(Network::next_event_time(&p), Some(Time(1_500)));
+    Network::advance_to(&mut p, Time(1_499));
+    assert_eq!(Network::pop_event(&mut p), None);
+    Network::advance_to(&mut p, Time(1_500));
+    assert_eq!(
+        Network::pop_event(&mut p),
+        Some(PathEvent::RouteChanged { at: Time(1_500) })
+    );
+    assert_eq!(Network::pop_event(&mut p), None);
+    assert_eq!(Network::next_event_time(&p), None);
+    assert_eq!(p.dir(Dir::Reverse).config().delay, Delay::Fixed(7_000));
+}
+
+/// 丢包在瓶颈之前（对照开关）：丢掉的包不占容量，后面的包早走；丢哪几个包两种位置一样（同一条流、每包抽一个数）。
+#[test]
+fn loss_before_bottleneck_frees_the_capacity() {
+    let base = DirConfig {
+        loss: Loss::Independent { ppm: 400_000 },
+        ..bottleneck(
+            Capacity::Constant {
+                rate_bps: 10_000_000,
+            },
+            QueueLimit::delay(1_000_000),
+            Aqm::TailDrop,
+        )
+    };
+    let early = DirConfig {
+        loss_before_bottleneck: true,
+        ..base.clone()
+    };
+    let arrivals = |cfg: DirConfig| {
+        let mut p: P = Path::new(5, fwd(cfg));
+        for i in 0..40u32 {
+            p.send(0, 1, 1250, i);
+        }
+        let mut got = Vec::new();
+        while let Some(d) = p.pop() {
+            got.push((d.payload, d.at.micros()));
+        }
+        (got, p.dir_stats(Dir::Forward))
+    };
+    let (late, ls) = arrivals(base);
+    let (first, fs) = arrivals(early);
+    assert_eq!(ls.lost, fs.lost);
+    assert!(ls.lost > 5 && ls.lost < 30, "{}", ls.lost);
+    let ids = |v: &[(u32, u64)]| v.iter().map(|(i, _)| *i).collect::<Vec<_>>();
+    assert_eq!(ids(&late), ids(&first), "丢的是同样几个包");
+    for (k, ((id, at_late), (_, at_first))) in late.iter().zip(&first).enumerate() {
+        // 每个包正好发 1 ms：丢在后面时第 id 个包第 id+1 毫秒走；丢在前面时活下来的第 k 个包第 k+1 毫秒走
+        assert_eq!(*at_late, (u64::from(*id) + 1) * 1000);
+        assert_eq!(*at_first, (k as u64 + 1) * 1000);
+    }
+}
+
+/// 交叉 TCP 也跟着开关走：丢包挪到瓶颈之前，被丢的数据包不占队列。
+#[test]
+fn loss_before_bottleneck_applies_to_cross_traffic() {
+    let run = |first: bool| {
+        let cfg = DirConfig {
+            loss: Loss::Independent { ppm: 50_000 },
+            loss_before_bottleneck: first,
+            delay: Delay::Fixed(10_000),
+            ..bottleneck(
+                Capacity::Constant {
+                    rate_bps: 10_000_000,
+                },
+                QueueLimit::delay(50_000),
+                Aqm::TailDrop,
+            )
+        };
+        let mut p: P = Path::new(8, PathConfig::symmetric(cfg));
+        let id = p.add_cross(
+            Dir::Forward,
+            CrossSpec::Tcp {
+                cfg: TcpConfig::default(),
+                start: Time::ZERO,
+                bytes: None,
+            },
+        );
+        p.advance_to(Time(3_000_000));
+        p.cross_stats(id)
+    };
+    let (late, early) = (run(false), run(true));
+    assert!(late.lost > 0 && early.lost > 0);
+    assert!(early.delivered_bytes > 0 && late.delivered_bytes > 0);
+    assert_ne!(late, early);
+}
+
+#[test]
+fn nominal_rate_of_each_capacity() {
+    let at = |capacity: Capacity, origin: u64, now: u64| {
+        let b = Bottleneck::new(
+            BottleneckConfig {
+                capacity,
+                ..BottleneckConfig::default()
+            },
+            Time(origin),
+        );
+        b.rate_at(Time(now))
+    };
+    assert_eq!(at(Capacity::Unlimited, 0, 5), 0);
+    assert_eq!(at(Capacity::Constant { rate_bps: 7 }, 0, 5), 7);
+    assert_eq!(
+        at(
+            Capacity::Poisson {
+                rate_bps: 9,
+                opportunity_bytes: 1500
+            },
+            0,
+            5
+        ),
+        9
+    );
+    let trace = |repeat| {
+        Capacity::Trace(Trace {
+            segments: vec![(1_000, 100), (0, 999), (2_000, 200)],
+            repeat,
+        })
+    };
+    // 起点在 10 ms：[10, 11) ms 100，[11, 13) ms 200（时长 0 的段跳过）
+    assert_eq!(at(trace(false), 10_000, 10_000), 100);
+    assert_eq!(at(trace(false), 10_000, 10_999), 100);
+    assert_eq!(at(trace(false), 10_000, 11_000), 200);
+    assert_eq!(at(trace(false), 10_000, 12_999), 200);
+    // 走完了：不重复时最后一段一直保持，重复时从头再来
+    assert_eq!(at(trace(false), 10_000, 50_000), 200);
+    assert_eq!(at(trace(true), 10_000, 13_500), 100);
+    assert_eq!(at(trace(true), 10_000, 14_500), 200);
+    // 起点之前按起点算；空轨迹为 0
+    assert_eq!(at(trace(true), 10_000, 0), 100);
+    let empty = Capacity::Trace(Trace {
+        segments: Vec::new(),
+        repeat: true,
+    });
+    assert_eq!(at(empty, 0, 5), 0);
+}
+
+#[test]
+fn nominal_delay_does_not_draw() {
+    assert_eq!(Delay::Fixed(40).nominal_us(Time(9)), 40);
+    let steps = Delay::Steps {
+        initial_us: 10,
+        steps: vec![(Time(300), 30), (Time(100), 20), (Time(300), 33)],
+    };
+    assert_eq!(steps.nominal_us(Time(99)), 10);
+    assert_eq!(steps.nominal_us(Time(100)), 20);
+    assert_eq!(steps.nominal_us(Time(300)), 33, "同一时刻以后面的为准");
+    let periodic = |period_us| Delay::Periodic {
+        initial_us: 99,
+        period_us,
+        phase_us: 1_000,
+        low_us: 10,
+        high_us: 41,
+    };
+    assert_eq!(periodic(500).nominal_us(Time(999)), 99);
+    assert_eq!(
+        periodic(500).nominal_us(Time(1_000)),
+        25,
+        "上下限的中点（向下取整）"
+    );
+    assert_eq!(periodic(0).nominal_us(Time(5_000)), 99);
 }

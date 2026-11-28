@@ -10,10 +10,18 @@
 //! - **写**：键的顺序固定，同一个 [`Scenario`] 写出来逐字节相同；读回来再写，逐字节相同。
 //! - **网络内联**：微软轨迹有几十段，每段一行写在文件里，不引用外部文件。引用要多一套“文件找不到、改过了没有、相对路径”的错误，
 //!   世界文件要能单独拷走、按哈希核对就是自包含；几十行的体积（约 10 KB）不是问题。
-//! - **随机数布局**：[`RNG_LAYOUT`]（现在只有 1，见 `a1-plan.md` 第 2 节）写在文件里，读到别的号就报错，不会用错的布局跑。
+//! - **随机数布局**：`rng_layout` 写在文件里（[`RNG_LAYOUTS`]），读到别的号就报错，不会用错的布局跑。
+//!   - 布局 1（`a1-plan.md` 第 2 节）：老的 `Net`，网络是 `links N` 加每段一行 `link.<i>`，两个方向对称；
+//!   - 布局 2（`a2-plan.md` 第 6、8 节）：分层的 `Path`，两个方向各一组层参数，加按时刻换参数、换路、交叉流量，
+//!     键见 [`layout2`] 模块。两种布局的网络键互斥：布局 2 的键出现在布局 1 的文件里（或反过来）都报错。
+//!   - 布局 1 的文件写法和以前逐字节相同，哈希不变。
+
+mod layout2;
 
 use crate::content::Action;
-use crate::{ByteModelKind, ByteNoise, CodecKind, EstimatorKind, Outcome, Phase, Scenario};
+use crate::{
+    ByteModelKind, ByteNoise, CodecKind, EstimatorKind, NetworkPlan, Outcome, Phase, Scenario,
+};
 use peerdesk_core::adaptive::Profile;
 use peerdesk_core::error::Error;
 use peerdesk_core::kv::{content_hash, join_fields, Kv, KvError, KvWriter};
@@ -25,8 +33,10 @@ use std::path::{Path, PathBuf};
 
 /// 文件格式的版本。
 pub const FORMAT_VERSION: u32 = 1;
-/// 随机数布局号：现有场景的随机数取用顺序（所有网络毛病共用一条流，合成桌面另有一条）。A2 引入每层独立的“布局 2”。
+/// 布局 1 的随机数布局号：现有场景的随机数取用顺序（所有网络毛病共用一条流，合成桌面另有一条）。
 pub const RNG_LAYOUT: u32 = 1;
+/// 认识的随机数布局号：1 是老的 `Net`，2 是每层一条随机数流的 `Path`（A2）。
+pub const RNG_LAYOUTS: [u32; 2] = [1, 2];
 /// 世界文件的扩展名。
 pub const EXTENSION: &str = "world";
 
@@ -272,7 +282,7 @@ pub fn to_text(s: &Scenario) -> Result<String, WorldError> {
     if *byte_noise != ByteNoise::Default {
         w.put("byte_noise", byte_noise.name())?;
     }
-    w.put_display("rng_layout", RNG_LAYOUT)?;
+    w.put_display("rng_layout", network.layout())?;
     w.put_display("seed", seed)?;
     w.put(
         "estimator",
@@ -300,9 +310,14 @@ pub fn to_text(s: &Scenario) -> Result<String, WorldError> {
         ])?;
         w.put(&format!("phase.{i}"), &fields)?;
     }
-    w.put_display("links", network.len())?;
-    for (i, (at, link)) in network.iter().enumerate() {
-        w.put(&format!("link.{i}"), &link_fields(*at, link)?)?;
+    match network {
+        NetworkPlan::Layout1(links) => {
+            w.put_display("links", links.len())?;
+            for (i, (at, link)) in links.iter().enumerate() {
+                w.put(&format!("link.{i}"), &link_fields(*at, link)?)?;
+            }
+        }
+        NetworkPlan::Layout2(plan) => layout2::write(&mut w, plan)?,
     }
     Ok(w.finish())
 }
@@ -354,9 +369,9 @@ pub fn from_text(text: &str) -> Result<Scenario, WorldError> {
         ByteNoise::Default
     };
     let rng_layout = kv.take_u32("rng_layout")?;
-    if rng_layout != RNG_LAYOUT {
+    if !RNG_LAYOUTS.contains(&rng_layout) {
         return bad(format!(
-            "随机数布局是 {rng_layout}，这个程序只会 {RNG_LAYOUT}（用别的布局跑，结果就不是文件描述的那个世界）"
+            "随机数布局是 {rng_layout}，这个程序只会 {RNG_LAYOUTS:?}（用别的布局跑，结果就不是文件描述的那个世界）"
         ));
     }
     let seed = kv.take_u64("seed")?;
@@ -392,13 +407,29 @@ pub fn from_text(text: &str) -> Result<Scenario, WorldError> {
         f.finish()?;
         phases.push(Phase { action, frames });
     }
-    let count = kv.take_u32("links")?;
-    let mut network = Vec::new();
-    for i in 0..count {
-        let key = format!("link.{i}");
-        let text = kv.take(&key)?;
-        network.push(parse_link(&text, &key)?);
-    }
+    let network = if rng_layout == RNG_LAYOUT {
+        if let Some(key) = layout2::KEYS.into_iter().find(|k| kv.has(k)) {
+            return bad(format!(
+                "{key} 是随机数布局 2 的键，这个文件写的是 rng_layout 1（两种布局的网络不能混写）"
+            ));
+        }
+        let count = kv.take_u32("links")?;
+        let mut links = Vec::new();
+        for i in 0..count {
+            let key = format!("link.{i}");
+            let text = kv.take(&key)?;
+            links.push(parse_link(&text, &key)?);
+        }
+        NetworkPlan::Layout1(links)
+    } else {
+        if kv.has("links") {
+            return bad(
+                "links 是随机数布局 1 的键，这个文件写的是 rng_layout 2（两种布局的网络不能混写）"
+                    .to_owned(),
+            );
+        }
+        NetworkPlan::Layout2(Box::new(layout2::read(&mut kv)?))
+    };
     kv.finish()?;
 
     let mut s = Scenario::fixed(&name, phases);
@@ -538,6 +569,19 @@ impl World {
         })
     }
 
+    /// 布局 1 的世界换成布局 2（`NetworkPlan::to_layout2`，A2-3 对照用），哈希按新的内容重算；已经是布局 2 的不变。
+    ///
+    /// # Errors
+    /// 换了之后写不成文件（同 [`to_text`]）。
+    pub fn with_layout2(&self, loss_first: bool) -> Result<Self, WorldError> {
+        let mut scenario = self.scenario.clone();
+        scenario.network = scenario.network.to_layout2(loss_first);
+        Ok(Self {
+            hash: hash(&to_text(&scenario)?),
+            scenario,
+        })
+    }
+
     /// 跑这个世界。
     ///
     /// # Errors
@@ -588,7 +632,7 @@ mod tests {
         s.probe_ids = false;
         s.start_bps = 2_000_000;
         s.max_bps = 50_000_000;
-        s.network = vec![
+        s.network = NetworkPlan::Layout1(vec![
             (
                 0,
                 Link {
@@ -624,29 +668,30 @@ mod tests {
                 },
             ),
             (3_000_000, Link::cellular()),
-        ];
+        ]);
         s
     }
 
     fn ms_trace_scenario() -> Scenario {
         let csv = include_str!("../traces/ms-02560.csv");
         let mut s = Scenario::fixed("ms-02560", phases());
-        s.network = csv
-            .lines()
-            .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
-            .map(|l| {
-                let f: Vec<u64> = l.split(',').map(|x| x.trim().parse().unwrap()).collect();
-                let link = Link {
-                    delay_us: 25_000,
-                    jitter_us: 3_000,
-                    loss_permille: u16::try_from(f[2]).unwrap(),
-                    rate_bps: Some(f[1]),
-                    max_queue_us: 200_000,
-                    ..Link::lan()
-                };
-                (f[0] * 1000, link)
-            })
-            .collect();
+        s.network = NetworkPlan::Layout1(
+            csv.lines()
+                .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+                .map(|l| {
+                    let f: Vec<u64> = l.split(',').map(|x| x.trim().parse().unwrap()).collect();
+                    let link = Link {
+                        delay_us: 25_000,
+                        jitter_us: 3_000,
+                        loss_permille: u16::try_from(f[2]).unwrap(),
+                        rate_bps: Some(f[1]),
+                        max_queue_us: 200_000,
+                        ..Link::lan()
+                    };
+                    (f[0] * 1000, link)
+                })
+                .collect(),
+        );
         s
     }
 
@@ -722,7 +767,7 @@ mod tests {
                     frames: 1,
                 }],
             );
-            s.network = Vec::new();
+            s.network = NetworkPlan::Layout1(Vec::new());
             assert_round_trips(&s);
         }
     }
@@ -889,7 +934,12 @@ mod tests {
         let g = good();
         let cases = [
             ("\nworld 1\n", "\nworld 2\n", "格式版本是 2"),
-            ("\nrng_layout 1\n", "\nrng_layout 2\n", "随机数布局是 2"),
+            ("\nrng_layout 1\n", "\nrng_layout 9\n", "随机数布局是 9"),
+            (
+                "\nrng_layout 1\n",
+                "\nrng_layout 2\n",
+                "links 是随机数布局 1 的键",
+            ),
             ("\nwidth 640\n", "\nwidth 0\n", "不能为 0"),
             ("\nfps 60\n", "\nfps 0\n", "fps 不能为 0"),
             (
@@ -1154,5 +1204,307 @@ mod tests {
         assert_eq!(session_key(&tile).unwrap(), hash(&to_text(&tile).unwrap()));
         assert_eq!(codec_named("h264-l05"), Some(CodecKind::H264L05));
         assert_eq!(codec_named("mpeg2"), None);
+    }
+
+    /// 布局 2 的每一种写法都用上：四种容量、两种队列策略、三种丢包、三种延迟、限速器、三种交叉流量、
+    /// 带新参数和纯中断的换路、按时刻换参数。
+    fn layout2_scenario() -> Scenario {
+        use crate::{Layout2, PathStep};
+        use peerdesk_core::path::{
+            Aqm, BottleneckConfig, Capacity, CrossSpec, Delay, Dir, DirConfig, Loss, Noise,
+            PathConfig, Policer, QueueLimit, Receiver, RouteChange, TcpConfig, Trace,
+        };
+        use peerdesk_core::time::Time;
+        let full = DirConfig {
+            policer: Some(Policer {
+                rate_bps: 30_000_000,
+                burst_bytes: 30_000,
+            }),
+            bottleneck: BottleneckConfig {
+                capacity: Capacity::Trace(Trace {
+                    segments: vec![(1_000_000, 5_000_000), (0, 1), (500_000, 0)],
+                    repeat: true,
+                }),
+                limit: QueueLimit {
+                    max_delay_us: Some(100_000),
+                    max_bytes: Some(60_000),
+                },
+                aqm: Aqm::codel(),
+            },
+            loss: Loss::Burst {
+                loss_ppm: 30_000,
+                avg_burst_milli: 3_000,
+            },
+            delay: Delay::Steps {
+                initial_us: 20_000,
+                steps: vec![(Time(1_000_000), 30_000), (Time(2_000_000), 25_000)],
+            },
+            noise: Noise {
+                jitter_us: 3_000,
+                fifo_jitter: true,
+                spikes: Some(Spikes {
+                    every_us: 400_000,
+                    length_us: 30_000,
+                    max_us: 20_000,
+                }),
+                doze: Some(Doze {
+                    idle_us: 30_000,
+                    wake_us: 20_000,
+                }),
+            },
+            receiver: Receiver {
+                busy: Some(Busy {
+                    every_us: 100_000,
+                    length_us: 5_000,
+                }),
+                batch_us: 4_000,
+            },
+            loss_before_bottleneck: true,
+        };
+        let plain = |capacity, loss, delay| DirConfig {
+            bottleneck: BottleneckConfig {
+                capacity,
+                limit: QueueLimit {
+                    max_delay_us: None,
+                    max_bytes: None,
+                },
+                aqm: Aqm::TailDrop,
+            },
+            loss,
+            delay,
+            ..DirConfig::default()
+        };
+        let poisson = plain(
+            Capacity::Poisson {
+                rate_bps: 12_000_000,
+                opportunity_bytes: 1500,
+            },
+            Loss::Independent { ppm: 1_000 },
+            Delay::Periodic {
+                initial_us: 20_000,
+                period_us: 15_000_000,
+                phase_us: 3_000_000,
+                low_us: 25_000,
+                high_us: 60_000,
+            },
+        );
+        let constant = plain(
+            Capacity::Constant {
+                rate_bps: 8_000_000,
+            },
+            Loss::None,
+            Delay::Fixed(5_000),
+        );
+        let empty_steps = plain(
+            Capacity::Unlimited,
+            Loss::None,
+            Delay::Steps {
+                initial_us: 1,
+                steps: Vec::new(),
+            },
+        );
+        let empty_trace = plain(
+            Capacity::Trace(Trace {
+                segments: Vec::new(),
+                repeat: false,
+            }),
+            Loss::None,
+            Delay::Fixed(0),
+        );
+        let tcp = TcpConfig::default();
+        let mut s = Scenario::fixed("布局 2", phases());
+        s.network = NetworkPlan::Layout2(Box::new(Layout2 {
+            start: PathConfig {
+                forward: full,
+                reverse: poisson,
+            },
+            steps: vec![(
+                700_000,
+                PathStep {
+                    config: PathConfig {
+                        forward: constant.clone(),
+                        reverse: empty_steps,
+                    },
+                    up: false,
+                },
+            )],
+            routes: vec![
+                RouteChange {
+                    at: Time(1_000_000),
+                    down_us: 300_000,
+                    new: Some(PathConfig {
+                        forward: empty_trace,
+                        reverse: constant,
+                    }),
+                },
+                RouteChange {
+                    at: Time(2_000_000),
+                    down_us: 50_000,
+                    new: None,
+                },
+            ],
+            cross: vec![
+                (
+                    Dir::Forward,
+                    CrossSpec::Cbr {
+                        rate_bps: 2_000_000,
+                        packet_bytes: 1_200,
+                        start: Time(100),
+                        stop: Some(Time(900_000)),
+                    },
+                ),
+                (
+                    Dir::Reverse,
+                    CrossSpec::Cbr {
+                        rate_bps: 1,
+                        packet_bytes: 100,
+                        start: Time::ZERO,
+                        stop: None,
+                    },
+                ),
+                (
+                    Dir::Reverse,
+                    CrossSpec::Tcp {
+                        cfg: tcp,
+                        start: Time(5),
+                        bytes: Some(1_000_000),
+                    },
+                ),
+                (
+                    Dir::Forward,
+                    CrossSpec::Tcp {
+                        cfg: tcp,
+                        start: Time(6),
+                        bytes: None,
+                    },
+                ),
+                (
+                    Dir::Forward,
+                    CrossSpec::Bursts {
+                        cfg: tcp,
+                        connections: 30,
+                        min_bytes: 30_000,
+                        max_bytes: 50_000,
+                        mean_off_us: 10_000_000,
+                        start_on: true,
+                        start: Time(7),
+                    },
+                ),
+            ],
+        }));
+        s
+    }
+
+    #[test]
+    fn layout2_round_trips_byte_identical() {
+        let s = layout2_scenario();
+        let text = assert_round_trips(&s);
+        assert!(text.contains("\nrng_layout 2\n"));
+        assert!(!text.contains("\nlinks "), "布局 2 不写布局 1 的键");
+        assert!(text.contains("capacity=trace:repeat:1000000@5000000,0@1,500000@0"));
+        assert!(text.contains("\nroute.1 at=2000000 down_us=50000 new=0\n"));
+        assert!(!text.contains("route.1.fwd"));
+        // 布局 1 转过来的也能来回；布局 1 的写法和以前一样（哈希不变）由 round_trips_are_byte_identical 守着
+        let mut converted = busy_scenario();
+        converted.network = converted.network.to_layout2(true);
+        let t = assert_round_trips(&converted);
+        assert!(t.contains("loss_first=1"));
+        assert_ne!(hash(&t), hash(&to_text(&busy_scenario()).unwrap()));
+        assert!(!to_text(&busy_scenario()).unwrap().contains("loss_first"));
+        let w = World {
+            hash: hash(&to_text(&busy_scenario()).unwrap()),
+            scenario: busy_scenario(),
+        };
+        let two = w.with_layout2(false).unwrap();
+        assert_eq!(two.scenario.network.layout(), 2);
+        assert_eq!(two.hash, hash(&to_text(&two.scenario).unwrap()));
+        assert_eq!(
+            two.with_layout2(true).unwrap().hash,
+            two.hash,
+            "已经是布局 2 的不变"
+        );
+    }
+
+    /// 把 `text` 里的 `from` 换成 `to` 再读，应当报错，消息里有 `want`。
+    fn rejects(text: &str, from: &str, to: &str, want: &str) {
+        assert!(text.contains(from), "测试用的文本里没有 {from:?}");
+        let bad = text.replacen(from, to, 1);
+        let e = from_text(&bad).map(|_| ()).unwrap_err().to_string();
+        assert!(e.contains(want), "{from:?} → {to:?}：{e}");
+    }
+
+    #[test]
+    fn layout2_reports_every_bad_value() {
+        let text = to_text(&layout2_scenario()).unwrap();
+        let cases = [
+            // 两种布局的键不能混写
+            ("\nrng_layout 2\n", "\nrng_layout 3\n", "随机数布局是 3"),
+            (
+                "\nsteps 1\n",
+                "\nlinks 0\nsteps 1\n",
+                "links 是随机数布局 1 的键",
+            ),
+            (
+                "capacity=trace:repeat:",
+                "capacity=trace:twice:",
+                "trace:once",
+            ),
+            (
+                "capacity=trace:repeat:1000000@5000000",
+                "capacity=trace:repeat:1000000@x",
+                "非负整数@非负整数",
+            ),
+            (
+                "capacity=trace:repeat:1000000@5000000",
+                "capacity=trace:repeat:1000000",
+                "非负整数@非负整数",
+            ),
+            (
+                "capacity=poisson:12000000:1500",
+                "capacity=poisson:12000000",
+                "2 个用冒号隔开",
+            ),
+            (
+                "capacity=const:8000000",
+                "capacity=const:x",
+                "1 个用冒号隔开",
+            ),
+            (
+                "capacity=unlimited",
+                "capacity=unlimited:5",
+                "capacity 的值",
+            ),
+            ("capacity=unlimited", "capacity=fast", "capacity 的值"),
+            ("aqm=codel:5000:100000", "aqm=codel:5000", "aqm 的值"),
+            ("aqm=tail", "aqm=red", "aqm 的值"),
+            ("loss=burst:30000:3000", "loss=burst:30000", "loss 的值"),
+            ("loss=ind:1000", "loss=ind:5000000000", "超出范围"),
+            ("loss=none", "loss=some", "loss 的值"),
+            ("delay=fixed:5000", "delay=fixed:5:6", "delay 的值"),
+            ("delay=steps:20000:", "delay=steps:x:", "delay 的值"),
+            ("delay=periodic:20000:", "delay=periodic:x:", "delay 的值"),
+            ("delay=fixed:5000", "delay=slow", "delay 的值"),
+            ("policer=30000000:30000", "policer=30000000", "policer"),
+            ("step.0 at=700000 up=0", "step.0 at=700000 up=0 x=1", "x"),
+            ("new=0", "new=2", "new"),
+            ("kind=bursts", "kind=video", "kind"),
+            ("dir=rev", "dir=up", "dir"),
+            ("connections=30", "connections=x", "connections"),
+            ("mss_bytes=1250", "mss_bytes=-1", "mss_bytes"),
+            ("packet_bytes=1200", "packet_bytes=x", "packet_bytes"),
+        ];
+        for (from, to, want) in cases {
+            rejects(&text, from, to, want);
+        }
+        // 布局 2 的键出现在布局 1 的文件里
+        let one = to_text(&Scenario::fixed("x", phases())).unwrap();
+        for key in layout2::KEYS {
+            rejects(
+                &one,
+                "\nlinks ",
+                &format!("\n{key} 0\nlinks "),
+                "是随机数布局 2 的键",
+            );
+        }
     }
 }
