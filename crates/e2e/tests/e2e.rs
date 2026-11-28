@@ -513,14 +513,23 @@ fn real_log_rhythm_keeps_the_rate_and_the_frame_rate() {
     after.sort_unstable();
     let min = after.first().copied().unwrap_or(0);
     let p5 = after.get(after.len() / 20).copied().unwrap_or(0);
+    // 调试构建的画面小（DEFAULT_SIZE），内容本身用不到 3 Mbps：码率停在应用受限，不是被抖动打下去。
+    // 2026-11-28 实测：发布构建 2 秒后 5% 分位过 3000；调试构建最低和 5% 分位都是 2331 kbps，应用受限 94.6%，
+    // 没有一次降码率。调试构建的线按实测留一成五的余量。
+    let p5_floor: u64 = if cfg!(debug_assertions) {
+        2_000_000
+    } else {
+        3_000_000
+    };
     gate(
         &o,
         "码率不被 Wi-Fi 的抖动打下去",
-        min >= 1_000_000 && p5 >= 3_000_000,
+        min >= 1_000_000 && p5 >= p5_floor,
         &format!(
-            "2 秒之后最低 {} kbps、5% 分位 {} kbps（链路 50000 kbps、上限 6000，要求不低于 1000 和 3000）",
+            "2 秒之后最低 {} kbps、5% 分位 {} kbps（链路 50000 kbps、上限 6000，要求不低于 1000 和 {}）",
             min / 1000,
-            p5 / 1000
+            p5 / 1000,
+            p5_floor / 1000
         ),
     );
     // 帧率档位不来回跳：链路宽，内容装得进预算

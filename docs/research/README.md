@@ -19,7 +19,9 @@
 | [O-modes-industry.md](O-modes-industry.md) | 电影、音乐模式的同行调研（2026-11-26）：AnyDesk、GeForce NOW、Moonlight 的模式或预设，Zoom、Teams 的音乐模式，W3C contentHint，Chromium 投屏的视频检测，对 PeerDesk 的建议 |
 | [P-industry.md](P-industry.md) | 业内资料摘录（2026-11-27）：帧率稳定、QSV MFT、显卡读回、软件编码帧数、局域网探测（Sunshine、OBS、FFmpeg、Chromium、WebRTC；引文经转述，关键处要回原文核对） |
 | [P-fps-bitrate.md](P-fps-bitrate.md) | 帧率和码率为什么保持不住（2026-11-27 用户日志分析）：Mac Wi-Fi 和 Windows 局域网的根因排序、谁在决定帧率、探测该加什么不该加什么、修法和回归测试、日志缺的数据 |
-| [reports/](reports/) | 给产品负责人的报告：AI Agent 业内调研、美国市场赚钱方案、核心用户功能设计（设备管理、MCP、无显示器主机、规模化、计费单位） |
+| [reports/](reports/) | 给产品负责人的报告：AI Agent 业内调研、美国市场赚钱方案、核心用户功能设计（设备管理、MCP、无显示器主机、规模化、计费单位）、同类产品周边功能对照（标配清单和补齐顺序） |
+
+> **接手先看 [HANDOFF.md](HANDOFF.md)**：所有进行中的工作、分支、最后的提交和下一步（2026-11-28）。
 
 ## 待办与进度（2026-11-27，每完成一项就更新这里）
 
@@ -51,6 +53,8 @@ fpsfix 第 2、3 步暂停，等设计定了再决定保留什么。和对手（
 
 | # | 事项 | 负责 | 说明 |
 | --- | --- | --- | --- |
+| 3a | 补齐标配：连入确认、多显示器、Mac 和 Linux 无人值守、隐私屏、虚拟显示器、唤醒和重启连回、会话内开关、文件权限；Agent 功能追 Jump | 我 + Sonnet | 优先计划：`O-standard-plan.md`（依据 `reports/PeerDesk 同类产品周边功能对照.md`） |
+| 3b | Android 控制端（Rust 底座 + Kotlin/Compose，系统硬解） | 我 | `R-android.md`，分支 `android` |
 | 4 | 第一阶段（付钱和留存）：账户设备表、登录、在线状态、主机健康、手机网页版、提醒、体检向导、订阅、本机 MCP；并行 iOS P0 | 我 + Fable | 分步计划和验收：`O-phase1-plan.md`（P1–P10） |
 | 5 | 账户和订阅（计费挂在账户上，不挂在设备指纹上） | 我 | 赚钱方案第 3 节；技术调研 `O-accounts-research.md`（Supabase 令牌校验、桌面和无屏幕主机登录、Stripe 接法、胶水代码放哪） |
 | 6 | 上架：公司主体、Apple 和 Windows 签名、App Store、商店账号 | 你 | 产品负责人自己准备（2026-11-27） |
