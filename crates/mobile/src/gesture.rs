@@ -317,7 +317,14 @@ impl Gestures {
         Vec::new()
     }
 
-    fn one(&mut self, mut f: Finger, mut moved: bool, t: &Touch, phase: Phase, out: &mut Vec<Action>) -> State {
+    fn one(
+        &mut self,
+        mut f: Finger,
+        mut moved: bool,
+        t: &Touch,
+        phase: Phase,
+        out: &mut Vec<Action>,
+    ) -> State {
         if t.id != f.id {
             if phase == Phase::Down && t.t_ms.saturating_sub(f.down_ms) <= LONG_PRESS_MS {
                 // 第二根手指：进入双指
@@ -457,13 +464,15 @@ impl Gestures {
         match (phase, which) {
             // 第三根手指：留给系统，这个手势作废（已经开始的滚动、缩放就停在那儿）
             (Phase::Down, None) => State::Done { left: 3 },
-            (Phase::Down, Some(_)) | (Phase::Move | Phase::Up | Phase::Cancel, None) => State::Two {
-                a,
-                b,
-                what,
-                dist,
-                scroll,
-            },
+            (Phase::Down, Some(_)) | (Phase::Move | Phase::Up | Phase::Cancel, None) => {
+                State::Two {
+                    a,
+                    b,
+                    what,
+                    dist,
+                    scroll,
+                }
+            }
             (Phase::Move, Some(first)) => {
                 let before = midpoint(a.last, b.last);
                 if first {
@@ -603,7 +612,6 @@ mod tests {
         top: 100.0,
         width: 1000.0,
         height: 500.0,
-        zoomed: false,
     };
 
     fn g(mode: Mode) -> Gestures {
@@ -628,6 +636,10 @@ mod tests {
         Action::Input(InputEvent::MouseButton { button, down })
     }
 
+    fn cur(x: f32, y: f32) -> Action {
+        Action::Cursor { x, y }
+    }
+
     #[test]
     fn a_tap_clicks_where_the_finger_is() {
         let mut s = g(Mode::Direct);
@@ -645,78 +657,93 @@ mod tests {
             s.touch(&t(2, Phase::Up, -50.0, 50.0, 1100)).first(),
             Some(&mv(0, 0))
         );
+        // 慢慢松开（没到长按）不算点击
+        s.touch(&t(1, Phase::Down, 500.0, 350.0, 2000));
+        assert!(s
+            .touch(&t(1, Phase::Up, 500.0, 350.0, 2000 + TAP_MS + 1))
+            .is_empty());
     }
 
     #[test]
-    fn a_slow_release_or_a_slide_is_not_a_click() {
+    fn one_finger_slides_the_picture_in_touch_mode() {
         let mut s = g(Mode::Direct);
-        s.touch(&t(1, Phase::Down, 500.0, 350.0, 0));
-        assert!(s
-            .touch(&t(1, Phase::Up, 500.0, 350.0, TAP_MS + 1))
-            .is_empty());
-        // 没放大：单指滑动移动光标，不按键
-        s.touch(&t(1, Phase::Down, 0.0, 100.0, 1000));
+        s.touch(&t(1, Phase::Down, 100.0, 200.0, 0));
         assert!(
-            s.touch(&t(1, Phase::Move, 5.0, 100.0, 1010)).is_empty(),
+            s.touch(&t(1, Phase::Move, 105.0, 200.0, 10)).is_empty(),
             "没超过防抖距离"
         );
         assert_eq!(
-            s.touch(&t(1, Phase::Move, 500.0, 350.0, 1020)),
-            vec![mv(32768, 32768)]
-        );
-        assert!(s.touch(&t(1, Phase::Up, 500.0, 350.0, 1030)).is_empty());
-        // 放大了：单指滑动平移画面
-        s.set_view(View {
-            zoomed: true,
-            ..VIEW
-        });
-        s.touch(&t(1, Phase::Down, 100.0, 200.0, 2000));
-        assert_eq!(
-            s.touch(&t(1, Phase::Move, 130.0, 180.0, 2010)),
+            s.touch(&t(1, Phase::Move, 130.0, 180.0, 20)),
             vec![Action::Pan {
-                dx: 30.0,
+                dx: 25.0,
                 dy: -20.0
             }]
         );
-        // 系统取消：不点击
-        assert!(s.touch(&t(1, Phase::Cancel, 130.0, 180.0, 2020)).is_empty());
+        assert_eq!(
+            s.touch(&t(1, Phase::Move, 140.0, 180.0, 30)),
+            vec![Action::Pan { dx: 10.0, dy: 0.0 }]
+        );
+        // 滑过之后抬起不点击，也不会再变成长按
+        assert!(s.tick(30 + LONG_PRESS_MS).is_empty());
+        assert!(s.touch(&t(1, Phase::Up, 140.0, 180.0, 40)).is_empty());
+        // 系统取消：什么也不发
+        s.touch(&t(1, Phase::Down, 100.0, 200.0, 100));
+        assert!(s.touch(&t(1, Phase::Cancel, 100.0, 200.0, 110)).is_empty());
         assert!(
-            s.touch(&t(1, Phase::Up, 130.0, 180.0, 2030)).is_empty(),
+            s.touch(&t(1, Phase::Up, 100.0, 200.0, 120)).is_empty(),
             "已经回到空闲"
         );
     }
 
     #[test]
-    fn a_long_press_drags_until_the_finger_lifts() {
+    fn a_long_press_buzzes_then_right_clicks_or_drags() {
         let mut s = g(Mode::Direct);
+        // 长按后松开：右键（在手指处）
         s.touch(&t(1, Phase::Down, 0.0, 100.0, 0));
         assert!(s.tick(LONG_PRESS_MS - 1).is_empty());
-        assert_eq!(s.tick(LONG_PRESS_MS), vec![mv(0, 0), btn(LEFT, true)]);
-        // 再 tick 不重复按下
-        assert!(s.tick(LONG_PRESS_MS + 100).is_empty());
+        assert_eq!(s.tick(LONG_PRESS_MS), vec![Action::Haptic]);
+        assert!(s.tick(LONG_PRESS_MS + 100).is_empty(), "只震一次");
+        assert!(
+            s.touch(&t(1, Phase::Move, 4.0, 100.0, 600)).is_empty(),
+            "抖一点还是长按"
+        );
+        assert!(
+            s.touch(&t(2, Phase::Down, 9.0, 9.0, 610)).is_empty(),
+            "别的手指不管"
+        );
+        assert!(s.touch(&t(1, Phase::Down, 0.0, 100.0, 620)).is_empty());
+        let out = s.touch(&t(1, Phase::Up, 4.0, 100.0, 700));
+        assert_eq!(out, vec![mv(0, 0), btn(RIGHT, true), btn(RIGHT, false)]);
+        // 长按后拖动：从按下的地方按住左键，跟着手指走，抬起松开
+        s.touch(&t(1, Phase::Down, 0.0, 100.0, 1000));
+        s.tick(1000 + LONG_PRESS_MS);
+        let out = s.touch(&t(1, Phase::Move, 500.0, 350.0, 1600));
+        assert_eq!(out, vec![mv(0, 0), btn(LEFT, true), mv(32768, 32768)]);
         assert_eq!(
-            s.touch(&t(1, Phase::Move, 1000.0, 600.0, 700)),
+            s.touch(&t(1, Phase::Move, 1000.0, 600.0, 1700)),
             vec![mv(65535, 65535)]
         );
         // 拖拽中别的手指不打断
-        assert!(s.touch(&t(2, Phase::Down, 10.0, 10.0, 710)).is_empty());
-        assert!(s.touch(&t(2, Phase::Up, 10.0, 10.0, 720)).is_empty());
-        assert!(s.touch(&t(1, Phase::Down, 0.0, 0.0, 730)).is_empty());
+        assert!(s.touch(&t(2, Phase::Down, 10.0, 10.0, 1710)).is_empty());
+        assert!(s.touch(&t(2, Phase::Up, 10.0, 10.0, 1720)).is_empty());
+        assert!(s.touch(&t(1, Phase::Down, 0.0, 0.0, 1730)).is_empty());
         assert_eq!(
-            s.touch(&t(1, Phase::Up, 1000.0, 600.0, 800)),
+            s.touch(&t(1, Phase::Up, 1000.0, 600.0, 1800)),
             vec![btn(LEFT, false)]
         );
-        // 取消也要松开左键，不能让被控端一直按着
-        s.touch(&t(1, Phase::Down, 0.0, 100.0, 1000));
-        s.tick(1000 + LONG_PRESS_MS);
-        assert_eq!(
-            s.touch(&t(1, Phase::Cancel, 0.0, 100.0, 1600)),
-            vec![btn(LEFT, false)]
-        );
-        // 动过了就不算长按
+        // 拖拽中被系统取消：也要松开左键，不能让被控端一直按着
         s.touch(&t(1, Phase::Down, 0.0, 100.0, 2000));
-        s.touch(&t(1, Phase::Move, 50.0, 100.0, 2010));
-        assert!(s.tick(2000 + LONG_PRESS_MS).is_empty());
+        s.tick(2000 + LONG_PRESS_MS);
+        s.touch(&t(1, Phase::Move, 100.0, 100.0, 2600));
+        assert_eq!(
+            s.touch(&t(1, Phase::Cancel, 100.0, 100.0, 2700)),
+            vec![btn(LEFT, false)]
+        );
+        // 长按后被系统取消：不右键
+        s.touch(&t(1, Phase::Down, 0.0, 100.0, 3000));
+        s.tick(3000 + LONG_PRESS_MS);
+        assert!(s.touch(&t(1, Phase::Cancel, 0.0, 100.0, 3600)).is_empty());
+        assert_eq!(s.state, State::Idle);
     }
 
     #[test]
@@ -749,15 +776,12 @@ mod tests {
         ));
         assert!(s.touch(&t(1, Phase::Up, 400.0, 350.0, 2200)).is_empty());
         s.touch(&t(2, Phase::Up, 600.0, 350.0, 2210));
-        // 第二根手指在长按时间之后才来：已经不是单指等待了（长按先发生），这里不进入双指
+        // 第二根手指在长按时间之后才来：不进入双指，别的手指的移动也不算
         s.touch(&t(1, Phase::Down, 400.0, 350.0, 3000));
         assert!(s
             .touch(&t(2, Phase::Down, 600.0, 350.0, 3000 + LONG_PRESS_MS + 1))
             .is_empty());
-        assert!(
-            s.touch(&t(2, Phase::Move, 650.0, 350.0, 3600)).is_empty(),
-            "别的手指的移动不算"
-        );
+        assert!(s.touch(&t(2, Phase::Move, 650.0, 350.0, 3600)).is_empty());
         s.touch(&t(1, Phase::Up, 400.0, 350.0, 3700));
         assert_eq!(s.state, State::Idle);
     }
@@ -833,14 +857,18 @@ mod tests {
     }
 
     #[test]
-    fn the_trackpad_moves_a_cursor_and_clicks_where_it_is() {
-        let mut s = g(Mode::Trackpad);
+    fn the_mouse_mode_moves_a_cursor_and_clicks_where_it_is() {
+        let mut s = g(Mode::Direct);
+        // 进鼠标模式：交出光标位置，并把被控端的指针放过去
+        assert_eq!(
+            s.set_mode(Mode::Trackpad),
+            vec![cur(0.5, 0.5), mv(32768, 32768)]
+        );
         assert_eq!(s.mode(), Mode::Trackpad);
-        assert_eq!(s.cursor(), (0.5, 0.5));
         // 手指在哪不重要：往右划 250 像素 = 光标往右走四分之一个画面宽
         s.touch(&t(1, Phase::Down, 750.0, 550.0, 0));
         let out = s.touch(&t(1, Phase::Move, 1000.0, 550.0, 10));
-        assert_eq!(out, vec![mv(49151, 32768)]);
+        assert_eq!(out, vec![cur(0.75, 0.5), mv(49151, 32768)]);
         s.touch(&t(1, Phase::Up, 1000.0, 550.0, 20));
         // 单指点：在光标处点击
         s.touch(&t(1, Phase::Down, 10.0, 10.0, 100));
@@ -854,39 +882,73 @@ mod tests {
         s.touch(&t(1, Phase::Move, 5000.0, -5000.0, 210));
         assert_eq!(s.cursor(), (1.0, 0.0));
         s.touch(&t(1, Phase::Up, 5000.0, -5000.0, 220));
-        // 长按拖拽：从光标处拖
+        // 长按后拖动：从光标处拖，光标跟着位移走
         s.touch(&t(1, Phase::Down, 500.0, 300.0, 1000));
+        assert_eq!(s.tick(1000 + LONG_PRESS_MS), vec![Action::Haptic]);
+        let out = s.touch(&t(1, Phase::Move, 250.0, 425.0, 1600));
         assert_eq!(
-            s.tick(1000 + LONG_PRESS_MS),
-            vec![mv(65535, 0), btn(LEFT, true)]
-        );
-        assert_eq!(
-            s.touch(&t(1, Phase::Move, 250.0, 425.0, 1600)),
-            vec![mv(49151, 16384)]
+            out,
+            vec![
+                mv(65535, 0),
+                btn(LEFT, true),
+                cur(0.75, 0.25),
+                mv(49151, 16384)
+            ]
         );
         assert_eq!(
             s.touch(&t(1, Phase::Up, 250.0, 425.0, 1700)),
             vec![btn(LEFT, false)]
         );
-        // 双指点：在光标处右键；双指滚动不移动光标
-        s.touch(&t(1, Phase::Down, 400.0, 300.0, 2000));
-        s.touch(&t(2, Phase::Down, 600.0, 300.0, 2010));
-        let out = s.touch(&t(2, Phase::Up, 600.0, 300.0, 2100));
+        // 长按后松开：在光标处右键
+        s.touch(&t(1, Phase::Down, 10.0, 10.0, 2000));
+        s.tick(2000 + LONG_PRESS_MS);
+        let out = s.touch(&t(1, Phase::Up, 10.0, 10.0, 2600));
         assert_eq!(
             out,
             vec![mv(49151, 16384), btn(RIGHT, true), btn(RIGHT, false)]
         );
-        s.touch(&t(1, Phase::Up, 400.0, 300.0, 2110));
+        // 双指点：在光标处右键；双指滚动不移动光标
         s.touch(&t(1, Phase::Down, 400.0, 300.0, 3000));
         s.touch(&t(2, Phase::Down, 600.0, 300.0, 3010));
-        let out = s.touch(&t(1, Phase::Move, 400.0, 340.0, 3020));
+        let out = s.touch(&t(2, Phase::Up, 600.0, 300.0, 3100));
+        assert_eq!(
+            out,
+            vec![mv(49151, 16384), btn(RIGHT, true), btn(RIGHT, false)]
+        );
+        s.touch(&t(1, Phase::Up, 400.0, 300.0, 3110));
+        s.touch(&t(1, Phase::Down, 400.0, 300.0, 4000));
+        s.touch(&t(2, Phase::Down, 600.0, 300.0, 4010));
+        let out = s.touch(&t(1, Phase::Move, 400.0, 340.0, 4020));
         assert_eq!(
             out,
             vec![Action::Input(InputEvent::Wheel { dx: 0, dy: 60 })]
         );
-        // 换回直接点击模式
-        s.set_mode(Mode::Direct);
+        // 回到触屏模式：不交出东西
+        assert!(s.set_mode(Mode::Direct).is_empty());
         assert_eq!(s.mode(), Mode::Direct);
+    }
+
+    #[test]
+    fn mouse_buttons_on_the_screen_press_at_the_cursor() {
+        let mut s = g(Mode::Trackpad);
+        // 鼠标模式：先放好位置再按
+        assert_eq!(
+            s.button(LEFT, true),
+            vec![mv(32768, 32768), btn(LEFT, true)]
+        );
+        // 按住左键时另一根手指滑动：光标带着左键走，就是精细地选中文字
+        s.touch(&t(1, Phase::Down, 100.0, 300.0, 0));
+        let out = s.touch(&t(1, Phase::Move, 350.0, 300.0, 10));
+        assert_eq!(out, vec![cur(0.75, 0.5), mv(49151, 32768)]);
+        s.touch(&t(1, Phase::Up, 350.0, 300.0, 20));
+        assert_eq!(
+            s.button(LEFT, false),
+            vec![mv(49151, 32768), btn(LEFT, false)]
+        );
+        assert_eq!(s.button(RIGHT, true).last(), Some(&btn(RIGHT, true)));
+        // 触屏模式下按钮就只是按键
+        s.set_mode(Mode::Direct);
+        assert_eq!(s.button(RIGHT, false), vec![btn(RIGHT, false)]);
     }
 
     #[test]
@@ -923,6 +985,18 @@ mod tests {
         s.touch(&t(2, Phase::Up, 0.0, 100.0, 80));
         s.touch(&t(5, Phase::Up, 0.0, 100.0, 90));
         assert_eq!(s.state, State::Idle);
+        // 换画面位置之后，点击按新位置换算
+        s.set_view(View {
+            left: 100.0,
+            top: 0.0,
+            width: 200.0,
+            height: 100.0,
+        });
+        s.touch(&t(1, Phase::Down, 300.0, 100.0, 1000));
+        assert_eq!(
+            s.touch(&t(1, Phase::Up, 300.0, 100.0, 1050)).first(),
+            Some(&mv(65535, 65535))
+        );
         // 工具函数的边界
         assert_eq!(whole(1e9), i16::MAX);
         assert_eq!(whole(-1e9), i16::MIN);

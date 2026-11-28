@@ -18,7 +18,7 @@ use peerdesk_core::video::VideoDecoder;
 use peerdesk_net::NetError;
 
 use super::codec::SurfaceDecoder;
-use crate::gesture::{Gestures, Mode, Phase, Touch, View};
+use crate::gesture::{Gestures, Mode, Phase, Touch, View, RIGHT};
 use crate::{
     addr_from_handle, apply, device_target, handle_from_addr, keymap, DecoderFactory, ScreenSink,
     Session, SinkFactory,
@@ -100,7 +100,6 @@ pub extern "system" fn Java_ai_peerdesk_app_Native_start<'local>(
         top: 0.0,
         width: 1.0,
         height: 1.0,
-        zoomed: false,
     };
     let handle = Box::new(Handle {
         session,
@@ -175,7 +174,7 @@ pub extern "system" fn Java_ai_peerdesk_app_Native_tick<'local>(
     new_string(&mut env, out)
 }
 
-/// 画面在界面上的位置变了（缩放、平移、横竖屏）；`view_w`、`view_h` 是显示区域的像素，被控端按它编码。
+/// 画面在界面上的位置变了（缩放、平移、横竖屏）；`view_w`、`view_h` 是画面画出来的像素，被控端按它编码。
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub extern "system" fn Java_ai_peerdesk_app_Native_setView<'local>(
@@ -186,7 +185,6 @@ pub extern "system" fn Java_ai_peerdesk_app_Native_setView<'local>(
     top: jfloat,
     width: jfloat,
     height: jfloat,
-    zoomed: jboolean,
     view_w: jint,
     view_h: jint,
 ) {
@@ -199,7 +197,6 @@ pub extern "system" fn Java_ai_peerdesk_app_Native_setView<'local>(
                 top,
                 width,
                 height,
-                zoomed: zoomed == JNI_TRUE,
             });
         h.session.set_view(
             u16::try_from(view_w).unwrap_or(0),
@@ -208,19 +205,45 @@ pub extern "system" fn Java_ai_peerdesk_app_Native_setView<'local>(
     }
 }
 
-/// 触控模式：0 直接点击，1 触控板。
+/// 触控模式：0 触屏模式，1 鼠标模式（鼠标助手）。返回值同 `touch`（进鼠标模式时交出光标位置）。
 #[no_mangle]
 pub extern "system" fn Java_ai_peerdesk_app_Native_setMode<'local>(
-    _env: JNIEnv<'local>,
+    mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     h: jlong,
     mode: jint,
-) {
-    if let Some(h) = handle(h) {
-        h.gestures
+) -> jstring {
+    let out = handle(h).and_then(|h| {
+        let actions = h
+            .gestures
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .set_mode(Mode::from_code(mode));
+        apply(&h.session, actions)
+    });
+    new_string(&mut env, out)
+}
+
+/// 屏幕上的“左键”“右键”按钮（鼠标助手）：`button` 0 左键、1 右键，`down` 按下或抬起。
+/// 鼠标模式下点在光标处；按住左键再用另一根手指移动光标，就是精细地选中文字。
+#[no_mangle]
+pub extern "system" fn Java_ai_peerdesk_app_Native_button<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    h: jlong,
+    button: jint,
+    down: jboolean,
+) {
+    if let Some(h) = handle(h) {
+        let Some(button) = u8::try_from(button).ok().filter(|b| *b <= RIGHT) else {
+            return;
+        };
+        let actions = h
+            .gestures
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .button(button, down == JNI_TRUE);
+        let _ = apply(&h.session, actions);
     }
 }
 

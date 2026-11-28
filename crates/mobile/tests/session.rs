@@ -144,7 +144,6 @@ fn a_phone_session_sees_frames_and_its_taps_reach_the_host() {
         top: 0.0,
         width: 390.0,
         height: 220.0,
-        zoomed: false,
     };
     let mut g = Gestures::new(Mode::Direct, view, 8.0, 40.0);
     let mut actions = g.touch(&Touch {
@@ -260,10 +259,14 @@ fn view_changes_go_back_to_the_ui_and_inputs_go_out() {
                 },
                 Action::Input(InputEvent::ReleaseAll),
                 Action::Pan { dx: -3.0, dy: 4.0 },
+                Action::Haptic,
+                Action::Cursor { x: 0.25, y: 1.0 },
             ]
         )
         .as_deref(),
-        Some(r#"[{"type":"zoom","factor":1.5,"cx":10,"cy":20.5},{"type":"pan","dx":-3,"dy":4}]"#)
+        Some(
+            r#"[{"type":"zoom","factor":1.5,"cx":10,"cy":20.5},{"type":"pan","dx":-3,"dy":4},{"type":"haptic"},{"type":"cursor","x":0.25,"y":1}]"#
+        )
     );
 }
 
