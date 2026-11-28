@@ -2260,6 +2260,55 @@ mod tests {
     }
 
     /// 区域类输入的全过程（64×64 = 4×4 个宏块）：刚配置整屏是新的；画质表按“编码的设成这一帧的 QP、静止的只会变细”走；
+    /// M2b 的测量工具单独用 [`RegionTracker`] 算每帧的区域类特征：它和假后端里的是同一份代码，同样的变化、同样的 QP 序列，
+    /// 逐帧交出同样的 [`Regions`]（含静止宏块的画质差分布）。
+    #[test]
+    fn the_standalone_tracker_gives_the_same_inputs_as_the_backend() {
+        use peerdesk_core::changes::Move;
+        let feed = ChangeFeed::default();
+        let (mut b, seen) = probed(FakeConfig::default(), Some(&feed));
+        let p = planes(0);
+        let edges = content::mb_edges(&p.0, SIZE);
+        let mut tracker = RegionTracker::default();
+        let steps: [(u8, bool, Option<peerdesk_core::changes::Changes>); 6] = [
+            (30, false, None),
+            (20, false, None),
+            (
+                28,
+                false,
+                Some(changes(
+                    &[Rect::new(10, 2, 10, 4)],
+                    &[Move {
+                        from: (0, 0),
+                        to: Rect::new(16, 16, 32, 16),
+                    }],
+                )),
+            ),
+            (20, false, None),
+            (40, true, Some(changes(&[Rect::new(0, 60, 64, 4)], &[]))),
+            (30, false, None),
+        ];
+        for (i, (qp, key, change)) in steps.iter().enumerate() {
+            let mut acc = Accum::default();
+            if let Some(c) = change {
+                feed.push(c);
+                acc.add(c);
+            }
+            let survey = tracker.survey(SIZE, i == 0, Some(&acc), &edges);
+            frame(ready(
+                b.submit(i420(&p), ask(i as u64, Some(*qp), 1 << 20, *key)),
+            ));
+            assert_eq!(last(&seen).regions, survey.regions(*qp), "第 {i} 帧");
+            tracker.commit(&survey, *qp, *key);
+        }
+        // 重新配置之后重来
+        tracker.reset();
+        b.reconfigure(SIZE, RATES).unwrap();
+        let survey = tracker.survey(SIZE, true, None, &edges);
+        frame(ready(b.submit(i420(&p), ask(9, Some(30), 1 << 20, false))));
+        assert_eq!(last(&seen).regions, survey.regions(30));
+    }
+
     /// 画质差分布和连续次数；跳过的版本累计；关键帧整屏重设；重新配置作废。
     #[test]
     fn region_inputs_follow_the_change_feed_and_the_quality_table() {

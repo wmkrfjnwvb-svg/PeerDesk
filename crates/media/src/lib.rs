@@ -20,6 +20,7 @@ mod color;
 pub mod content;
 pub mod fake;
 pub mod fitted;
+pub mod fitted_v2;
 /// Linux 的显卡和 VA-API 能力（检测和给用户的说明）。
 #[cfg(target_os = "linux")]
 pub mod gpu;

@@ -985,7 +985,10 @@ mod tests {
         };
         let default = mk(ByteModelKind::Default);
         let fitted = mk(ByteModelKind::Openh264V1);
+        let regional = mk(ByteModelKind::Openh264V2);
         assert_ne!(default, fitted);
+        assert_ne!(default, regional);
+        assert_ne!(fitted, regional);
         assert_eq!(default, mk(ByteModelKind::Default));
     }
 

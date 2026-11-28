@@ -8,6 +8,8 @@
   round-pages.txt   M2 的真字体页面：打字、整页滚动（全部留出；M2 的 main 轮里也有）
   round-refine.txt  M2 的静止补清晰链（10 条链 × 12 种子 × 5 分辨率）。场景切换门槛不重测：它和字节模型的新输入无关，沿用 M2 的 850
   round-roll.txt    新增的滚动窗口组：窗口宽高取整屏的 25%、50%、75%、100%（win*）
+  round-direct.txt  诊断（不进拟合，测量之后加的，原因见 data-m2b.md 4.9）：直接按 q 编一个关键帧，再按同一个 q 连编 9 帧（q = 12…20，12 个种子，1080p），
+                    和 B2 的 hold 链（先 QP 30 再降到 q）比低 QP 地板
 B2 的链（hold 链、desc 链）用 `measure floor <输出目录> <第几份> <共几份>` 单独跑，任务写死在代码里（12 个种子，种子 6、7、9、11 留出）。
 集：
 - main、refine：和 M2 相同（种子 6、7、9、11 和整个 2560×1440 留出，其余拟合；真字体页面全部留出）。
@@ -48,7 +50,9 @@ def main(out, pages=None):
             kind = name.split("-")[1]
             split = "hold" if kind == "code" else "fit"
             roll_jobs.append(f"pngseq {split} rolling real-{name} {path} {q1080} -")
-    for name, jobs in (("round-main", main_jobs), ("round-pages", pages_jobs), ("round-refine", refine_jobs), ("round-roll", roll_jobs)):
+    chains = ";".join(",".join([str(q)] * 10) for q in range(12, 21))
+    direct_jobs = [f"refine {'hold' if sd in m2.HOLD_SEEDS else 'fit'} {sd} 1920 1080 {chains}" for sd in m2.SEEDS]
+    for name, jobs in (("round-main", main_jobs), ("round-pages", pages_jobs), ("round-refine", refine_jobs), ("round-roll", roll_jobs), ("round-direct", direct_jobs)):
         if not jobs:
             continue
         rng.shuffle(jobs)  # 打散，各份的工作量差不多
