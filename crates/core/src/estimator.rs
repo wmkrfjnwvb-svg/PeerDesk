@@ -1926,7 +1926,8 @@ impl RateEstimator for ClassicV1 {
                 let from_bps = self.rate_bps;
                 self.rate_bps = self.rate_bps.min(target).clamp(self.min_bps, self.max_bps);
                 self.last_decrease = Some(now);
-                if self.notes.len() < MAX_NOTES {
+                // 码率真的降了才写（已经不比目标高时码率不变，以前也写一条“850 → 850”，日志里一长串没用的说明）
+                if self.rate_bps < from_bps && self.notes.len() < MAX_NOTES {
                     self.notes.push(format!(
                         "降码率 {} → {} kbps：趋势{}（{} ms，门限 {} ms），排队 {} ms，丢包 {}‰，\
                          送达 {} kbps（{}），包串测得容量 {}",
@@ -3819,30 +3820,48 @@ mod tests {
     }
 
     /// 说明攒满了（会话每秒才取走一次）：后面的降码率不再写说明，码率照降，不能因为说明满了就不降。
+    /// 没满时，只有码率真的变了才写“降码率”（以前码率已经到目标了还每个往返写一条“850 → 850”）。
     #[test]
     fn a_full_note_buffer_keeps_the_first_notes_and_never_blocks_a_cut() {
         let mut f = Feed::new(Profile::STABLE, 30_000_000);
         f.put(1_000, 0, 3_500_000, FLAT, NET);
-        // 持续拥塞 6 秒、会话一直没取走说明：每个往返（100 ms）写一条降码率的说明
-        for _ in 0..300 {
-            f.put(20_000, 0, 125_000, FLAT, NET);
+        let _ = f.v.take_notes();
+        for i in 0..MAX_NOTES {
+            f.v.notes.push(format!("先攒着的说明 {i}"));
         }
-        assert_eq!(f.v.rate_bps(), 850_000, "降到送达速率（1 Mbps）的 85%");
-        // 说明满了以后再来一次更严重的拥塞：码率照降
-        // （发送端一直有积压：送达速率是链路的能力，可以按它降到底线）
-        for _ in 0..10 {
+        // 持续拥塞，发送端一直有积压（送达速率是链路的能力）：按送达速率（100 kbps）降到底线
+        for _ in 0..30 {
             f.put_busy(20_000, 0, 12_500, FLAT, NET);
         }
         assert_eq!(f.v.rate_bps(), 100_000, "说明满了不影响降码率");
         let notes = f.v.take_notes();
-        assert_eq!(notes.len(), MAX_NOTES, "降码率的说明最多攒这么多条");
         assert!(
-            notes.iter().any(|n| n.contains("降码率 32400 → 850 kbps")),
-            "{notes:?}"
+            !notes.iter().any(|n| n.starts_with("降码率")),
+            "满了以后的不再写：{notes:?}"
         );
+        // 没满：降了才写，码率不变的那几个往返不写
+        let mut g = Feed::new(Profile::STABLE, 30_000_000);
+        g.put(1_000, 0, 3_500_000, FLAT, NET);
+        for _ in 0..300 {
+            g.put_busy(20_000, 0, 125_000, FLAT, NET);
+        }
+        assert_eq!(g.v.rate_bps(), 850_000, "降到送达速率（1 Mbps）的 85%");
+        let cuts: Vec<String> =
+            g.v.take_notes()
+                .into_iter()
+                .filter(|n| n.starts_with("降码率"))
+                .collect();
+        assert!(!cuts.is_empty());
+        let pair = |n: &str| -> Option<(u64, u64)> {
+            let rest = n.strip_prefix("降码率 ")?;
+            let mut it = rest.split(' ');
+            let from = it.next()?.parse().ok()?;
+            let to = it.nth(1)?.parse().ok()?;
+            Some((from, to))
+        };
         assert!(
-            !notes.iter().any(|n| n.contains("→ 100 kbps")),
-            "满了以后的不再写"
+            cuts.iter().all(|n| pair(n).is_some_and(|(a, b)| b < a)),
+            "{cuts:?}"
         );
     }
 
