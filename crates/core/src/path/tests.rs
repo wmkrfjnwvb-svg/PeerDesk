@@ -998,6 +998,7 @@ fn full_config() -> DirConfig {
                 idle_us: 30_000,
                 wake_us: 20_000,
             }),
+            pdv: Some(Pdv::RFC8868),
         },
         receiver: Receiver {
             busy: Some(Busy {
@@ -1010,7 +1011,7 @@ fn full_config() -> DirConfig {
     }
 }
 
-const STREAMS: [&str; 7] = [
+const STREAMS: [&str; 8] = [
     layer::BOTTLENECK,
     layer::LOSS,
     layer::DELAY,
@@ -1018,6 +1019,7 @@ const STREAMS: [&str; 7] = [
     layer::SPIKES,
     layer::DOZE,
     layer::BUSY,
+    layer::PDV,
 ];
 
 fn logs(cfg: DirConfig) -> Vec<Vec<u64>> {
@@ -1125,6 +1127,10 @@ fn switching_a_layer_off_or_changing_it_leaves_every_other_stream_untouched() {
             })
         }),
         ("批量收关掉", None, |c| c.receiver.batch_us = 0),
+        ("NR-BPDV 关掉", Some(layer::PDV), |c| c.noise.pdv = None),
+        ("NR-BPDV 改参数", None, |c| {
+            c.noise.pdv = Some(Pdv { std_us: 1_000 })
+        }),
     ];
     for (what, own, change) in changes {
         let mut cfg = full_config();
@@ -1833,4 +1839,138 @@ fn nominal_delay_does_not_draw() {
         "上下限的中点（向下取整）"
     );
     assert_eq!(periodic(0).nominal_us(Time(5_000)), 99);
+}
+
+// ---------------------------------------------------------------- RFC 8868 的 NR-BPDV（A2-4b）
+
+/// 分布：z = |截断到 ±3σ 的 N(0, σ²)|。理论值（σ 的倍数）：均值 0.79712、中位 0.67449、90% 分位 1.64485，
+/// 最大 3（用 Python 的 math.erf 和 NormalDist 算的）。12 个种子各抽 20000 个，均值在两倍标准误以内。
+#[test]
+fn pdv_follows_the_truncated_half_normal() {
+    let pdv = Pdv { std_us: 1_000_000 };
+    let draws = |seed: u64| {
+        let mut rng = LayerRng::new(seed, Dir::Forward, layer::PDV);
+        let mut v: Vec<u64> = (0..20_000).map(|_| pdv.sample(rng.next_u64())).collect();
+        v.sort_unstable();
+        v
+    };
+    check(
+        ["均值 / σ", "中位 / σ", "90% 分位 / σ"],
+        [0.797_12, 0.674_49, 1.644_85],
+        |seed| {
+            let v = draws(seed);
+            let mean = v.iter().sum::<u64>() as f64 / v.len() as f64;
+            [
+                mean / 1e6,
+                v[v.len() / 2] as f64 / 1e6,
+                v[v.len() * 9 / 10] as f64 / 1e6,
+            ]
+        },
+    );
+    let v = draws(1);
+    assert!(*v.last().unwrap() <= 3_000_000, "截断在 3σ");
+    assert_eq!(*v.first().unwrap() / 1000, 0, "最小接近 0");
+    // 被截断在 3σ 的比例约 0.27%（2·(1 − Φ(3))）
+    let capped = v.iter().filter(|x| **x >= 2_999_000).count();
+    assert!((20..=100).contains(&capped), "{capped}");
+    // 表的两端
+    assert_eq!(pdv.sample(0), 0);
+    assert_eq!(pdv.sample(u64::MAX), 3_000_000);
+    assert_eq!(Pdv::RFC8868.std_us, 5_000);
+}
+
+/// 不乱序：每个包都不早于上一个包加上它按瓶颈速率的串行时间；延迟变化落在 [0, 3σ]（排队之外）。
+#[test]
+fn pdv_never_reorders_and_respects_serialization() {
+    let cfg = DirConfig {
+        noise: Noise {
+            pdv: Some(Pdv::RFC8868),
+            ..Noise::default()
+        },
+        delay: Delay::Fixed(50_000),
+        ..bottleneck(
+            Capacity::Constant {
+                rate_bps: 1_000_000,
+            },
+            QueueLimit::delay(300_000),
+            Aqm::TailDrop,
+        )
+    };
+    let mut p = P::new(9, fwd(cfg));
+    // 每 5 ms 一个 500 字节的包：串行 4 ms，比间隔短，瓶颈不排队
+    for i in 0..2_000u32 {
+        p.advance_to(Time(u64::from(i) * 5_000));
+        p.send(0, 1, 500, i);
+    }
+    let mut prev: Option<(u32, u64)> = None;
+    let mut extra = Vec::new();
+    while let Some(d) = p.pop() {
+        let sent = u64::from(d.payload) * 5_000;
+        let at = d.at.micros();
+        // 没有 PDV 时：发出 + 串行 4 ms + 传播 50 ms
+        extra.push(at - sent - 4_000 - 50_000);
+        if let Some((pi, pat)) = prev {
+            assert_eq!(d.payload, pi + 1, "不乱序");
+            assert!(
+                at >= pat + 4_000,
+                "第 {} 个包 {at} 早于上一个 {pat} + 串行 4 ms",
+                d.payload
+            );
+        }
+        prev = Some((d.payload, at));
+    }
+    assert_eq!(extra.len(), 2_000);
+    // 被前一个包推后的包，额外延迟是前一个的减去 1 ms（间隔 5 − 串行 4），所以仍不超过 3σ；
+    // 均值比 0.797σ 大：包密时“不乱序”这条规则本身就把延迟变化拉长了（RFC 8868 的定义如此）
+    assert!(extra.iter().all(|x| *x <= 15_000), "最大 3σ = 15 ms");
+    let mean = extra.iter().sum::<u64>() as f64 / 2_000.0;
+    assert!(mean > 0.797 * 5_000.0, "{mean}");
+
+    // 包稀（每 100 ms 一个）时推不动，额外延迟的均值就是 0.797σ ≈ 3986 µs
+    let mut sparse = P::new(
+        9,
+        fwd(DirConfig {
+            noise: Noise {
+                pdv: Some(Pdv::RFC8868),
+                ..Noise::default()
+            },
+            ..DirConfig::default()
+        }),
+    );
+    for i in 0..4_000u64 {
+        sparse.advance_to(Time(i * 100_000));
+        sparse.send(0, 1, 100, 0);
+    }
+    let mut sum = 0u64;
+    let mut n = 0u64;
+    while let Some(d) = sparse.pop() {
+        sum += d.at.micros() % 100_000;
+        n += 1;
+    }
+    let mean = sum as f64 / n as f64;
+    // 标准差约 0.6σ = 3 ms，4000 个的标准误约 47 µs
+    assert!((mean - 3_985.6).abs() < 2.0 * 47.5, "{mean}");
+
+    // 不限速时串行为 0，只保证不早于上一个包
+    let mut q = P::new(
+        9,
+        fwd(DirConfig {
+            noise: Noise {
+                pdv: Some(Pdv::RFC8868),
+                ..Noise::default()
+            },
+            ..DirConfig::default()
+        }),
+    );
+    for i in 0..500u32 {
+        q.send(0, 1, 100, i);
+    }
+    let mut last = 0;
+    let mut order = Vec::new();
+    while let Some(d) = q.pop() {
+        assert!(d.at.micros() >= last);
+        last = d.at.micros();
+        order.push(d.payload);
+    }
+    assert_eq!(order, (0..500).collect::<Vec<_>>());
 }

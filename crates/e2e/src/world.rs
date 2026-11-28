@@ -1262,6 +1262,7 @@ mod tests {
                     idle_us: 30_000,
                     wake_us: 20_000,
                 }),
+                pdv: Some(peerdesk_core::path::Pdv::RFC8868),
             },
             receiver: Receiver {
                 busy: Some(Busy {
@@ -1413,6 +1414,8 @@ mod tests {
         assert!(text.contains("\nrng_layout 2\n"));
         assert!(!text.contains("\nlinks "), "布局 2 不写布局 1 的键");
         assert!(text.contains("capacity=trace:repeat:1000000@5000000,0@1,500000@0"));
+        assert!(text.contains(" batch_us=4000 pdv=5000\n"), "打开时才写 pdv");
+        assert_eq!(text.matches(" pdv=").count(), 1, "没开的方向不写");
         assert!(text.contains("\nroute.1 at=2000000 down_us=50000 new=0\n"));
         assert!(!text.contains("route.1.fwd"));
         // 布局 1 转过来的也能来回；布局 1 的写法和以前一样（哈希不变）由 round_trips_are_byte_identical 守着

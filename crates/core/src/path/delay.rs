@@ -154,6 +154,46 @@ pub struct Noise {
     pub spikes: Option<Spikes>,
     /// 省电唤醒。
     pub doze: Option<Doze>,
+    /// RFC 8868 的不乱序有界延迟变化（NR-BPDV，见 [`Pdv`]）。默认关。
+    pub pdv: Option<Pdv>,
+}
+
+/// RFC 8868 第 4.5.2、4.5.3 节的“Approximately Random Subject to No-Reordering Bounded PDV”（NR-BPDV），
+/// RFC 8867 第 4.2 节要求评估时用它。
+///
+/// - 每个包的额外延迟 z(n) = |max(min(N(0, std²), N_STD·std), −N_STD·std)|，原文推荐 std = 5 ms、N_STD = 3；
+/// - 不乱序：j(n) 早于 j(n−1) + serial(n−1) 时改成 j(n−1) + serial(n−1)，serial 是上一个包按瓶颈速率的串行时间
+///   （瓶颈不限速时为 0）。
+///
+/// 正态分布用整数表查（`pdv_table.rs`，N_STD 固定为 3），不用浮点函数，跨平台逐字节相同。表由
+/// `statistics.NormalDist().inv_cdf((1 + k / 1024) / 2)` 算出，取 1025 个点，相邻两点之间线性插值。
+///
+/// 原文的一处矛盾：RFC 8867 第 4.2 节写“Maximum end-to-end jitter: 30 ms”，而 8868 的公式在推荐参数下最大是
+/// 3 × 5 = 15 ms。这里照 8868 的公式（8867 自己说“Jitter models are described in [RFC8868]”）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pdv {
+    /// 正态分布的标准差（微秒），原文推荐 5000。
+    pub std_us: u64,
+}
+
+impl Pdv {
+    /// RFC 8868 推荐的参数：std = 5 ms，N_STD = 3。
+    pub const RFC8868: Pdv = Pdv { std_us: 5_000 };
+
+    /// 由一个随机数得到这个包的额外延迟（微秒）。
+    #[must_use]
+    pub fn sample(&self, draw: u64) -> u64 {
+        use super::pdv_table::{HALF_NORMAL_MICRO, STEPS};
+        // 高 10 位选格，接下来 32 位在格里线性插值
+        let cell = draw >> 54;
+        let frac = (draw >> 22) & 0xFFFF_FFFF;
+        let i = usize::try_from(cell.min(STEPS - 1)).unwrap_or(0);
+        let lo = u64::from(HALF_NORMAL_MICRO.get(i).copied().unwrap_or(0));
+        let hi = u64::from(HALF_NORMAL_MICRO.get(i + 1).copied().unwrap_or(0));
+        let micro = lo + (((hi - lo) * frac) >> 32);
+        let z = u128::from(micro) * u128::from(self.std_us) / 1_000_000;
+        u64::try_from(z).unwrap_or(u64::MAX)
+    }
 }
 
 /// 接收端（第 7 层）。
