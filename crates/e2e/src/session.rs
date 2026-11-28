@@ -296,6 +296,10 @@ struct Pair<'a> {
     received_bytes: u64,
     first_received: Option<Time>,
     flow: flow::FlowLog,
+    /// 编码耗时（帧出发时刻）抽样器；模型按 0 算时为 `None`（见 [`crate::encode_time`]）。
+    encode_time: Option<encode_time::Sampler>,
+    /// 编好了、还在“编码中”的帧：（编完的本地时刻，分片），到时间才交给节奏器。
+    held: std::collections::VecDeque<(Time, Vec<peerdesk_core::media::Outgoing>)>,
 }
 
 impl<'a> Pair<'a> {
@@ -389,6 +393,8 @@ impl<'a> Pair<'a> {
             rx,
             wall,
             route_changes: Vec::new(),
+            encode_time: encode_time::Sampler::new(s.encode_time, s.seed, index),
+            held: std::collections::VecDeque::new(),
             // 分段路径每段正向排队：（时间加权的和 微秒·微秒，最大 微秒），按帧末采样
             seg_queue: Vec::new(),
             // 每一帧的采集时间，按帧号。
@@ -466,6 +472,7 @@ impl<'a> Pair<'a> {
             Some(self.next_tick),
             self.pacer
                 .next_due(self.now, self.tx.pacing_bps(self.pacing)),
+            self.held.front().map(|(t, _)| *t),
         ]
         .into_iter()
         .flatten()
@@ -531,6 +538,8 @@ impl<'a> Pair<'a> {
         };
         let now = self.now;
         self.clock = Clock::InFrame(now.plus(self.interval));
+        // 上一帧的编码耗时超过一个帧间隔时，到这里才编完
+        self.release_encoded();
         self.frames_left = self.frames_left.saturating_sub(1);
         // 被控端：这一帧。
         steps.apply_due(&mut net.inner, self.global(now));
@@ -564,7 +573,8 @@ impl<'a> Pair<'a> {
         }
         let wanted = self.pending || self.tx.wants_frame();
         let pacer_busy = self.pacer.busy(self.tx.pacing_bps(self.pacing), frame_us);
-        if self.tx.frame_gate(now, wanted, pacer_busy) {
+        // 和产品一样：上一帧还在编码时这一帧不编（产品的 `encoding`，不问 frame_gate）
+        if self.held.is_empty() && self.tx.frame_gate(now, wanted, pacer_busy) {
             let rtt = net
                 .inner
                 .nominal_rtt_us()
@@ -593,8 +603,14 @@ impl<'a> Pair<'a> {
                     }
                 }
             }
-            // 和产品一样经发送节奏控制发出（见 peerdesk_core::pacer）
-            self.pacer.push(out);
+            // 和产品一样经发送节奏控制发出（见 peerdesk_core::pacer）；有编码耗时模型时编完才交给节奏器
+            match self.encode_time.as_mut() {
+                Some(clock) => {
+                    let done = now.plus(clock.next_us());
+                    self.held.push_back((done, out));
+                }
+                None => self.pacer.push(out),
+            }
             self.send(net)?;
         }
         Ok(())
@@ -638,11 +654,21 @@ impl<'a> Pair<'a> {
         route_changed(&mut self.tx, &mut self.rx, at);
     }
 
+    /// 编完了的帧交给节奏器（按编完的先后）。
+    fn release_encoded(&mut self) {
+        while self.held.front().is_some_and(|(t, _)| *t <= self.now) {
+            if let Some((_, out)) = self.held.pop_front() {
+                self.pacer.push(out);
+            }
+        }
+    }
+
     /// 醒来：网络控制器的定时任务、发出、该发反馈就发。
     fn wake(&mut self, net: &mut impl Network<Packet>) -> Result<(), Error> {
         if !self.active() {
             return Ok(());
         }
+        self.release_encoded();
         let now = self.now;
         let controlling = self.profile.start();
         if self.next_tick <= now {
@@ -1282,6 +1308,37 @@ mod tests {
         assert!(r[0].frames > 0 && r[0].first_picture_ms.is_some());
         let st = r[0].path.unwrap();
         assert!(st.sent > 0);
+    }
+
+    /// 编码耗时模型：编完才交给节奏器，第一个包晚到至少表里的最小耗时；中位大于一个帧间隔时，
+    /// 上一帧没编完下一帧不编（和产品的 `encoding` 一样），帧数变少；按 0 算时和没有这一层逐字节相同。
+    #[test]
+    fn encode_time_delays_departure() {
+        let run = |model| {
+            let mut one = pair("enc", 90, 0, false, 0);
+            one.scenario.encode_time = model;
+            let m = MultiScenario {
+                network: NetworkPlan::Layout2(Box::new(Layout2 {
+                    start: PathConfig::symmetric(link(3_000_000, 20_000)),
+                    ..Layout2::default()
+                })),
+                seed: 5,
+                pairs: vec![one],
+            };
+            run_multi(&m).unwrap().remove(0)
+        };
+        let off = run(encode_time::EncodeTime::Zero);
+        let again = run(encode_time::EncodeTime::Zero);
+        assert_eq!(off.received_bytes, again.received_bytes);
+        assert_eq!(off.first_received_us, again.first_received_us);
+        let slow = run(encode_time::EncodeTime::Openh264Office { median_us: 25_000 });
+        let (a, b) = (
+            off.first_received_us.unwrap(),
+            slow.first_received_us.unwrap(),
+        );
+        assert!(b >= a + 423 * 25, "{a} → {b}");
+        assert!(slow.first_picture_ms.is_some() && slow.bad == 0);
+        assert!(slow.frames <= off.frames, "{} {}", slow.frames, off.frames);
     }
 
     #[test]

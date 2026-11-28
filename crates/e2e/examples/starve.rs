@@ -8,8 +8,41 @@
 use std::collections::BTreeMap;
 use std::io::Write as _;
 
+use peerdesk_e2e::encode_time::{EncodeTime, MAC_MEDIAN_US};
 use peerdesk_e2e::rfc8867::{cases, truncated};
-use peerdesk_e2e::{run_multi, FeatureRow};
+use peerdesk_e2e::{run_multi, Action, FeatureRow, Phase};
+
+/// 办公负载（和 `nackspread` 同一套，一轮 495 帧），重复到 `frames` 帧。
+fn office_phases(frames: u32) -> Vec<Phase> {
+    let p = |action, frames| Phase { action, frames };
+    let cycle = [
+        p(Action::Idle, 30),
+        p(Action::Typing, 90),
+        p(Action::Idle, 30),
+        p(Action::Scrolling, 60),
+        p(Action::Idle, 30),
+        p(Action::Dragging, 60),
+        p(Action::Idle, 30),
+        p(Action::Switching, 15),
+        p(Action::Idle, 30),
+        p(Action::Video, 90),
+        p(Action::Idle, 30),
+    ];
+    let mut out = Vec::new();
+    let mut left = frames;
+    for ph in cycle.iter().cycle() {
+        if left == 0 {
+            break;
+        }
+        let n = ph.frames.min(left);
+        out.push(Phase {
+            action: ph.action,
+            frames: n,
+        });
+        left -= n;
+    }
+    out
+}
 
 /// 一格的汇总。
 #[derive(Default)]
@@ -60,8 +93,42 @@ fn mean_recv_kbps(f: &peerdesk_e2e::flow::FlowLog, t0: u64, t1: u64) -> u64 {
 /// 公平只随相位变，就是两路严格同频、相位固定带来的假象（小流的包总落在大流一帧突发的同一个位置）。
 fn sweep(case: peerdesk_e2e::rfc8867::Case, t0: u64, t1: u64) {
     let mut out = std::io::stdout().lock();
-    let _ = writeln!(out, "# {} 相位扫描，{} – {} s 的平均接收 kbps", case.id, t0 / 1000, t1 / 1000);
-    let base = truncated(case, t1 / 1000 + 1);
+    let _ = writeln!(
+        out,
+        "# {} 相位扫描，{} – {} s 的平均接收 kbps",
+        case.id,
+        t0 / 1000,
+        t1 / 1000
+    );
+    let mut base = truncated(case, t1 / 1000 + 1);
+    let enc = std::env::var_os("STARVE_ENC").is_some();
+    let office = std::env::var_os("STARVE_OFFICE").is_some();
+    let _ = writeln!(
+        out,
+        "编码耗时模型 {}，内容 {}",
+        if enc {
+            "openh264 办公形状、中位 7 ms"
+        } else {
+            "按 0 算"
+        },
+        if office {
+            "办公（只在画面变了时编码，各路内容种子不同）"
+        } else {
+            "一直在播的视频"
+        }
+    );
+    for (i, p) in base.multi.pairs.iter_mut().enumerate() {
+        if enc {
+            p.scenario.encode_time = EncodeTime::Openh264Office {
+                median_us: MAC_MEDIAN_US,
+            };
+        }
+        if office {
+            let frames: u32 = p.scenario.phases.iter().map(|ph| ph.frames).sum();
+            p.scenario.phases = office_phases(frames);
+            p.scenario.seed += 1000 * u64::try_from(i).unwrap_or(0);
+        }
+    }
     let start = base.multi.pairs.first().map_or(0, |p| p.start_us);
     for d in (0..=30).step_by(3) {
         let mut c = base.clone();

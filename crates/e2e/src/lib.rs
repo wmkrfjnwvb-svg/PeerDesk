@@ -10,6 +10,7 @@
 //! 同一个场景同一个种子，结果逐字节相同，可以放进 CI 当回归门槛。
 
 pub mod content;
+pub mod encode_time;
 pub mod flow;
 pub mod homes;
 pub mod report;
@@ -391,6 +392,8 @@ pub struct Scenario {
     pub byte_model: ByteModelKind,
     /// 字节模型的扰动（默认是模型自己的做法；占位模型只能是默认）。
     pub byte_noise: ByteNoise,
+    /// 编码耗时（帧出发时刻）模型，默认按 0 算（见 [`encode_time`]）。
+    pub encode_time: encode_time::EncodeTime,
 }
 
 impl Scenario {
@@ -433,6 +436,7 @@ impl Scenario {
             probe_ids: true,
             byte_model: ByteModelKind::Default,
             byte_noise: ByteNoise::Default,
+            encode_time: encode_time::EncodeTime::Zero,
         }
     }
 }

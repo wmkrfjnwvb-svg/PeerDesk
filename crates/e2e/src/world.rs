@@ -19,6 +19,7 @@
 mod layout2;
 
 use crate::content::Action;
+use crate::encode_time::EncodeTime;
 use crate::{
     ByteModelKind, ByteNoise, CodecKind, EstimatorKind, NetworkPlan, Outcome, Phase, Scenario,
 };
@@ -257,6 +258,7 @@ pub fn to_text(s: &Scenario) -> Result<String, WorldError> {
         probe_ids,
         byte_model,
         byte_noise,
+        encode_time,
     } = s;
     check_byte_model(*codec, *byte_model)?;
     check_byte_noise(*byte_model, *byte_noise)?;
@@ -281,6 +283,10 @@ pub fn to_text(s: &Scenario) -> Result<String, WorldError> {
     // 扰动是后来加的键：只在不是默认时写。这样没有它的老世界文件照样读得进来，默认的场景写出来和以前逐字节相同（哈希不变）
     if *byte_noise != ByteNoise::Default {
         w.put("byte_noise", byte_noise.name())?;
+    }
+    // 编码耗时也是后来加的键，同样只在不是默认（按 0 算）时写
+    if *encode_time != EncodeTime::Zero {
+        w.put("encode_time", &encode_time.name())?;
     }
     w.put_display("rng_layout", network.layout())?;
     w.put_display("seed", seed)?;
@@ -368,6 +374,16 @@ pub fn from_text(text: &str) -> Result<Scenario, WorldError> {
         kv.take_choice("byte_noise", &ByteNoise::ALL)?
     } else {
         ByteNoise::Default
+    };
+    let encode_time = if kv.has("encode_time") {
+        let text = kv.take("encode_time")?;
+        EncodeTime::parse(&text).ok_or_else(|| {
+            WorldError::Format(format!(
+                "encode_time 认不出：{text}（只能是 zero 或 openh264-office/<中位微秒>）"
+            ))
+        })?
+    } else {
+        EncodeTime::Zero
     };
     let rng_layout = kv.take_u32("rng_layout")?;
     if !RNG_LAYOUTS.contains(&rng_layout) {
@@ -461,6 +477,7 @@ pub fn from_text(text: &str) -> Result<Scenario, WorldError> {
     s.probe_ids = probe_ids;
     s.byte_model = byte_model;
     s.byte_noise = byte_noise;
+    s.encode_time = encode_time;
     Ok(s)
 }
 
@@ -1138,6 +1155,27 @@ mod tests {
         assert!(WorldError::Run(Error::InvalidArgument("c"))
             .to_string()
             .starts_with("仿真出错："));
+    }
+
+    /// 编码耗时的键：默认（按 0 算）时不写，哈希不变；打开时写出来能读回；认不出的写法拒绝。
+    #[test]
+    fn encode_time_is_written_only_when_it_is_on() {
+        let mut s = Scenario::fixed("enc", phases());
+        let plain = to_text(&s).unwrap();
+        assert!(!plain.contains("encode_time"), "{plain}");
+        assert_eq!(from_text(&plain).unwrap().encode_time, EncodeTime::Zero);
+        s.encode_time = EncodeTime::Openh264Office { median_us: 7_000 };
+        let text = to_text(&s).unwrap();
+        assert!(
+            text.contains("\nencode_time openh264-office/7000\n"),
+            "{text}"
+        );
+        let back = from_text(&text).unwrap();
+        assert_eq!(back.encode_time, s.encode_time);
+        assert_eq!(to_text(&back).unwrap(), text);
+        assert_ne!(hash(&text), hash(&plain));
+        let bad = text.replace("openh264-office/7000", "lognormal");
+        assert!(from_text(&bad).is_err());
     }
 
     /// 扰动的键：默认时不写（老的世界文件、默认场景的哈希都不变），不是默认时写出来能读回；
