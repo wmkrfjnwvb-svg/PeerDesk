@@ -1,4 +1,4 @@
-//! 日志：写到数据目录的 `logs/peerdesk.log`，出问题时把这个文件发出来就能排查。
+//! 日志（桌面端和手机端共用）：写到数据目录的 `logs/peerdesk.log`，出问题时把这个文件发出来就能排查。
 //!
 //! 内容包括连接的各个阶段（找服务器、打洞、直连还是中继、各用了多久、失败原因）
 //! 和会话中每秒一行的统计（帧数、码率、目标码率、RTT、丢包、最长卡顿）。
@@ -101,7 +101,12 @@ impl log::Log for FileLog {
 
 /// 打开日志。只能打开一次，再次调用不起作用。
 pub fn init(dir: &Path, echo: bool) {
-    let logger = Box::new(FileLog::new(dir, MAX_BYTES, echo));
+    init_with(dir, MAX_BYTES, echo);
+}
+
+/// 同 [`init`]，单个文件的大小上限自己定（手机端空间小，用得比桌面端小）。
+pub fn init_with(dir: &Path, max_bytes: u64, echo: bool) {
+    let logger = Box::new(FileLog::new(dir, max_bytes, echo));
     if log::set_boxed_logger(logger).is_ok() {
         log::set_max_level(log::LevelFilter::Info);
         log::info!(

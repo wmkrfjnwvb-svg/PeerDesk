@@ -18,7 +18,7 @@ soft = ["media", "peerdesk-media/source"]
 portmap = ["dep:igd-next"]
 
 [dependencies]
-log = "0.4"
+log = { version = "0.4", features = ["std"] }
 peerdesk-core.workspace = true
 peerdesk-media = { workspace = true, optional = true }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }

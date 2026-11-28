@@ -221,6 +221,7 @@ fn caps() -> Caps {
         .with(Caps::TRANSPORT_CC)
         .with(Caps::PROBE_TRAIN)
         .with(Caps::PROBE_ID)
+        .with(Caps::INPUT_STAMP)
 }
 
 impl ViewEnv for MobileEnv {
@@ -287,6 +288,28 @@ pub struct Session {
     view: watch::Sender<(u16, u16)>,
 }
 
+/// 手机端日志文件的大小上限（轮换一份，最多占两份）。比桌面端小：手机空间紧，导出时也要打进压缩包。
+const LOG_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+/// 打开文件日志（只在进程里第一次生效）：写到 `<data_dir>/logs/peerdesk.log`，和桌面端同一个日志器、同一种行格式。
+/// 内容是连接各阶段（找服务器、打洞、直连还是中继、各用了多久、失败原因）和会话中每秒一行的统计；
+/// 不记录画面、键盘输入的内容和密码。
+pub fn init_logging(data_dir: &Path) {
+    peerdesk_net::logfile::init_with(&data_dir.join("logs"), LOG_MAX_BYTES, false);
+}
+
+/// 日志里怎么写“连谁”：设备码只留最后 3 位，不写密码（密码根本不会传到这里）。
+#[must_use]
+pub fn describe_target(target: &ViewTarget) -> String {
+    match target {
+        ViewTarget::Addr { addr, .. } => format!("直连地址 {addr}"),
+        ViewTarget::Device { server, device, .. } => match device {
+            Lookup::Code(code) => format!("设备码 ***{:03}，服务器 {}", code % 1000, server.addr),
+            Lookup::Device(_) => format!("按设备指纹，服务器 {}", server.addr),
+        },
+    }
+}
+
 impl Session {
     /// 开始一次访问：在自己的线程里连接并跑会话。`data_dir` 放身份（第一次自动生成）、集群节点缓存和会话记录；
     /// `password` 为空表示不带密码。结果和过程都从 [`Self::next_event`] 取，最后一定有一个 [`Event::Ended`]。
@@ -311,6 +334,7 @@ impl Session {
         sink: SinkFactory,
         decoder: Option<DecoderFactory>,
     ) -> Self {
+        init_logging(&data_dir);
         let (tx, events) = mpsc::channel();
         let (input, input_rx) = tokio::sync::mpsc::channel(INPUT_QUEUE);
         let (stop, stop_rx) = watch::channel(false);
@@ -331,9 +355,15 @@ impl Session {
             .name("peerdesk-session".to_owned())
             .spawn(move || {
                 let event = match resolve() {
-                    Ok(target) => ended(run(target, auth, env, input_rx, stop_rx)),
+                    Ok(target) => {
+                        peerdesk_net::note!(info, "手机端会话开始：{}", describe_target(&target));
+                        ended(run(target, auth, env, input_rx, stop_rx))
+                    }
                     Err(text) => Event::Ended { ok: false, text },
                 };
+                if let Event::Ended { ok, text } = &event {
+                    peerdesk_net::note!(info, "手机端会话结束：成功={ok}，原因={text}");
+                }
                 let _ = tx.send(event);
             });
         if let Err(e) = spawned {

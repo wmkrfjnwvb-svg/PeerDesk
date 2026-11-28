@@ -118,13 +118,18 @@ class KeyCatcherView(
     override fun onCheckIsTextEditor() = true
 
     override fun onCreateInputConnection(outAttrs: EditorInfo): InputConnection {
-        outAttrs.inputType = InputType.TYPE_CLASS_TEXT or
-            InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS or
-            InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD
+        // 普通文字、不要联想：英文输入法照样一个字母一个字母提交；中文输入法可以拼音组字。
+        // 不能用“可见密码”：输入法见到密码框会切成纯英文，中文就打不了（产品负责人 11-28 实测）
+        outAttrs.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
         outAttrs.imeOptions = EditorInfo.IME_FLAG_NO_EXTRACT_UI or
             EditorInfo.IME_FLAG_NO_FULLSCREEN or EditorInfo.IME_ACTION_NONE
         return object : BaseInputConnection(this, false) {
+            /** 输入法正在组的字（拼音、或者还没确认的词），不发给被控端。 */
+            private var composing = ""
+
             override fun commitText(text: CharSequence?, newCursorPosition: Int): Boolean {
+                // 提交的文字替换掉正在组的字
+                composing = ""
                 val s = text?.toString().orEmpty()
                 // 换行当回车键发，其余当文字
                 val parts = s.split('\n')
@@ -135,9 +140,20 @@ class KeyCatcherView(
                 return true
             }
 
-            // 组合中的文字（中文拼音等）等输入法自己提交，我们不显示它
-            override fun setComposingText(text: CharSequence?, newCursorPosition: Int) = true
-            override fun finishComposingText() = true
+            // 组合中的文字（中文拼音等）先记着、不发；输入法用 commitText 提交时替换掉它。
+            // 有的输入法（例如搜狗）选词后不调 commitText，而是先把组好的字放进组合区再调 finishComposingText：
+            // 按 Android 的定义这时组合区的文字就是提交的文字，要发出去
+            override fun setComposingText(text: CharSequence?, newCursorPosition: Int): Boolean {
+                composing = text?.toString().orEmpty()
+                return true
+            }
+
+            override fun finishComposingText(): Boolean {
+                val s = composing
+                composing = ""
+                if (s.isNotEmpty()) commitText(s, 1)
+                return true
+            }
 
             override fun deleteSurroundingText(beforeLength: Int, afterLength: Int): Boolean {
                 repeat(beforeLength.coerceIn(0, MAX_DELETE)) { onKey(KeyEvent.KEYCODE_DEL) }

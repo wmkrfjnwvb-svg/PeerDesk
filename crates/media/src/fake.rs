@@ -2197,6 +2197,7 @@ mod tests {
             frame_id,
             header,
             data,
+            first_seen: peerdesk_core::Time::ZERO,
         };
         let f0 = encode_one(&mut b, 0, 30, false);
         let _lost = encode_one(&mut b, 1, 30, false);
