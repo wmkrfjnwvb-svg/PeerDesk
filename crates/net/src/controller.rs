@@ -10,6 +10,7 @@ use peerdesk_core::frame::Picture;
 use peerdesk_core::input::{InputEvent, InputSender};
 use peerdesk_core::media::{DecodeJob, DecodeWorker, MediaReceiver};
 use peerdesk_core::proto::{Caps, Channel, Control, RejectReason};
+use peerdesk_core::reaction::{FrameStamp, ReactionTracker, ReactionWindow, Shown};
 use peerdesk_core::record::ViewResult;
 use peerdesk_core::screen::Screen;
 use peerdesk_core::session::{Session, SessionConfig, State};
@@ -138,8 +139,12 @@ pub struct LinkQuality {
     pub queue_ms: u32,
     /// 这一秒显示的帧数。
     pub fps: u32,
-    /// 这一秒“按键或点击到下一幅画面”的中位数（毫秒）；没有操作时为 `None`。
+    /// 这一秒“操作到画面”的中位数（毫秒）；没有操作时为 `None`。对方支持帧上带输入序号
+    /// （[`Caps::INPUT_STAMP`]）时是“发出操作到显示第一幅带上它的画面”，否则是旧算法（见下一项）。
     pub reaction_ms: Option<u32>,
+    /// 旧算法：这一秒“按键或点击到下一幅画面”的中位数（毫秒）。画面静止时被控端也在出帧（补清晰），
+    /// 下一幅画面多半是操作生效之前采的，所以这个数偏小；留着只为和新算法对照。
+    pub reaction_next_frame_ms: Option<u32>,
     /// 这一秒收到的画面码率（kbps）。
     pub recv_kbps: u32,
     /// 这一秒最慢的一次解码（毫秒）。
@@ -186,8 +191,8 @@ impl std::fmt::Debug for EstablishedHook {
 struct StatsWindow {
     /// 这一秒最慢的一次解码（微秒）。
     decode_us: u64,
-    /// 这一秒里“按键或点击之后到下一幅画面”的时间（微秒）：用户感觉到的操作延迟（上限）。
-    reactions: Vec<u64>,
+    /// 这一秒的操作到画面：新算法（帧上带输入序号）的各次和旧算法（操作后的下一幅画面）的各次。
+    reaction: ReactionWindow,
     frames: u32,
     max_gap_us: u64,
     bytes: u64,
@@ -208,7 +213,7 @@ struct StatsWindow {
 }
 
 /// 按键或点击之后这么久还没有新画面，就不算这一次（多半是操作没有改变画面）。
-const REACTION_LIMIT_US: u64 = 2_000_000;
+const REACTION_LIMIT_US: u64 = peerdesk_core::reaction::REACTION_LIMIT_US;
 
 /// 一组操作延迟的中位数和最大值（毫秒）。
 fn reaction_summary(v: &[u64]) -> (u64, u64) {
@@ -265,9 +270,13 @@ pub struct ControllerReport {
     pub max_gap: Duration,
 }
 
-/// 解码线程交回的结果：帧号和解出的画面。
-/// 解码结果：帧号、画面、解码耗时（微秒）。
-type Decoded = (u32, Result<Option<Picture>, peerdesk_core::Error>, u64);
+/// 解码线程交回的结果：帧号、画面、解码耗时（微秒）、收到这一帧第一个分片的时间。
+type Decoded = (
+    u32,
+    Result<Option<Picture>, peerdesk_core::Error>,
+    u64,
+    peerdesk_core::time::Time,
+);
 
 /// 启动解码线程。解码一帧要好几毫秒到几十毫秒，放在会话循环里会让本地的键鼠输入排队等它。
 /// 任务通道关闭（会话结束）时线程退出。
@@ -293,7 +302,10 @@ fn spawn_decoder(
                     *b = name;
                 }
             }
-            if done_tx.send((job.frame_id, result, took)).is_err() {
+            if done_tx
+                .send((job.frame_id, result, took, job.first_seen))
+                .is_err()
+            {
                 break;
             }
         }
@@ -472,6 +484,9 @@ pub async fn run(
     let mut window = StatsWindow::default();
     let mut last_quic = link.quic_stats();
     let mut waiting_input: Option<peerdesk_core::time::Time> = None;
+    // 操作到画面的新算法（见 peerdesk_core::reaction）：对方随帧发“包含到第几个输入”时才有
+    let stamped = caps.has(Caps::INPUT_STAMP);
+    let mut tracker = ReactionTracker::new();
     let mut last_shown = link.now();
     let session_start = link.now();
     let mut first_frame: Option<u64> = None;
@@ -501,7 +516,7 @@ pub async fn run(
             () = &mut time_limit, if !time_up => time_up = true,
             // 解码线程交回一帧：显示。
             done = decoded_rx.recv() => match done {
-                Some((frame_id, Ok(Some(picture)), took)) => {
+                Some((frame_id, Ok(Some(picture)), took, first_packet)) => {
                     window.decode_us = window.decode_us.max(took);
                     window.decode.add(took);
                     shown_size = picture.size();
@@ -518,7 +533,7 @@ pub async fn run(
                     if let Some(at) = waiting_input.take() {
                         let took = now.since(at);
                         if took <= REACTION_LIMIT_US {
-                            window.reactions.push(took);
+                            window.reaction.add_next_frame(took);
                         }
                     }
                     tracer.record(link.now(), trace, Stage::FrameDelivered, u64::from(frame_id));
@@ -527,17 +542,21 @@ pub async fn run(
                     frame_log.shown(frame_id, crate::framelog::unix_us());
                     let present_us = u64::try_from(presenting.elapsed().as_micros()).unwrap_or(u64::MAX);
                     window.present.add(present_us);
+                    let shown = Shown { frame_id, first_packet, decoded: now, shown: link.now() };
+                    for r in tracker.shown(shown) {
+                        window.reaction.add(r);
+                    }
                     if let Some(j) = &journal {
                         j.frame(now, view_frame(frame_id, ViewResult::Shown, took, present_us));
                     }
                     last_picture = Some(picture);
                 }
-                Some((frame_id, Ok(None), took)) => {
+                Some((frame_id, Ok(None), took, _)) => {
                     if let Some(j) = &journal {
                         j.frame(link.now(), view_frame(frame_id, ViewResult::NoPicture, took, 0));
                     }
                 }
-                Some((frame_id, Err(_), took)) => {
+                Some((frame_id, Err(_), took, _)) => {
                     media.decode_failed();
                     if let Some(j) = &journal {
                         j.frame(link.now(), view_frame(frame_id, ViewResult::DecodeFailed, took, 0));
@@ -649,6 +668,17 @@ pub async fn run(
                         Ok(ack) => sender.ack(u32::from_be_bytes(ack)),
                         Err(_) => bad_datagrams = bad_datagrams.saturating_add(1),
                     },
+                    // 被控端随帧发的“包含到第几个输入”（操作到画面用）
+                    Channel::Control if payload.first() == Some(&peerdesk_core::reaction::TAG) => {
+                        match FrameStamp::decode(&payload) {
+                            Ok(stamp) => {
+                                for r in tracker.stamp(stamp) {
+                                    window.reaction.add(r);
+                                }
+                            }
+                            Err(_) => bad_datagrams = bad_datagrams.saturating_add(1),
+                        }
+                    }
                     // 被控端每秒的状态（详情面板）
                     Channel::Control => match peerdesk_core::stats::HostStats::decode(&payload) {
                         Ok(stats) => host_stats = Some(stats),
@@ -671,7 +701,12 @@ pub async fn run(
                     if press && waiting_input.is_none() {
                         waiting_input = Some(link.now());
                     }
+                    // 新算法：每次按键、点击、打的字都记序号，等第一幅带上它的画面
+                    let counted = peerdesk_core::reaction::counts(&event);
                     sender.push(event);
+                    if stamped && counted {
+                        tracker.sent(link.now(), sender.next_seq().wrapping_sub(1));
+                    }
                     input_sent = input_sent.saturating_add(1);
                     let failed = sender.packet()?.and_then(|p| link.send(Channel::Input, &p).err());
              if let Some(e) = failed { break e.to_string(); }
@@ -684,8 +719,15 @@ pub async fn run(
                 let gap = window.max_gap_us.max(now.since(last_shown));
                 let reassembly = media.reassembly();
                 let stats = media.stats();
+                window.reaction.add_unanswered(tracker.expire(now));
+                // 对方随帧发输入序号时用新算法；老版本的对方只能用旧算法，日志里写明
+                let (reactions, reaction_label) = if stamped {
+                    (window.reaction.totals(), "操作到画面")
+                } else {
+                    (window.reaction.next_frame(), "操作到画面（旧算法：操作后的下一幅画面，对方版本不带输入序号）")
+                };
                 crate::note!(info, target: "peerdesk::stats",
-                    "接收 帧 {} 画面 {} kbps 最长间隔 {} ms 作废 {} 纠错恢复 {} 坏帧 {} RTT {} ms 输入未确认 {} 操作到画面 {} 次 中位 {} ms 最大 {} ms",
+                    "接收 帧 {} 画面 {} kbps 最长间隔 {} ms 作废 {} 纠错恢复 {} 坏帧 {} RTT {} ms 输入未确认 {} {} {} 次 中位 {} ms 最大 {} ms",
                     window.frames,
                     stats.video_bytes.saturating_sub(window.bytes) * 8 / 1000,
                     gap / 1000,
@@ -694,10 +736,15 @@ pub async fn run(
                     stats.bad.saturating_sub(window.bad),
                     link.rtt().as_millis(),
                     sender.pending(),
-                    window.reactions.len(),
-                    reaction_summary(&window.reactions).0,
-                    reaction_summary(&window.reactions).1,
+                    reaction_label,
+                    reactions.len(),
+                    reaction_summary(reactions).0,
+                    reaction_summary(reactions).1,
                 );
+                // 新算法的分段，和旧算法的数放在一起对照
+                if let Some(line) = window.reaction.line().filter(|_| stamped) {
+                    crate::note!(info, target: "peerdesk::stats", "{line}");
+                }
                 // 接收端各步骤（见 crate::diag）：收齐一帧用了多久、请求了多少重传、解码和显示各花多少
                 let assembled = stats.assembled.saturating_sub(window.assembled);
                 crate::note!(info, target: "peerdesk::stats",
@@ -724,8 +771,10 @@ pub async fn run(
                         loss_permille: fb.loss_permille,
                         queue_ms: fb.queue_delay_us / 1000,
                         fps: window.frames,
-                        reaction_ms: (!window.reactions.is_empty())
-                            .then(|| u32::try_from(reaction_summary(&window.reactions).0).unwrap_or(u32::MAX)),
+                        reaction_ms: (!reactions.is_empty())
+                            .then(|| u32::try_from(reaction_summary(reactions).0).unwrap_or(u32::MAX)),
+                        reaction_next_frame_ms: (!window.reaction.next_frame().is_empty())
+                            .then(|| u32::try_from(reaction_summary(window.reaction.next_frame()).0).unwrap_or(u32::MAX)),
                         recv_kbps: u32::try_from(stats.video_bytes.saturating_sub(window.bytes) * 8 / 1000).unwrap_or(u32::MAX),
                         decode_ms: u32::try_from(window.decode_us / 1000).unwrap_or(u32::MAX),
                         width: shown_size.0,
@@ -737,7 +786,7 @@ pub async fn run(
                     });
                 }
                 if let Some(j) = journal.as_mut() {
-                    j.second(now, quic, input_sent, &window.reactions);
+                    j.second(now, quic, input_sent, reactions);
                 }
                 window = StatsWindow {
                     bytes: stats.video_bytes,
@@ -818,7 +867,11 @@ pub async fn run(
             link.now(),
             link.quic_stats(),
             input_sent,
-            &window.reactions,
+            if stamped {
+                window.reaction.totals()
+            } else {
+                window.reaction.next_frame()
+            },
             reason,
         ));
     }

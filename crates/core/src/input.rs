@@ -175,6 +175,12 @@ impl InputSender {
         self.next_seq = self.next_seq.wrapping_add(1);
     }
 
+    /// 下一个事件会拿到的序号；刚加入的事件的序号是它减一（回绕）。
+    #[must_use]
+    pub const fn next_seq(&self) -> u32 {
+        self.next_seq
+    }
+
     /// 是否有还没发出过的事件。
     #[must_use]
     pub fn has_unsent(&self) -> bool {
@@ -488,6 +494,7 @@ mod tests {
             next_expected: u32::MAX,
         };
         tx.push(key(1, true));
+        assert_eq!(tx.next_seq(), 0, "刚加入的事件的序号是它减一");
         tx.push(key(1, false));
         assert_eq!(
             rx.on_packet(&tx.packet().unwrap().unwrap()).unwrap().len(),

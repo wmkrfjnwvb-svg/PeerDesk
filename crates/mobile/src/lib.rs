@@ -221,6 +221,7 @@ fn caps() -> Caps {
         .with(Caps::TRANSPORT_CC)
         .with(Caps::PROBE_TRAIN)
         .with(Caps::PROBE_ID)
+        .with(Caps::INPUT_STAMP)
 }
 
 impl ViewEnv for MobileEnv {

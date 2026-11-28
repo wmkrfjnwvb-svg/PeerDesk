@@ -203,6 +203,9 @@ async fn controller_survives_a_hostile_host() {
     raw.send(Channel::File, b"x").unwrap();
     // 魔数不对
     raw.send_raw(vec![9u8; 40]).unwrap();
+    // 帧上带输入序号的戳被截断
+    raw.send(Channel::Control, &[peerdesk_core::reaction::TAG, 1, 0])
+        .unwrap();
     // 只发一帧的前半：超过截止时间后作废
     raw.send(Channel::Video, &[0, 0, 0, 5, 0, 0, 0, 2, 0, 0, 0, 4, 1, 1])
         .unwrap();
@@ -237,7 +240,7 @@ async fn controller_survives_a_hostile_host() {
         .unwrap()
         .unwrap();
     assert_eq!(report.end, "对端结束会话");
-    assert_eq!(report.bad_datagrams, 5);
+    assert_eq!(report.bad_datagrams, 6);
     assert_eq!(report.frames_delivered, 0);
     assert_eq!(report.bad_frames, 1);
     assert!(report.screen.is_none());

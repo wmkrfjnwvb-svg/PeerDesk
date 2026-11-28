@@ -2037,6 +2037,8 @@ pub struct DecodeJob {
     pub header: FrameHeader,
     /// 码流。
     pub data: Vec<u8>,
+    /// 收到这一帧第一个分片的时间（量“操作到画面”各段用，见 [`crate::reaction`]）。
+    pub first_seen: Time,
 }
 
 /// 解码线程上的解码器。自己也记着有没有失败过：失败之后、关键帧到来之前的帧都不解，
@@ -2349,6 +2351,7 @@ impl MediaReceiver {
             frame_id: frame.frame_id,
             header: fh,
             data: data.to_vec(),
+            first_seen: frame.first_seen,
         })
     }
 

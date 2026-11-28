@@ -14,6 +14,7 @@ use peerdesk_core::input::{InputEvent, InputReceiver, KeyState};
 use peerdesk_core::media::{encode_job, FrameJob, MediaSender, SenderConfig};
 use peerdesk_core::policy::ContentPolicy;
 use peerdesk_core::proto::{Caps, Channel, Control, RejectReason};
+use peerdesk_core::reaction::{Busy, HostStamper};
 use peerdesk_core::session::{Session, SessionConfig, State};
 use peerdesk_core::time::Time;
 use peerdesk_core::trace::{Stage, TraceId, Tracer};
@@ -442,6 +443,11 @@ pub async fn serve(
     // 编码线程正在编一帧时不再派新的；这期间画面变了先记下，编完再编最新的那一幅（不排队）。
     let mut encoding = false;
     let mut pending_change = false;
+    // 操作到画面（见 peerdesk_core::reaction）：帧包含到第几个输入、本端各段的时间。本端的统计行总是有；
+    // 戳只在对方也支持时发。`encoding_changed` 是正在编的那一帧画面变没变（没变的是补清晰等）。
+    let send_stamps = caps.has(Caps::INPUT_STAMP);
+    let mut stamper = HostStamper::new();
+    let mut encoding_changed = false;
 
     // 每秒一行统计写进日志，用户发日志就能看到真实效果。
     let mut stats_tick = tokio::time::interval(STATS_EVERY);
@@ -491,6 +497,9 @@ pub async fn serve(
                                 for event in &events {
                                     keys.apply(event);
                                     sink.inject(event);
+                                }
+                                if events.iter().any(peerdesk_core::reaction::counts) {
+                                    stamper.injected(link.now(), receiver.next_expected());
                                 }
                                 input_events = input_events.saturating_add(count);
                             } else {
@@ -636,6 +645,10 @@ pub async fn serve(
                     let now = link.now();
                     j.frame(now, frame_record(&job, took, &timing, info, changed, now.since(captured_at)));
                 }
+                // 这一帧第一次带上新输入（或者是它后面重复的几帧）：戳先于画面的分片发出
+                if let Some(stamp) = stamper.encoded(link.now(), job.frame_id).filter(|_| send_stamps) {
+                    let _ = link.send(Channel::Control, &stamp.encode());
+                }
                 if out.is_empty() {
                     continue;
                 }
@@ -685,6 +698,9 @@ pub async fn serve(
                     crate::note!(info, target: "peerdesk::stats", "{line}");
                 }
                 if let Some(line) = encode_window.take_line() {
+                    crate::note!(info, target: "peerdesk::stats", "{line}");
+                }
+                if let Some(line) = stamper.take_line() {
                     crate::note!(info, target: "peerdesk::stats", "{line}");
                 }
                 crate::note!(info, target: "peerdesk::stats",
@@ -773,6 +789,7 @@ pub async fn serve(
                 if changed {
                     media.screen_changed(link.now());
                     frame_log.changed(captured);
+                    stamper.changed(captured_at, Busy::of(encoding, encoding_changed));
                 }
                 // 每一轮都检查迟迟没有确认的帧（不能只在编帧时查：关键帧没确认时根本不编帧）
                 media.expire_unacked(link.now());
@@ -793,13 +810,20 @@ pub async fn serve(
                 // （被在途上限、节奏器拦下时 frame_gate 记一次“网络受限”，码率控制据此判断发送端是不是应用受限）
                 let pacer_busy = pacer.busy(media.pacing_bps(pacing), 1_000_000 / u64::from(opts.fps.max(1)));
                 let wanted = pending_change || media.wants_frame();
-                if encoding || !media.frame_gate(link.now(), wanted, pacer_busy) {
+                if encoding {
+                    continue;
+                }
+                if !media.frame_gate(link.now(), wanted, pacer_busy) {
+                    // 有带输入的变化等着却被网络挡住：记下（没有等着的时候这是空操作）
+                    stamper.gated();
                     continue;
                 }
                 let rtt = u64::try_from(link.rtt().as_micros()).unwrap_or(u64::MAX);
                 let job = media.start_frame(link.now(), rtt);
                 frame_log.encoded(job.frame_id, captured);
-                if jobs.send((job, frame, std::mem::take(&mut pending_change), captured_at)).is_err() {
+                stamper.dispatched(link.now(), job.frame_id);
+                encoding_changed = std::mem::take(&mut pending_change);
+                if jobs.send((job, frame, encoding_changed, captured_at)).is_err() {
                     failed = true;
                     break "编码线程结束".to_owned();
                 }

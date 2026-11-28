@@ -75,7 +75,8 @@ pub(crate) fn session(identity: &Identity, policy: &Policy, auth: Auth) -> Sessi
             .with(Caps::VIEW_SIZE)
             .with(Caps::TRANSPORT_CC)
             .with(Caps::PROBE_TRAIN)
-            .with(Caps::PROBE_ID),
+            .with(Caps::PROBE_ID)
+            .with(Caps::INPUT_STAMP),
         policy: policy.clone(),
         auth,
         // 由网络层替换成真实连接的通道绑定。
