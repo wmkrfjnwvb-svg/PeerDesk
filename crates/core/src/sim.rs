@@ -458,6 +458,71 @@ impl<T> Net<T> {
             .get(&(from, to))
             .map_or(0, |busy| busy.since(self.now))
     }
+
+    /// `from → to` 方向现在的链路参数（没有这条链路时为 `None`）。只读，不影响任何一个包；
+    /// 仿真主循环拿它的延迟当名义往返、拿速率填特征行的真值。
+    #[must_use]
+    pub fn link(&self, from: usize, to: usize) -> Option<Link> {
+        self.links.get(&(from, to)).copied()
+    }
+}
+
+/// 仿真主循环看到的网络：老的 [`Net`]（随机数布局 1）和分层的 [`crate::path::Path`]（布局 2）都实现它，
+/// 主循环对它泛型（单态化，不用动态分派）。方案见 `docs/research/Q-redesign/a2-plan.md` 第 8 节。
+///
+/// 时钟的约定和 `Net` 一样：`pop` 把时钟推到送达时刻，`advance_to` 只往前走。“路径变了”这类事件由
+/// `next_event_time` 报时刻、`pop_event` 取出（时刻到了才取得到）；`Net` 没有事件，用默认实现。
+pub trait Network<T> {
+    /// 发送一个 `size_bytes` 字节的包。发送方无法得知它是否会丢。
+    fn send(&mut self, from: usize, to: usize, size_bytes: usize, payload: T);
+    /// 下一次送达的时间；没有在途的包时为 `None`。
+    fn peek_time(&self) -> Option<Time>;
+    /// 取出下一次送达，并把时钟推进到它的到达时间。
+    fn pop(&mut self) -> Option<Delivery<T>>;
+    /// 把时钟推进到 `t`；时钟不会倒退。
+    fn advance_to(&mut self, t: Time);
+    /// 还在途中的包数。
+    fn in_flight(&self) -> usize;
+    /// `from → to` 方向瓶颈里现在真实排着多久的数据（微秒），见 [`Net::backlog_us`]。
+    fn backlog_us(&self, from: usize, to: usize) -> u64;
+    /// 计数，口径和 `Net` 一样（进结果的指纹）。细分的计数见 [`Self::path_stats`]。
+    fn stats(&self) -> NetStats;
+    /// 分层模型的细分计数；`Net` 没有，为 `None`。
+    fn path_stats(&self) -> Option<crate::path::PathStats> {
+        None
+    }
+    /// 下一个事件的时刻（包括还没到时刻的计划）；没有事件时为 `None`。
+    fn next_event_time(&self) -> Option<Time> {
+        None
+    }
+    /// 取出一个时刻已经到了的事件。
+    fn pop_event(&mut self) -> Option<crate::path::PathEvent> {
+        None
+    }
+}
+
+impl<T> Network<T> for Net<T> {
+    fn send(&mut self, from: usize, to: usize, size_bytes: usize, payload: T) {
+        Net::send(self, from, to, size_bytes, payload);
+    }
+    fn peek_time(&self) -> Option<Time> {
+        Net::peek_time(self)
+    }
+    fn pop(&mut self) -> Option<Delivery<T>> {
+        Net::pop(self)
+    }
+    fn advance_to(&mut self, t: Time) {
+        Net::advance_to(self, t);
+    }
+    fn in_flight(&self) -> usize {
+        Net::in_flight(self)
+    }
+    fn backlog_us(&self, from: usize, to: usize) -> u64 {
+        Net::backlog_us(self, from, to)
+    }
+    fn stats(&self) -> NetStats {
+        Net::stats(self)
+    }
 }
 
 #[cfg(test)]

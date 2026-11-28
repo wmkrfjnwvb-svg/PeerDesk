@@ -6,7 +6,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::print_stdout)]
 
 use peerdesk_core::sim::Link;
-use peerdesk_e2e::{behaviour_fingerprint, run_probed, Action, CodecKind, Phase, Scenario};
+use peerdesk_e2e::{
+    behaviour_fingerprint, run_probed, Action, CodecKind, NetworkPlan, Phase, Scenario,
+};
 
 fn phase(action: Action, frames: u32) -> Phase {
     Phase { action, frames }
@@ -45,24 +47,24 @@ fn scenarios() -> Vec<Scenario> {
         Scenario::new("l0-lan", mixed()),
         // 窄带：会降分辨率（半尺寸的亮度抽样）、丢帧重发关键帧、帧率降档
         Scenario {
-            network: vec![(0, narrow)],
+            network: NetworkPlan::Layout1(vec![(0, narrow)]),
             ..Scenario::new("l0-narrow", mixed())
         },
         Scenario {
-            network: vec![(0, Link::cellular())],
+            network: NetworkPlan::Layout1(vec![(0, Link::cellular())]),
             seed: 7,
             ..Scenario::new("l0-cellular", mixed())
         },
         // 丢包：重传、纠错、关键帧恢复
         Scenario {
-            network: vec![(0, lossy)],
+            network: NetworkPlan::Layout1(vec![(0, lossy)]),
             seed: 3,
             fps: 60,
             ..Scenario::new("l0-lossy", mixed())
         },
         // 带宽中途减到五分之一再恢复
         Scenario {
-            network: vec![
+            network: NetworkPlan::Layout1(vec![
                 (
                     0,
                     Link {
@@ -87,7 +89,7 @@ fn scenarios() -> Vec<Scenario> {
                         ..Link::lan()
                     },
                 ),
-            ],
+            ]),
             ..Scenario::new("l0-step", mixed())
         },
     ]

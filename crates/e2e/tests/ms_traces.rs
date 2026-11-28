@@ -12,8 +12,8 @@
 use peerdesk_core::adaptive::Profile;
 use peerdesk_core::sim::Link;
 use peerdesk_e2e::{
-    run, Action, ContentPolicy, EstimatorKind, FeatureRow, Outcome, Phase, ProbeStats, Scenario,
-    StateShare,
+    run, Action, ContentPolicy, EstimatorKind, FeatureRow, NetworkPlan, Outcome, Phase, ProbeStats,
+    Scenario, StateShare,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -146,7 +146,7 @@ fn estimator() -> EstimatorKind {
 
 fn one(name: &str, csv: &str, seed: u64, estimator: EstimatorKind) -> Sample {
     let o = run(&Scenario {
-        network: network(csv),
+        network: NetworkPlan::Layout1(network(csv)),
         profile: Profile::WIRELESS,
         estimator,
         start_bps: ContentPolicy::OFFICE.start_bps,
