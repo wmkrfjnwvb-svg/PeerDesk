@@ -78,6 +78,10 @@ pub fn run_multi(m: &MultiScenario) -> Result<Vec<Outcome>, Error> {
         })
         .collect();
     let out = with_network(&m.network, m.seed, &specs, false)?;
+    // 每一对一行指纹（`PEERDESK_E2E_FINGERPRINTS` 设了才写）：身份用这一对自己的场景，名字要各不相同
+    for (p, f) in m.pairs.iter().zip(&out) {
+        note_fingerprint(&p.scenario, &f.outcome);
+    }
     Ok(out.into_iter().map(|f| f.outcome).collect())
 }
 
@@ -291,6 +295,7 @@ struct Pair<'a> {
     outcome: Option<Finished>,
     received_bytes: u64,
     first_received: Option<Time>,
+    flow: flow::FlowLog,
 }
 
 impl<'a> Pair<'a> {
@@ -424,6 +429,7 @@ impl<'a> Pair<'a> {
             outcome: None,
             received_bytes: 0,
             first_received: None,
+            flow: flow::FlowLog::default(),
         })
     }
 
@@ -597,19 +603,24 @@ impl<'a> Pair<'a> {
     /// 节奏器里到时间的包发出去，记进这个阶段的字节。
     fn send(&mut self, net: &mut impl Network<Packet>) -> Result<(), Error> {
         let sending = self.profile.start();
+        let mut tagged = Tagged {
+            net,
+            pair: self.index,
+            host: self.host,
+            viewer: self.viewer,
+            packets: 0,
+        };
         let wire = send_ready(
             &mut self.pacer,
             &mut self.tx,
             self.pacing,
-            &mut Tagged {
-                net,
-                pair: self.index,
-                host: self.host,
-                viewer: self.viewer,
-            },
+            &mut tagged,
             self.now,
             &mut self.seq,
         )?;
+        if tagged.packets > 0 {
+            self.flow.sent(self.now, tagged.packets, wire);
+        }
         if let Some(acc) = self.acc.as_mut() {
             acc.bytes = acc.bytes.saturating_add(wire);
         }
@@ -691,6 +702,8 @@ impl<'a> Pair<'a> {
             };
             self.fb_seq = self.fb_seq.wrapping_add(1);
             let datagram = encode_datagram(&header, &fb)?;
+            self.flow
+                .feedback(u64::try_from(datagram.len()).unwrap_or(u64::MAX));
             net.send(
                 self.viewer,
                 self.host,
@@ -756,10 +769,11 @@ impl<'a> Pair<'a> {
             return Ok(());
         }
         self.video_since_feedback = self.video_since_feedback.saturating_add(1);
-        self.received_bytes = self
-            .received_bytes
-            .saturating_add(u64::try_from(size).unwrap_or(u64::MAX));
+        let size = u64::try_from(size).unwrap_or(u64::MAX);
+        self.received_bytes = self.received_bytes.saturating_add(size);
         self.first_received.get_or_insert(now);
+        // 单程延迟：两端用的都是这一对的本地时钟
+        self.flow.received(now, size, now.since(header.send_time));
         let receiving = self.profile.start();
         let got = self.stage.receive(&mut self.rx, now, header, body);
         self.profile.stop(
@@ -849,6 +863,11 @@ impl<'a> Pair<'a> {
 
     /// 帧末：每段排队采样、记录仪的秒记录（时钟已经推进到帧末）。
     fn end_frame<N: Wire>(&mut self, net: &Shared<N>) {
+        self.flow.sample(
+            self.now,
+            net.inner.true_rate_bps(),
+            net.backlog_us(self.host, self.viewer),
+        );
         let queues = net.inner.segment_queues_us();
         self.seg_queue.resize(queues.len(), (0, 0));
         for ((sum, max), q) in self.seg_queue.iter_mut().zip(queues) {
@@ -948,6 +967,7 @@ impl<'a> Pair<'a> {
             trace: std::mem::take(&mut self.trace),
             received_bytes: self.received_bytes,
             first_received_us: self.first_received.map(Time::micros),
+            flow: std::mem::take(&mut self.flow),
         };
         if self.profile.on {
             use std::io::Write as _;
@@ -997,10 +1017,13 @@ pub(crate) struct Tagged<'n, N> {
     pair: usize,
     host: usize,
     viewer: usize,
+    /// 这一次发了几个包。
+    packets: u64,
 }
 
 impl<N: Network<Packet>> Tagged<'_, N> {
     pub(crate) fn send(&mut self, size_bytes: usize, bytes: Vec<u8>) {
+        self.packets += 1;
         self.net.send(
             self.host,
             self.viewer,

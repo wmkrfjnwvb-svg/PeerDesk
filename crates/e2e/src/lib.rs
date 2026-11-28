@@ -10,8 +10,10 @@
 //! 同一个场景同一个种子，结果逐字节相同，可以放进 CI 当回归门槛。
 
 pub mod content;
+pub mod flow;
 pub mod homes;
 pub mod report;
+pub mod rfc8867;
 mod session;
 pub use session::{run_multi, MultiScenario, Packet, PairSpec};
 pub mod timeline;
@@ -647,6 +649,8 @@ pub struct Outcome {
     pub received_bytes: u64,
     /// 控制端第一次收到画面数据报的时刻（微秒，这一对的本地时间）；没收到为 `None`。**不进指纹**。
     pub first_received_us: Option<u64>,
+    /// 这一对按 100 ms 一格的流量记录（RFC 8868 的指标用，见 [`flow::FlowLog`]）。**不进指纹**。
+    pub flow: flow::FlowLog,
 }
 
 /// 两秒一个窗口（对账时比每个窗口发了多少字节，见 `a1-plan.md` 第 4 节）。
