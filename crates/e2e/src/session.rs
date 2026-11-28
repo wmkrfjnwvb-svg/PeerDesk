@@ -176,14 +176,22 @@ impl<N: Wire> Network<Packet> for Shared<N> {
             (None, None) => None,
         }
     }
+    /// 取出不晚于进来时 `peek_time` 的那一个送达。从里面的网络取出的包要加额外延迟时，挪进延迟队列；
+    /// 延迟队列的队首晚于这个时刻就返回 `None`（调用方等到新的 `peek_time` 再来取），决不提前交出去
+    /// （2026-11-28 主会话审查发现：以前会把加了延迟的包当场交出去，稀疏的反馈方向上额外延迟等于没加）。
     fn pop(&mut self) -> Option<Delivery<Packet>> {
+        let limit = self.peek_time()?;
         loop {
             let inner = self.inner.peek_time();
             let held = self.delayed_head();
+            // 两边都只取不晚于 limit 的：挪进延迟队列之后，里面的网络的下一个包也可能已经晚于 limit
+            let inner = inner.filter(|t| *t <= limit);
+            let held = held.filter(|t| *t <= limit);
             let take_inner = match (inner, held) {
                 (Some(a), Some(b)) => a <= b,
                 (Some(_), None) => true,
-                (None, _) => false,
+                (None, Some(_)) => false,
+                (None, None) => return None,
             };
             if !take_inner {
                 return self.delayed.pop_first().map(|(_, d)| d);
@@ -1061,6 +1069,7 @@ fn drive<N: Wire>(
             let Some(d) = net.pop() else {
                 break;
             };
+            debug_assert!(d.at <= now, "送达 {:?} 晚于现在 {now:?}", d.at);
             let size = d.payload.bytes.len();
             let Ok((header, body)) = decode_datagram(&d.payload.bytes) else {
                 continue;
@@ -1131,6 +1140,52 @@ mod tests {
         assert_eq!(net.in_flight(), 0);
         assert!(net.pop().is_none() && net.peek_time().is_none());
         assert_eq!(net.stats().sent, 4);
+    }
+
+    /// 主会话审查发现的问题（2026-11-28）：加了额外延迟的包，在里面的网络下一个包更晚时，以前会被当场交出去。
+    /// 现在 `pop` 决不交出晚于进来时 `peek_time` 的包，加了延迟的包在到达时刻（发出 + 传播 + 额外）才交出去。
+    #[test]
+    fn a_delayed_packet_is_not_delivered_early() {
+        let path: Path<Packet> = Path::new(
+            1,
+            PathConfig::symmetric(DirConfig {
+                delay: Delay::Fixed(10_000),
+                ..DirConfig::default()
+            }),
+        );
+        let mut net = Shared::new(path, vec![0, 8_000]);
+        net.send(
+            0,
+            1,
+            100,
+            Packet {
+                pair: 1,
+                bytes: vec![1],
+            },
+        ); // 10 ms 出里面的网络，18 ms 到
+        net.advance_to(Time(15_000));
+        net.send(
+            0,
+            1,
+            100,
+            Packet {
+                pair: 0,
+                bytes: vec![2],
+            },
+        ); // 25 ms 到
+        let mut now = Time(15_000);
+        let mut got = Vec::new();
+        // 和全局循环一样：推进到 peek_time，只取不晚于现在的
+        while let Some(t) = net.peek_time() {
+            now = now.max(t);
+            net.advance_to(now);
+            while net.peek_time().is_some_and(|t| t <= now) {
+                let Some(d) = net.pop() else { break };
+                assert!(d.at <= now, "{:?} 晚于 {now:?}", d.at);
+                got.push((d.payload.pair, d.at.micros(), now.micros()));
+            }
+        }
+        assert_eq!(got, vec![(1, 18_000, 18_000), (0, 25_000, 25_000)]);
     }
 
     fn pair(name: &str, frames: u32, start_us: u64, reverse: bool, extra: u64) -> PairSpec {
