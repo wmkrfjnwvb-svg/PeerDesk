@@ -19,7 +19,7 @@
 | [O-modes-industry.md](O-modes-industry.md) | 电影、音乐模式的同行调研（2026-11-26）：AnyDesk、GeForce NOW、Moonlight 的模式或预设，Zoom、Teams 的音乐模式，W3C contentHint，Chromium 投屏的视频检测，对 PeerDesk 的建议 |
 | [P-industry.md](P-industry.md) | 业内资料摘录（2026-11-27）：帧率稳定、QSV MFT、显卡读回、软件编码帧数、局域网探测（Sunshine、OBS、FFmpeg、Chromium、WebRTC；引文经转述，关键处要回原文核对） |
 | [P-fps-bitrate.md](P-fps-bitrate.md) | 帧率和码率为什么保持不住（2026-11-27 用户日志分析）：Mac Wi-Fi 和 Windows 局域网的根因排序、谁在决定帧率、探测该加什么不该加什么、修法和回归测试、日志缺的数据 |
-| [reports/](reports/) | 给产品负责人的报告：AI Agent 业内调研、美国市场赚钱方案、核心用户功能设计（设备管理、MCP、无显示器主机、规模化、计费单位） |
+| [reports/](reports/) | 给产品负责人的报告：AI Agent 业内调研、美国市场赚钱方案、核心用户功能设计（设备管理、MCP、无显示器主机、规模化、计费单位）、同类产品周边功能对照（标配清单和补齐顺序） |
 
 ## 待办与进度（2026-11-27，每完成一项就更新这里）
 
