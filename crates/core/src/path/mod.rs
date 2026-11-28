@@ -78,10 +78,13 @@ mod dir;
 mod loss;
 mod policer;
 pub mod rng;
+pub mod segments;
 pub mod tcp;
 
 #[cfg(test)]
 mod cross_tests;
+#[cfg(test)]
+mod segment_tests;
 #[cfg(test)]
 mod testkit;
 #[cfg(test)]
