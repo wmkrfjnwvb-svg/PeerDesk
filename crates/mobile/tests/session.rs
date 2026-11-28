@@ -243,6 +243,47 @@ fn a_wrong_password_ends_with_the_reason() {
 }
 
 #[test]
+fn view_changes_go_back_to_the_ui_and_inputs_go_out() {
+    let s = Session::failed("测试".to_owned());
+    assert_eq!(
+        peerdesk_mobile::apply(&s, vec![Action::Input(InputEvent::ReleaseAll)]),
+        None
+    );
+    assert_eq!(
+        peerdesk_mobile::apply(
+            &s,
+            vec![
+                Action::Zoom {
+                    factor: 1.5,
+                    cx: 10.0,
+                    cy: 20.5
+                },
+                Action::Input(InputEvent::ReleaseAll),
+                Action::Pan { dx: -3.0, dy: 4.0 },
+            ]
+        )
+        .as_deref(),
+        Some(r#"[{"type":"zoom","factor":1.5,"cx":10,"cy":20.5},{"type":"pan","dx":-3,"dy":4}]"#)
+    );
+}
+
+#[test]
+fn a_session_that_failed_before_starting_says_why() {
+    let s = Session::failed("设备码应为 9 位数字".to_owned());
+    assert_eq!(
+        s.next_event(Duration::from_millis(10)),
+        Some(Event::Ended {
+            ok: false,
+            text: "设备码应为 9 位数字".to_owned()
+        })
+    );
+    assert!(s.next_event(Duration::from_millis(10)).is_none());
+    assert!(!s.send(InputEvent::ReleaseAll));
+    s.set_view(1, 1);
+    s.stop();
+}
+
+#[test]
 fn device_targets_are_parsed_with_reasons() {
     let ViewTarget::Device { server, .. } = device_target("127.0.0.1", "123 456 789").unwrap()
     else {

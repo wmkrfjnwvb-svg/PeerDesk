@@ -16,10 +16,45 @@ peerdesk-core.workspace = true
 # 不带软件 H.264（OpenH264）：手机端用系统的解码器
 peerdesk-net = { workspace = true, features = ["media"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+# 只用它的 Annex B 工具（取 SPS、PPS），不带 OpenH264
+peerdesk-media.workspace = true
+
+# Android：JNI 绑定和系统解码器（MediaCodec 解到 Surface）。都是 MIT 或 Apache-2.0。
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+# api-level-28：取解码器名字（AMediaCodec_getName）；最低 Android 10（API 29）
+ndk = { version = "0.9", default-features = false, features = ["media", "api-level-28"] }
 
 [dev-dependencies]
 # 桌面上的闭环测试：被控端要软件编码，控制端在测试里用 OpenH264 代替手机的系统解码器
 peerdesk-net = { workspace = true, features = ["media", "soft"] }
 
-[lints]
-workspace = true
+# 与工作区相同的检查；unsafe 从 forbid 放宽为 deny：JNI 和 MediaCodec 是系统接口，只在 src/android/ 的两个文件里
+# 放开，每处写 SAFETY（和平台层、媒体层同样的规矩）。
+[lints.rust]
+unsafe_code = "deny"
+unreachable_patterns = "deny"
+unused_must_use = "deny"
+unused_results = "allow"
+missing_debug_implementations = "deny"
+trivial_casts = "deny"
+unused_qualifications = "deny"
+
+[lints.clippy]
+# match 必须逐个列出枚举成员：新增成员时所有 match 都会编译失败，强制处理。
+wildcard_enum_match_arm = "deny"
+match_wildcard_for_single_variants = "deny"
+# 非测试代码不允许可能 panic 的写法：处理的是不可信的网络输入。
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+cast_possible_truncation = "deny"
+cast_sign_loss = "deny"
+cast_possible_wrap = "deny"

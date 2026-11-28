@@ -103,6 +103,6 @@ crates/mobile/               Rust 核心（编成 libpeerdesk_mobile.so）
 |---|---|
 | A0 | 完成：SDK 平台 36、编译工具 36.0.0、NDK r29 装好（`scripts/android-setup.sh`，许可协议由产品负责人同意）；`scripts/android-env.sh` 交叉编译环境；`peerdesk-net`（带 media、不带 OpenH264）编到 `aarch64-linux-android` 通过 |
 | A1 | 完成：控制端驱动挪进 `peerdesk-net::viewer`，桌面改用它（行为不变，测试全过）；OpenH264 改成可选；解码器可由调用方提供；`crates/mobile`：`Session`（事件队列、输入、显示区域、断开）、`gesture`（手势表 8 个测试）；**Linux 闭环测试**：真实 QUIC、真实被控端会话，手机核心连上、连续出画面、点击按顺序到被控端、密码错误给原因（0.5 秒跑完）；`libpeerdesk_mobile.so` 编到 arm64 |
-| A2 | 下一步：MediaCodec 解码到 Surface、JNI 导出函数 |
+| A2 | 完成（真机待测）：`android/codec.rs` MediaCodec 解到 Surface（先默认解码器、再系统软件解码器；低延迟设置分 6 档，`configure` 失败退一档，键名按 Moonlight 核对过）；`android/bridge.rs` 11 个 JNI 函数（开始、取事件、触点、长按计时、画面位置、触控模式、按键、文字、松开全部、断开、释放）；`Picture::Presented`；按键码到 HID、SPS/PPS 提取、低延迟档位都是纯逻辑有测试；`libpeerdesk_mobile.so` 2.7 MB，不含 OpenH264 |
 | A3–A5 | 未开始 |
 

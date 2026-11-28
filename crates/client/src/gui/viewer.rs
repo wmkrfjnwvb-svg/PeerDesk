@@ -182,7 +182,7 @@ impl Viewer {
                     self.showing_yuv = true;
                     None
                 }
-                Picture::Nv12(_) | Picture::Rgb(_) | Picture::Described(_) => {
+                Picture::Nv12(_) | Picture::Rgb(_) | Picture::Described(_) | Picture::Presented { .. } => {
                     picture.to_screen().ok()
                 }
             };

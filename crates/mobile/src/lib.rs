@@ -8,12 +8,16 @@
 //! - [`gesture`]：触控到鼠标的状态机。
 //! - 解码器由平台层提供（Android 的 MediaCodec），这里不带 OpenH264。
 
+#[cfg(target_os = "android")]
+mod android;
+pub mod decoder_setup;
 pub mod gesture;
+pub mod keymap;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use peerdesk_core::auth::Auth;
@@ -276,7 +280,8 @@ impl ViewEnv for MobileEnv {
 /// 一次访问的句柄。丢弃时断开。
 #[derive(Debug)]
 pub struct Session {
-    events: mpsc::Receiver<Event>,
+    /// 放在锁里：界面可能从不同的线程调句柄（取事件在后台线程、触控在界面线程）。
+    events: Mutex<mpsc::Receiver<Event>>,
     input: tokio::sync::mpsc::Sender<InputEvent>,
     stop: watch::Sender<bool>,
     view: watch::Sender<(u16, u16)>,
@@ -317,20 +322,27 @@ impl Session {
             });
         if let Err(e) = spawned {
             // 线程都起不来：直接告诉界面，不装作在连
-            let (tx, events) = mpsc::channel();
-            let _ = tx.send(Event::Ended {
-                ok: false,
-                text: format!("启动会话失败：{e}"),
-            });
-            return Self {
-                events,
-                input,
-                stop,
-                view,
-            };
+            return Self::failed(format!("启动会话失败：{e}"));
         }
         Self {
-            events,
+            events: Mutex::new(events),
+            input,
+            stop,
+            view,
+        }
+    }
+
+    /// 一个还没开始就失败了的访问（例如设备码填错）：第一个事件就是 [`Event::Ended`]，原因是 `text`。
+    /// 界面照常取事件、显示原因，不用另写一条出错的路径。
+    #[must_use]
+    pub fn failed(text: String) -> Self {
+        let (tx, events) = mpsc::channel();
+        let _ = tx.send(Event::Ended { ok: false, text });
+        let (input, _) = tokio::sync::mpsc::channel(1);
+        let (stop, _) = watch::channel(false);
+        let (view, _) = watch::channel((0, 0));
+        Self {
+            events: Mutex::new(events),
             input,
             stop,
             view,
@@ -340,7 +352,11 @@ impl Session {
     /// 取下一个事件，最多等 `timeout`；没有就返回 `None`。[`Event::Ended`] 之后不会再有事件。
     #[must_use]
     pub fn next_event(&self, timeout: Duration) -> Option<Event> {
-        self.events.recv_timeout(timeout).ok()
+        self.events
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .recv_timeout(timeout)
+            .ok()
     }
 
     /// 发一个输入事件。队列满或会话已结束时返回 `false`（事件丢弃）。
@@ -367,6 +383,25 @@ impl Drop for Session {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+/// 手势状态机的输出：输入事件发给被控端，缩放、平移交回界面（一行 JSON 数组，没有就是 `None`）。
+pub fn apply(session: &Session, actions: Vec<gesture::Action>) -> Option<String> {
+    let mut view = Vec::new();
+    for action in actions {
+        match action {
+            gesture::Action::Input(event) => {
+                let _ = session.send(event);
+            }
+            gesture::Action::Zoom { factor, cx, cy } => view.push(format!(
+                "{{\"type\":\"zoom\",\"factor\":{factor},\"cx\":{cx},\"cy\":{cy}}}"
+            )),
+            gesture::Action::Pan { dx, dy } => {
+                view.push(format!("{{\"type\":\"pan\",\"dx\":{dx},\"dy\":{dy}}}"));
+            }
+        }
+    }
+    (!view.is_empty()).then(|| format!("[{}]", view.join(",")))
 }
 
 fn ended(result: Result<Summary, NetError>) -> Event {

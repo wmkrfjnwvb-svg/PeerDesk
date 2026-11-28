@@ -56,6 +56,32 @@ pub enum Phase {
     Cancel,
 }
 
+impl Phase {
+    /// 界面传来的编号：0 按下、1 移动、2 抬起、3 取消；别的数是 `None`。
+    #[must_use]
+    pub const fn from_code(code: i32) -> Option<Self> {
+        match code {
+            0 => Some(Self::Down),
+            1 => Some(Self::Move),
+            2 => Some(Self::Up),
+            3 => Some(Self::Cancel),
+            _ => None,
+        }
+    }
+}
+
+impl Mode {
+    /// 界面传来的编号：1 是触控板，别的都是直接点击。
+    #[must_use]
+    pub const fn from_code(code: i32) -> Self {
+        if code == 1 {
+            Self::Trackpad
+        } else {
+            Self::Direct
+        }
+    }
+}
+
 /// 一个原始触点。坐标是界面上的像素。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Touch {
@@ -807,6 +833,18 @@ mod tests {
         // 换回直接点击模式
         s.set_mode(Mode::Direct);
         assert_eq!(s.mode(), Mode::Direct);
+    }
+
+    #[test]
+    fn codes_from_the_ui_are_read() {
+        assert_eq!(Phase::from_code(0), Some(Phase::Down));
+        assert_eq!(Phase::from_code(1), Some(Phase::Move));
+        assert_eq!(Phase::from_code(2), Some(Phase::Up));
+        assert_eq!(Phase::from_code(3), Some(Phase::Cancel));
+        assert_eq!(Phase::from_code(4), None);
+        assert_eq!(Mode::from_code(1), Mode::Trackpad);
+        assert_eq!(Mode::from_code(0), Mode::Direct);
+        assert_eq!(Mode::from_code(7), Mode::Direct);
     }
 
     #[test]
