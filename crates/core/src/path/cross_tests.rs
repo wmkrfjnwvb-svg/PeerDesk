@@ -655,3 +655,86 @@ fn with_sack_a_deep_queue_does_not_stall_slow_start() {
     assert!(s_util > 0.9, "{s_util}");
     assert!(n5 < s5, "对照：NewReno 前 5 秒 {n5}");
 }
+
+// ---------------------------------------------------------------- A3-1：更像真实的交叉流
+
+/// 随机开始、确认抖动打破同步：两条同 RTT 的 TCP 吞吐比在 12 个种子上有散布（不再几乎正好是 1），仍在 0.5–2。
+#[test]
+fn start_and_ack_jitter_break_the_lockstep_of_two_tcp_flows() {
+    let opts = CrossOptions {
+        start_jitter_us: 2_000_000,
+        ack_jitter_us: 2_000,
+        extra_one_way_us: 0,
+    };
+    let mut ratios = Vec::new();
+    for seed in SEEDS {
+        let mut p = path(
+            seed,
+            queue(cap(10_000_000), QueueLimit::bytes(100_000), Aqm::TailDrop),
+        );
+        let a = p.add_cross_with(Dir::Forward, tcp(Time(0)), opts);
+        let b = p.add_cross_with(Dir::Forward, tcp(Time(0)), opts);
+        p.advance_to(Time(30_000_000));
+        let (a0, b0) = (
+            p.cross_stats(a).delivered_bytes,
+            p.cross_stats(b).delivered_bytes,
+        );
+        p.advance_to(Time(150_000_000));
+        let ga = (p.cross_stats(a).delivered_bytes - a0) as f64;
+        let gb = (p.cross_stats(b).delivered_bytes - b0) as f64;
+        ratios.push(ga / gb);
+    }
+    let lo = ratios.iter().copied().fold(9.0, f64::min);
+    let hi = ratios.iter().copied().fold(0.0, f64::max);
+    println!("[TCP] 两条同 RTT、随机开始和确认抖动：吞吐比范围 {lo:.4}–{hi:.4}");
+    assert!(ratios.iter().all(|r| (0.5..=2.0).contains(r)), "{ratios:?}");
+    assert!(hi - lo > 0.01, "要有散布：{ratios:?}");
+}
+
+/// 额外往返：一条 TCP 的平滑往返多出约 2 × 额外单程；随机开始只往后推，落在给定的范围里。
+#[test]
+fn extra_delay_lengthens_the_round_trip_and_start_jitter_only_delays() {
+    let srtt = |extra: u64| {
+        let mut p = path(1, queue(cap(10_000_000), QueueLimit::delay(50_000), Aqm::TailDrop));
+        let id = p.add_cross_with(
+            Dir::Forward,
+            CrossSpec::Tcp {
+                cfg: TcpConfig::default(),
+                start: Time::ZERO,
+                bytes: Some(200_000),
+            },
+            CrossOptions {
+                extra_one_way_us: extra,
+                ..CrossOptions::default()
+            },
+        );
+        p.advance_to(Time(5_000_000));
+        p.cross_sender(id).and_then(TcpSender::srtt).unwrap()
+    };
+    let (base, longer) = (srtt(0), srtt(40_000));
+    assert!(
+        (longer as i64 - base as i64 - 80_000).abs() < 20_000,
+        "{base} → {longer}"
+    );
+    // 随机开始：定速流在 [1 s, 1 s + 0.5 s] 里开始
+    for seed in SEEDS {
+        let mut p = path(seed, queue(cap(10_000_000), QueueLimit::delay(50_000), Aqm::TailDrop));
+        let id = p.add_cross_with(
+            Dir::Forward,
+            CrossSpec::Cbr {
+                rate_bps: 1_000_000,
+                packet_bytes: 1_000,
+                start: Time(1_000_000),
+                stop: None,
+            },
+            CrossOptions {
+                start_jitter_us: 500_000,
+                ..CrossOptions::default()
+            },
+        );
+        p.advance_to(Time(999_999));
+        assert_eq!(p.cross_stats(id).sent_packets, 0, "不会提前");
+        p.advance_to(Time(1_500_001));
+        assert!(p.cross_stats(id).sent_packets > 0, "推迟不超过 0.5 s");
+    }
+}

@@ -24,6 +24,17 @@
 //! 每个源一条流 `cross/<序号>`（方向是它挂的方向）：短连接的空闲时间和文件大小从这里抽。每条 TCP 连接的两个方向各有一条
 //! 车道（[`super::Lane`]，名字 `cross/<序号>/<第几阵>/<第几条>`），丢包和周期性延迟的随机数从车道的流里抽，不动主流量的流。
 //! 交叉包不经过限速器、延迟噪声、接收端三层。
+//!
+//! # 更像真实的交叉流（[`CrossOptions`]，A3-1）
+//! A2-4b 里两条同 RTT 的 TCP 吞吐比收敛到 0.9995–1.0005：丢尾队列让两条流同时丢包，AIMD 在同步丢包下窗口收敛到相等。
+//! 真实的 TCP 随机得多（开始时刻、确认的时机、往返各不相同；主会话审 A2-4b 时提出）。三项，默认都是 0（和以前完全一样）：
+//! - `start_jitter_us`：开始时刻在 [start, start + 这么久] 里均匀抽（随机数流 `cross/<序号>/start`，只抽一次）；
+//! - `ack_jitter_us`：每个确认多一个 [0, 这么久] 的均匀延迟，同一条连接的确认不乱序（每条连接一条流
+//!   `cross/<序号>/<第几阵>/<第几条>/ack-jitter`）；
+//! - `extra_one_way_us`：这条流在共享瓶颈之外多走的单程延迟（到服务器的那一段），数据和确认各加一次。补 A2-3 第二步记下的限制：
+//!   以前交叉流的往返只有挂的那一段自己的传播延迟，比真实的短、比真实的“凶”。
+//!
+//! 默认值不抽任何随机数，所以不用这些选项的源，抽到的数和以前逐个相同。
 
 use std::collections::BTreeMap;
 
@@ -33,6 +44,17 @@ use super::dir::{DirState, Lane, Transit};
 use super::rng::{Dir, LayerRng};
 use super::tcp::{SackBlocks, TcpConfig, TcpReceiver, TcpSender, TcpStats};
 use super::Verdict;
+
+/// 交叉流更像真实的几项，见模块文档。默认都是 0：和以前完全一样。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CrossOptions {
+    /// 开始时刻的随机推迟上限（微秒）。
+    pub start_jitter_us: u64,
+    /// 每个确认的随机延迟上限（微秒），同一条连接不乱序。
+    pub ack_jitter_us: u64,
+    /// 共享瓶颈之外多走的单程延迟（微秒），数据和确认各加一次。
+    pub extra_one_way_us: u64,
+}
 
 /// 交叉流量的种类。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -169,6 +191,8 @@ struct Flow {
     data_lane: Lane,
     ack_lane: Lane,
     finished: bool,
+    /// 确认抖动：自己的随机数流和上一个确认的到达时刻（`ack_jitter_us` 为 0 时没有）。
+    ack_jitter: Option<(LayerRng, Time)>,
 }
 
 #[derive(Debug, Clone)]
@@ -205,6 +229,7 @@ enum Kind {
 #[derive(Debug, Clone)]
 pub struct Source {
     dir: Dir,
+    opts: CrossOptions,
     rng: LayerRng,
     stats: CrossStats,
     /// 已经结束的连接的 TCP 计数。
@@ -223,10 +248,59 @@ fn add_tcp(a: TcpStats, b: TcpStats) -> TcpStats {
 }
 
 impl Source {
-    /// 新源。`index` 是它在路径里的序号；`now` 之前的开始时刻按 `now` 算。
+    /// 新源。`index` 是它在路径里的序号；`now` 之前的开始时刻按 `now` 算；`opts` 见 [`CrossOptions`]。
     #[must_use]
-    pub fn new(seed: u64, index: usize, dir: Dir, spec: CrossSpec, now: Time) -> Self {
+    pub fn with_options(
+        seed: u64,
+        index: usize,
+        dir: Dir,
+        spec: CrossSpec,
+        opts: CrossOptions,
+        now: Time,
+    ) -> Self {
         let mut rng = LayerRng::new(seed, dir, &format!("cross/{index}"));
+        // 开始时刻的随机推迟：自己一条流，不动 `rng`（没有推迟时一个数也不抽）
+        let delay = if opts.start_jitter_us > 0 {
+            LayerRng::new(seed, dir, &format!("cross/{index}/start"))
+                .below(opts.start_jitter_us.saturating_add(1))
+        } else {
+            0
+        };
+        let spec = match spec {
+            CrossSpec::Cbr {
+                rate_bps,
+                packet_bytes,
+                start,
+                stop,
+            } => CrossSpec::Cbr {
+                rate_bps,
+                packet_bytes,
+                start: start.plus(delay),
+                stop,
+            },
+            CrossSpec::Tcp { cfg, start, bytes } => CrossSpec::Tcp {
+                cfg,
+                start: start.plus(delay),
+                bytes,
+            },
+            CrossSpec::Bursts {
+                cfg,
+                connections,
+                min_bytes,
+                max_bytes,
+                mean_off_us,
+                start_on,
+                start,
+            } => CrossSpec::Bursts {
+                cfg,
+                connections,
+                min_bytes,
+                max_bytes,
+                mean_off_us,
+                start_on,
+                start: start.plus(delay),
+            },
+        };
         let kind = match spec {
             CrossSpec::Cbr {
                 rate_bps,
@@ -289,6 +363,7 @@ impl Source {
         };
         Self {
             dir,
+            opts,
             rng,
             stats: CrossStats::default(),
             tcp_done: TcpStats::default(),
@@ -375,7 +450,16 @@ impl Source {
             } => {
                 if start.take().is_some() {
                     let segs = bytes.map(|b| b.div_ceil(cfg.mss_bytes as u64).max(1));
-                    let mut flow = new_flow(ctx.seed, dir, index, self.generation, 0, *cfg, segs);
+                    let mut flow = new_flow(
+                        ctx.seed,
+                        dir,
+                        index,
+                        self.generation,
+                        0,
+                        *cfg,
+                        segs,
+                        self.opts.ack_jitter_us > 0,
+                    );
                     let mut out = Vec::new();
                     flow.snd.start(t, &mut out);
                     send_data(
@@ -388,10 +472,20 @@ impl Source {
                         0,
                         t,
                         &out,
+                        self.opts.extra_one_way_us,
                     );
                     flows.push(flow);
                 } else {
-                    timeouts(ctx, dir, &mut self.stats, flows, index, self.generation, t);
+                    timeouts(
+                        ctx,
+                        dir,
+                        &mut self.stats,
+                        flows,
+                        index,
+                        self.generation,
+                        t,
+                        self.opts.extra_one_way_us,
+                    );
                 }
             }
             Kind::Bursts {
@@ -416,8 +510,16 @@ impl Source {
                         let size = *min_bytes + self.rng.below(*max_bytes - *min_bytes + 1);
                         sizes.push(size);
                         let segs = Some(size.div_ceil(cfg.mss_bytes as u64).max(1));
-                        let mut flow =
-                            new_flow(ctx.seed, dir, index, self.generation, k, *cfg, segs);
+                        let mut flow = new_flow(
+                            ctx.seed,
+                            dir,
+                            index,
+                            self.generation,
+                            k,
+                            *cfg,
+                            segs,
+                            self.opts.ack_jitter_us > 0,
+                        );
                         let mut out = Vec::new();
                         flow.snd.start(t, &mut out);
                         let ki = usize::try_from(k).unwrap_or(usize::MAX);
@@ -431,6 +533,7 @@ impl Source {
                             ki,
                             t,
                             &out,
+                            self.opts.extra_one_way_us,
                         );
                         flows.push(flow);
                     }
@@ -441,7 +544,16 @@ impl Source {
                         sizes,
                     });
                 } else {
-                    timeouts(ctx, dir, &mut self.stats, flows, index, self.generation, t);
+                    timeouts(
+                        ctx,
+                        dir,
+                        &mut self.stats,
+                        flows,
+                        index,
+                        self.generation,
+                        t,
+                        self.opts.extra_one_way_us,
+                    );
                 }
             }
         }
@@ -473,6 +585,12 @@ impl Source {
                     .cross_transit(&mut flow.ack_lane, t, cfg.ack_bytes as u64)
                 {
                     Transit::Arrives { at, .. } => {
+                        let mut at = at.plus(self.opts.extra_one_way_us);
+                        if let Some((rng, last)) = flow.ack_jitter.as_mut() {
+                            at = at.plus(rng.below(self.opts.ack_jitter_us.saturating_add(1)));
+                            at = at.max(*last);
+                            *last = at;
+                        }
                         let it = Item {
                             src: item.src,
                             generation: item.generation,
@@ -498,6 +616,7 @@ impl Source {
                     item.flow,
                     t,
                     &out,
+                    self.opts.extra_one_way_us,
                 );
                 if flow.snd.is_done() && !flow.finished {
                     flow.finished = true;
@@ -525,6 +644,7 @@ impl Source {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn new_flow(
     seed: u64,
     dir: Dir,
@@ -533,6 +653,7 @@ fn new_flow(
     k: u32,
     cfg: TcpConfig,
     segs: Option<u64>,
+    ack_jitter: bool,
 ) -> Flow {
     let name = format!("cross/{src}/{generation}/{k}");
     Flow {
@@ -541,10 +662,17 @@ fn new_flow(
         data_lane: Lane::new(seed, dir, &name),
         ack_lane: Lane::new(seed, dir.other(), &name),
         finished: false,
+        ack_jitter: ack_jitter.then(|| {
+            (
+                LayerRng::new(seed, dir.other(), &format!("{name}/ack-jitter")),
+                Time::ZERO,
+            )
+        }),
     }
 }
 
 /// 超时的连接（定时器到期的那些）处理超时，重发。
+#[allow(clippy::too_many_arguments)]
 fn timeouts(
     ctx: &mut Ctx<'_>,
     dir: Dir,
@@ -553,12 +681,24 @@ fn timeouts(
     src: usize,
     generation: u64,
     t: Time,
+    extra_one_way_us: u64,
 ) {
     for (k, flow) in flows.iter_mut().enumerate() {
         if flow.snd.next_timer().is_some_and(|d| d <= t) {
             let mut out = Vec::new();
             flow.snd.on_timeout(t, &mut out);
-            send_data(ctx, dir, stats, flow, src, generation, k, t, &out);
+            send_data(
+                ctx,
+                dir,
+                stats,
+                flow,
+                src,
+                generation,
+                k,
+                t,
+                &out,
+                extra_one_way_us,
+            );
         }
     }
 }
@@ -575,6 +715,7 @@ fn send_data(
     k: usize,
     t: Time,
     out: &[u64],
+    extra_one_way_us: u64,
 ) {
     let size = flow.snd_mss();
     for seq in out {
@@ -585,7 +726,7 @@ fn send_data(
                 stats.wait_sum_us += wait_us;
                 stats.wait_count += 1;
                 ctx.push(
-                    at,
+                    at.plus(extra_one_way_us),
                     Item {
                         src,
                         generation,
@@ -643,7 +784,8 @@ mod tests {
             start: Time(0),
             bytes: None,
         };
-        let mut s = Source::new(1, 0, Dir::Forward, spec, Time(0));
+        let mut s =
+            Source::with_options(1, 0, Dir::Forward, spec, CrossOptions::default(), Time(0));
         s.fire(&mut ctx, 0, Time(0));
         let sent = s.stats().sent_packets;
         assert_eq!(sent, 10, "初始窗口 10 个包");
@@ -670,7 +812,7 @@ mod tests {
             start: Time(0),
             stop: None,
         };
-        let mut c = Source::new(1, 1, Dir::Forward, cbr, Time(0));
+        let mut c = Source::with_options(1, 1, Dir::Forward, cbr, CrossOptions::default(), Time(0));
         c.deliver(&mut ctx, 1, Time(50), stale);
         assert_eq!(c.stats(), CrossStats::default());
     }

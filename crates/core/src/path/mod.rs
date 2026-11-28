@@ -98,7 +98,7 @@ use crate::Time;
 
 pub use bottleneck::{Aqm, Bottleneck, BottleneckConfig, Capacity, QueueLimit, Trace, Verdict};
 pub use codel::Codel;
-pub use cross::{BurstRecord, CrossSpec, CrossStats};
+pub use cross::{BurstRecord, CrossOptions, CrossSpec, CrossStats};
 pub use delay::{Delay, DelayState, Noise, Pdv, Receiver, Windows};
 pub use dir::{DirConfig, DirState, Lane, Outcome, Transit};
 pub use loss::{burst_probabilities, Loss, LossState};
@@ -434,9 +434,15 @@ impl<T> Path<T> {
     /// 在 `dir` 方向的瓶颈上挂一个交叉流量源，返回它的序号。`start` 早于现在的按现在算。
     /// 源的事件在 `send`、`advance_to`、`pop` 里随时钟往前处理（见 [`cross`] 模块文档）。
     pub fn add_cross(&mut self, dir: Dir, spec: CrossSpec) -> usize {
+        self.add_cross_with(dir, spec, CrossOptions::default())
+    }
+
+    /// 同 [`Self::add_cross`]，带更像真实的几项（随机开始、确认抖动、额外往返，见 [`CrossOptions`]）。
+    pub fn add_cross_with(&mut self, dir: Dir, spec: CrossSpec, opts: CrossOptions) -> usize {
         let index = self.sources.len();
-        self.sources
-            .push(cross::Source::new(self.seed, index, dir, spec, self.now));
+        self.sources.push(cross::Source::with_options(
+            self.seed, index, dir, spec, opts, self.now,
+        ));
         index
     }
 
