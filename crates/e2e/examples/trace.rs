@@ -25,10 +25,7 @@ fn write(path: &Path, text: &str) -> Result<(), String> {
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (Some(world), Some(out)) = (args.first(), args.get(1)) else {
-        let _ = writeln!(
-            std::io::stderr(),
-            "用法：trace <世界文件> <输出目录>"
-        );
+        let _ = writeln!(std::io::stderr(), "用法：trace <世界文件> <输出目录>");
         return ExitCode::from(2);
     };
     match run(Path::new(world), &PathBuf::from(out)) {

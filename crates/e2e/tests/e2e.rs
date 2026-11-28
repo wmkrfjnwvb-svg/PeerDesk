@@ -715,17 +715,21 @@ fn periodic_probes_climb_during_a_minute_of_light_activity() {
         .filter_map(|l| l.get(1..7).and_then(|t| t.trim().parse::<u64>().ok()))
         .max()
         .unwrap_or(0);
+    // 起步之后（第一阵流量发完，2 秒时）码率还不到 15 Mbps，才需要周期探测把它探上去。#71 第 2 步之前，第一阵流量
+    // 收尾时会按送达速率误降到几 Mbps，非探不可；不再误降以后起步就到了，不要求探（探了也每轮都要有结论）。
+    let after_start = rate_at(&o, 2_000);
     gate(
         &o,
-        "轻操作时周期探测把码率探上去，每轮都有结论，到了就不再探",
-        p.run_sent >= 3
+        "轻操作时码率到得了位（起步没到就靠周期探测），每轮探测都有结论，到了就不再探",
+        (p.run_sent >= 3 || after_start >= 15_000_000)
             && verdicts >= p.run_sent
             && verdicts - p.run_sent <= p.run_verdicts[3]
             && end >= 15_000_000
             && last_probe_ms < 45_000,
         &format!(
-            "发出 {} 轮，结论 {verdicts} 个（证实 {}、否定 {}、超时 {}、中止 {}）；码率 1000 → {} kbps；\
+            "起步之后 {} kbps；发出 {} 轮，结论 {verdicts} 个（证实 {}、否定 {}、超时 {}、中止 {}）；码率 1000 → {} kbps；\
              最后一轮在 {last_probe_ms} ms；探测 {} 字节，占 {}‰",
+            after_start / 1000,
             p.run_sent,
             p.run_verdicts[0],
             p.run_verdicts[1],
