@@ -110,6 +110,9 @@ pub struct EncodedFrame {
     pub payload: Vec<u8>,
     /// 是否关键帧。
     pub key: bool,
+    /// 这一帧编码用的 QP：软件编码器知道；硬件编码器只能调码率、不知道实际 QP，为 `None`。
+    /// 帧率调节据此判断“画质还有没有余地”（见 [`crate::governor`]）。
+    pub qp: Option<u8>,
 }
 
 /// 视频编码器。
@@ -317,6 +320,8 @@ impl VideoEncoder for TileEncoder {
             .map(|encoded| EncodedFrame {
                 payload: header.frame(&encoded.data),
                 key: fresh,
+                // 块编码没有 QP
+                qp: None,
             }))
     }
 

@@ -229,6 +229,7 @@ OTHER DEALINGS IN THE FONT SOFTWARE.
 
 `crates/e2e/traces/ms-*.csv` 是从该挑战赛仓库自带的 `data/` 目录（24 通仿真评测通话，带真实带宽和丢包）中摘取的轨迹，
 由 `scripts/ms-traces.py` 转换：只保留变化最多的 40 秒、只记变化时刻、百分数换成千分比、缺失值沿用上一步。
+`crates/e2e/bench/ms144/worlds/*.world`（固定的对比基准）里内联的是同样的轨迹，许可相同。
 
 - 来源：Microsoft，https://github.com/microsoft/RL4BandwidthEstimationChallenge （`data/` 目录）。
 - 论文：Khairy et al., "ACM MMSys 2024 Bandwidth Estimation in Real Time Communications Challenge", arXiv:2403.06324。
