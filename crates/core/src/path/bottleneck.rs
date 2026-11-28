@@ -164,6 +164,8 @@ pub struct Bottleneck {
     queued_bytes: u64,
     codel: Option<Codel>,
     last_arrival_ns: u64,
+    /// 最近一个发出去的包在队首等了多久（纳秒）。
+    last_wait_ns: u64,
 }
 
 /// 把 `bits` 比特按 `rate_bps` 发完要多少纳秒（向上取整）。
@@ -186,6 +188,7 @@ impl Bottleneck {
             queued_bytes: 0,
             codel: None,
             last_arrival_ns: 0,
+            last_wait_ns: 0,
         };
         b.reconfigure(cfg, origin);
         b
@@ -246,6 +249,12 @@ impl Bottleneck {
         self.queued_bytes
     }
 
+    /// 最近一个到达的包在瓶颈里等了多久（微秒，开始发之前的排队时间）。
+    #[must_use]
+    pub const fn last_wait_us(&self) -> u64 {
+        self.last_wait_ns / NS
+    }
+
     /// 最后一个包到达的时刻（下一个包不能比它早）。
     #[must_use]
     pub const fn last_arrival(&self) -> Time {
@@ -261,6 +270,7 @@ impl Bottleneck {
         let at_ns = at.micros().saturating_mul(NS).max(self.last_arrival_ns);
         self.last_arrival_ns = at_ns;
         if matches!(self.cfg.capacity, Capacity::Unlimited) {
+            self.last_wait_ns = 0;
             let t = Time(at_ns / NS);
             return Verdict::Departs { start: t, done: t };
         }
@@ -274,6 +284,7 @@ impl Bottleneck {
         }
         let start_ns = self.cursor_ns.max(at_ns);
         let wait_ns = start_ns - at_ns;
+        self.last_wait_ns = wait_ns;
         let too_long = self
             .cfg
             .limit
