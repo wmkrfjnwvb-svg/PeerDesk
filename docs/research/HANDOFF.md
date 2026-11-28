@@ -1,4 +1,4 @@
-# 交接：所有进行中的工作和下一步（2026-11-28 12:00 UTC，主会话写）
+# 交接：所有进行中的工作和下一步（2026-11-28 13:00 UTC，主会话写）
 
 会话没了也能接上：每一项写了分支、最后的提交、做到哪、下一步。决定和方案的详细内容在各自的文档里，这里只是索引。
 分工照 CLAUDE.md：主会话调度、审查、合并、做产品；diskagent 会话做仿真框架；指纹（`crates/e2e/golden/fingerprints.txt`）只由主会话改。
@@ -17,32 +17,32 @@
 
 ## 2. 进行中
 
-### 2.1 Android 控制端（主会话）——分支 `android`，最后 024f73d（WIP）
+### 2.1 Android 控制端（主会话）——分支 `android`，已在云端
 
-- 方案和进度：`R-android.md`（第 7 节进度表）。
-- 已完成并真机验证过：A0 工具链、A1 Rust 核心（`crates/mobile`）、A2 MediaCodec 解到 Surface 加 JNI、A3 Kotlin + Compose 界面。
-  产品负责人 11-28 实测：**能连上、能看到画面、能点击**。
-- 修过的真机问题：句柄按位放进 long（Android 11 起堆指针带标记，30b885c）；密码显示/隐藏；记住设备码和密码（Keystore 加密）。
-- **做到一半（024f73d，编不过）**：手势按 ToDesk 的习惯改（产品负责人反馈“操作有点怪”）。新手势表写在 `crates/mobile/src/gesture.rs` 开头：
-  - 触屏模式：单指点左键、单指滑动平移画面、长按震一下后松开右键或拖动拖拽、双指滑动滚动、捏合缩放、双指点右键；
-  - 鼠标模式（鼠标助手）：屏幕上有光标、手指精细移动光标、屏幕上的左键右键按钮（按住左键再滑动 = 精细选中文字）。
-  - 下一步：
-    1. 按新表重写 `gesture.rs` 的测试；
-    2. `lib.rs` 的 `apply` 把 `Action::Haptic`、`Action::Cursor` 转成 JSON（`{"type":"haptic"}`、`{"type":"cursor","x":..,"y":..}`）；
-    3. `android/bridge.rs`：`setView` 去掉 `zoomed` 参数、`setMode` 返回动作 JSON（进鼠标模式时交出光标）、新加 `button(h, button, down)`（调 `Gestures::button`）；
-    4. Kotlin：工具条加“鼠标”按钮切鼠标模式；收到 cursor 画光标；浮动的“左键”“右键”按钮（按下、抬起分别调 `button`）；收到 haptic 震一下；画面放大时光标到边上跟着平移；`Native.kt`、`NativeSession.kt` 跟着改签名；
-    5. `scripts/android-build.sh` 编 APK 发给产品负责人。
-- 之后：A4（CI 里 `[android]` 标记出 APK）、诊断页导出日志、切后台不断开、Android 合进 dev（等手势改完、CI 的 lint 和覆盖率过）。
+- 方案和进度：`R-android.md`（第 7 节进度表）。真机验证过：能连上、能看、能点（11-28）。
+- 259aa39：手势照 ToDesk（`gesture.rs` 开头的表）、虚拟鼠标（小鼠标 ↔ 大鼠标：左键、右键、身体、关闭，`MouseAssist.kt`）；APK 发给产品负责人测过。
+- 产品负责人第二轮反馈和处理（fcca0e3，Rust 已完成、测过）：
+  - 捏合抖：根因是一个触摸事件拆成逐根手指更新、缩放不跟手、每帧改 SurfaceView 尺寸、编码尺寸提示每步都发。
+    改成整个事件一起交（`Gestures::moves`、JNI `moves`）、以旧中点缩放再跟中点平移；
+  - 双指滚动和捏合冲突：判据改成比较两指距离变化和中点走过的距离，分不出看方向（照 Android ScaleGestureDetector、libinput），真实手势的测试；
+  - 点击告诉界面位置（`tap`）：画水波、记住输入位置。
+- **进行中**（Kotlin，子代理在做，WIP 44d2023、b7b130f 未审）：批量移动、SurfaceView 改用缩放平移变换、编码尺寸提示 300 ms 防抖、箭头尖挪到左键正上方、点击水波和按键时箭头缩小、
+  软键盘弹出时把输入位置让到键盘上面（adjustPan 的思路）、导出手势记录（真机问题拿原始触点回放）。
+  下一步：审代码 → `scripts/android-build.sh` 和 JVM 测试 → 提交 → APK 发产品负责人。
+- 合进 dev 前的本地门槛（已把 dev 758ac0b 合进 android）：覆盖率过（行 99.12%）；e2e 在跑；clippy 要重跑（合并后 e2e 的 `Picture` 匹配缺 `Presented`，已补）。
+  过了以后去掉 `[skip ci]` 推一次，让 CI（含新的 android 任务）跑，再合进 dev。
+- CI 新的 `android` 任务（f031521）：改了 `android/`、`crates/mobile/` 才跑；`[android]`、`[pkg]` 上传 APK。CLAUDE.md 表里加了 `[android]`（在 android 分支，合并后生效）。
+- 之后：诊断页、切后台不断开。
 - 构建：`source scripts/android-env.sh`；SDK 在 `~/android-sdk`（`scripts/android-setup.sh` 装，许可协议产品负责人已同意）。新容器要重新装。
 
-### 2.2 仿真框架 A2-3（diskagent 会话）——分支 `sim-a2`，最后 4a21217（已在云端，工作区干净）
+### 2.2 仿真框架 A2-4（diskagent 会话）——分支 `sim-a2`
 
-- 第一步（Network 接口、布局 2、路径变了事件）：**主会话审过，通过**，等 sim-a2 的 CI（3eec326）过了合进 dev，golden 加它的 1 行 `layout2 … c417b89064bb3f42`。
-- 第一步和第二小步“分段路径”：**都已审过、合进 dev**（2026-11-28 合并提交，golden 加了 5 行：layout2 1 行、homes 4 行）。结果在 `Q-redesign/a2-plan.md` 第 8 节末尾。
-  - 合并之后：diskagent 把 dev 合回 sim-a2 再往下做（下一步看 a2-plan，A2-4 或主会话安排）。
-  - 家庭场景已经量出产品问题：A 家有人上传、出口没有 AQM 时，码率掉到 2.1 Mbps、冻结 16.8 次（开 CoDel 时 0 次）——要靠分段测量认出“A 自己出口在堵”（B 阶段）。
-  - 已知限制：交叉流的往返只含它挂的那一段（A3 补）；家庭参数是一个点，不是分布。
-- 记下的问题（不是仿真的错）：长 TCP 把码率挤到 106 kbps；换路后约 0.7 秒才恢复；布局 1 在高丢包链路上偏乐观（A5 迁移门槛时按布局 2 重定）。
+- A2-3 已合进 dev（758ac0b，CI 过）。diskagent 已把 dev 合回 sim-a2（eb31696）。
+- A2-4 设计（a2-plan 第 5 节“A2-4 的设计”）主会话审过、同意，补充：golden 153 行全部逐字节不变；SACK 默认开，受影响的指纹前后对比后由主会话改 golden；
+  收敛时间加“未收敛”记法和“稳定值 ÷ 公平份额”；最终报告 12 个种子。
+- 分三步：A2-4a 多会话（进行中，12:36 起）→ A2-4b NR-BPDV 抖动和 TCP SACK → A2-4c RFC 8867 八个用例和 RFC 8868 指标的报告。
+- 为了早点进 A3：A2-4b 合并后 diskagent 就开始写 A3 的设计，和 A2-4c 的长时间运行并行。
+- 记下的问题（不是仿真的错）：A 家有人上传、出口没有 AQM 时码率掉到 2.1 Mbps、冻结 16.8 次；长 TCP 把码率挤到 106 kbps；换路后约 0.7 秒才恢复。
 
 ### 2.3 账户设备表（主会话）——分支 `devices-s1`，最后 4acff3a
 
@@ -51,7 +51,7 @@
 
 ## 3. 排队（按 `O-standard-plan.md` 的顺序）
 
-1. Android 手势改完、合进 dev（2.1）。
+1. Android 第三轮改完、真机测过、合进 dev（2.1）。
 2. S1 连入确认（设计已定，见 `O-standard-plan.md` 2.1）。
 3. S2 多显示器、S3 Mac 和 Linux 无人值守、S6 唤醒和重启连回、S7 会话内开关、S8 文件权限（S7、S8 可以派 Sonnet）。
 4. 账户线 P1–P3b（本地用自己生成的密钥测，不等 Supabase）。
