@@ -96,3 +96,13 @@ crates/mobile/               Rust 核心（编成 libpeerdesk_mobile.so）
 - `ring` 在 NDK r29 下编译是否顺利没试过（预计可以，quinn 和 rustls 在 Android 上有人用）。
 - 切网（Wi-Fi 和移动数据之间）时 QUIC 连接迁移：现在的代码遇到断开会重连，迁移不做；先按重连验收，再看要不要做迁移。
 - 后台：Android 切到后台后网络和解码会被限制，第一版切后台就暂停画面（告诉被控端停发），回来时请求关键帧。
+
+## 7. 进度（每完成一步更新）
+
+| 步 | 状态 |
+|---|---|
+| A0 | 完成：SDK 平台 36、编译工具 36.0.0、NDK r29 装好（`scripts/android-setup.sh`，许可协议由产品负责人同意）；`scripts/android-env.sh` 交叉编译环境；`peerdesk-net`（带 media、不带 OpenH264）编到 `aarch64-linux-android` 通过 |
+| A1 | 完成：控制端驱动挪进 `peerdesk-net::viewer`，桌面改用它（行为不变，测试全过）；OpenH264 改成可选；解码器可由调用方提供；`crates/mobile`：`Session`（事件队列、输入、显示区域、断开）、`gesture`（手势表 8 个测试）；**Linux 闭环测试**：真实 QUIC、真实被控端会话，手机核心连上、连续出画面、点击按顺序到被控端、密码错误给原因（0.5 秒跑完）；`libpeerdesk_mobile.so` 编到 arm64 |
+| A2 | 下一步：MediaCodec 解码到 Surface、JNI 导出函数 |
+| A3–A5 | 未开始 |
+

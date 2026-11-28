@@ -3390,6 +3390,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "peerdesk-mobile"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "peerdesk-core",
+ "peerdesk-net",
+ "tokio",
+]
+
+[[package]]
 name = "peerdesk-net"
 version = "0.1.0"
 dependencies = [

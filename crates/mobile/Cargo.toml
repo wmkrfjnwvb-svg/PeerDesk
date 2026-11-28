@@ -1,0 +1,25 @@
+[package]
+name = "peerdesk-mobile"
+description = "PeerDesk 手机端的 Rust 核心：连接、会话、触控手势（Android 和 iOS 共用），界面用原生写（见 docs/research/R-android.md）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+# rlib 给测试和桌面上的闭环测试用；cdylib 编成 Android 的 libpeerdesk_mobile.so
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+log = "0.4"
+peerdesk-core.workspace = true
+# 不带软件 H.264（OpenH264）：手机端用系统的解码器
+peerdesk-net = { workspace = true, features = ["media"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+
+[dev-dependencies]
+# 桌面上的闭环测试：被控端要软件编码，控制端在测试里用 OpenH264 代替手机的系统解码器
+peerdesk-net = { workspace = true, features = ["media", "soft"] }
+
+[lints]
+workspace = true
