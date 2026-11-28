@@ -12,6 +12,7 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.TextButton
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.platform.LocalContext
 import kotlinx.coroutines.Dispatchers
@@ -126,18 +127,21 @@ fun ConnectScreen(ui: UiState, vm: PeerDeskViewModel) {
             modifier = Modifier.fillMaxWidth(),
         ) { Text(stringResource(R.string.connect_button)) }
 
-        // 手势记录在会话结束后导出：会话中弹出系统分享会把应用切到后台，会话就断了
-        if (ui.phase == Phase.Connect && vm.hasTrace()) {
-            val ctx = LocalContext.current
+        // 诊断记录（核心日志加手势记录）在会话结束后导出：会话中弹出系统分享会把应用切到后台，会话就断了
+        val ctx = LocalContext.current
+        val hasTrace = vm.hasTrace()
+        val available = remember(ui.phase, ui.notice, hasTrace) { diagAvailable(logNames(ctx), hasTrace) }
+        if (ui.phase == Phase.Connect && available) {
             val scope = rememberCoroutineScope()
-            val title = stringResource(R.string.trace_share_title)
+            val title = stringResource(R.string.diag_share_title)
             TextButton(onClick = {
-                val text = vm.traceText()
+                val text = if (hasTrace) vm.traceText() else null
                 scope.launch {
-                    val uri = withContext(Dispatchers.IO) { writeTraceFile(ctx, text) }
-                    ctx.startActivity(shareTraceIntent(uri, title))
+                    // 打 zip 在后台线程做
+                    val uri = withContext(Dispatchers.IO) { writeDiagZipFile(ctx, text) }
+                    ctx.startActivity(shareDiagIntent(uri, title))
                 }
-            }) { Text(stringResource(R.string.toolbar_export_trace)) }
+            }) { Text(stringResource(R.string.export_diagnostics)) }
         }
 
         Text(

@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
 <paths>
-    <!-- 手势记录导出：cache/traces/ -->
-    <cache-path name="traces" path="traces/" />
+    <!-- 诊断记录导出：cache/diag/ -->
+    <cache-path name="diag" path="diag/" />
 </paths>
