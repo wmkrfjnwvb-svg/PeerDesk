@@ -8,8 +8,8 @@ rust-version.workspace = true
 
 [dependencies]
 peerdesk-core.workspace = true
-openh264 = { version = "0.9.10", default-features = false }
-openh264-sys2 = { version = "0.9.10", default-features = false }
+openh264 = { version = "0.9.10", default-features = false, optional = true }
+openh264-sys2 = { version = "0.9.10", default-features = false, optional = true }
 opus = "0.4"
 log = "0.4"
 # 控制端用显卡显示 NV12（和界面 eframe 用的是同一个 glow）
@@ -37,7 +37,10 @@ cros-codecs = { version = "=0.0.6", features = ["vaapi"] }
 [features]
 # 从源码编译 OpenH264（开发、测试、CI）。发布版改为运行时加载 Cisco 官方的二进制（以后加 `libloading`）。
 default = ["source"]
-source = ["openh264/source", "openh264-sys2/source"]
+source = ["soft", "openh264/source", "openh264-sys2/source"]
+# 软件 H.264 编解码（OpenH264）。手机端不带：手机系统的解码器由厂商付了专利许可，我们从源码编的 OpenH264
+# 没有 Cisco 二进制那层专利保护（见 docs/research/R-android.md 1.1）。
+soft = ["dep:openh264", "dep:openh264-sys2"]
 
 # 与工作区相同的检查；unsafe 从 forbid 放宽为 deny：改码率要调 OpenH264 的底层接口（只在那两个函数里放开），
 # Windows 硬件编码的系统接口在 mf.rs 里（整个文件放开，每处写 SAFETY）。

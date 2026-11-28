@@ -61,6 +61,8 @@ mod tls;
 mod tls_verifier;
 #[cfg(feature = "media")]
 mod view_record;
+#[cfg(feature = "media")]
+pub mod viewer;
 
 pub use error::NetError;
 pub use identity::{Fingerprint, Identity};

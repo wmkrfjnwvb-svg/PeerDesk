@@ -22,14 +22,14 @@ if [ ! -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" ]; then
   rm -rf "$tmp"
 fi
 SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
-# 许可证：sdkmanager 要求先接受 Google 的 Android SDK 许可协议。脚本不替人接受：
-# 没接受过就停下，说明怎么做（GitHub 的 Ubuntu 机器预装了 SDK，许可已接受，CI 不走这一步）。
-if [ ! -d "$ANDROID_HOME/licenses" ] || [ -z "$(ls -A "$ANDROID_HOME/licenses" 2>/dev/null)" ]; then
-  echo "还没有接受 Android SDK 许可协议。请先阅读并接受：" >&2
-  echo "  $SDKMANAGER --sdk_root=$ANDROID_HOME --licenses" >&2
-  exit 3
+# 许可证：装平台和 NDK 时 sdkmanager 会问是否接受 Google 的 Android SDK 许可协议。脚本不替人接受：
+# 默认照常一项项问；读过并接受了协议的人可以设 ANDROID_SDK_LICENSE_ACCEPTED=1，让脚本代为回答“接受”。
+# （GitHub 的 Ubuntu 机器预装了 SDK，CI 不走这一步。）
+if [ "${ANDROID_SDK_LICENSE_ACCEPTED:-}" = "1" ]; then
+  yes | "$SDKMANAGER" --sdk_root="$ANDROID_HOME" "$PLATFORM" "$BUILD_TOOLS" "platform-tools" "$NDK" > /dev/null
+else
+  "$SDKMANAGER" --sdk_root="$ANDROID_HOME" "$PLATFORM" "$BUILD_TOOLS" "platform-tools" "$NDK"
 fi
-"$SDKMANAGER" --sdk_root="$ANDROID_HOME" "$PLATFORM" "$BUILD_TOOLS" "platform-tools" "$NDK" > /dev/null
 rustup target add aarch64-linux-android x86_64-linux-android
 echo "ANDROID_HOME=$ANDROID_HOME"
 echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/29.0.14206865"
