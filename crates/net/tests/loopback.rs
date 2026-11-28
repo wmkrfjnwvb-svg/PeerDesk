@@ -167,6 +167,7 @@ async fn full_session_video_input_and_files() {
     let report = controller::run(
         ctrl_link,
         ControllerOptions {
+            decoder: None,
             record: None,
             session: session_h264(&p.ctrl_id, &policy),
             deadline_us: 200_000,
@@ -298,6 +299,7 @@ async fn interrupted_upload_resumes_from_partial_file() {
     let report = controller::run(
         ctrl_link,
         ControllerOptions {
+            decoder: None,
             record: None,
             session: session(&p.ctrl_id, &policy),
             deadline_us: 200_000,
@@ -341,6 +343,7 @@ async fn host_ending_first_is_reported_to_controller() {
     let report = controller::run(
         ctrl_link,
         ControllerOptions {
+            decoder: None,
             record: None,
             session: session(&p.ctrl_id, &policy),
             deadline_us: 100_000,
@@ -393,6 +396,7 @@ async fn paced_session_delivers_frames() {
     let report = controller::run(
         ctrl_link,
         ControllerOptions {
+            decoder: None,
             record: None,
             session: session_h264(&p.ctrl_id, &policy),
             deadline_us: 100_000,
@@ -561,6 +565,7 @@ async fn controller_reports_rejection() {
     let result = controller::run(
         ctrl_link,
         ControllerOptions {
+            decoder: None,
             record: None,
             session: session(&p.ctrl_id, &only_chacha),
             deadline_us: 1,
@@ -654,6 +659,7 @@ async fn idle_screen_costs_almost_nothing_on_the_wire() {
         let report = controller::run(
             ctrl_link,
             ControllerOptions {
+                decoder: None,
                 record: None,
                 session: session(&p.ctrl_id, &policy),
                 deadline_us: 200_000,
@@ -743,6 +749,7 @@ async fn sources_with_a_change_counter_are_encoded_only_when_it_moves() {
     let report = controller::run(
         ctrl_link,
         ControllerOptions {
+            decoder: None,
             record: None,
             session: session(&p.ctrl_id, &policy),
             deadline_us: 100_000,
@@ -795,6 +802,7 @@ async fn host_encodes_native_size_even_in_a_small_window() {
     let report = controller::run(
         ctrl_link,
         ControllerOptions {
+            decoder: None,
             record: None,
             session: with_view(&p.ctrl_id),
             deadline_us: 200_000,
@@ -880,6 +888,7 @@ async fn gpu_frames_are_captured_at_the_encode_size() {
     let report = controller::run(
         ctrl_link,
         ControllerOptions {
+            decoder: None,
             record: None,
             session: session_h264(&p.ctrl_id, &policy),
             deadline_us: 200_000,
@@ -950,6 +959,7 @@ async fn the_host_session_writes_a_recording_that_matches_its_report() {
     let creport = controller::run(
         ctrl_link,
         ControllerOptions {
+            decoder: None,
             record: Some(ViewRecordSetup {
                 setup: RecordSetup {
                     dir: ctrl_records.clone(),

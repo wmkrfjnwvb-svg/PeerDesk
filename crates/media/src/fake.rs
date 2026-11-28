@@ -355,7 +355,7 @@ impl FakeConfig {
             },
             compute_us: 0,
             faults: Faults {
-                first_frame_prime: Some(crate::soft::DEFAULT_LAYER_QP),
+                first_frame_prime: Some(crate::qp::DEFAULT_LAYER_QP),
                 scene_keyframes: SceneKeyframes::Declared,
                 ..Faults::default()
             },
@@ -2210,6 +2210,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "soft")]
     fn like_openh264_declares_what_openh264_declares() {
         let fake = FakeBackend::with_default_model(
             FakeConfig::like_openh264(),

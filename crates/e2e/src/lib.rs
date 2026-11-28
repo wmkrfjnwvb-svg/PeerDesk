@@ -1134,7 +1134,8 @@ fn show_described(
                 *shown = Some(d);
                 last = Some(job.frame_id);
             }
-            Ok(Some(Picture::Rgb(_) | Picture::Nv12(_)) | None) => {}
+            // 假解码器只出内容描述；真实像素和“平台解码器自己画到屏幕上”（手机）在 L0 里不会出现
+            Ok(Some(Picture::Rgb(_) | Picture::Nv12(_) | Picture::Presented { .. }) | None) => {}
             Err(_) => {
                 rx.decode_failed();
                 last = None;

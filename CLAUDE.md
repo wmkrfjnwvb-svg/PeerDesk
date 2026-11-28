@@ -107,7 +107,8 @@
   | `[mac]` | 只跑 macOS 的测试和实机测试 |
   | `[win]` | 只跑 Windows 的测试和实机测试 |
   | `[full]` | 全部平台，加界面截图 |
-  | `[pkg]` | 打 Windows/macOS 安装包 |
+  | `[pkg]` | 打 Windows/macOS 安装包（也上传 Android APK） |
+  | `[android]` | 编 Android APK、跑它的单元测试并上传 APK（改了 `android/`、`crates/mobile/` 时构建和测试照跑，只是不上传） |
 
   可以组合，例如 `[mac][pkg]`。
 - 提交信息里**不要写方括号形式的标记原文**，除非真要触发（2026-11-27：合并说明里写了“方括号 full 照跑”，CI 当成标记跑了全平台）。

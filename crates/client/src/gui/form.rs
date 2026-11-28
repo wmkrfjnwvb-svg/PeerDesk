@@ -12,28 +12,8 @@ use super::i18n::Strings;
 /// 没写端口时用的端口。
 pub const DEFAULT_PORT: u16 = 4433;
 
-/// 控制端要连到哪里。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Target {
-    /// 直接连这个地址；给了指纹就核对。
-    Addr {
-        /// 地址。
-        addr: SocketAddr,
-        /// 要核对的指纹。
-        pin: Option<Fingerprint>,
-    },
-    /// 通过服务器找到这台设备（按设备码或指纹），先试直连，不通走中继。连接时核对设备指纹。
-    Device {
-        /// 信令服务器。
-        server: Server,
-        /// 被控端。
-        device: Lookup,
-        /// 路径策略。
-        policy: PathPolicy,
-        /// 会员令牌（空表示免费用户）。
-        account: String,
-    },
-}
+/// 控制端要连到哪里（和手机端共用，见 `peerdesk_net::viewer`）。
+pub use peerdesk_net::viewer::ViewTarget as Target;
 
 /// 端口：1 到 65535。
 pub fn parse_port(text: &str, s: &Strings) -> Result<u16, String> {

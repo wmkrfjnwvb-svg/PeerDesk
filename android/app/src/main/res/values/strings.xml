@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">PeerDesk</string>
+
+    <!-- 连接页 -->
+    <string name="connect_title">Connect to a computer</string>
+    <string name="connect_server">Server</string>
+    <string name="connect_server_hint">host:port</string>
+    <string name="connect_code">Device code</string>
+    <string name="connect_password">Password</string>
+    <string name="connect_button">Connect</string>
+    <string name="connect_bad_code">The device code has 9 digits.</string>
+    <string name="connect_background_note">PeerDesk disconnects when you leave the app. Come back and connect again.</string>
+    <string name="connect_failed">Could not connect: %1$s</string>
+    <string name="connect_ended">Session ended: %1$s</string>
+    <string name="connect_ended_background">Disconnected because the app went to the background. Connect again to continue.</string>
+    <string name="connect_no_surface">The display surface is not available. Close the app and open it again.</string>
+
+    <!-- 会话页 -->
+    <string name="session_connecting">Connecting…</string>
+    <string name="session_reconnecting">Connection lost, reconnecting (attempt %1$d): %2$s</string>
+    <string name="toolbar_disconnect">Disconnect</string>
+    <string name="toolbar_keyboard">Keyboard</string>
+    <string name="toolbar_hide">Hide toolbar</string>
+    <string name="toolbar_show">Show toolbar</string>
+    <string name="mouse_left_desc">Left mouse button. Hold it and drag to select; the pointer is the arrow tip.</string>
+    <string name="mouse_right_desc">Right mouse button</string>
+    <string name="mouse_handle_desc">Mouse body. Drag it to move the pointer.</string>
+    <string name="mouse_close_desc">Shrink the mouse to a small icon</string>
+    <string name="mouse_mini_desc">Small mouse. Tap to open the full mouse, or drag to move it.</string>
+    <string name="connect_gestures">Gestures: tap = left click, swipe = move the view, long-press then release = right click, long-press then drag = drag, two-finger tap = right click, two fingers = scroll, pinch = zoom. Tap the small on-screen mouse for a full mouse with left and right buttons.</string>
+    <string name="toolbar_export_trace">Export last session\'s gesture log</string>
+    <string name="trace_share_title">PeerDesk gesture log</string>
+    <string name="back_again_to_disconnect">Press back again to disconnect</string>
+    <string name="route_direct">Direct</string>
+    <string name="route_relay">Relay</string>
+
+    <!-- 状态行 -->
+    <string name="status_line">%1$d ms · %2$d fps · %3$s · loss %4$s</string>
+    <string name="status_mbps">%1$.1f Mbps</string>
+    <string name="status_kbps">%1$d kbps</string>
+    <string name="status_waiting">Waiting for the first frame…</string>
+    <string name="diag_router">Your Wi-Fi or router link is slow or dropping packets (%1$d ms to the router). Move closer to the router or switch to 5 GHz.</string>
+    <string name="diag_internet">The problem is on the internet path, not your Wi-Fi. Waiting or switching networks may help.</string>
+    <string name="diag_unmeasured">The network is slow or lossy. The router could not be measured, so the cause is probably on the internet path.</string>
+
+    <!-- 快捷键栏 -->
+    <string name="key_esc">Esc</string>
+    <string name="key_tab">Tab</string>
+    <string name="key_ctrl">Ctrl</string>
+    <string name="key_alt">Alt</string>
+    <string name="key_win">Win</string>
+    <string name="key_cmd">Cmd</string>
+    <string name="connect_show_password">Show password</string>
+    <string name="connect_hide_password">Hide password</string>
+</resources>

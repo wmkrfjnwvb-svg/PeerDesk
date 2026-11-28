@@ -1,4 +1,4 @@
-# 交接：所有进行中的工作和下一步（2026-11-28 12:00 UTC，主会话写）
+# 交接：所有进行中的工作和下一步（2026-11-28 14:00 UTC，主会话写）
 
 会话没了也能接上：每一项写了分支、最后的提交、做到哪、下一步。决定和方案的详细内容在各自的文档里，这里只是索引。
 分工照 CLAUDE.md：主会话调度、审查、合并、做产品；diskagent 会话做仿真框架；指纹（`crates/e2e/golden/fingerprints.txt`）只由主会话改。
@@ -17,32 +17,24 @@
 
 ## 2. 进行中
 
-### 2.1 Android 控制端（主会话）——分支 `android`，最后 024f73d（WIP）
+### 2.1 Android 控制端（主会话）——**已合进 dev**（本次合并），分支 `android` 最后 4d3f302
 
-- 方案和进度：`R-android.md`（第 7 节进度表）。
-- 已完成并真机验证过：A0 工具链、A1 Rust 核心（`crates/mobile`）、A2 MediaCodec 解到 Surface 加 JNI、A3 Kotlin + Compose 界面。
-  产品负责人 11-28 实测：**能连上、能看到画面、能点击**。
-- 修过的真机问题：句柄按位放进 long（Android 11 起堆指针带标记，30b885c）；密码显示/隐藏；记住设备码和密码（Keystore 加密）。
-- **做到一半（024f73d，编不过）**：手势按 ToDesk 的习惯改（产品负责人反馈“操作有点怪”）。新手势表写在 `crates/mobile/src/gesture.rs` 开头：
-  - 触屏模式：单指点左键、单指滑动平移画面、长按震一下后松开右键或拖动拖拽、双指滑动滚动、捏合缩放、双指点右键；
-  - 鼠标模式（鼠标助手）：屏幕上有光标、手指精细移动光标、屏幕上的左键右键按钮（按住左键再滑动 = 精细选中文字）。
-  - 下一步：
-    1. 按新表重写 `gesture.rs` 的测试；
-    2. `lib.rs` 的 `apply` 把 `Action::Haptic`、`Action::Cursor` 转成 JSON（`{"type":"haptic"}`、`{"type":"cursor","x":..,"y":..}`）；
-    3. `android/bridge.rs`：`setView` 去掉 `zoomed` 参数、`setMode` 返回动作 JSON（进鼠标模式时交出光标）、新加 `button(h, button, down)`（调 `Gestures::button`）；
-    4. Kotlin：工具条加“鼠标”按钮切鼠标模式；收到 cursor 画光标；浮动的“左键”“右键”按钮（按下、抬起分别调 `button`）；收到 haptic 震一下；画面放大时光标到边上跟着平移；`Native.kt`、`NativeSession.kt` 跟着改签名；
-    5. `scripts/android-build.sh` 编 APK 发给产品负责人。
-- 之后：A4（CI 里 `[android]` 标记出 APK）、诊断页导出日志、切后台不断开、Android 合进 dev（等手势改完、CI 的 lint 和覆盖率过）。
+- 方案和进度：`R-android.md`（第 7 节进度表，真机反馈和根因都写在里面）。
+- 合进 dev 的：`peerdesk-net::viewer`（桌面和手机共用的访问驱动）、OpenH264 可选、`crates/mobile`（会话、手势状态机、按键映射、MediaCodec 解到 Surface、JNI）、
+  `android/` Kotlin + Compose 界面（连接页、会话页、虚拟鼠标、点击水波、软键盘让位、会话全屏、返回键按两次、手势记录导出）、CI 的 `android` 任务（`[android]` 标记）。
+- 真机记录回放（`crates/mobile/tests/trace_replay.rs`，两份产品负责人的记录）：滚动 25 次、捏合 26 次全对；修过的根因：系统取消只带一根手指时卡死、
+  两指上下叠着滚动时一根比另一根早动 40 多毫秒被当成捏合。
+- 合并的 CI 带 `[mac]`（桌面控制端改用共用驱动、OpenH264 改可选，先在 macOS 上验证），过了再推一次 `[win]`。
+- 下一步：等产品负责人测 4d3f302 的 APK；诊断页（首帧、解码耗时、帧率、冻结）、切后台不断开；iOS 以后。
 - 构建：`source scripts/android-env.sh`；SDK 在 `~/android-sdk`（`scripts/android-setup.sh` 装，许可协议产品负责人已同意）。新容器要重新装。
 
-### 2.2 仿真框架 A2-3（diskagent 会话）——分支 `sim-a2`，最后 4a21217（已在云端，工作区干净）
+### 2.2 仿真框架 A2-4（diskagent 会话）——分支 `sim-a2`
 
-- 第一步（Network 接口、布局 2、路径变了事件）：**主会话审过，通过**，等 sim-a2 的 CI（3eec326）过了合进 dev，golden 加它的 1 行 `layout2 … c417b89064bb3f42`。
-- 第一步和第二小步“分段路径”：**都已审过、合进 dev**（2026-11-28 合并提交，golden 加了 5 行：layout2 1 行、homes 4 行）。结果在 `Q-redesign/a2-plan.md` 第 8 节末尾。
-  - 合并之后：diskagent 把 dev 合回 sim-a2 再往下做（下一步看 a2-plan，A2-4 或主会话安排）。
-  - 家庭场景已经量出产品问题：A 家有人上传、出口没有 AQM 时，码率掉到 2.1 Mbps、冻结 16.8 次（开 CoDel 时 0 次）——要靠分段测量认出“A 自己出口在堵”（B 阶段）。
-  - 已知限制：交叉流的往返只含它挂的那一段（A3 补）；家庭参数是一个点，不是分布。
-- 记下的问题（不是仿真的错）：长 TCP 把码率挤到 106 kbps；换路后约 0.7 秒才恢复；布局 1 在高丢包链路上偏乐观（A5 迁移门槛时按布局 2 重定）。
+- **A2-4a（多会话共享瓶颈）和 A2-4b（NR-BPDV 抖动、TCP SACK）已审过、合进 dev**（本次合并，sim-a2 38fa76c）。golden：带 TCP 交叉流的 3 行改了、A2-4a 新增 `zero` 一行（154 行）。
+  - A2-4a 审出的 `Shared::pop` 提前送达已修（断言又抓到同函数第二个洞，一起修）。
+  - SACK 让量尺更接近真实，带长 TCP、A 家上传丢尾的场景变差（最长等待 410→790、657→988 ms）：是产品问题（和 TCP 抢带宽，B 阶段），不是仿真的错。
+  - 两条同 RTT 的 TCP 收敛到 0.9995–1.0005：丢尾同步丢包，比真实规整；A3 给交叉流随机的开始时刻和确认抖动。
+- 下一步：A2-4c（RFC 8867 八个用例、RFC 8868 指标，每对在接收端按 200 ms 分窗算公平和收敛；最终 12 个种子），同时写 A3 设计。diskagent 先把 dev 合回 sim-a2。
 
 ### 2.3 账户设备表（主会话）——分支 `devices-s1`，最后 4acff3a
 
@@ -51,13 +43,15 @@
 
 ## 3. 排队（按 `O-standard-plan.md` 的顺序）
 
-1. Android 手势改完、合进 dev（2.1）。
+1. Android 真机反馈继续（2.1），诊断页、切后台不断开。
 2. S1 连入确认（设计已定，见 `O-standard-plan.md` 2.1）。
 3. S2 多显示器、S3 Mac 和 Linux 无人值守、S6 唤醒和重启连回、S7 会话内开关、S8 文件权限（S7、S8 可以派 Sonnet）。
 4. 账户线 P1–P3b（本地用自己生成的密钥测，不等 Supabase）。
 5. Agent 功能 G1–G4（工具分层草案在 `industry-agent-remote-control.md`）。
 6. 隐私屏、虚拟显示器（做法在 `industry-privacy-virtual-display.md`；Mac 虚拟屏要无显示器的 Mac mini 实测）。
 7. “停下后没变清晰”在微软轨迹上很普遍（11-28 基线 144 次里 111 次）：和 #79 补清晰策略一起查。
+   真机：静止时补清晰的小帧让闲着也有 140–300 kbps（中继成本），小变化只补变化的那块（bench-competitors 第 2 节）。
+8. 打字的“操作到画面”量尺（分支 `reaction`，Fable 在做第 1 步）；4G 虚假重传（NACK 3b，B 阶段第一步，bench-competitors 第 4 节）。
 
 ## 4. 推到云端的其他分支（没合进 dev，保存着）
 
@@ -65,7 +59,13 @@
 `worktree-agent-a8b1b3f174e8aa283`、`worktree-agent-a9615c6713cd1d397`、`a2-cross`（已合）、`tray`、`panel`、`rate2`（已合）、
 `presence`（在线状态轮询，不合并，换成订阅）、`music-mode`、`ui-redesign`、`ui-stage3`。
 
+## 4.5 对标实测
+
+`bench-competitors-2026-11-28.md`：ToDesk、UU 远程（响应、帧率、画质），4G 虚假重传的两端日志和根因，以后怎么量。
+
 ## 5. 要产品负责人办的（不急，到了再准备）
+
+- Lumos5G 数据集的下载账号（A3 的 5G 类型要用；没有之前 5G 用合成轨迹，标“可信度低”）。
 
 - 真机测：#71 的安装包（7c56f8c 的 CI 产物）、Android APK（手势改完后的新版）。
 - 以后：Supabase 测试项目、Stripe 沙盒、发信服务（账户线 P2、P8）；苹果开发者账号和 Mac（iOS、Mac 公证）；

@@ -19,9 +19,10 @@ use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 
 use crate::files::{send_files, FileResult};
-use crate::host::{control_reader, HELLO_TIMEOUT};
 use crate::host_record::{end_reason, wall_now_us};
-use crate::stream::{read_control, write_control, write_kind, StreamKind};
+use crate::stream::{
+    control_reader, read_control, write_control, write_kind, StreamKind, HELLO_TIMEOUT,
+};
 use crate::view_record::{view_frame, ViewJournal, ViewParams};
 use crate::{Fingerprint, Link, NetError};
 
@@ -73,6 +74,36 @@ pub struct ControllerOptions {
     pub view: Option<tokio::sync::watch::Receiver<(u16, u16)>>,
     /// 会话记录（见 [`crate::recorder`]）：`None` 表示不记录。打不开时写日志说明原因，会话照常进行。
     pub record: Option<crate::recorder::ViewRecordSetup>,
+    /// H.264 解码器从哪来：`None` 用默认的（桌面：本系统的硬件解码器优先，OpenH264 兜底）；
+    /// 手机端传系统的解码器（Android 的 MediaCodec，见 `docs/research/R-android.md`）。
+    pub decoder: Option<DecoderFactory>,
+}
+
+/// 造 H.264 解码器的函数（见 [`ControllerOptions::decoder`]）。每次会话造一个。
+#[derive(Clone)]
+pub struct DecoderFactory(
+    pub Arc<dyn Fn() -> Result<Box<dyn VideoDecoder>, NetError> + Send + Sync>,
+);
+
+impl std::fmt::Debug for DecoderFactory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DecoderFactory")
+    }
+}
+
+/// 默认的 H.264 解码器：本系统的硬件解码器优先，出错时改用 OpenH264。
+#[cfg(feature = "soft")]
+fn default_h264_decoder() -> Result<Box<dyn VideoDecoder>, NetError> {
+    Ok(Box::new(peerdesk_media::AutoH264Decoder::new()?))
+}
+
+/// 没带 OpenH264 的构建（手机端）没有默认解码器：调用方必须通过 [`ControllerOptions::decoder`] 提供，
+/// 没提供就明确报错，不静默换成别的编码。
+#[cfg(not(feature = "soft"))]
+fn default_h264_decoder() -> Result<Box<dyn VideoDecoder>, NetError> {
+    Err(NetError::Connect(
+        "这个版本没有自带 H.264 解码器，要由调用方提供（手机端用系统解码器）".to_owned(),
+    ))
 }
 
 /// 交出连接的回调（见 [`ControllerOptions::on_link`]）。
@@ -398,7 +429,10 @@ pub async fn run(
     let (mut bad_datagrams, mut input_sent) = (0u64, 0u64);
     // 两端都支持 H.264 就用它，否则用块编码。
     let decoder: Box<dyn VideoDecoder> = if caps.common(Caps::H264) == Caps::H264 {
-        Box::new(peerdesk_media::AutoH264Decoder::new()?)
+        match &opts.decoder {
+            Some(make) => (make.0)()?,
+            None => default_h264_decoder()?,
+        }
     } else {
         Box::new(TileDecoder::new())
     };

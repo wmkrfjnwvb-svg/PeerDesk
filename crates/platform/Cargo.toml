@@ -8,8 +8,8 @@ rust-version.workspace = true
 
 [dependencies]
 peerdesk-core.workspace = true
-peerdesk-net = { workspace = true, features = ["media"] }
-peerdesk-media.workspace = true
+peerdesk-net = { workspace = true, features = ["media", "soft"] }
+peerdesk-media = { workspace = true, features = ["source"] }
 # 剪贴板读写（文本、图片）和 PNG 编解码
 arboard = "3.7"
 png = "0.18"

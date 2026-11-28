@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/media", "crates/e2e", "crates/net", "crates/platform", "crates/client", "crates/server"]
+members = ["crates/core", "crates/media", "crates/e2e", "crates/net", "crates/platform", "crates/client", "crates/server", "crates/mobile"]
 
 [workspace.package]
 version = "0.1.0"
@@ -12,7 +12,8 @@ repository = "https://github.com/peerdesk/peerdesk"
 [workspace.dependencies]
 peerdesk-core = { path = "crates/core" }
 peerdesk-net = { path = "crates/net", default-features = false }
-peerdesk-media = { path = "crates/media" }
+# 默认不带软件 H.264（OpenH264）：桌面的成员在自己的 Cargo.toml 里打开 `source`，手机端不带（见 docs/research/R-android.md）。
+peerdesk-media = { path = "crates/media", default-features = false }
 peerdesk-platform = { path = "crates/platform" }
 
 # 编译期检查：所有 crate 通过 `[lints] workspace = true` 继承。
