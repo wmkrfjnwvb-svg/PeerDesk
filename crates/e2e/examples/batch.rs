@@ -141,7 +141,8 @@ fn row(world: &World, o: &Outcome, wall_ms: f64, source: &str) -> String {
         .phases
         .iter()
         .filter(|p| p.action == Action::Idle)
-        .filter_map(|p| p.sharp_ms.map(|ms| format!("{ms:.0}")))
+        // 每个停下阶段一项，没变清晰的写 `-`：两份 CSV 才能按阶段对齐（汇总脚本求和时本来就跳过 `-`）
+        .map(|p| p.sharp_ms.map_or("-".to_owned(), |ms| format!("{ms:.0}")))
         .collect();
     let mut cols = vec![
         world.hash.clone(),
