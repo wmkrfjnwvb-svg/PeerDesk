@@ -7,6 +7,10 @@
 //!   8867 写的“最大 30 ms”和 8868 的公式对不上，照 8868，见 `Pdv`）；
 //! - 媒体（第 4.3 节）：150 kbps 起步、1.5 Mbps 封顶（产品默认起步是 1 Mbps，这里为了对齐 RFC 改成 150 kbps），
 //!   内容是一直播的 `Video` 段（远程桌面里码率最高、最接近“有足够多的数据要发”的真实内容）；
+//! - 画面 640×360（[`MEDIA_SIZE`]，主会话 2026-11-28 定）：原文第 4.3 节给的分辨率范围是 144p–720p，对应
+//!   150 kbps–1.5 Mbps；这些用例测的是竞争、公平和收敛，不是画质；1.5 Mbps 封顶时 720p 本来就糊；L1 在 720p 上
+//!   一路只有 0.5–1 倍实时，12 个种子要 6 小时。分辨率会改变帧大小和分片，可能影响码控，所以 5.1 另在 720p 上跑一遍
+//!   对照（例子程序的 `--size 1280x720`），结论写在报告里；
 //! - 音频（第 4.3 节“CBR 20 Kbps”）：我们的仿真没有音频编码，每一路音频是一条 20 kbps 的定速交叉流（每秒 50 个 50 字节的包），
 //!   挂在共享瓶颈上，不受码控；
 //! - 5.8 的“暂停”：远程桌面没有“停发媒体流”，暂停那 20 秒改成 `Idle`（画面静止，产品照常发反馈和静止探测）。
@@ -50,6 +54,8 @@ pub const MEDIA_START_BPS: u64 = 150_000;
 pub const AUDIO_BPS: u64 = 20_000;
 /// 帧率。
 const FPS: u32 = 30;
+/// 画面尺寸（见模块文档）。
+pub const MEDIA_SIZE: (u16, u16) = (640, 360);
 
 /// 一路媒体的时间线（全局时间，微秒）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -213,6 +219,7 @@ fn media_scenario(name: &str, flow: &MediaFlow, seed: u64, network: &NetworkPlan
         }),
     }
     let mut s = Scenario::fixed(name, phases);
+    (s.width, s.height) = MEDIA_SIZE;
     s.codec = CodecKind::H264;
     s.fps = FPS;
     s.start_bps = MEDIA_START_BPS;
@@ -606,6 +613,21 @@ pub fn cases(seed: u64) -> Vec<Case> {
     v.push(case_5_7(seed));
     v.push(case_5_8(seed));
     v
+}
+
+/// 换画面尺寸（720p 对照用）。名字里加上尺寸，指纹行的身份分得开。
+#[must_use]
+pub fn with_size(mut c: Case, width: u16, height: u16) -> Case {
+    if (width, height) == MEDIA_SIZE {
+        return c;
+    }
+    for p in &mut c.multi.pairs {
+        p.scenario.width = width;
+        p.scenario.height = height;
+        p.scenario.name = format!("{}@{width}x{height}", p.scenario.name);
+    }
+    c.id = format!("{}@{width}x{height}", c.id);
+    c
 }
 
 /// 把用例截短到前 `secs` 秒（CI 的冒烟：保证能跑、指标有数）。各路的阶段按比例截，开始晚于截止的去掉。
@@ -1072,6 +1094,12 @@ mod tests {
         assert_eq!(p.cross.len(), 1, "一路音频");
         let s = &c.multi.pairs[0].scenario;
         assert_eq!((s.start_bps, s.max_bps), (150_000, 1_500_000));
+        assert_eq!((s.width, s.height), (640, 360));
+        let big = with_size(c.clone(), 1280, 720);
+        assert_eq!(big.id, "5.1-trace-50ms@1280x720");
+        assert_eq!(big.multi.pairs[0].scenario.width, 1280);
+        assert!(big.multi.pairs[0].scenario.name.ends_with("@1280x720"));
+        assert_eq!(with_size(c.clone(), 640, 360).id, c.id);
         assert_eq!(s.phases.iter().map(|p| p.frames).sum::<u32>(), 3_000);
         // UDP 背景流：4 Mbps 物理容量，背景流 3、1.5、3.4、3 Mbps
         let u = case_5_1(Mechanism::Udp, 100, 1);

@@ -1,7 +1,8 @@
 //! RFC 8867 的 8 个基础用例（A2-4c）：每个用例跑 N 个种子，按用例出一份 markdown 报告（RFC 8868 的指标，见
 //! `peerdesk_e2e::rfc8867` 的模块文档）。只在本地跑，不进 CI（CI 里是 `tests/rfc8867.rs` 的 10 秒冒烟）。
 //!
-//! 用法：`rfc8867 [--seeds N] [--jobs N] [--out 报告.md] [--only 用例名前缀]`
+//! 用法：`rfc8867 [--seeds N] [--jobs N] [--out 报告.md] [--only 用例名前缀] [--size 宽x高]`
+//! - `--size`：换画面尺寸（默认 640×360，见 `rfc8867::MEDIA_SIZE`）；5.1 的 720p 对照用 `--only 5.1 --size 1280x720`；
 //! - 默认 3 个种子（开发时迭代）；最终报告用 12 个（主会话 2026-11-28 定），按均值加减两倍标准误；
 //! - 一次运行 = 一个用例 × 一个种子，几个线程分着跑；
 //! - 报告里每个数都能追到用例名和种子（种子 1..=N）。
@@ -19,6 +20,7 @@ struct Options {
     jobs: usize,
     out: Option<String>,
     only: Option<String>,
+    size: Option<(u16, u16)>,
 }
 
 fn parse() -> Result<Options, String> {
@@ -27,6 +29,7 @@ fn parse() -> Result<Options, String> {
         jobs: std::thread::available_parallelism().map_or(1, usize::from),
         out: None,
         only: None,
+        size: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -44,6 +47,13 @@ fn parse() -> Result<Options, String> {
             }
             "--out" => o.out = Some(value("--out")?),
             "--only" => o.only = Some(value("--only")?),
+            "--size" => {
+                let v = value("--size")?;
+                let parsed = v
+                    .split_once('x')
+                    .and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?)));
+                o.size = Some(parsed.ok_or(format!("--size {v:?} 要写成 宽x高"))?);
+            }
             other => return Err(format!("不认识的参数 {other}")),
         }
     }
@@ -206,6 +216,10 @@ fn main() -> ExitCode {
             cases(seed)
                 .into_iter()
                 .filter(|c| o.only.as_ref().is_none_or(|p| c.id.starts_with(p.as_str())))
+                .map(|c| match o.size {
+                    Some((w, h)) => peerdesk_e2e::rfc8867::with_size(c, w, h),
+                    None => c,
+                })
                 .collect()
         })
         .collect();
