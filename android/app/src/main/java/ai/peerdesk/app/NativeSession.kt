@@ -20,6 +20,8 @@ class NativeSession(private val handle: Long) {
     fun nextEvent(timeoutMs: Int): String? = use(null) { Native.nextEvent(it, timeoutMs) }
     fun touch(id: Int, phase: Int, x: Float, y: Float, tMs: Long): String? =
         use(null) { Native.touch(it, id, phase, x, y, tMs) }
+    fun moves(ids: IntArray, xs: FloatArray, ys: FloatArray, tMs: Long): String? =
+        use(null) { Native.moves(it, ids, xs, ys, tMs) }
     fun tick(tMs: Long): String? = use(null) { Native.tick(it, tMs) }
     fun setView(rect: ViewRect, viewW: Int, viewH: Int) = use(Unit) {
         Native.setView(it, rect.left, rect.top, rect.width, rect.height, viewW, viewH)

@@ -82,11 +82,14 @@ fun applyPan(
 fun applyOps(
     s: ViewState, ops: List<ViewOp>,
     containerW: Float, containerH: Float, aspect: Float,
+    /** 键盘把画面往上顶了多少像素：手势给的是屏幕坐标，换成没顶之前的坐标再算缩放中心。 */
+    imeShift: Float = 0f,
 ): ViewState = ops.fold(s) { acc, op ->
     when (op) {
-        is ViewOp.Zoom -> applyZoom(acc, op.factor, op.cx, op.cy, containerW, containerH, aspect)
+        is ViewOp.Zoom -> applyZoom(acc, op.factor, op.cx, op.cy + imeShift, containerW, containerH, aspect)
         is ViewOp.Pan -> applyPan(acc, op.dx, op.dy, containerW, containerH, aspect)
         ViewOp.Haptic -> acc
+        is ViewOp.Tap -> acc
     }
 }
 

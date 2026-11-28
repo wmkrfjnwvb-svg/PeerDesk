@@ -30,7 +30,7 @@ const val MINI_DEFAULT_FX = 1f
 const val MINI_DEFAULT_FY = 0.85f
 
 /**
- * 展开的大鼠标：最上面一条放箭头光标（箭头尖在这一条的最上沿、水平居中）和右上角的关闭按钮；
+ * 展开的大鼠标：最上面一条放箭头光标（箭头尖在这一条的最上沿、在左键的正上方）和右上角的关闭按钮；
  * 下面是鼠标本体，上半是左键、右键，下半是身体（拖把）。
  */
 data class VMouse(
@@ -39,7 +39,7 @@ data class VMouse(
     val right: PxBox,
     val body: PxBox,
     val close: PxBox,
-    /** 箭头尖的屏幕位置 = 遥控端光标的位置。 */
+    /** 箭头尖的屏幕位置 = 遥控端光标的位置。尖在左键正上方（左键水平中心），纵向在最上沿。 */
     val tipX: Float,
     val tipY: Float,
 ) {
@@ -68,7 +68,7 @@ fun vmouseLayout(containerW: Float, containerH: Float, fx: Float, fy: Float, s: 
         right = PxBox(l + s.width / 2, t + s.arrowH, s.width / 2, btnH),
         body = PxBox(l, bodyTop, s.width, t + gh - bodyTop),
         close = PxBox(l + s.width - s.closeSize, t, s.closeSize, minOf(s.closeSize, s.arrowH)),
-        tipX = l + s.width / 2,
+        tipX = l + s.width / 4,
         tipY = t,
     )
 }
@@ -135,8 +135,10 @@ private sealed interface Role {
 }
 
 data class RouteResult(
-    /** 转发给 `Native.touch` 的手指。 */
+    /** 按下、抬起、取消：逐根转发给 `Native.touch`。 */
     val touches: List<TouchOp>,
+    /** 同一个 ACTION_MOVE 里所有转发的手指的新位置：一起交给 `Native.moves`（逐根交会让捏合抖）。 */
+    val moves: List<TouchOp>,
     val mouse: List<MouseEvent>,
 )
 
@@ -161,6 +163,7 @@ class TouchRouter(private val tapSlopPx: Float = 8f) {
     ): RouteResult {
         val ops = touchOps(action, actionIndex, ids, xs, ys)
         val touches = ArrayList<TouchOp>()
+        val moves = ArrayList<TouchOp>()
         val mouse = ArrayList<MouseEvent>()
         for (op in ops) {
             if (op.phase == TouchPhase.DOWN) {
@@ -180,7 +183,7 @@ class TouchRouter(private val tapSlopPx: Float = 8f) {
             val up = op.phase == TouchPhase.UP
             val ending = up || op.phase == TouchPhase.CANCEL
             when (role) {
-                Role.Forward -> touches.add(op)
+                Role.Forward -> if (move) moves.add(op) else touches.add(op)
                 is Role.Key -> {
                     // 只有左键按住拖动才带着整只鼠标走
                     if (move && role.index == 0 && (op.x != role.lastX || op.y != role.lastY)) {
@@ -219,6 +222,6 @@ class TouchRouter(private val tapSlopPx: Float = 8f) {
             }
             if (ending) roles.remove(op.id)
         }
-        return RouteResult(touches, mouse)
+        return RouteResult(touches, moves, mouse)
     }
 }

@@ -82,6 +82,8 @@ sealed interface ViewOp {
     data class Pan(val dx: Float, val dy: Float) : ViewOp
     /** 长按到点了：震一下。 */
     data object Haptic : ViewOp
+    /** 触屏点击落在屏幕 (x, y)（像素）；button 0 左键、1 右键。界面画水波、记输入位置。 */
+    data class Tap(val x: Float, val y: Float, val button: Int) : ViewOp
 }
 
 /** 解析 `touch`/`tick` 返回的变换数组；null、空串、坏格式都当作“没有变换”。 */
@@ -101,6 +103,13 @@ fun parseViewOps(json: String?): List<ViewOp> {
                         ),
                     )
                     "haptic" -> add(ViewOp.Haptic)
+                    "tap" -> add(
+                        ViewOp.Tap(
+                            o.optDouble("x", 0.0).toFloat(),
+                            o.optDouble("y", 0.0).toFloat(),
+                            if (o.optInt("button", 0) == 1) 1 else 0,
+                        ),
+                    )
                     "pan" -> add(
                         ViewOp.Pan(o.optDouble("dx", 0.0).toFloat(), o.optDouble("dy", 0.0).toFloat()),
                     )

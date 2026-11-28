@@ -15,6 +15,8 @@ object Native {
 
     external fun nextEvent(h: Long, timeoutMs: Int): String?
     external fun touch(h: Long, id: Int, phase: Int, x: Float, y: Float, tMs: Long): String?
+    /** 一个 ACTION_MOVE 里所有手指的新位置，一起交（逐根交会让捏合抖）。返回同 touch。 */
+    external fun moves(h: Long, ids: IntArray, xs: FloatArray, ys: FloatArray, tMs: Long): String?
     external fun tick(h: Long, tMs: Long): String?
     external fun setView(
         h: Long, left: Float, top: Float, width: Float, height: Float,
