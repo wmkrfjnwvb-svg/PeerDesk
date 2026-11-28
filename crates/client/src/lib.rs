@@ -13,7 +13,8 @@ pub mod gui;
 pub mod instance;
 pub mod keychain;
 pub mod libcheck;
-pub mod logfile;
+// 文件日志器在网络层（手机端也用它）；这里转出，桌面端的引用路径不变
+pub use peerdesk_net::logfile;
 pub mod process;
 
 /// 默认的数据目录（身份、设置、日志都在这里）。
