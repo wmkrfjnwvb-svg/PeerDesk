@@ -1636,6 +1636,22 @@ mod tests {
         }
     }
 
+    /// 按画面区域拟合的字节模型（M2b 的 openh264-v2）同样过体检，扰动开关、按 QP 编和按码率窗口编各一次。
+    /// 体检里没有接区域信道，区域类输入只有“第一帧整屏是新的”，所以另外用一份带区域的输入把模型扫一遍 QP。
+    #[test]
+    fn the_region_byte_model_passes_the_checkup_too() {
+        use crate::fitted_v2::RegionByteModel;
+        for noise in [true, false] {
+            for cfg in [FakeConfig::default(), FakeConfig::window()] {
+                let clock = ManualClock::new();
+                let model = RegionByteModel::openh264_v2().unwrap().with_noise(noise);
+                let mut b = FakeBackend::new(cfg, Arc::new(clock.clone()), Box::new(model));
+                let report = run_with(small(), &mut b, &mut |d| clock.advance(d));
+                assert_clean(&report);
+            }
+        }
+    }
+
     /// 同一配置体检两次，报告逐项相同（确定性）。
     #[test]
     fn the_checkup_is_deterministic() {

@@ -14,8 +14,14 @@
 //! - `scene <集> <种子> <宽> <高> <QP> <面积千分比,…>`：整屏换窗口的门槛：前一帧是桌面，后一帧把其中一块（占这么多千分比）换成另一个桌面的内容；
 //!   `scenev` 同上，换进来的是视频噪声（变化面积能到 100%）。
 //!
-//! 另有一个子命令 `measure floor <输出目录> <第几份> <共几份>`：低 QP 地板的根因实验（`docs/research/Q-redesign/m2b-plan.md` 第 2 节），
-//! 不读清单，任务（12 个种子）写死在代码里，每帧多记解码后对原图的亮度 PSNR。
+//! 另有一个子命令 `measure floor <输出目录> <第几份> <共几份>`：低 QP 地板的链（`docs/research/Q-redesign/m2b-plan.md` 第 2 节，
+//! B3 带上新特征重跑），不读清单，任务（12 个种子）写死在代码里，每帧多记解码后对原图的亮度 PSNR。
+//!
+//! M2b（B3）每帧多记的区域类特征（`docs/research/Q-redesign/data-m2b.md` 第 4 节）：和假后端运行时的输入是**同一份代码**
+//! （[`RegionTracker`]：宏块画质表、累计变化的换算、脏区域细节、画质差分布），不是另写一份。区域本身由画面来源交出：
+//! 合成桌面自己知道画了什么（`RealisticDesktop::changes`），真字体页面由 `scripts/m2-pages.py` 写在 `regions.txt` 里。
+//! 另外每帧用逐像素比较核对：实际变了的像素必须全落在“脏区域 ∪ 移动目的地”里（`uncovered_px` 必须是 0，不是就报错退出），
+//! 并记 `changed_px`（实际变了多少像素）、`region_px`（区域面积）。
 //!
 //! 固定：单线程；每个（序列, QP）新开一个后端；每个任务的第一个 QP 编两遍，字节数必须相同（自检，不同就报错退出）。
 
@@ -25,36 +31,58 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::time::Instant;
 
+use peerdesk_core::changes::{Accum, Changes, Move, Rect};
 use peerdesk_core::frame::Picture;
 use peerdesk_core::screen::Screen;
 use peerdesk_core::video::{Codec, FrameHeader, VideoDecoder};
 use peerdesk_e2e::content::{Action, RealisticDesktop};
 use peerdesk_media::backend::{EncoderBackend, Finished, FrameAsk, FrameInput, Rates, Submitted};
-use peerdesk_media::content::{detail_permille, luma_changed_permille, sample_luma};
+use peerdesk_media::content::{detail_permille, luma_changed_permille, mb_edges, sample_luma};
+use peerdesk_media::fake::{RegionTracker, Regions};
 use peerdesk_media::soft::OpenH264Backend;
 use peerdesk_media::H264Decoder;
 
 type Res<T> = Result<T, String>;
 
-const HEADER: &str = "backend,seq,class,split,w,h,frame,qp,asked_key,got_key,bytes,changed_permille,detail_permille,prev_qp,enc_us";
+/// 前 15 列和 M2 一样；后面是 M2b 加的：区域类特征（假后端同一份代码算的）、核对用的实际变化、解码后的亮度 PSNR。
+/// `gap` 是静止宏块的画质差分布，只列非零的格，`画质差:宏块数` 用 `|` 连起来，没有为 `-`。
+const HEADER: &str = "backend,seq,class,split,w,h,frame,qp,asked_key,got_key,bytes,changed_permille,detail_permille,prev_qp,enc_us,\
+dirty_px,moved_px,dirty_mbs,moved_mbs,full_move,dirty_detail,repeat,changed_px,region_px,uncovered_px,gap,psnr";
 
-/// 一帧：I420 三个平面，和上一帧比的变化面积、细节（都是亮度平面上算的，千分之几）。
+/// 一帧：I420 三个平面，和上一帧比的变化面积、细节（都是亮度平面上算的，千分之几），再加区域类的来源数据。
 struct Frame {
     y: Vec<u8>,
     u: Vec<u8>,
     v: Vec<u8>,
     changed: u32,
     detail: u32,
+    /// 每个宏块里有细节的抽样点数（脏区域细节用）。
+    edges: Vec<u16>,
+    /// 这一帧相对上一帧的变化（画面来源交的）。
+    changes: Changes,
+    /// 逐像素比出来的实际变了的像素数（第一帧是全部）。
+    changed_px: u64,
+    /// 脏区域 ∪ 移动目的地的面积。
+    region_px: u64,
+    /// 实际变了、却不在区域里的像素数（必须是 0）。
+    uncovered_px: u64,
+}
+
+/// 上一帧：亮度抽样（算变化面积）和（风格处理后的）像素（逐像素核对）。
+struct Prev {
+    sample: Vec<u8>,
+    pixels: Vec<u32>,
 }
 
 /// 编码结果的一行。
-#[derive(PartialEq, Eq)]
 struct Out {
     asked_key: bool,
     got_key: bool,
     bytes: usize,
     us: u64,
     prev_qp: Option<u8>,
+    regions: Regions,
+    psnr: Option<f64>,
 }
 
 /// 小的确定性随机数（splitmix64）：只用来摆放测量画面，和产品无关。
@@ -198,19 +226,81 @@ fn styled(screen: &Screen, style: u8) -> Res<Screen> {
     Screen::from_pixels(screen.width(), screen.height(), px).map_err(|e| e.to_string())
 }
 
-/// 把一幅画面变成 I420 和（相对上一帧的）内容特征。`prev` 是上一帧的亮度抽样，用完换成这一帧的。
-fn to_frame(screen: &Screen, style: u8, prev: &mut Option<Vec<u8>>) -> Res<Frame> {
-    let (_, _, y, u, v) = peerdesk_media::screen_to_i420(&styled(screen, style)?);
+/// 把 `changes`（画面来源交的变化区域）里的矩形涂到一张遮罩上，返回（区域面积，实际变了的像素数，其中不在区域里的）。
+/// 第一帧（没有上一帧）整屏都是新的，实际变化就是全部像素。
+fn cover(prev: Option<&[u32]>, cur: &Screen, ch: &Changes) -> (u64, u64, u64) {
+    let (w, h) = (usize::from(cur.width()), usize::from(cur.height()));
+    let mut mask = vec![false; w * h];
+    for r in ch
+        .dirty
+        .iter()
+        .copied()
+        .chain(ch.moves.iter().map(|m| m.to))
+    {
+        for row in usize::from(r.y)..usize::try_from(r.bottom()).unwrap_or(0).min(h) {
+            let (a, b) = (
+                row * w + usize::from(r.x),
+                row * w + usize::try_from(r.right()).unwrap_or(0).min(w),
+            );
+            if let Some(s) = mask.get_mut(a..b) {
+                s.fill(true);
+            }
+        }
+    }
+    let region = mask.iter().filter(|m| **m).count() as u64;
+    let Some(prev) = prev else {
+        return (region, (w * h) as u64, 0);
+    };
+    let (mut changed, mut uncovered) = (0u64, 0u64);
+    for ((a, b), covered) in prev.iter().zip(cur.pixels()).zip(&mask) {
+        if a != b {
+            changed += 1;
+            uncovered += u64::from(!covered);
+        }
+    }
+    (region, changed, uncovered)
+}
+
+/// 把一幅画面变成 I420 和（相对上一帧的）内容特征。`prev` 是上一帧，用完换成这一帧；`changes` 是画面来源交的变化区域
+/// （第一帧不用，整屏都是新的）。
+fn to_frame(screen: &Screen, style: u8, prev: &mut Option<Prev>, changes: Changes) -> Res<Frame> {
+    let shown = styled(screen, style)?;
+    let (w, h, y, u, v) = peerdesk_media::screen_to_i420(&shown);
+    let size = (
+        u16::try_from(w).map_err(|e| e.to_string())?,
+        u16::try_from(h).map_err(|e| e.to_string())?,
+    );
     let sample = sample_luma(&y);
-    let changed = luma_changed_permille(&sample, prev.as_ref());
+    let changed = luma_changed_permille(&sample, prev.as_ref().map(|p| &p.sample));
     let detail = detail_permille(&y);
-    *prev = Some(sample);
+    let changes = if prev.is_none() {
+        Changes::whole(size)
+    } else {
+        changes
+    };
+    let (region_px, changed_px, uncovered_px) =
+        cover(prev.as_ref().map(|p| p.pixels.as_slice()), &shown, &changes);
+    if uncovered_px != 0 {
+        return Err(format!(
+            "区域漏了：{uncovered_px} 个实际变了的像素不在脏区域和移动目的地里（区域面积 {region_px}，实际变了 {changed_px}）"
+        ));
+    }
+    let edges = mb_edges(&y, size);
+    *prev = Some(Prev {
+        sample,
+        pixels: shown.pixels().to_vec(),
+    });
     Ok(Frame {
         y,
         u,
         v,
         changed,
         detail,
+        edges,
+        changes,
+        changed_px,
+        region_px,
+        uncovered_px,
     })
 }
 
@@ -281,7 +371,8 @@ fn make_frames(class: &str, seed: u64, size: (u16, u16), n: usize) -> Res<Vec<Fr
         let mut rng = Rng(seed ^ 0xf011);
         for t in 0..n {
             let s = full_video(w, h, u32::try_from(t).unwrap_or(0), &mut rng)?;
-            out.push(to_frame(&s, 0, &mut prev)?);
+            // 整屏每帧都是新的颗粒
+            out.push(to_frame(&s, 0, &mut prev, Changes::whole(size))?);
         }
         return Ok(out);
     }
@@ -291,7 +382,7 @@ fn make_frames(class: &str, seed: u64, size: (u16, u16), n: usize) -> Res<Vec<Fr
         // 切窗口：基底是桌面，每一帧把一块（占 10%–100%，顺序打乱）换成另一个桌面（弹窗在最上面）同一位置的内容。
         // 真实的 `Action::Switching` 只切一次，凑不出序列，所以这样摆；换掉的是真合成桌面的内容，不是随机噪声。
         let base = desk.screen().clone();
-        out.push(to_frame(&base, style, &mut prev)?);
+        out.push(to_frame(&base, style, &mut prev, Changes::whole(size))?);
         let mut donors = Vec::new();
         for k in 0..3u64 {
             let mut d = RealisticDesktop::new(w, h, seed.wrapping_add(1000 + k)).map_err(err)?;
@@ -300,6 +391,8 @@ fn make_frames(class: &str, seed: u64, size: (u16, u16), n: usize) -> Res<Vec<Fr
         }
         let mut rng = Rng(seed ^ 0x5717c4);
         let mut areas: Vec<u32> = (1..=10).map(|i| i * 100).collect();
+        // 上一帧贴了哪一块（第 1 帧的上一帧是基底，没有）：这一帧它还原成基底，也是变了的
+        let mut last_rect: Option<Rect> = None;
         for i in 1..n {
             // 每十帧把 10%–100% 各用一次，顺序每轮重新打乱
             if (i - 1) % 10 == 0 {
@@ -315,7 +408,12 @@ fn make_frames(class: &str, seed: u64, size: (u16, u16), n: usize) -> Res<Vec<Fr
             if let Some(d) = donors.get(i % donors.len().max(1)) {
                 paste(&mut s, d, x, y, rw, rh);
             }
-            out.push(to_frame(&s, style, &mut prev)?);
+            let this = Rect::new(x, y, rw, rh);
+            let mut ch = Changes::empty(size);
+            ch.dirty.extend(last_rect.take());
+            ch.dirty.push(this);
+            last_rect = Some(this);
+            out.push(to_frame(&s, style, &mut prev, ch)?);
         }
         return Ok(out);
     }
@@ -327,7 +425,12 @@ fn make_frames(class: &str, seed: u64, size: (u16, u16), n: usize) -> Res<Vec<Fr
         "video" => Action::Video,
         other => return Err(format!("不认识的类别：{other}")),
     };
-    out.push(to_frame(desk.screen(), style, &mut prev)?);
+    out.push(to_frame(
+        desk.screen(),
+        style,
+        &mut prev,
+        Changes::whole(size),
+    )?);
     while out.len() < n {
         let mut moved = false;
         for _ in 0..12 {
@@ -339,12 +442,59 @@ fn make_frames(class: &str, seed: u64, size: (u16, u16), n: usize) -> Res<Vec<Fr
         if !moved {
             return Err(format!("{class} 连走 12 步画面都没变"));
         }
-        out.push(to_frame(desk.screen(), style, &mut prev)?);
+        // 合成桌面自己交这一步画了哪里、搬了哪里（没变的步是空的，最后走的这一步就是变了的那一步）
+        out.push(to_frame(
+            desk.screen(),
+            style,
+            &mut prev,
+            desk.changes().clone(),
+        )?);
     }
     Ok(out)
 }
 
-/// 读一个目录里的 PNG（按文件名排序，RGB 或 RGBA、8 位），每张是一帧；变化面积相对前一张算。
+/// 读目录里的 `regions.txt`：第 k 行是第 k 帧相对第 k−1 帧的变化。每行若干个以空白隔开的记号：
+/// `d:x,y,w,h` 是脏区域，`m:fromx,fromy,x,y,w,h` 是移动（目的地 x,y,w,h，来源左上角 fromx,fromy）；空行是没变；
+/// 第 0 行（第一帧）整屏都是新的，内容不看。
+fn read_regions(path: &Path, frames: usize) -> Res<Vec<Changes>> {
+    let text = fs::read_to_string(path).map_err(|e| format!("读 {} 失败：{e}", path.display()))?;
+    // 画面尺寸读图片时才知道，这里先填 (0, 0)，交给 `to_frame` 之前改过来
+    let mut out: Vec<Changes> = Vec::new();
+    for (k, line) in text.lines().enumerate() {
+        let mut ch = Changes::empty((0, 0));
+        if k > 0 {
+            for tok in line.split_whitespace() {
+                let (kind, rest) = tok
+                    .split_once(':')
+                    .ok_or_else(|| format!("记号不对：{tok}"))?;
+                let v: Vec<u16> = rest
+                    .split(',')
+                    .map(|n| num(n, "区域坐标"))
+                    .collect::<Res<_>>()?;
+                match (kind, v.as_slice()) {
+                    ("d", [x, y, w, h]) => ch.dirty.push(Rect::new(*x, *y, *w, *h)),
+                    ("m", [fx, fy, x, y, w, h]) => ch.moves.push(Move {
+                        from: (*fx, *fy),
+                        to: Rect::new(*x, *y, *w, *h),
+                    }),
+                    _ => return Err(format!("记号不对：{tok}")),
+                }
+            }
+        }
+        out.push(ch);
+    }
+    if out.len() != frames {
+        return Err(format!(
+            "{} 有 {} 行，图片有 {frames} 张",
+            path.display(),
+            out.len()
+        ));
+    }
+    Ok(out)
+}
+
+/// 读一个目录里的 PNG（按文件名排序，RGB 或 RGBA、8 位），每张是一帧；变化面积相对前一张算；
+/// 变化区域读同目录的 `regions.txt`（`scripts/m2-pages.py` 生成页面时一起交出来的）。
 fn read_pngs(dir: &Path) -> Res<(Vec<Frame>, (u16, u16))> {
     let mut names: Vec<_> = fs::read_dir(dir)
         .map_err(|e| format!("读目录 {} 失败：{e}", dir.display()))?
@@ -356,6 +506,7 @@ fn read_pngs(dir: &Path) -> Res<(Vec<Frame>, (u16, u16))> {
     let mut prev = None;
     let mut frames = Vec::new();
     let mut size = (0u16, 0u16);
+    let mut changes = read_regions(&dir.join("regions.txt"), names.len())?.into_iter();
     for path in &names {
         let file = File::open(path).map_err(|e| e.to_string())?;
         let mut reader = png::Decoder::new(std::io::BufReader::new(file))
@@ -386,13 +537,45 @@ fn read_pngs(dir: &Path) -> Res<(Vec<Frame>, (u16, u16))> {
         }
         size = (w, h);
         let screen = Screen::from_pixels(w, h, px).map_err(|e| e.to_string())?;
-        frames.push(to_frame(&screen, 0, &mut prev)?);
+        let mut ch = changes.next().ok_or("regions.txt 行数不够")?;
+        ch.size = size;
+        frames.push(to_frame(&screen, 0, &mut prev, ch)?);
     }
     Ok((frames, size))
 }
 
+/// 解码后的亮度和原图亮度比，PSNR（分贝）；完全相同记 99。
+fn luma_psnr(orig: &[u8], decoded: &[u8]) -> Option<f64> {
+    if orig.len() != decoded.len() || orig.is_empty() {
+        return None;
+    }
+    let sum: f64 = orig
+        .iter()
+        .zip(decoded)
+        .map(|(a, b)| {
+            let d = i32::from(*a) - i32::from(*b);
+            f64::from(d * d)
+        })
+        .sum();
+    let n = f64::from(u32::try_from(orig.len()).ok()?);
+    let mse = sum / n;
+    Some(if mse <= 0.0 {
+        99.0
+    } else {
+        10.0 * (255.0f64 * 255.0 / mse).log10()
+    })
+}
+
 /// 用一个新开的后端把 `frames` 依次编掉，第 i 帧按 `qps[i]` 编。
-fn encode_run(frames: &[Frame], size: (u16, u16), qps: &[u8], forced: &[usize]) -> Res<Vec<Out>> {
+/// 每帧编之前用 [`RegionTracker`]（和假后端同一份代码）盘点区域类输入，编出来之后按这一帧的 QP 更新宏块画质表。
+/// `psnr` 为真时每帧解码（产品的 `H264Decoder`）、量亮度对原图的 PSNR。
+fn encode_run(
+    frames: &[Frame],
+    size: (u16, u16),
+    qps: &[u8],
+    forced: &[usize],
+    psnr: bool,
+) -> Res<Vec<Out>> {
     let mut backend = OpenH264Backend::new();
     let rates = Rates {
         bps: 8_000_000,
@@ -401,11 +584,22 @@ fn encode_run(frames: &[Frame], size: (u16, u16), qps: &[u8], forced: &[usize]) 
     let _ = backend
         .reconfigure(size, rates)
         .map_err(|e| format!("配置后端失败：{e:?}"))?;
+    let mut dec = if psnr {
+        Some(H264Decoder::new().map_err(|e| e.to_string())?)
+    } else {
+        None
+    };
+    let mut tracker = RegionTracker::default();
     let mut outs = Vec::with_capacity(frames.len());
     let mut prev_qp = None;
     for (i, frame) in frames.iter().enumerate() {
         let qp = qps.get(i).copied().ok_or("QP 列表比帧数短")?;
         let asked_key = forced.contains(&i);
+        // 每一帧都编，所以累计就是这一帧的变化（假后端里跳过的版本也会累计进来，这里没有跳过的）
+        let mut acc = Accum::default();
+        acc.add(&frame.changes);
+        let survey = tracker.survey(size, i == 0, Some(&acc), &frame.edges);
+        let regions = survey.regions(qp);
         let ask = FrameAsk {
             token: u64::try_from(i).unwrap_or(0),
             budget: usize::MAX / 2,
@@ -424,12 +618,36 @@ fn encode_run(frames: &[Frame], size: (u16, u16), qps: &[u8], forced: &[usize]) 
         let us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
         match done {
             Submitted::Ready(Finished::Frame(f)) => {
+                tracker.commit(&survey, qp, f.key);
+                let quality = match dec.as_mut() {
+                    Some(dec) => {
+                        let header = FrameHeader {
+                            codec: Codec::H264,
+                            key: f.key,
+                            width: size.0,
+                            height: size.1,
+                        };
+                        match dec
+                            .decode_picture(&header, &f.data)
+                            .map_err(|e| e.to_string())?
+                        {
+                            Some(Picture::Nv12(nv)) => {
+                                let n = usize::from(size.0) * usize::from(size.1);
+                                nv.data().get(..n).and_then(|y| luma_psnr(&frame.y, y))
+                            }
+                            _ => None,
+                        }
+                    }
+                    None => None,
+                };
                 outs.push(Out {
                     asked_key,
                     got_key: f.key,
                     bytes: f.data.len(),
                     us,
                     prev_qp,
+                    regions,
+                    psnr: quality,
                 });
             }
             Submitted::Ready(Finished::Dropped { .. }) | Submitted::Pending => {
@@ -450,6 +668,22 @@ struct Rows<'a> {
     size: (u16, u16),
 }
 
+/// 静止宏块的画质差分布写成 `画质差:宏块数|…`（只列非零的格），没有为 `-`。
+fn gap_text(r: &Regions) -> String {
+    let parts: Vec<String> = r
+        .static_gap
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| **n > 0)
+        .map(|(g, n)| format!("{}:{n}", g + 1))
+        .collect();
+    if parts.is_empty() {
+        "-".to_owned()
+    } else {
+        parts.join("|")
+    }
+}
+
 impl Rows<'_> {
     fn write(&mut self, frames: &[Frame], qps: &[u8], outs: &[Out]) -> Res<()> {
         for (i, (frame, out)) in frames.iter().zip(outs).enumerate() {
@@ -457,9 +691,13 @@ impl Rows<'_> {
             let prev = out
                 .prev_qp
                 .map_or_else(|| "-".to_owned(), |p| p.to_string());
+            let r = &out.regions;
+            let psnr = out
+                .psnr
+                .map_or_else(|| "-".to_owned(), |p| format!("{p:.3}"));
             writeln!(
                 self.w,
-                "openh264,{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+                "openh264,{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
                 self.name,
                 self.class,
                 self.split,
@@ -473,7 +711,19 @@ impl Rows<'_> {
                 frame.changed,
                 frame.detail,
                 prev,
-                out.us
+                out.us,
+                r.dirty_px,
+                r.moved_px,
+                r.dirty_mbs,
+                r.moved_mbs,
+                u8::from(r.full_move),
+                r.dirty_detail_permille,
+                r.repeat,
+                frame.changed_px,
+                frame.region_px,
+                frame.uncovered_px,
+                gap_text(r),
+                psnr
             )
             .map_err(|e| e.to_string())?;
         }
@@ -487,15 +737,16 @@ fn run_qps(
     frames: &[Frame],
     per_frame_qps: &[Vec<u8>],
     forced: &[usize],
+    psnr: bool,
 ) -> Res<()> {
     for (k, qps) in per_frame_qps.iter().enumerate() {
-        let outs = encode_run(frames, rows.size, qps, forced)?;
+        let outs = encode_run(frames, rows.size, qps, forced, psnr)?;
         if k == 0 {
-            let again = encode_run(frames, rows.size, qps, forced)?;
+            let again = encode_run(frames, rows.size, qps, forced, psnr)?;
             let same = outs
                 .iter()
                 .zip(&again)
-                .all(|(a, b)| (a.bytes, a.got_key) == (b.bytes, b.got_key));
+                .all(|(a, b)| (a.bytes, a.got_key, a.regions) == (b.bytes, b.got_key, b.regions));
             if !same || outs.len() != again.len() {
                 return Err(format!("自检失败：{} 同输入两次输出不同", rows.name));
             }
@@ -503,6 +754,36 @@ fn run_qps(
         rows.write(frames, qps, &outs)?;
     }
     Ok(())
+}
+
+/// 同一幅画面重复 `n` 帧（静止补清晰的链）：第一帧整屏是新的，之后什么都没变。
+fn still_frames(base: &Frame, n: usize, size: (u16, u16)) -> Vec<Frame> {
+    (0..n)
+        .map(|i| Frame {
+            y: base.y.clone(),
+            u: base.u.clone(),
+            v: base.v.clone(),
+            changed: if i == 0 { 1000 } else { 0 },
+            detail: base.detail,
+            edges: base.edges.clone(),
+            changes: if i == 0 {
+                Changes::whole(size)
+            } else {
+                Changes::empty(size)
+            },
+            changed_px: if i == 0 {
+                u64::from(size.0) * u64::from(size.1)
+            } else {
+                0
+            },
+            region_px: if i == 0 {
+                u64::from(size.0) * u64::from(size.1)
+            } else {
+                0
+            },
+            uncovered_px: 0,
+        })
+        .collect()
 }
 
 fn run_job(job: &Job, out: &mut BufWriter<File>) -> Res<()> {
@@ -525,7 +806,7 @@ fn run_job(job: &Job, out: &mut BufWriter<File>) -> Res<()> {
                 size: *size,
             };
             let plan: Vec<Vec<u8>> = qps.iter().map(|q| vec![*q; fr.len()]).collect();
-            run_qps(&mut rows, &fr, &plan, forced)
+            run_qps(&mut rows, &fr, &plan, forced, false)
         }
         Job::Refine {
             split,
@@ -540,12 +821,15 @@ fn run_job(job: &Job, out: &mut BufWriter<File>) -> Res<()> {
             for _ in 0..(seed % 3) * 30 {
                 let _ = desk.step(Action::Scrolling).map_err(|e| e.to_string())?;
             }
+            // 链上每一步编的是同一幅：转换一次，之后第一帧整屏是新的，其余什么都没变
+            let base = to_frame(
+                desk.screen(),
+                style_of(*seed),
+                &mut None,
+                Changes::whole(*size),
+            )?;
             for chain in chains {
-                let mut prev = None;
-                let fr = chain
-                    .iter()
-                    .map(|_| to_frame(desk.screen(), style_of(*seed), &mut prev))
-                    .collect::<Res<Vec<Frame>>>()?;
+                let fr = still_frames(&base, chain.len(), *size);
                 let tag: Vec<String> = chain.iter().map(ToString::to_string).collect();
                 let mut rows = Rows {
                     w: out,
@@ -554,7 +838,7 @@ fn run_job(job: &Job, out: &mut BufWriter<File>) -> Res<()> {
                     split,
                     size: *size,
                 };
-                run_qps(&mut rows, &fr, std::slice::from_ref(chain), &[])?;
+                run_qps(&mut rows, &fr, std::slice::from_ref(chain), &[], false)?;
             }
             Ok(())
         }
@@ -575,7 +859,7 @@ fn run_job(job: &Job, out: &mut BufWriter<File>) -> Res<()> {
                 size,
             };
             let plan: Vec<Vec<u8>> = qps.iter().map(|q| vec![*q; fr.len()]).collect();
-            run_qps(&mut rows, &fr, &plan, forced)
+            run_qps(&mut rows, &fr, &plan, forced, false)
         }
         Job::Scene {
             split,
@@ -603,9 +887,12 @@ fn run_job(job: &Job, out: &mut BufWriter<File>) -> Res<()> {
                 let mut shown = base.screen().clone();
                 paste(&mut shown, &donor_screen, x, y, rw, rh);
                 // 前一帧是桌面，后一帧换掉一块；之后再回到桌面，看“换回来”会不会也被当成场景切换
+                // 换进来、换回去，变的都是这一块
+                let mut swap = Changes::empty(*size);
+                swap.dirty.push(Rect::new(x, y, rw, rh));
                 let fr = [base.screen(), &shown, base.screen()]
                     .into_iter()
-                    .map(|s| to_frame(s, 0, &mut prev))
+                    .map(|s| to_frame(s, 0, &mut prev, swap.clone()))
                     .collect::<Res<Vec<Frame>>>()?;
                 let mut rows = Rows {
                     w: out,
@@ -619,95 +906,16 @@ fn run_job(job: &Job, out: &mut BufWriter<File>) -> Res<()> {
                     split,
                     size: *size,
                 };
-                run_qps(&mut rows, &fr, &[vec![*qp; fr.len()]], &[])?;
+                run_qps(&mut rows, &fr, &[vec![*qp; fr.len()]], &[], false)?;
             }
             Ok(())
         }
     }
 }
 
-/// 低 QP 地板实验的 CSV 表头。`chain` 是 `hold` 或 `desc`；`idx` 0 是先按 QP 30 编的那一帧。
-const FLOOR_HEADER: &str = "seed,w,h,chain,q,idx,qp,bytes,got_key,psnr";
-
-/// 解码后的亮度和原图亮度比，PSNR（分贝）；完全相同记 99。
-fn luma_psnr(orig: &[u8], decoded: &[u8]) -> Option<f64> {
-    if orig.len() != decoded.len() || orig.is_empty() {
-        return None;
-    }
-    let sum: f64 = orig
-        .iter()
-        .zip(decoded)
-        .map(|(a, b)| {
-            let d = i32::from(*a) - i32::from(*b);
-            f64::from(d * d)
-        })
-        .sum();
-    let n = f64::from(u32::try_from(orig.len()).ok()?);
-    let mse = sum / n;
-    Some(if mse <= 0.0 {
-        99.0
-    } else {
-        10.0 * (255.0f64 * 255.0 / mse).log10()
-    })
-}
-
-/// 同一幅画面依次按 `qps` 编，每帧解码后量亮度 PSNR。返回（字节数, 是不是关键帧, PSNR）。
-fn floor_chain(
-    frame: &Frame,
-    size: (u16, u16),
-    qps: &[u8],
-) -> Res<Vec<(usize, bool, Option<f64>)>> {
-    let mut backend = OpenH264Backend::new();
-    let rates = Rates {
-        bps: 8_000_000,
-        fps: 30,
-    };
-    let _ = backend
-        .reconfigure(size, rates)
-        .map_err(|e| format!("配置后端失败：{e:?}"))?;
-    let mut dec = H264Decoder::new().map_err(|e| e.to_string())?;
-    let mut out = Vec::with_capacity(qps.len());
-    for (i, qp) in qps.iter().enumerate() {
-        let ask = FrameAsk {
-            token: u64::try_from(i).unwrap_or(0),
-            budget: usize::MAX / 2,
-            qp: Some(*qp),
-            keyframe: false,
-        };
-        let input = FrameInput::I420 {
-            y: &frame.y,
-            u: &frame.u,
-            v: &frame.v,
-        };
-        let Submitted::Ready(Finished::Frame(f)) = backend
-            .submit(input, ask)
-            .map_err(|e| format!("第 {i} 帧编码失败：{e:?}"))?
-        else {
-            return Err(format!("第 {i} 帧没有立刻编出来"));
-        };
-        let header = FrameHeader {
-            codec: Codec::H264,
-            key: f.key,
-            width: size.0,
-            height: size.1,
-        };
-        let psnr = match dec
-            .decode_picture(&header, &f.data)
-            .map_err(|e| e.to_string())?
-        {
-            Some(Picture::Nv12(nv)) => {
-                let n = usize::from(size.0) * usize::from(size.1);
-                nv.data().get(..n).and_then(|y| luma_psnr(&frame.y, y))
-            }
-            _ => None,
-        };
-        out.push((f.data.len(), f.key, psnr));
-    }
-    Ok(out)
-}
-
-/// `measure floor`：每个种子一幅 1080p 画面（和 refine 同一套摆法）。
-/// 链 1（`hold`）：先按 QP 30 编一帧，再按同一个 q 连编 20 帧，q = 12…20；链 2（`desc`）：从 30 每帧降 1 到 12。
+/// `measure floor`：每个种子一幅 1080p 画面（和 refine 同一套摆法），低 QP 地板的链（B2 的做法，B3 带上新特征重跑）。
+/// 链 1（`floorhold`）：先按 QP 30 编一帧，再按同一个 q 连编 20 帧，q = 12…20；链 2（`floordesc`）：从 30 每帧降 1 到 12。
+/// 输出和别的任务同一种 CSV（每帧多量解码后亮度的 PSNR），`seq` 是 `floor-s<种子>-hold<q>` 或 `floor-s<种子>-desc`。
 fn run_floor(args: &[String]) -> Res<()> {
     let arg = |i: usize| {
         args.get(i)
@@ -718,39 +926,50 @@ fn run_floor(args: &[String]) -> Res<()> {
     fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     let file = File::create(dir.join(format!("floor-{shard}.csv"))).map_err(|e| e.to_string())?;
     let mut w = BufWriter::new(file);
-    writeln!(w, "{FLOOR_HEADER}").map_err(|e| e.to_string())?;
+    writeln!(w, "{HEADER}").map_err(|e| e.to_string())?;
     let size = (1920u16, 1080u16);
     for seed in 0..12u64 {
         if seed % shards.max(1) != shard {
             continue;
         }
+        let split = if matches!(seed, 6 | 7 | 9 | 11) {
+            "hold"
+        } else {
+            "fit"
+        };
         let mut desk = RealisticDesktop::new(size.0, size.1, seed).map_err(|e| e.to_string())?;
         warm(&mut desk, seed, "refine")?;
         for _ in 0..(seed % 3) * 30 {
             let _ = desk.step(Action::Scrolling).map_err(|e| e.to_string())?;
         }
-        let frame = to_frame(desk.screen(), style_of(seed), &mut None)?;
-        let mut chains: Vec<(&str, u8, Vec<u8>)> = (12..=20u8)
+        let base = to_frame(
+            desk.screen(),
+            style_of(seed),
+            &mut None,
+            Changes::whole(size),
+        )?;
+        let mut chains: Vec<(String, &str, Vec<u8>)> = (12..=20u8)
             .map(|q| {
                 let mut v = vec![30u8];
                 v.extend(std::iter::repeat_n(q, 20));
-                ("hold", q, v)
+                (format!("floor-s{seed}-hold{q}"), "floorhold", v)
             })
             .collect();
-        chains.push(("desc", 0, (12..=30u8).rev().collect()));
-        for (name, q, qps) in chains {
-            let rows = floor_chain(&frame, size, &qps)?;
-            for (i, ((bytes, key, psnr), qp)) in rows.iter().zip(&qps).enumerate() {
-                let p = psnr.map_or_else(|| "-".to_owned(), |p| format!("{p:.3}"));
-                writeln!(
-                    w,
-                    "{seed},{},{},{name},{q},{i},{qp},{bytes},{},{p}",
-                    size.0,
-                    size.1,
-                    u8::from(*key)
-                )
-                .map_err(|e| e.to_string())?;
-            }
+        chains.push((
+            format!("floor-s{seed}-desc"),
+            "floordesc",
+            (12..=30u8).rev().collect(),
+        ));
+        for (name, class, qps) in chains {
+            let fr = still_frames(&base, qps.len(), size);
+            let mut rows = Rows {
+                w: &mut w,
+                name: format!("{name}-{}x{}", size.0, size.1),
+                class,
+                split,
+                size,
+            };
+            run_qps(&mut rows, &fr, std::slice::from_ref(&qps), &[], true)?;
         }
         w.flush().map_err(|e| e.to_string())?;
     }

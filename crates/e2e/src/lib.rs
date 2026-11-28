@@ -33,6 +33,7 @@ use peerdesk_media::fake::{
     ByteModel, DefaultByteModel, FakeBackend, FakeConfig, FakeDecoder, ManualClock, ModelInput,
 };
 use peerdesk_media::fitted::FittedByteModel;
+use peerdesk_media::fitted_v2::RegionByteModel;
 use peerdesk_media::{H264Decoder, H264Encoder};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -74,13 +75,16 @@ pub enum ByteModelKind {
     Default,
     /// M2 实测拟合的 openh264 模型，各类合在一起的系数（[`FittedByteModel::openh264_v1`]）。
     Openh264V1,
+    /// M2b（B3）按画面区域（脏区域、移动区域、宏块画质表）重新拟合的 openh264 模型（[`RegionByteModel::openh264_v2`]）。
+    Openh264V2,
 }
 
 impl ByteModelKind {
     /// 全部，（文本里的名字，值）。
-    pub const ALL: [(&'static str, Self); 2] = [
+    pub const ALL: [(&'static str, Self); 3] = [
         ("default", Self::Default),
         ("openh264-v1", Self::Openh264V1),
+        ("openh264-v2", Self::Openh264V2),
     ];
 
     /// 文本里的名字。
@@ -89,6 +93,7 @@ impl ByteModelKind {
         match self {
             Self::Default => "default",
             Self::Openh264V1 => "openh264-v1",
+            Self::Openh264V2 => "openh264-v2",
         }
     }
 
@@ -108,6 +113,10 @@ impl ByteModelKind {
             Self::Openh264V1 => Box::new(
                 FittedByteModel::openh264_v1()
                     .map_err(|_| Error::Inconsistent("随包的 openh264-v1 字节模型文件读不出来"))?,
+            ),
+            Self::Openh264V2 => Box::new(
+                RegionByteModel::openh264_v2()
+                    .map_err(|_| Error::Inconsistent("随包的 openh264-v2 字节模型文件读不出来"))?,
             ),
         })
     }

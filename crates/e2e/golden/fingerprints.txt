@@ -35,6 +35,7 @@ lossy-stable 1280x720 fps30 h264 legacy seed1 max30000000 start1000000 pace0 pro
 model 320x240 fps30 h264-l05 classic-v1 seed1 max30000000 start1000000 pace0 probe11 Rs 0e3d4ee2a4b87222
 model 320x240 fps30 h264-l05 classic-v1 seed1 max30000000 start1000000 pace0 probe11 Rs 30d3369672c220d6
 model 320x240 fps30 h264-l05 classic-v1 seed1 max30000000 start1000000 pace0 probe11 Rs 30d3369672c220d6
+model 320x240 fps30 h264-l05 classic-v1 seed1 max30000000 start1000000 pace0 probe11 Rs d4e64c75a1820a8a
 ms-02560 1280x720 fps30 h264 classic-v1 seed1 max30000000 start1000000 pace0 probe11 Rs 93a135d8417a96e9
 ms-02560 1280x720 fps30 h264 classic-v1 seed10 max30000000 start1000000 pace0 probe11 Rs dea15bc6624cb778
 ms-02560 1280x720 fps30 h264 classic-v1 seed11 max30000000 start1000000 pace0 probe11 Rs 480c9f6599a7152e

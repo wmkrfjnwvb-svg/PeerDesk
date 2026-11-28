@@ -129,7 +129,7 @@ fn bad<T>(why: impl Into<String>) -> Result<T, ModelError> {
 }
 
 /// 十进制文本读成 10⁻⁶ 的整数（最多读 6 位小数，多的截掉）。
-fn micro(text: &str) -> Result<i128, ModelError> {
+pub(crate) fn micro(text: &str) -> Result<i128, ModelError> {
     let (neg, digits) = text
         .strip_prefix('-')
         .map_or((false, text), |rest| (true, rest));
