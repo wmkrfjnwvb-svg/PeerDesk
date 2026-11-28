@@ -63,6 +63,72 @@ fn goodput_bps(p: &mut P, id: usize, from_s: u64, to_s: u64) -> f64 {
 
 // ---------------------------------------------------------------- 定速背景流
 
+/// 按帧发的视频通话流：平均速率逐字节对；每帧在帧时钟上开始，帧内按 2.5 倍速率排开；
+/// 不排开时整帧同时进瓶颈，在 2 Mbps 上排出一段和帧一样长的队列；结束之后不发。
+#[test]
+fn a_frame_flow_sends_periodic_bursts_at_its_mean_rate() {
+    let make = |rate_bps, fps, pace_permille, stop| CrossSpec::Frames {
+        rate_bps,
+        fps,
+        packet_bytes: 1_200,
+        pace_permille,
+        start: Time(0),
+        stop,
+    };
+    let spec = |pace_permille, stop| make(1_000_000, 30, pace_permille, stop);
+    let mut p = path(
+        1,
+        queue(cap(2_000_000), QueueLimit::delay(300_000), Aqm::TailDrop),
+    );
+    let paced = p.add_cross(Dir::Forward, spec(2_500, Some(Time(10_000_000))));
+    // 第一帧 4166 字节 = 3 个整包 + 566 字节，间隔 1200 × 8 / 2.5 Mbps = 3.84 ms
+    p.advance_to(Time(0));
+    assert_eq!(p.cross_stats(paced).sent_packets, 1);
+    p.advance_to(Time(3_839));
+    assert_eq!(p.cross_stats(paced).sent_packets, 1);
+    p.advance_to(Time(11_520));
+    let first = p.cross_stats(paced);
+    assert_eq!((first.sent_packets, first.sent_bytes), (4, 4_166));
+    p.advance_to(Time(33_332));
+    assert_eq!(p.cross_stats(paced).sent_packets, 4, "下一帧按帧时钟开始");
+    p.advance_to(Time(33_333));
+    assert_eq!(p.cross_stats(paced).sent_packets, 5);
+    p.advance_to(Time(20_000_000));
+    let st = p.cross_stats(paced);
+    // 帧周期 33_333_333 ns：第 301 帧在 9.9999999 s 开始（早于结束时刻），只发出第一个包，后面的过了结束时刻
+    assert_eq!(st.sent_packets, 300 * 4 + 1, "10 秒 300 帧，帧 4 个包");
+    assert_eq!(st.sent_bytes, 300 * 4_166 + 1_200);
+    assert!(p.cross_sender(paced).is_none() && p.cross_bursts(paced).is_empty());
+
+    // 不排开：整帧同时进 2 Mbps 的瓶颈，帧里最后一个包要等前面三个（3 × 4.8 ms）
+    let mut q = path(
+        1,
+        queue(cap(2_000_000), QueueLimit::delay(300_000), Aqm::TailDrop),
+    );
+    let burst = q.add_cross(Dir::Forward, spec(0, None));
+    q.advance_to(Time(1_000));
+    let st = q.cross_stats(burst);
+    assert_eq!(st.sent_packets, 4, "整帧同一刻进来");
+    assert_eq!(st.wait_sum_us, 4_800 + 9_600 + 14_400);
+    // 速率 0 不发；帧率 0 按 1 算、速率很小时一帧至少 1 字节
+    let mut r = path(
+        1,
+        queue(cap(2_000_000), QueueLimit::delay(300_000), Aqm::TailDrop),
+    );
+    let none = r.add_cross(Dir::Forward, make(0, 30, 2_500, None));
+    let tiny = r.add_cross(Dir::Forward, make(1, 0, 2_500, None));
+    r.advance_to(Time(2_500_000));
+    assert_eq!(r.cross_stats(none).sent_packets, 0);
+    assert_eq!(
+        (
+            r.cross_stats(tiny).sent_packets,
+            r.cross_stats(tiny).sent_bytes
+        ),
+        (3, 3),
+        "每秒一帧，一帧 1 字节"
+    );
+}
+
 /// 定速背景流：注入的速率等于设定的速率（误差一个包）；开始、结束时刻对；不排队时在瓶颈里不等。
 #[test]
 fn a_constant_rate_flow_injects_exactly_its_rate_between_start_and_stop() {
@@ -695,7 +761,10 @@ fn start_and_ack_jitter_break_the_lockstep_of_two_tcp_flows() {
 #[test]
 fn extra_delay_lengthens_the_round_trip_and_start_jitter_only_delays() {
     let srtt = |extra: u64| {
-        let mut p = path(1, queue(cap(10_000_000), QueueLimit::delay(50_000), Aqm::TailDrop));
+        let mut p = path(
+            1,
+            queue(cap(10_000_000), QueueLimit::delay(50_000), Aqm::TailDrop),
+        );
         let id = p.add_cross_with(
             Dir::Forward,
             CrossSpec::Tcp {
@@ -718,7 +787,10 @@ fn extra_delay_lengthens_the_round_trip_and_start_jitter_only_delays() {
     );
     // 随机开始：定速流在 [1 s, 1 s + 0.5 s] 里开始
     for seed in SEEDS {
-        let mut p = path(seed, queue(cap(10_000_000), QueueLimit::delay(50_000), Aqm::TailDrop));
+        let mut p = path(
+            seed,
+            queue(cap(10_000_000), QueueLimit::delay(50_000), Aqm::TailDrop),
+        );
         let id = p.add_cross_with(
             Dir::Forward,
             CrossSpec::Cbr {

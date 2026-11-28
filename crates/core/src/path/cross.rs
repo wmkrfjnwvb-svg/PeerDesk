@@ -96,6 +96,24 @@ pub enum CrossSpec {
         /// 开始的时刻。
         start: Time,
     },
+    /// 按帧发的定速流：视频通话（Zoom、Teams 一类，不是我们的码率控制）。每 `1/fps` 秒一帧，
+    /// 一帧 `rate_bps / fps` 的数据切成 `packet_bytes` 的包，按 `rate_bps × pace_permille / 1000` 的速率排开发出
+    /// （WebRTC 节奏器默认是媒体码率的 2.5 倍，即 2500；0 是整帧同时进瓶颈）。和 [`Self::Cbr`] 的平均速率相同，
+    /// 区别只在帧周期的突发：多路共享窄瓶颈时，别人的周期性突发会被我们的排队判断采到（a3-plan 第 11 节）。
+    Frames {
+        /// 平均速率（比特每秒），0 是不发。
+        rate_bps: u64,
+        /// 帧率。
+        fps: u32,
+        /// 包长（字节）。
+        packet_bytes: usize,
+        /// 一帧内排开的速率是平均速率的多少千分比；0 是不排开。
+        pace_permille: u32,
+        /// 开始的时刻（第一帧）。
+        start: Time,
+        /// 结束的时刻（不含），`None` 是一直发。
+        stop: Option<Time>,
+    },
 }
 
 /// 一个源的计数。
@@ -203,6 +221,22 @@ enum Kind {
         next_ns: Option<u64>,
         stop_ns: Option<u64>,
     },
+    Frames {
+        frame_ns: u64,
+        /// 一帧几个包（最后一个是余下的字节）。
+        per_frame: u64,
+        /// 一帧多少字节。
+        frame_bytes: u64,
+        /// 一帧里相邻两个包相隔多久（不排开时为 0）。
+        gap_ns: u64,
+        packet_bytes: u64,
+        /// 这一帧开始的时刻。
+        frame_ns_at: u64,
+        /// 这一帧已经发了几个包。
+        sent: u64,
+        next_ns: Option<u64>,
+        stop_ns: Option<u64>,
+    },
     Tcp {
         cfg: TcpConfig,
         bytes: Option<u64>,
@@ -278,6 +312,21 @@ impl Source {
                 start: start.plus(delay),
                 stop,
             },
+            CrossSpec::Frames {
+                rate_bps,
+                fps,
+                packet_bytes,
+                pace_permille,
+                start,
+                stop,
+            } => CrossSpec::Frames {
+                rate_bps,
+                fps,
+                packet_bytes,
+                pace_permille,
+                start: start.plus(delay),
+                stop,
+            },
             CrossSpec::Tcp { cfg, start, bytes } => CrossSpec::Tcp {
                 cfg,
                 start: start.plus(delay),
@@ -321,6 +370,40 @@ impl Source {
                 Kind::Cbr {
                     interval_ns,
                     packet_bytes,
+                    next_ns: (rate_bps > 0).then_some(start_ns),
+                    stop_ns: stop.map(|t| t.micros().saturating_mul(1000)),
+                }
+            }
+            CrossSpec::Frames {
+                rate_bps,
+                fps,
+                packet_bytes,
+                pace_permille,
+                start,
+                stop,
+            } => {
+                let packet = u64::try_from(packet_bytes).unwrap_or(u64::MAX).max(1);
+                let frame_ns = 1_000_000_000 / u64::from(fps.max(1));
+                // 一帧的字节 = 速率 × 帧周期 / 8（至少 1 字节），切成整包加余下的一个
+                let frame_bytes =
+                    u64::try_from(u128::from(rate_bps) * u128::from(frame_ns) / 8_000_000_000)
+                        .unwrap_or(u64::MAX)
+                        .max(1);
+                let per_frame = frame_bytes.div_ceil(packet);
+                let pace_bps = u128::from(rate_bps) * u128::from(pace_permille) / 1000;
+                // 不排开（速率 0）时间隔为 0
+                let gap_ns = (u128::from(packet) * 8_000_000_000)
+                    .checked_div(pace_bps)
+                    .map_or(0, |g| u64::try_from(g).unwrap_or(u64::MAX));
+                let start_ns = start.max(now).micros().saturating_mul(1000);
+                Kind::Frames {
+                    frame_ns,
+                    per_frame,
+                    frame_bytes,
+                    gap_ns,
+                    packet_bytes: packet,
+                    frame_ns_at: start_ns,
+                    sent: 0,
                     next_ns: (rate_bps > 0).then_some(start_ns),
                     stop_ns: stop.map(|t| t.micros().saturating_mul(1000)),
                 }
@@ -377,7 +460,7 @@ impl Source {
     pub fn stats(&self) -> CrossStats {
         let mut s = self.stats;
         let live: &[Flow] = match &self.kind {
-            Kind::Cbr { .. } => &[],
+            Kind::Cbr { .. } | Kind::Frames { .. } => &[],
             Kind::Tcp { flows, .. } | Kind::Bursts { flows, .. } => flows,
         };
         s.tcp = live
@@ -391,7 +474,7 @@ impl Source {
     pub fn bursts(&self) -> &[BurstRecord] {
         match &self.kind {
             Kind::Bursts { log, .. } => log,
-            Kind::Cbr { .. } | Kind::Tcp { .. } => &[],
+            Kind::Cbr { .. } | Kind::Frames { .. } | Kind::Tcp { .. } => &[],
         }
     }
 
@@ -400,7 +483,7 @@ impl Source {
     pub fn sender(&self) -> Option<&TcpSender> {
         match &self.kind {
             Kind::Tcp { flows, .. } | Kind::Bursts { flows, .. } => flows.first().map(|f| &f.snd),
-            Kind::Cbr { .. } => None,
+            Kind::Cbr { .. } | Kind::Frames { .. } => None,
         }
     }
 
@@ -408,7 +491,9 @@ impl Source {
     #[must_use]
     pub fn next_time(&self) -> Option<Time> {
         match &self.kind {
-            Kind::Cbr { next_ns, .. } => next_ns.map(|n| Time(n / 1000)),
+            Kind::Cbr { next_ns, .. } | Kind::Frames { next_ns, .. } => {
+                next_ns.map(|n| Time(n / 1000))
+            }
             Kind::Tcp { start, flows, .. } => {
                 start.or_else(|| flows.iter().filter_map(|f| f.snd.next_timer()).min())
             }
@@ -440,6 +525,42 @@ impl Source {
                     Verdict::TailDropped | Verdict::AqmDropped => self.stats.queue_dropped += 1,
                 }
                 let next = n.saturating_add(*interval_ns);
+                *next_ns = stop_ns.is_none_or(|s| next < s).then_some(next);
+            }
+            Kind::Frames {
+                frame_ns,
+                per_frame,
+                frame_bytes,
+                gap_ns,
+                packet_bytes,
+                frame_ns_at,
+                sent,
+                next_ns,
+                stop_ns,
+            } => {
+                let Some(n) = *next_ns else { return };
+                let size = (*packet_bytes).min(frame_bytes.saturating_sub(*sent * *packet_bytes));
+                let verdict = ctx.dir(dir).cross_arrive(Time(n / 1000), size);
+                self.stats.sent_packets += 1;
+                self.stats.sent_bytes += size;
+                match verdict {
+                    Verdict::Departs { start, .. } => {
+                        self.stats.wait_sum_us += start.since(Time(n / 1000));
+                        self.stats.wait_count += 1;
+                    }
+                    Verdict::TailDropped | Verdict::AqmDropped => self.stats.queue_dropped += 1,
+                }
+                *sent += 1;
+                // 这一帧还有包：隔 gap 再发（排开的速率不够在一帧里发完时，下一帧照样按帧时钟开始）；
+                // 发完了：下一帧按帧时钟开始
+                let next_frame = frame_ns_at.saturating_add(*frame_ns);
+                let next = if *sent < *per_frame && n.saturating_add(*gap_ns) < next_frame {
+                    n.saturating_add(*gap_ns)
+                } else {
+                    *frame_ns_at = next_frame;
+                    *sent = 0;
+                    next_frame
+                };
                 *next_ns = stop_ns.is_none_or(|s| next < s).then_some(next);
             }
             Kind::Tcp {
@@ -563,7 +684,7 @@ impl Source {
     pub fn deliver(&mut self, ctx: &mut Ctx<'_>, index: usize, t: Time, item: Item) {
         let dir = self.dir;
         let (cfg, flows) = match &mut self.kind {
-            Kind::Cbr { .. } => return,
+            Kind::Cbr { .. } | Kind::Frames { .. } => return,
             Kind::Tcp { cfg, flows, .. } | Kind::Bursts { cfg, flows, .. } => (*cfg, flows),
         };
         if item.generation != self.generation {

@@ -1413,6 +1413,28 @@ mod tests {
                     },
                 ),
                 (
+                    Dir::Forward,
+                    CrossSpec::Frames {
+                        rate_bps: 1_000_000,
+                        fps: 30,
+                        packet_bytes: 1_200,
+                        pace_permille: 2_500,
+                        start: Time(7),
+                        stop: Some(Time(800_000)),
+                    },
+                ),
+                (
+                    Dir::Reverse,
+                    CrossSpec::Frames {
+                        rate_bps: 500_000,
+                        fps: 60,
+                        packet_bytes: 1_000,
+                        pace_permille: 0,
+                        start: Time::ZERO,
+                        stop: None,
+                    },
+                ),
+                (
                     Dir::Reverse,
                     CrossSpec::Tcp {
                         cfg: TcpConfig { sack: false, ..tcp },

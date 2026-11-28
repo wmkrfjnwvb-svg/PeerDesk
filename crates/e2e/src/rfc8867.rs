@@ -537,6 +537,46 @@ pub fn case_5_6(queue_ms: u64, seed: u64) -> Case {
     )
 }
 
+/// 不在 RFC 8867 里（PeerDesk 自己加的，名字以 `pd-` 开头）：同一条 2 Mbps 窄上行上有一个视频通话
+/// （Zoom、Teams 一类：1 Mbps、30 fps 按帧突发，帧内按 2.5 倍媒体码率排开，WebRTC 节奏器的默认；不是我们的码率控制，
+/// 不会让），我们一路 5 s 起。60 s；单程 50 ms；队列 300 ms。
+/// 为什么要它（a3-plan 第 11 节，主会话 2026-11-28）：5.2 窄段一路被饿死，是常驻队列判断采到了别的流的周期性突发；
+/// 真实里更常见的“别的周期性突发”是同一条窄上行上的视频通话，而不是两路 PeerDesk。
+/// 公平份额按容量减去通话的 1 Mbps 算（和 UDP 背景流一样从容量里扣）。
+#[must_use]
+pub fn case_video_call(seed: u64) -> Case {
+    let path = PathConfig::symmetric(dir(
+        Capacity::Constant {
+            rate_bps: 2_000_000,
+        },
+        50_000,
+        300_000,
+    ));
+    let call = vec![(
+        Dir::Forward,
+        CrossSpec::Frames {
+            rate_bps: 1_000_000,
+            fps: 30,
+            packet_bytes: 1_200,
+            pace_permille: 2_500,
+            start: Time::ZERO,
+            stop: None,
+        },
+    )];
+    build(
+        "pd-video-call".to_owned(),
+        "PeerDesk 加项：窄上行上同时有视频通话（1 Mbps、30 fps 按帧突发）".to_owned(),
+        60,
+        path,
+        call,
+        vec![flow(5, 60)],
+        &[],
+        vec![(0, 1_000_000)],
+        vec![(0, 2_000_000)],
+        seed,
+    )
+}
+
 /// 5.7 对抗短 TCP：300 s；2 Mbps；两路媒体 5 s 起；十条短 TCP 流，2 条开始时是开、8 条是关。
 ///
 /// 两种读法（主会话 2026-11-28 定：主用例照 8867 字面，30 个连接的作为压力变体另跑，报告里两种都标明）：
@@ -681,6 +721,7 @@ pub fn cases(seed: u64) -> Vec<Case> {
     v.push(case_5_7(seed));
     v.push(case_5_7_stress(seed));
     v.push(case_5_8(seed));
+    v.push(case_video_call(seed));
     v
 }
 
@@ -1142,7 +1183,32 @@ mod tests {
     #[test]
     fn the_cases_follow_the_rfc_tables() {
         let all = cases(1);
-        assert_eq!(all.len(), 15);
+        assert_eq!(all.len(), 16);
+        // 加项：视频通话按帧发，公平份额扣掉它的 1 Mbps
+        let vc = all.last().unwrap();
+        assert_eq!(vc.id, "pd-video-call");
+        assert_eq!(vc.forward_capacity, vec![(0, 1_000_000)]);
+        let NetworkPlan::Layout2(p) = &vc.multi.network else {
+            panic!()
+        };
+        // 交叉流里还有音频（定速）；按帧发的只有通话一条
+        let frames: Vec<_> = p
+            .cross
+            .iter()
+            .filter(|(_, c)| matches!(c, CrossSpec::Frames { .. }))
+            .collect();
+        assert!(matches!(
+            frames[..],
+            [(
+                Dir::Forward,
+                CrossSpec::Frames {
+                    rate_bps: 1_000_000,
+                    fps: 30,
+                    pace_permille: 2_500,
+                    ..
+                }
+            )]
+        ));
         let c = case_5_1(Mechanism::Trace, 50, 1);
         assert_eq!(c.duration_us, 100_000_000);
         assert_eq!(
@@ -1195,7 +1261,10 @@ mod tests {
                     packet_bytes: 1_200,
                     ..
                 } => Some(*rate_bps),
-                CrossSpec::Cbr { .. } | CrossSpec::Tcp { .. } | CrossSpec::Bursts { .. } => None,
+                CrossSpec::Cbr { .. }
+                | CrossSpec::Frames { .. }
+                | CrossSpec::Tcp { .. }
+                | CrossSpec::Bursts { .. } => None,
             })
             .collect();
         assert_eq!(rates, vec![3_000_000, 1_500_000, 3_400_000, 3_000_000]);

@@ -531,6 +531,22 @@ fn cross_fields(dir: Dir, spec: &CrossSpec) -> Result<String, WorldError> {
             fields.push(("start", start.micros().to_string()));
             fields.push(("stop", opt(stop.map(Time::micros))));
         }
+        CrossSpec::Frames {
+            rate_bps,
+            fps,
+            packet_bytes,
+            pace_permille,
+            start,
+            stop,
+        } => {
+            fields.push(("kind", "frames".to_owned()));
+            fields.push(("rate_bps", rate_bps.to_string()));
+            fields.push(("fps", fps.to_string()));
+            fields.push(("packet_bytes", packet_bytes.to_string()));
+            fields.push(("pace_permille", pace_permille.to_string()));
+            fields.push(("start", start.micros().to_string()));
+            fields.push(("stop", opt(stop.map(Time::micros))));
+        }
         CrossSpec::Tcp { cfg, start, bytes } => {
             fields.push(("kind", "tcp".to_owned()));
             fields.push(("start", start.micros().to_string()));
@@ -567,7 +583,7 @@ fn parse_cross(text: &str, ctx: &str) -> Result<(Dir, CrossSpec), WorldError> {
 }
 
 fn parse_cross_fields(f: &mut Kv) -> Result<(Dir, CrossSpec), WorldError> {
-    const KINDS: [(&str, u8); 3] = [("cbr", 0), ("tcp", 1), ("bursts", 2)];
+    const KINDS: [(&str, u8); 4] = [("cbr", 0), ("tcp", 1), ("bursts", 2), ("frames", 3)];
     let dir = f.take_choice("dir", &DIRS)?;
     let spec = match f.take_choice("kind", &KINDS)? {
         0 => CrossSpec::Cbr {
@@ -580,6 +596,14 @@ fn parse_cross_fields(f: &mut Kv) -> Result<(Dir, CrossSpec), WorldError> {
             start: Time(f.take_u64("start")?),
             bytes: f.take_opt_u64("bytes")?,
             cfg: parse_tcp(f)?,
+        },
+        3 => CrossSpec::Frames {
+            rate_bps: f.take_u64("rate_bps")?,
+            fps: f.take_u32("fps")?,
+            packet_bytes: f.take_parsed("packet_bytes", "非负整数")?,
+            pace_permille: f.take_u32("pace_permille")?,
+            start: Time(f.take_u64("start")?),
+            stop: f.take_opt_u64("stop")?.map(Time),
         },
         _ => CrossSpec::Bursts {
             connections: f.take_u32("connections")?,
