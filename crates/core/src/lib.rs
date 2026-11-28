@@ -14,6 +14,7 @@
 //! - [`file`]：文件传输协议与断点续传。
 //! - [`trace`]：业务链路追踪。
 //! - [`sim`] / [`scenario`]：确定性网络仿真与端到端场景。
+//! - [`path`]：分层的网络路径模型（随机数布局 2，A2）。
 //! - [`config`]：客户端与服务端配置。
 
 pub mod adaptive;
@@ -41,6 +42,7 @@ pub mod input;
 pub mod kv;
 pub mod media;
 pub mod pacer;
+pub mod path;
 pub mod paths;
 pub mod policy;
 pub mod probe;
