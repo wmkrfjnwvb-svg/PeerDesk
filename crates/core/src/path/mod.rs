@@ -80,6 +80,8 @@ pub mod rng;
 
 #[cfg(test)]
 mod testkit;
+#[cfg(test)]
+mod tests;
 
 use std::collections::{BTreeMap, VecDeque};
 
