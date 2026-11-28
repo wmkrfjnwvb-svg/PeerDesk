@@ -1,138 +1,147 @@
-# T: Remote terminal design (2026-11-28, main session)
+# T：远程终端设计（2026-11-28，主会话）
 
-Goal: run the host's shell inside our existing encrypted QUIC session, with no SSH port opened. The standard is iTerm2 class (see "Standards" in `N-terminal-files-ui-plan.md`). Research is in `industry-terminal.md`.
-Core users run Agents (such as Claude Code) on their own machines all the time. Three things matter most:
-- a long session never dies because the network dropped;
-- 100 MB of output never freezes anything;
-- they can approve the Agent's permission prompts from their phone.
+目标：在我们已有的加密 QUIC 会话里用被控端的 shell，不开 SSH 端口。标准是 iTerm2 一档（`N-terminal-files-ui-plan.md` 的“标准”），调研见 `industry-terminal.md`。
+核心用户在自己电脑上常驻跑 Agent（Claude Code 之类），最在意三件事：
+- 长会话不因断网而死；
+- 100 MB 的输出不卡；
+- 在手机上也能批准 Agent 的权限提示。
 
-## 1. Architecture (decided)
+## 1. 架构（已定）
 
 ```
 被控端                                                    控制端
 shell ⇄ PTY ⇄ 读线程 ─→ 仿真器（alacritty_terminal）        仿真器 ─→ egui 画格子
                  │        └ 屏幕 + scrollback（快照的来源）    ↑
                  └→ 输出环形缓冲（4 MB，按字节序号）──QUIC 流──┘
-键盘、粘贴、鼠标、改大小 ←──────────────────── 同一条流的反方向
+键盘、粘贴、鼠标、改大小、Ack ←──────────────── 同一条流的反方向
 ```
 
-- **Industry practice and our choice.** We follow tmux and RustDesk: the host keeps the PTY running and holds the screen plus scrollback.
-  - We do not follow mosh's "sync only the visible screen", because mosh has no scrollback, and Agent users need to scroll back through output.
-  - We do take mosh's idea for one case: when the controller cannot keep up, the host drops the intermediate output and sends the latest screen (see §4).
-- **Two emulators.** One on the host, used for snapshots. One on the controller, used for display, selection, local scrollback and reflow when the size changes. Both use the same alacritty_terminal version (Apache-2.0).
-- **One QUIC stream per tab.** A session (PTY) lives independently of the stream: closing the stream is a detach, and the PTY stays.
-- **Code location.** A new crate `crates/term`:
-  - pure logic, so it can be covered by tests: protocol, session table, snapshot, backpressure;
-  - PTY glue (`pty_unix.rs` and `pty_windows.rs`), which only calls system interfaces and is excluded from coverage; the reason goes in `scripts/coverage.sh`.
-  - The GUI widget goes in `crates/client/src/gui/terminal/`. Splitting out the pure parts (key encoding, colour table, selection) is what lets them be tested.
+- **业内做法和我们的选择**：照 tmux 和 RustDesk，被控端常驻 PTY，屏幕和 scrollback 放在被控端。
+  - 不照 mosh 只同步可见屏幕：mosh 没有 scrollback，Agent 用户要翻输出。
+  - 只借 mosh 的一点：控制端跟不上时，主机丢掉中间输出、发最新屏幕（第 4 节）。
+- **两边各一个仿真器**：被控端的用来做快照；控制端的用来显示、选择、本地 scrollback、改大小时重排。两边用同一个 alacritty_terminal 版本（Apache-2.0，0.26.0）。
+- **一个标签一条 QUIC 流**：会话（PTY）和流的生命周期分开，关流是“离开”，PTY 还在。
+- **代码位置**：新 crate `crates/term`（包名 `peerdesk-term`）。
+  - 纯逻辑，能被测试覆盖：协议、会话表、快照、背压、环形缓冲。
+  - PTY 胶水只调系统接口，不计覆盖率，理由写进 `scripts/coverage.sh`。
+  - 界面控件放 `crates/client/src/gui/terminal/`，按键编码、颜色表、选择这些纯逻辑拆出来测。
 
-## 2. Protocol
+## 2. 协议
 
-- Capability bit `Caps::TERMINAL` and stream type `StreamKind::Terminal`.
-- Framing is the same as files: a 4-byte length plus the message. The first message on a stream is one of `Open`, `Attach` or `List`.
+- 能力位 `Caps::TERMINAL`，流类型 `StreamKind::Terminal`。
+- 分帧和文件一样：4 字节长度加消息。流上的第一条消息是 `Open`、`Attach` 或 `List`。
 
-| Direction | Message | Content |
+| 方向 | 消息 | 内容 |
 |---|---|---|
-| C→H | `Open { cols, rows }` | Open a new session (the host's default login shell) |
-| C→H | `Attach { id, cols, rows, have: Option<u64> }` | Reattach to an existing session. `have` is the output sequence number the controller already has |
-| C→H | `List` | List the sessions |
-| H→C | `Opened { id, shell, start: u64 }` | Session created; output counts from `start` |
-| H→C | `Snapshot { at: u64, bytes }` | Escape sequences that reproduce the screen plus recent scrollback (§3). Output after this starts at `at` |
-| H→C | `Output { at: u64, bytes }` | Output bytes, `at` = byte sequence number of the first byte |
-| H→C | `Sessions { list }` | id, title (OSC 0/2), start time, last output time, whether it has exited |
-| H→C | `Exit { code }` | The shell exited. The session is gone once this is sent |
-| C→H | `Input { bytes }` | Keyboard, paste, mouse reports (encoded by the controller) |
-| C→H | `Resize { cols, rows }` | Window size changed (host does SIGWINCH / ResizePseudoConsole) |
-| C→H | `Close` | End the session (kill the process tree) |
-| H→C | `Refused { reason }` | No permission, no logged-in user, too many sessions. The reason says what to do |
+| 控→被 | `Open { cols, rows, 主题颜色 }` | 开新会话（被控端默认的登录 shell） |
+| 控→被 | `Attach { id, cols, rows, have, 主题颜色 }` | 接回已有会话。`have` 是控制端已经有的输出序号 |
+| 控→被 | `List` | 列出会话 |
+| 被→控 | `Opened { id, shell, start }` | 会话建好了，输出从 `start` 开始计数 |
+| 被→控 | `Snapshot { at, skipped_lines, bytes }` | 重现屏幕和最近 scrollback 的转义序列（第 3 节）。之后的输出从 `at` 接着发；`skipped_lines` 是跳过了大约多少行 |
+| 被→控 | `Output { at, bytes }` | 输出字节，`at` 是第一个字节的序号 |
+| 被→控 | `Sessions { list }` | id、标题（OSC 0/2）、开始时间、最后输出时间、是否已退出 |
+| 被→控 | `Exit { code }` | shell 退出了。发完这条会话就没了 |
+| 控→被 | `Input { bytes }` | 键盘、粘贴、鼠标上报（控制端编好码） |
+| 控→被 | `Resize { cols, rows, 格子像素宽高 }` | 窗口大小变了（被控端做 SIGWINCH / ResizePseudoConsole） |
+| 控→被 | `Ack { at }` | 控制端已经收到并处理到第几个字节（每 64 KB 或 50 ms 一次，有新的才发） |
+| 控→被 | `Close` | 结束会话（杀掉进程树） |
+| 被→控 | `Refused { reason }` | 没权限、没人登录、会话太多；原因写清怎么办 |
 
-- **Exact resume on reconnect.**
-  - If the bytes from `have` onward are still in the host's ring buffer, the host sends `Output` from `have`. Nothing is lost and the controller's scrollback is untouched. Eternal Terminal works this way.
-  - Otherwise the host sends a `Snapshot`.
-- **Priority.** Terminal streams get a higher QUIC priority than file and clipboard streams. Ctrl+C is not delayed when output piles up, because input travels in the other direction and the host writes it to the PTY as soon as it arrives.
+- **重连精确续传**：
+  - `have` 之后的字节还在被控端的环形缓冲里，就从 `have` 发 `Output`，一个字节都不丢，控制端的 scrollback 也不动（Eternal Terminal 的做法）；
+  - 不在了才发 `Snapshot`。
+- **积压按 Ack 算**：积压 = 已发 − 最新 `Ack.at`。QUIC 写入返回只说明进了 quinn 的缓冲，不能当“对方收到了”。
+- **谁回答程序的查询**（设备属性、光标位置、颜色）：只有被控端的仿真器回，控制端仿真器的回复丢掉（T1a 评审定）。
+  - 理由：控制端断开时程序照样有回答、不会卡；没有多一个往返；以后多人观看也只有一份回答。
+  - 被控端不知道的由控制端告诉它：`Open`/`Attach` 带主题颜色（前景、背景、光标、16 色），用来回答 OSC 10/11/4，vim 和 Claude Code 用 OSC 11 判断深浅色；`Resize` 带格子的像素宽高，用来回答 CSI 14t/16t。控制端换主题时发一条更新。
+- **优先级**：终端流的 QUIC 优先级高于文件和剪贴板流。积压很多时 Ctrl+C 也不晚：输入走反方向，被控端收到马上写进 PTY。
 
-## 3. Snapshot
+## 3. 快照
 
-- **What it is.** The host's emulator state is serialized into a sequence of escape codes. A brand-new emulator that eats this sequence ends up in the same state. That way the controller doesn't need a second code path for snapshots. It is the same idea as tmux redrawing on attach.
-- **What it contains, in order:**
-  1. reset;
-  2. the last N scrollback lines (default 10,000, capped at 2 MB), with SGR attributes; wrapped lines end without CRLF so reflow keeps working;
-  3. the main screen;
-  4. if the alternate screen is active, `?1049h` and then the alternate screen;
-  5. scroll region, origin mode, autowrap, cursor keys, keypad mode, bracketed paste, mouse modes (1000/1002/1003/1006), focus reporting, cursor shape and visibility, title, and finally the cursor position.
-- **Oracle (hard gate).**
-  - The bytes of recorded real terminal sessions go into emulator A.
-  - Serialize A, feed the result into a new emulator B of the same size, and compare cell by cell: character, wide-character flag, foreground, background, attributes. Also compare the cursor, every mode in item 5, and scrollback line by line.
-  - Recorded material, captured with `script` and stored in `crates/term/tests/data/`:
-    - `ls --color`, `git log --graph --color`;
-    - vim editing (alternate screen);
-    - htop / top refreshing;
-    - a Claude Code full-screen session (alternate screen plus mouse);
-    - Chinese output and emoji;
-    - an over-wide line that wraps.
-  - Also add a random test that cuts the byte stream at arbitrary points: snapshot after every few KB, so a cut in the middle of an escape sequence is covered.
-  - We don't only use synthetic data: random bytes alone would mostly test garbage input, not real usage.
+- **是什么**：把被控端仿真器的状态写成一串转义序列，新仿真器吃下它就到同样的状态。控制端不用为快照另写一套代码。和 tmux 接回会话时重画屏幕是一个思路。
+- **内容，按顺序**：
+  1. 复位；
+  2. 最近 N 行 scrollback（默认 1 万行，最多 2 MB），带 SGR 属性；软换行的行尾不加 CRLF，重排还能用；
+  3. 主屏；
+  4. 备用屏开着时，`?1049h` 再画备用屏；
+  5. 滚动区域、原点模式、自动换行、光标键模式、小键盘模式、括号粘贴、鼠标模式（1000/1002/1003/1006）、焦点上报、光标形状和显示、标题，最后是光标位置。
+- **公开接口拿不到的，我们自己跟踪**（T1a 发现）：
+  - 滚动区域是私有字段，用 vte 再解析一遍同一份字节来跟踪；
+  - 标题在复位时清掉但不发事件，在同一个回调里自己记；
+  - 备用屏开着时主屏没有读取方法，只能先克隆备用屏、切过去读、再切回来写回。
+  - 还原不了：自定义制表位、当前字符集（画线字符已经按 Unicode 存在格子里）、`CSI b` 重复的上一个字符。
+- **没结束的尾巴**：快照点正好落在转义序列或半个 UTF-8 字符中间时，快照带上尾巴的长度，`Snapshot.at` 设成尾巴开头，后面的 `Output` 从那里重发。这是 T1a 在每个字节处切断的测试里发现的。
+  - 超过 64 KB 的 OSC（大的 OSC 52、iTerm2 内嵌图片）跟踪不了尾巴：快照最多等 1 秒让它结束；还没结束就照发快照，`Output` 从这个 OSC 结束后接着发，只丢它自己的效果，并写日志。
+- **标准答案（硬门槛）**：
+  - 真实录制的终端字节喂给仿真器 A，A 的快照喂给同样大小的新仿真器 B，逐格比较：字符、零宽字符、宽字符标志、前景、背景、属性、下划线颜色、链接；再比光标、所有模式、滚动区域、调色板、标题、scrollback 逐行。
+  - 录制（`script` 录，放 `crates/term/tests/data/`，共 11 个，140 KB）：`ls --color`、`git log --graph --color`、中文和 emoji、长行折行、vim（备用屏）、vim 加鼠标、top、less、tmux（滚动区域、多窗格）、`claude --help`、Claude Code 首次界面。
+  - 每个录制约 230 个切点（包括转义序列中间），每点都比较，再从切点续喂，和一次喂完的结果比较。
+  - 还缺：Claude Code 全屏的真实会话（容器里没登录，要在已登录的机器上录）。
 
-## 4. Backpressure and 100 MB output
+## 4. 背压和 100 MB 输出
 
-- **The host always reads the PTY.** The read thread → emulator → ring buffer, so the shell is never stalled because the controller is slow. alacritty parses at the 100 MB/s level; measure it before relying on that.
-- **Each stream has its own send backlog limit.** The limit is max(256 KB, estimated rate × 250 ms). When the backlog goes over the limit:
-  - stop sending `Output` and mark the stream as behind;
-  - once the backlog has drained, send one `Snapshot`, then go back to sending `Output`.
-- **What the controller shows.** It draws a separator line in its own UI: "Skipped about N lines of output (the network couldn't keep up); full content is on the host." We never insert fake text into the terminal content. The host's own scrollback keeps everything (subject to its limit).
-- **Controller.** It parses received bytes for at most 4 ms per frame; anything left over goes to the next frame. It only draws the visible rows, and caches each row by the emulator's damage information. The UI frame time p99 must stay ≤ 33 ms.
+- **被控端永远读 PTY**：读线程 → 仿真器 → 环形缓冲，shell 不会因为控制端慢被卡住。
+  - 实测（T1a，release 的 opt-level z）：alacritty 本身约 60 MB/s，加上我们的第二遍解析约 45–50 MB/s；100 MB 输出被控端约 2 秒 CPU，在独立线程里。
+  - T1b 量 opt-level 3 的收益和安装包变大多少，再定。
+- **每条流有自己的积压上限**：max(256 KB, 估计速率 × 250 ms)，最多 8 MB。积压超过上限：
+  - 不再发 `Output`，标记落后，记下跳过了多少字节和行；
+  - 积压排空后发一条 `Snapshot`，再回到正常发送；
+  - 积压 30 秒一个字节都没排出去，算流死了，关掉这条流，会话不受影响。
+  - 状态机：正常 → 落后 → 追赶 → 正常，另有停滞（终点）。每次转换都写日志并带结论。常数还没有真实链路的数据，T1b 用仿真网络量。
+- **控制端显示**：在自己的界面上画一条分隔线“跳过了约 N 行输出（网络跟不上），完整内容在被控端”。终端内容里绝不插假字。被控端自己的 scrollback 是全的（在上限内）。
+- **控制端处理**：每帧最多花 4 ms 解析收到的字节，剩下的下一帧接着解析。只画可见行，按仿真器的脏行信息缓存每一行。界面帧时间 p99 ≤ 33 ms。
 
-## 5. Lifecycle and security
+## 5. 生命周期和安全
 
-- **Lifecycle.**
-  - The host keeps at most 8 sessions.
-  - A session ends when the shell exits or `Close` is sent. A controller disconnect does not end it.
-  - When the host program restarts, sessions are gone. tmux-style persistence across restarts is out of scope; the docs say so.
-- **When the shell exits.** The tab stays open and shows "Process exited (code N)"; pressing Enter opens a new one. That matches iTerm2's default. RustDesk closes the tab directly.
-- **Permission.** A new `Permissions::terminal` setting, **off by default**. Turning it off immediately disconnects all terminal streams and ends their sessions. Without permission the host replies `Refused` with the reason and where to turn it on.
-- **Identity.** The shell runs as the logged-in user:
-  - Unix: the login shell from `getpwuid`, started with `-l`;
-  - Windows: pwsh → powershell → cmd;
-  - Windows service: start it with the logged-in user's token via `WTSQueryUserToken`. If no one is logged in, refuse and say why. **Never hand out a SYSTEM shell.**
-- **Environment.** `TERM=xterm-256color`, `COLORTERM=truecolor`, `TERM_PROGRAM=PeerDesk`; inherit the user's locale. On macOS make sure the locale is UTF-8, otherwise Chinese comes out garbled. RustDesk 1.4.7 fixed exactly this.
-- **Audit log.** Who (the controller's device code), when, opened, attached, closed and exited. Content is not recorded. Kept in the host log directory.
-- **OSC 52.** Writing to the clipboard is off by default. When it is requested, the controller shows a non-blocking prompt bar: "The terminal wants to write to the clipboard [Allow once] [Always allow for this device]".
+- **生命周期**：
+  - 被控端最多 8 个会话。
+  - shell 退出或收到 `Close` 时会话结束；控制端断开不结束。
+  - 被控端程序重启后会话就没了。跨重启的持久化（tmux 那样）不在范围内，文档写明。
+- **shell 退出后**：标签留着，显示“进程已退出（代码 N）”，按回车开新的。和 iTerm2 默认一样；RustDesk 是直接关标签。
+- **权限**：新加 `Permissions::terminal`，**默认关**。关掉时所有终端流立即断开、会话结束。没权限时回 `Refused`，说原因和在哪里打开。
+- **身份**：以登录用户身份运行。
+  - Unix：`getpwuid` 取登录 shell，加 `-l` 启动；
+  - Windows：pwsh → powershell → cmd；
+  - Windows 服务：用 `WTSQueryUserToken` 拿登录用户的令牌启动；没人登录就拒绝并说原因。**绝不给 SYSTEM shell**。T1b 先在服务模式下拒绝（“无人值守服务模式下的终端还没做，以后加”），令牌这条路以后做。
+- **环境变量**：`TERM=xterm-256color`、`COLORTERM=truecolor`、`TERM_PROGRAM=PeerDesk`，继承用户的语言设置。macOS 上要保证是 UTF-8，否则中文乱码（RustDesk 1.4.7 修的就是这个）。
+- **审计日志**：谁（控制端设备码）、什么时候开、接回、关、退出。不记内容。放在被控端的日志目录。
+- **OSC 52**：写剪贴板默认关。程序请求时，控制端显示不打断的提示条：“终端想写入剪贴板 [允许一次] [这台设备总是允许]”。
 
-## 6. Controller (desktop, T2)
+## 6. 控制端（桌面，T2）
 
-- **Rendering.**
-  - Monospace font: bundle one with an OFL licence and note it in `THIRD_PARTY_NOTICES.md`; CJK falls back to system fonts.
-  - Each row is laid out as colour runs, with wide characters taking two cells.
-  - Cursor: block, beam or underline, blinking.
-  - Minimum contrast (like iTerm2): if foreground and background are too close, adjust the brightness of the foreground.
-- **Input.**
-  - xterm encoding: arrow keys follow cursor-key mode, F1–F12, Alt sends an ESC prefix, Ctrl+letter.
-  - Pastes are wrapped with bracketed paste; IME uses egui's Ime events.
-  - When the app turns on mouse reporting, use SGR 1006.
-  - Mouse wheel: on the main screen it scrolls the scrollback; on the alternate screen without mouse mode it is converted to arrow keys (1007).
-- **Copy and paste.** Mac uses Cmd+C/V; Windows and Linux use Ctrl+Shift+C/V. Double-click selects a word, triple-click selects a line. Links are clickable (OSC 8 and URL recognition).
-- **Tabs.** One session per tab. Opening the terminal first runs `List`, and existing sessions are offered to reattach. Agent users mostly reattach.
-- **Colour schemes.** A few built-in ones with clear licences, following light and dark mode. Pick a font and size. Ctrl +/- zooms.
-- **Status.** Show the connecting / reconnecting / disconnected states in the tab. While reconnecting, the content stays visible and dimmed, and input is disabled. Once back, it continues from `have`.
+- **画法**：
+  - 等宽字体打包一个 OFL 授权的，写进 `THIRD_PARTY_NOTICES.md`；中日韩字符回退到系统字体；
+  - 每行按颜色分段排版，宽字符占两格；
+  - 光标有方块、竖线、下划线三种，会闪；
+  - 最小对比度（照 iTerm2）：前景和背景太接近时调前景的亮度。
+- **输入**：
+  - xterm 编码：方向键看光标键模式，F1–F12，Alt 前面加 ESC，Ctrl 加字母；
+  - 粘贴包上括号粘贴；输入法用 egui 的 Ime 事件；
+  - 程序打开鼠标上报时用 SGR 1006；
+  - 滚轮：主屏上翻 scrollback；备用屏上没开鼠标时转成方向键（1007）。
+- **复制粘贴**：Mac 上 Cmd+C/V，Windows 和 Linux 上 Ctrl+Shift+C/V。双击选词，三击选行。链接能点（OSC 8 和网址识别）。
+- **标签**：一个会话一个标签。打开终端时先 `List`，有现成的会话就让用户接回（Agent 用户多数是接回）。
+- **配色**：内置几套授权清楚的配色，跟随亮暗模式；能选字体和字号，Ctrl +/- 缩放。
+- **状态**：标签里显示连接中、重连中、断开。重连期间内容留着、变暗、不能输入；回来后从 `have` 接着收。
 
-## 7. Acceptance (measured; thresholds only go up)
+## 7. 验收（实测；门槛只升不降）
 
-| Item | How to measure | Threshold |
+| 项 | 怎么量 | 门槛 |
 |---|---|---|
-| Snapshot fidelity | §3 oracle, all recordings plus random cuts | 100% of cells match |
-| Reconnect | Real binaries + simulated network: cut for 30 s, restore, measure until the first keystroke echoes | ≤ 2 s; scrollback has no gap (exact resume) or has a separator line (snapshot) |
-| 100 MB output | Host runs `cat` on a 100 MB real log | Host and controller don't stall; UI frame time p99 ≤ 33 ms; Ctrl+C takes effect within 1 s |
-| Echo latency | Key → echo appears, over loopback / LAN | p95 ≤ 30 ms; with RTT 50 ms, p95 ≤ RTT + 20 ms |
-| Emulation | Major vttest items (screenshot comparison); esctest pass rate | Pass rate only goes up |
-| Real Agent | Claude Code full-screen mode runs on all three OSes, and the mouse can click its options | Real-machine checklist |
+| 快照保真 | 第 3 节的标准答案，所有录制加所有切点 | 逐格 100% 一致 |
+| 重连 | 真实二进制加仿真网络，断 30 秒再恢复，量到第一次按键回显 | ≤ 2 秒；scrollback 没有缺口（精确续传）或有分隔线（快照） |
+| 100 MB 输出 | 被控端 `cat` 一个 100 MB 的真实日志 | 两边不卡；界面帧时间 p99 ≤ 33 ms；Ctrl+C 1 秒内生效 |
+| 回显延迟 | 按键到回显出现，回环和局域网 | p95 ≤ 30 ms；往返 50 ms 时 p95 ≤ 往返 + 20 ms |
+| 仿真 | vttest 主要项（截图对比），esctest 通过率 | 通过率只升不降 |
+| 真实 Agent | Claude Code 全屏模式在三个系统上能用，能用鼠标点它的选项 | 真机清单 |
 
-## 8. Steps
+## 8. 步骤
 
-| Step | Content | Who |
-|---|---|---|
-| T1a | `crates/term`: protocol encoding and decoding, session table, snapshot plus oracle tests (recordings plus random cuts), backpressure state machine (pure logic) | Sonnet, reviewed by main session |
-| T1b | PTY glue (Unix portable-pty, Windows ConPTY), host stream handling, permission setting, audit log; net integration test with a real `/bin/sh` and the reconnect measurement | Sonnet |
-| T2a | Controller emulator plus egui terminal widget (rendering, input encoding, resize, scrollback), terminal entry in the GUI, tabs | Opus subagent (high quality bar) |
-| T2b | Selection, copy and paste, IME, mouse, links, colour schemes and fonts, OSC 52 prompt, status display; screenshot tests | Opus subagent |
-| T3 | Android terminal view plus Smart Keys row | Later |
-| T4 | BEL, OSC 9/777/133 notifications to the phone | Together with accounts and push |
+| 步 | 内容 | 谁做 | 状态 |
+|---|---|---|---|
+| T1a | `crates/term`：协议编解码、会话表、快照和标准答案测试（录制加切点）、背压状态机、环形缓冲，都是纯逻辑 | Sonnet，主会话审 | 完成（分支 `term-t1a`，覆盖率 99.59%） |
+| T1b | PTY 胶水（Unix portable-pty、Windows ConPTY）、被控端的流处理、权限开关、审计日志、Ack、控制端接口；网络层集成测试（真实 `/bin/sh`、重连、100 MB、Ctrl+C）；量重连、回显、opt-level | Sonnet | 进行中 |
+| T2a | 控制端仿真器加 egui 终端控件（画、输入编码、改大小、scrollback），界面里的终端入口，标签 | Opus 子代理（质量要求高） | |
+| T2b | 选择、复制粘贴、输入法、鼠标、链接、配色和字体、OSC 52 提示、状态显示；截图测试 | Opus 子代理 | |
+| T3 | Android 终端视图加 Smart Keys 行 | 以后 | |
+| T4 | BEL、OSC 9/777/133 通知推到手机 | 随账户和推送一起做 | |
