@@ -298,6 +298,19 @@ impl Session {
         sink: SinkFactory,
         decoder: Option<DecoderFactory>,
     ) -> Self {
+        Self::start_with(data_dir, move || Ok(target), password, sink, decoder)
+    }
+
+    /// 同 [`Self::start`]，但目标在会话线程里才算出来：按服务器名连接时要查 DNS，不能卡住调用的线程
+    /// （手机端是界面线程）。`resolve` 失败时，第一个事件就是带原因的 [`Event::Ended`]。
+    #[must_use]
+    pub fn start_with(
+        data_dir: PathBuf,
+        resolve: impl FnOnce() -> Result<ViewTarget, String> + Send + 'static,
+        password: &str,
+        sink: SinkFactory,
+        decoder: Option<DecoderFactory>,
+    ) -> Self {
         let (tx, events) = mpsc::channel();
         let (input, input_rx) = tokio::sync::mpsc::channel(INPUT_QUEUE);
         let (stop, stop_rx) = watch::channel(false);
@@ -317,8 +330,11 @@ impl Session {
         let spawned = std::thread::Builder::new()
             .name("peerdesk-session".to_owned())
             .spawn(move || {
-                let result = run(target, auth, env, input_rx, stop_rx);
-                let _ = tx.send(ended(result));
+                let event = match resolve() {
+                    Ok(target) => ended(run(target, auth, env, input_rx, stop_rx)),
+                    Err(text) => Event::Ended { ok: false, text },
+                };
+                let _ = tx.send(event);
             });
         if let Err(e) = spawned {
             // 线程都起不来：直接告诉界面，不装作在连

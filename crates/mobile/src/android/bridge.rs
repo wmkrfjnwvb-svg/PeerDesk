@@ -84,16 +84,14 @@ pub extern "system" fn Java_ai_peerdesk_app_Native_start<'local>(
         },
     ));
     let sink: SinkFactory = Arc::new(|| -> Box<dyn ScreenSink> { Box::new(NoSink) });
-    let session = match device_target(&server, &code) {
-        Ok(target) => Session::start(
-            PathBuf::from(data_dir),
-            target,
-            &password,
-            sink,
-            Some(decoder),
-        ),
-        Err(why) => Session::failed(why),
-    };
+    // 查服务器的 DNS 在会话线程里做（start_with）：这个函数在界面线程上调，要马上返回
+    let session = Session::start_with(
+        PathBuf::from(data_dir),
+        move || device_target(&server, &code),
+        &password,
+        sink,
+        Some(decoder),
+    );
     let view = View {
         left: 0.0,
         top: 0.0,

@@ -284,6 +284,29 @@ fn a_session_that_failed_before_starting_says_why() {
 }
 
 #[test]
+fn a_target_that_cannot_be_resolved_ends_with_the_reason() {
+    let (sink, _) = counting();
+    let s = Session::start_with(
+        temp_dir("resolve"),
+        || device_target("127.0.0.1", "12345"),
+        "",
+        sink,
+        None,
+    );
+    let mut seen = Vec::new();
+    wait(&s, &mut seen, |e| {
+        e.iter().any(|e| matches!(e, Event::Ended { .. }))
+    });
+    assert_eq!(
+        seen,
+        vec![Event::Ended {
+            ok: false,
+            text: "设备码应为 9 位数字".to_owned()
+        }]
+    );
+}
+
+#[test]
 fn device_targets_are_parsed_with_reasons() {
     let ViewTarget::Device { server, .. } = device_target("127.0.0.1", "123 456 789").unwrap()
     else {
