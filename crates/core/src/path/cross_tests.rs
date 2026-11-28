@@ -713,7 +713,7 @@ fn extra_delay_lengthens_the_round_trip_and_start_jitter_only_delays() {
     };
     let (base, longer) = (srtt(0), srtt(40_000));
     assert!(
-        (longer as i64 - base as i64 - 80_000).abs() < 20_000,
+        longer > base && (longer - base).abs_diff(80_000) < 20_000,
         "{base} → {longer}"
     );
     // 随机开始：定速流在 [1 s, 1 s + 0.5 s] 里开始
