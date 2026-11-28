@@ -125,6 +125,10 @@
 - **语言和代码风格**：Rust，代码注释和面向用户的文字用中文。
 - **lint 很严**：禁止 unwrap/expect/panic/索引越界写法/通配 match/截断转换。`unsafe` 只允许出现在平台层和媒体层的系统接口文件里，每处都要写 `// SAFETY:` 注释。
 - **覆盖率门槛 99%**：只有调用系统接口的胶水文件可以排除（见 `scripts/coverage.sh`），理由写在脚本注释里。
+- **端到端结果指纹**（`crates/e2e/golden/fingerprints.txt`，`scripts/e2e-fingerprints.sh`）：主会话审查后直接更新，不用问产品负责人（2026-11-28 定）。
+  - 新测试的行追加进去；算法本来就要变时重录。
+  - 提交信息写明变了哪些行、为什么变。
+  - 子代理不改这个文件，只在报告里逐条列出新增或变化的行。
 - **只发两个二进制**：客户端 `peerdesk`、服务端 `peerdesk-server`。
 - **许可证**：Apache-2.0，不能引入 GPL/AGPL 代码。借用 MIT 代码（例如 Airhand）要在 `THIRD_PARTY_NOTICES.md` 里注明。
 - **测试不能动开发者电脑的键鼠**：测试构建里系统输入注入一律不打开。

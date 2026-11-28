@@ -32,6 +32,9 @@ light-old-peer 1280x720 fps30 h264 classic-v1 seed1 max30000000 start1000000 pac
 lossy-stable 1280x720 fps30 h264 classic-v1 seed1 max30000000 start1000000 pace0 probe11 Rs 4675dec1373821f1
 lossy-stable 1280x720 fps30 h264 gcc-v1 seed1 max30000000 start1000000 pace0 probe11 Rs 143b258e193f2b1e
 lossy-stable 1280x720 fps30 h264 legacy seed1 max30000000 start1000000 pace0 probe11 Rs 8c805214729aa84c
+model 320x240 fps30 h264-l05 classic-v1 seed1 max30000000 start1000000 pace0 probe11 Rs 0e3d4ee2a4b87222
+model 320x240 fps30 h264-l05 classic-v1 seed1 max30000000 start1000000 pace0 probe11 Rs 30d3369672c220d6
+model 320x240 fps30 h264-l05 classic-v1 seed1 max30000000 start1000000 pace0 probe11 Rs 30d3369672c220d6
 ms-02560 1280x720 fps30 h264 classic-v1 seed1 max30000000 start1000000 pace0 probe11 Rs 93a135d8417a96e9
 ms-02560 1280x720 fps30 h264 classic-v1 seed10 max30000000 start1000000 pace0 probe11 Rs dea15bc6624cb778
 ms-02560 1280x720 fps30 h264 classic-v1 seed11 max30000000 start1000000 pace0 probe11 Rs 480c9f6599a7152e
@@ -116,3 +119,6 @@ varying-cellular 1280x720 fps30 h264 legacy seed1 max30000000 start2000000 pace0
 very-narrow 1280x720 fps30 h264 classic-v1 seed1 max30000000 start1000000 pace0 probe11 Rs 7cb0f9342e5c804f
 very-narrow 1280x720 fps30 h264 gcc-v1 seed1 max30000000 start1000000 pace0 probe11 Rs 488ddddb2d2af3f1
 very-narrow 1280x720 fps30 h264 legacy seed1 max30000000 start1000000 pace0 probe11 Rs 7cfb1c91ec2d1c41
+world-run 320x240 fps30 h264-l0 classic-v1 seed1 max30000000 start1000000 pace0 probe11 Rs 81a5644a62444e54
+world-run 320x240 fps30 h264-l0 classic-v1 seed1 max30000000 start1000000 pace0 probe11 Rs 81a5644a62444e54
+world-run 320x240 fps30 h264-l0 classic-v1 seed1 max30000000 start1000000 pace0 probe11 Rs 81a5644a62444e54
