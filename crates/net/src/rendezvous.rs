@@ -383,10 +383,11 @@ impl AccountSession {
             return Err(NetError::Refused(Refusal::Unsupported));
         }
         write_signal(&mut self.send, msg).await?;
-        match read_signal(&mut self.recv).await? {
-            SignalMsg::Refused { code } => Err(NetError::Refused(Refusal::from_code(code))),
-            reply => Ok(reply),
+        let reply = read_signal(&mut self.recv).await?;
+        if let SignalMsg::Refused { code } = reply {
+            return Err(NetError::Refused(Refusal::from_code(code)));
         }
+        Ok(reply)
     }
 
     /// 用入表令牌把这台设备加进账户。`os` 是 [`peerdesk_core::proto::PeerOs`] 的数值。

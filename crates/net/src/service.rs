@@ -1089,9 +1089,11 @@ mod tests {
         assert_eq!(pages.len(), 3, "31 台分 3 页");
         let counts: Vec<(usize, bool)> = pages
             .iter()
-            .map(|p| match p {
-                SignalMsg::DeviceRows { rows, more, .. } => (rows.len(), *more),
-                other => unreachable!("{}", other.name()),
+            .map(|p| {
+                let SignalMsg::DeviceRows { rows, more, .. } = p else {
+                    unreachable!("{}", p.name());
+                };
+                (rows.len(), *more)
             })
             .collect();
         assert_eq!(counts, [(MAX_ROWS, true), (MAX_ROWS, true), (7, false)]);

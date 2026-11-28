@@ -581,8 +581,11 @@ mod tests {
         assert_eq!(json_string("a\\b\nc"), "\"a\\\\b\\u000ac\"");
         assert_eq!(
             [ago(100, 0), ago(100, 90), ago(1_000, 100), ago(100_000, 100), ago(1_000_000, 100)],
-            ["还没有记录", "刚刚", "15 分钟前", "27 小时前", "11 天前"]
+            ["还没有记录", "刚刚", "15 分钟前", "1 天前", "11 天前"]
         );
+        // 边界：满 24 小时才算 1 天
+        assert_eq!(ago(86_499, 100), "23 小时前");
+        assert_eq!(ago(86_500, 100), "1 天前");
         assert_eq!(
             [os_name(0), os_name(1), os_name(2), os_name(3), os_name(9)],
             ["未知系统", "Windows", "macOS", "Linux", "未知系统"]
