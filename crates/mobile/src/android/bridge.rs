@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use jni::objects::{JClass, JObject, JString};
+use jni::objects::{JClass, JFloatArray, JIntArray, JObject, JString};
 use jni::sys::{jboolean, jfloat, jint, jlong, jstring, JNI_TRUE};
 use jni::JNIEnv;
 use ndk::native_window::NativeWindow;
@@ -152,6 +152,71 @@ pub extern "system" fn Java_ai_peerdesk_app_Native_touch<'local>(
         apply(&h.session, actions)
     });
     new_string(&mut env, out)
+}
+
+/// 一个触摸事件里所有手指的新位置（Android 的 `ACTION_MOVE`）：`ids`、`xs`、`ys` 一一对应，一起交给手势识别，
+/// 两根手指不会一根一根地更新（那样缩放会抖，见 `Gestures::moves`）。返回值同 `touch`。
+#[no_mangle]
+pub extern "system" fn Java_ai_peerdesk_app_Native_moves<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    h: jlong,
+    ids: JIntArray<'local>,
+    xs: JFloatArray<'local>,
+    ys: JFloatArray<'local>,
+    t_ms: jlong,
+) -> jstring {
+    let touches = read_moves(&mut env, &ids, &xs, &ys, u64::try_from(t_ms).unwrap_or(0));
+    let out = handle(h).and_then(|h| {
+        let actions = h
+            .gestures
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .moves(&touches);
+        apply(&h.session, actions)
+    });
+    new_string(&mut env, out)
+}
+
+/// 最多看几根手指（系统一般最多报 10 根）。
+const MAX_POINTERS: usize = 10;
+
+/// 把三个数组读成移动的触点；长度不一样时按最短的，读不出来就是空。
+fn read_moves(
+    env: &mut JNIEnv<'_>,
+    ids: &JIntArray<'_>,
+    xs: &JFloatArray<'_>,
+    ys: &JFloatArray<'_>,
+    t_ms: u64,
+) -> Vec<Touch> {
+    let len = |n: jni::errors::Result<i32>| usize::try_from(n.unwrap_or(0)).unwrap_or(0);
+    let n = len(env.get_array_length(ids))
+        .min(len(env.get_array_length(xs)))
+        .min(len(env.get_array_length(ys)))
+        .min(MAX_POINTERS);
+    let mut id = [0; MAX_POINTERS];
+    let mut x = [0.0; MAX_POINTERS];
+    let mut y = [0.0; MAX_POINTERS];
+    let (Some(id), Some(x), Some(y)) = (id.get_mut(..n), x.get_mut(..n), y.get_mut(..n)) else {
+        return Vec::new();
+    };
+    if env.get_int_array_region(ids, 0, id).is_err()
+        || env.get_float_array_region(xs, 0, x).is_err()
+        || env.get_float_array_region(ys, 0, y).is_err()
+    {
+        return Vec::new();
+    }
+    id.iter()
+        .zip(x.iter())
+        .zip(y.iter())
+        .map(|((id, x), y)| Touch {
+            id: u32::try_from(*id).unwrap_or(0),
+            phase: Phase::Move,
+            x: *x,
+            y: *y,
+            t_ms,
+        })
+        .collect()
 }
 
 /// 有手指按着时每隔几十毫秒调一次（长按）。返回值同 `touch`。

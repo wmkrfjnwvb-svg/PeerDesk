@@ -433,6 +433,9 @@ pub fn apply(session: &Session, actions: Vec<gesture::Action>) -> Option<String>
                 view.push(format!("{{\"type\":\"pan\",\"dx\":{dx},\"dy\":{dy}}}"));
             }
             gesture::Action::Haptic => view.push("{\"type\":\"haptic\"}".to_owned()),
+            gesture::Action::Tap { x, y, button } => view.push(format!(
+                "{{\"type\":\"tap\",\"x\":{x},\"y\":{y},\"button\":{button}}}"
+            )),
         }
     }
     (!view.is_empty()).then(|| format!("[{}]", view.join(",")))

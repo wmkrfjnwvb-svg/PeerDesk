@@ -31,8 +31,8 @@ pub const LONG_PRESS_MS: u64 = 500;
 pub const TWO_FINGER_GAP_MS: u64 = 150;
 /// 双指点：从第一根按下到第一根抬起最长多久（毫秒）。
 pub const TWO_FINGER_TAP_MS: u64 = 300;
-/// 两指距离变化超过这个比例就当作捏合。
-pub const PINCH_START: f32 = 0.06;
+/// 双指判断：一个量（两指距离的变化、中点走过的距离）是另一个的这么多倍，就定成它（见 `classify`）。
+pub const DOMINANCE: f32 = 2.0;
 /// 滚轮一格的高精度增量（和桌面端、Windows 的 `WHEEL_DELTA` 一样）。
 const NOTCH: f32 = 120.0;
 /// 鼠标左键、右键的编号（见 [`InputEvent::MouseButton`]）。
@@ -118,6 +118,16 @@ pub enum Action {
     },
     /// 长按到点了：界面震一下，告诉用户“现在松开是右键、拖动是拖拽”。
     Haptic,
+    /// 在界面的 (`x`, `y`) 点了一下（`button` 左键或右键）：界面画一个点击的水波；
+    /// 左键点的地方也是用户要输入的位置，弹出软键盘时界面把它让到键盘上面。
+    Tap {
+        /// 横坐标（界面像素）。
+        x: f32,
+        /// 纵坐标（界面像素）。
+        y: f32,
+        /// [`LEFT`] 或 [`RIGHT`]。
+        button: u8,
+    },
 }
 
 /// 一根手指：编号、按下时的位置和时间、上一次的位置。
@@ -216,6 +226,46 @@ impl Gestures {
     #[must_use]
     pub fn button(&self, button: u8, down: bool) -> Vec<Action> {
         vec![button_action(button, down)]
+    }
+
+    /// 同一个系统触摸事件里所有手指的移动（Android 的一个 `ACTION_MOVE` 带着每根手指的新位置）。
+    ///
+    /// 必须一起交：两根手指一根一根地更新，中间会出现“一根动了、另一根还在旧位置”的假状态，
+    /// 两指距离和中点在一次事件里来回跳，缩放就抖（Android 的 `ScaleGestureDetector` 也是一次拿整个事件算）。
+    /// 不是双指状态时逐个按 [`Self::touch`] 处理。阶段不是移动的触点忽略。
+    pub fn moves(&mut self, touches: &[Touch]) -> Vec<Action> {
+        if let State::Two {
+            mut a,
+            mut b,
+            what,
+            dist,
+            scroll,
+        } = self.state.clone()
+        {
+            let before = midpoint(a.last, b.last);
+            let mut ours = false;
+            for t in touches.iter().filter(|t| t.phase == Phase::Move) {
+                if t.id == a.id {
+                    a.last = (t.x, t.y);
+                    ours = true;
+                } else if t.id == b.id {
+                    b.last = (t.x, t.y);
+                    ours = true;
+                }
+            }
+            // 这两根手指都不在里面（别的手指、抬起）：什么也不做
+            if !ours {
+                return Vec::new();
+            }
+            let mut out = Vec::new();
+            self.state = self.two_moved(a, b, what, dist, scroll, before, &mut out);
+            return out;
+        }
+        touches
+            .iter()
+            .filter(|t| t.phase == Phase::Move)
+            .flat_map(|t| self.touch(t))
+            .collect()
     }
 
     /// 处理一个触点。
@@ -367,6 +417,11 @@ impl Gestures {
         out.push(Action::Input(self.pointer_at(at)));
         out.push(button_action(button, true));
         out.push(button_action(button, false));
+        out.push(Action::Tap {
+            x: at.0,
+            y: at.1,
+            button,
+        });
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -374,9 +429,9 @@ impl Gestures {
         &mut self,
         mut a: Finger,
         mut b: Finger,
-        mut what: Two,
-        mut dist: f32,
-        mut scroll: (f32, f32),
+        what: Two,
+        dist: f32,
+        scroll: (f32, f32),
         t: &Touch,
         phase: Phase,
         out: &mut Vec<Action>,
@@ -407,48 +462,7 @@ impl Gestures {
                 } else {
                     b.last = (t.x, t.y);
                 }
-                let after = midpoint(a.last, b.last);
-                let now_dist = distance(a.last, b.last);
-                if what == Two::Undecided {
-                    let start_dist = distance(a.start, b.start).max(1.0);
-                    if (now_dist / start_dist - 1.0).abs() > PINCH_START {
-                        what = Two::Pinch;
-                    } else if distance(midpoint(a.start, b.start), after) > self.slop {
-                        what = Two::Scroll;
-                        out.push(Action::Input(self.pointer_at(midpoint(a.start, b.start))));
-                    }
-                }
-                match what {
-                    Two::Undecided => {}
-                    Two::Pinch => {
-                        if dist > 0.0 && now_dist > 0.0 {
-                            out.push(Action::Zoom {
-                                factor: now_dist / dist,
-                                cx: after.0,
-                                cy: after.1,
-                            });
-                        }
-                    }
-                    Two::Scroll => {
-                        // 自然方向：手指往下 = 滚轮向上（正）；手指往右 = 往左滚（负）
-                        scroll.0 -= (after.0 - before.0) / self.notch_px * NOTCH;
-                        scroll.1 += (after.1 - before.1) / self.notch_px * NOTCH;
-                        let (dx, dy) = (whole(scroll.0), whole(scroll.1));
-                        if dx != 0 || dy != 0 {
-                            scroll.0 -= f32::from(dx);
-                            scroll.1 -= f32::from(dy);
-                            out.push(Action::Input(InputEvent::Wheel { dx, dy }));
-                        }
-                    }
-                }
-                dist = now_dist;
-                State::Two {
-                    a,
-                    b,
-                    what,
-                    dist,
-                    scroll,
-                }
+                self.two_moved(a, b, what, dist, scroll, before, out)
             }
             (Phase::Up | Phase::Cancel, Some(_)) => {
                 let quick = t.t_ms.saturating_sub(a.down_ms) <= TWO_FINGER_TAP_MS
@@ -458,6 +472,70 @@ impl Gestures {
                 }
                 State::Done { left: 1 }
             }
+        }
+    }
+
+    /// 两根手指的位置都更新好了（`before` 是更新前的中点）：判断是捏合还是滚动，再照做。
+    ///
+    /// 判断（定了就不再改，直到手指抬起）：两指距离的变化和中点走过的距离，哪个先超过防抖距离、
+    /// 并且明显比另一个大，就是哪个。双指滚动时两指间距总会有些变化（手指不会完全平行），
+    /// 所以不能只看距离变了百分之几；捏合时中点也会漂（常见一根手指不动、另一根动），
+    /// 所以也不能只看中点动了多少。
+    #[allow(clippy::too_many_arguments)]
+    fn two_moved(
+        &self,
+        a: Finger,
+        b: Finger,
+        mut what: Two,
+        mut dist: f32,
+        mut scroll: (f32, f32),
+        before: (f32, f32),
+        out: &mut Vec<Action>,
+    ) -> State {
+        let after = midpoint(a.last, b.last);
+        let now_dist = distance(a.last, b.last);
+        if what == Two::Undecided {
+            what = classify(a, b, self.slop);
+            if what == Two::Scroll {
+                out.push(Action::Input(self.pointer_at(midpoint(a.start, b.start))));
+            }
+        }
+        match what {
+            Two::Undecided => {}
+            Two::Pinch => {
+                if dist > 0.0 && now_dist > 0.0 && (now_dist - dist).abs() > f32::EPSILON {
+                    // 照看图软件的做法：旧中点下面的内容缩放后跟到新中点下面
+                    // （以旧中点为中心缩放，再平移中点走过的距离），画面贴着手指走
+                    out.push(Action::Zoom {
+                        factor: now_dist / dist,
+                        cx: before.0,
+                        cy: before.1,
+                    });
+                    let (dx, dy) = (after.0 - before.0, after.1 - before.1);
+                    if dx != 0.0 || dy != 0.0 {
+                        out.push(Action::Pan { dx, dy });
+                    }
+                }
+            }
+            Two::Scroll => {
+                // 自然方向：手指往下 = 滚轮向上（正）；手指往右 = 往左滚（负）
+                scroll.0 -= (after.0 - before.0) / self.notch_px * NOTCH;
+                scroll.1 += (after.1 - before.1) / self.notch_px * NOTCH;
+                let (dx, dy) = (whole(scroll.0), whole(scroll.1));
+                if dx != 0 || dy != 0 {
+                    scroll.0 -= f32::from(dx);
+                    scroll.1 -= f32::from(dy);
+                    out.push(Action::Input(InputEvent::Wheel { dx, dy }));
+                }
+            }
+        }
+        dist = now_dist;
+        State::Two {
+            a,
+            b,
+            what,
+            dist,
+            scroll,
         }
     }
 
@@ -478,6 +556,42 @@ const fn button_action(button: u8, down: bool) -> Action {
 
 fn distance(a: (f32, f32), b: (f32, f32)) -> f32 {
     (a.0 - b.0).hypot(a.1 - b.1)
+}
+
+/// 双指还没定时看一眼：捏合、滚动，还是再等等。
+///
+/// 两个量：两指距离从按下起变了多少（`span`），两指中点从按下起走了多远（`travel`）。业内做法：
+/// - Android 的 `ScaleGestureDetector`：两指距离变化超过防抖距离的 2 倍才算开始捏合；
+/// - libinput（Linux 触摸板）：看两根手指是不是朝同一个方向走，同向是滚动；滚动比捏合常见得多，分不清时偏向滚动。
+///
+/// 所以：中点走过防抖距离、或者两指距离变了 2 倍防抖距离之前，再等；之后
+/// - 一个量是另一个的 [`DOMINANCE`] 倍以上：定成它；
+/// - 分不出：两根手指都动了而且方向相近（夹角小于 45°）是滚动；有一根基本没动（一指按着、一指拉开的捏法）
+///   或者方向相反是捏合。
+fn classify(a: Finger, b: Finger, slop: f32) -> Two {
+    let span = (distance(a.last, b.last) - distance(a.start, b.start)).abs();
+    let travel = distance(midpoint(a.start, b.start), midpoint(a.last, b.last));
+    if span <= slop * 2.0 && travel <= slop {
+        return Two::Undecided;
+    }
+    if span > travel * DOMINANCE {
+        return Two::Pinch;
+    }
+    if travel > span * DOMINANCE {
+        return Two::Scroll;
+    }
+    let da = (a.last.0 - a.start.0, a.last.1 - a.start.1);
+    let db = (b.last.0 - b.start.0, b.last.1 - b.start.1);
+    let (la, lb) = (da.0.hypot(da.1), db.0.hypot(db.1));
+    if la.min(lb) <= slop / 2.0 {
+        return Two::Pinch;
+    }
+    // 夹角的余弦大于 cos 45°
+    if (da.0 * db.0 + da.1 * db.1) > la * lb * std::f32::consts::FRAC_1_SQRT_2 {
+        Two::Scroll
+    } else {
+        Two::Pinch
+    }
 }
 
 fn midpoint(a: (f32, f32), b: (f32, f32)) -> (f32, f32) {
@@ -544,7 +658,16 @@ mod tests {
         let out = s.touch(&t(1, Phase::Up, 504.0, 352.0, 120));
         assert_eq!(
             out,
-            vec![mv(32768, 32768), btn(LEFT, true), btn(LEFT, false)]
+            vec![
+                mv(32768, 32768),
+                btn(LEFT, true),
+                btn(LEFT, false),
+                Action::Tap {
+                    x: 500.0,
+                    y: 350.0,
+                    button: LEFT
+                }
+            ]
         );
         // 画面外的点贴到边上
         s.touch(&t(2, Phase::Down, -50.0, 50.0, 1000));
@@ -608,7 +731,19 @@ mod tests {
         );
         assert!(s.touch(&t(1, Phase::Down, 0.0, 100.0, 620)).is_empty());
         let out = s.touch(&t(1, Phase::Up, 4.0, 100.0, 700));
-        assert_eq!(out, vec![mv(0, 0), btn(RIGHT, true), btn(RIGHT, false)]);
+        assert_eq!(
+            out,
+            vec![
+                mv(0, 0),
+                btn(RIGHT, true),
+                btn(RIGHT, false),
+                Action::Tap {
+                    x: 0.0,
+                    y: 100.0,
+                    button: RIGHT
+                }
+            ]
+        );
         // 长按后拖动：从按下的地方按住左键，跟着手指走，抬起松开
         s.touch(&t(1, Phase::Down, 0.0, 100.0, 1000));
         s.tick(1000 + LONG_PRESS_MS);
@@ -649,7 +784,16 @@ mod tests {
         let out = s.touch(&t(1, Phase::Up, 400.0, 350.0, 150));
         assert_eq!(
             out,
-            vec![mv(32768, 32768), btn(RIGHT, true), btn(RIGHT, false)]
+            vec![
+                mv(32768, 32768),
+                btn(RIGHT, true),
+                btn(RIGHT, false),
+                Action::Tap {
+                    x: 500.0,
+                    y: 350.0,
+                    button: RIGHT
+                }
+            ]
         );
         // 剩下那根抬起时什么也不发
         assert!(s.touch(&t(2, Phase::Up, 600.0, 350.0, 160)).is_empty());
@@ -720,25 +864,31 @@ mod tests {
         let mut s = g();
         s.touch(&t(1, Phase::Down, 400.0, 300.0, 0));
         s.touch(&t(2, Phase::Down, 600.0, 300.0, 10));
-        // 距离 200 → 240：超过 6%，算捏合
+        // 一根不动、一根拉开 40：距离变化超过 2 倍防抖距离，算捏合。以旧中点为中心缩放，再跟着中点平移
         let out = s.touch(&t(2, Phase::Move, 640.0, 300.0, 20));
         assert_eq!(
             out,
-            vec![Action::Zoom {
-                factor: 1.2,
-                cx: 520.0,
-                cy: 300.0
-            }]
+            vec![
+                Action::Zoom {
+                    factor: 1.2,
+                    cx: 500.0,
+                    cy: 300.0
+                },
+                Action::Pan { dx: 20.0, dy: 0.0 }
+            ]
         );
         // 之后每次相对上一次
         let out = s.touch(&t(1, Phase::Move, 340.0, 300.0, 30));
         assert_eq!(
             out,
-            vec![Action::Zoom {
-                factor: 1.25,
-                cx: 490.0,
-                cy: 300.0
-            }]
+            vec![
+                Action::Zoom {
+                    factor: 1.25,
+                    cx: 520.0,
+                    cy: 300.0
+                },
+                Action::Pan { dx: -30.0, dy: 0.0 }
+            ]
         );
         // 第三根手指：作废，等三根都抬起
         assert!(s.touch(&t(3, Phase::Down, 10.0, 10.0, 40)).is_empty());
@@ -749,6 +899,169 @@ mod tests {
         }
         s.touch(&t(3, Phase::Up, 0.0, 0.0, 70));
         assert_eq!(s.state, State::Idle);
+    }
+
+    /// 一次事件里两根手指的新位置（批量交）。
+    fn both(s: &mut Gestures, a: (f32, f32), b: (f32, f32), t_ms: u64) -> Vec<Action> {
+        s.moves(&[
+            t(1, Phase::Move, a.0, a.1, t_ms),
+            t(2, Phase::Move, b.0, b.1, t_ms),
+        ])
+    }
+
+    /// 两指从 `a0`、`b0` 按下，按 `steps` 次事件线性走到 `a1`、`b1`（每次事件两指一起），收集所有输出。
+    fn glide(
+        a0: (f32, f32),
+        b0: (f32, f32),
+        a1: (f32, f32),
+        b1: (f32, f32),
+        steps: u16,
+    ) -> Vec<Action> {
+        let mut s = g();
+        s.touch(&t(1, Phase::Down, a0.0, a0.1, 0));
+        s.touch(&t(2, Phase::Down, b0.0, b0.1, 10));
+        let lerp =
+            |p: (f32, f32), q: (f32, f32), k: f32| (p.0 + (q.0 - p.0) * k, p.1 + (q.1 - p.1) * k);
+        let mut out = Vec::new();
+        for i in 1..=steps {
+            let k = f32::from(i) / f32::from(steps);
+            out.extend(both(
+                &mut s,
+                lerp(a0, a1, k),
+                lerp(b0, b1, k),
+                20 + u64::from(i) * 8,
+            ));
+        }
+        out
+    }
+
+    fn zooms(out: &[Action]) -> usize {
+        out.iter()
+            .filter(|a| matches!(a, Action::Zoom { .. }))
+            .count()
+    }
+
+    fn wheels(out: &[Action]) -> usize {
+        out.iter()
+            .filter(|a| matches!(a, Action::Input(InputEvent::Wheel { .. })))
+            .count()
+    }
+
+    #[test]
+    fn scroll_and_pinch_are_told_apart_with_real_hands() {
+        // 双指往下滚 150，手指间距从 200 收到 176（12%：真实的手不会完全平行；旧判据“距离变 6% 就是捏合”会判错）
+        let out = glide(
+            (400.0, 200.0),
+            (600.0, 200.0),
+            (412.0, 350.0),
+            (588.0, 350.0),
+            15,
+        );
+        assert_eq!(zooms(&out), 0, "{out:?}");
+        assert!(wheels(&out) > 0, "{out:?}");
+        // 斜着滚：两指方向差一点
+        let out = glide(
+            (400.0, 200.0),
+            (600.0, 200.0),
+            (430.0, 340.0),
+            (610.0, 350.0),
+            15,
+        );
+        assert_eq!(zooms(&out), 0, "{out:?}");
+        assert!(wheels(&out) > 0, "{out:?}");
+        // 对称捏开 200 → 320，中点同时往下漂 25（手在动）
+        let out = glide(
+            (400.0, 300.0),
+            (600.0, 300.0),
+            (340.0, 325.0),
+            (660.0, 325.0),
+            15,
+        );
+        assert_eq!(wheels(&out), 0, "{out:?}");
+        assert!(zooms(&out) > 0, "{out:?}");
+        // 拇指按着不动，食指斜着拉开：中点走了一半的距离，照样是捏合
+        let out = glide(
+            (400.0, 400.0),
+            (500.0, 300.0),
+            (400.0, 400.0),
+            (600.0, 200.0),
+            15,
+        );
+        assert_eq!(wheels(&out), 0, "{out:?}");
+        assert!(zooms(&out) > 0, "{out:?}");
+        // 捏小
+        let out = glide(
+            (300.0, 300.0),
+            (700.0, 300.0),
+            (420.0, 300.0),
+            (580.0, 300.0),
+            15,
+        );
+        assert_eq!(wheels(&out), 0, "{out:?}");
+        assert!(zooms(&out) > 0, "{out:?}");
+    }
+
+    #[test]
+    fn pinching_keeps_the_picture_under_the_fingers() {
+        // 拇指不动、食指拉开再挪：每次把缩放、平移作用到“按下时两根手指下面的内容点”，最后要还在两根手指下面
+        let mut s = g();
+        s.touch(&t(1, Phase::Down, 400.0, 400.0, 0));
+        s.touch(&t(2, Phase::Down, 500.0, 300.0, 10));
+        let mut under = [(400.0_f32, 400.0_f32), (500.0, 300.0)];
+        // 不转（两指连线方向不变）：缩放加平移跟得上；我们不旋转远程画面，转的那部分本来就跟不上
+        let path = [
+            ((400.0, 400.0), (530.0, 270.0)),
+            ((400.0, 400.0), (580.0, 220.0)),
+            ((380.0, 420.0), (620.0, 180.0)),
+        ];
+        for (i, (a, b)) in path.into_iter().enumerate() {
+            for act in both(&mut s, a, b, 20 + u64::try_from(i).unwrap_or(0) * 10) {
+                for p in &mut under {
+                    match act {
+                        Action::Zoom { factor, cx, cy } => {
+                            *p = (cx + (p.0 - cx) * factor, cy + (p.1 - cy) * factor);
+                        }
+                        Action::Pan { dx, dy } => *p = (p.0 + dx, p.1 + dy),
+                        Action::Input(_) | Action::Haptic | Action::Tap { .. } => {}
+                    }
+                }
+            }
+            let close = |p: (f32, f32), q: (f32, f32)| distance(p, q) < 0.5;
+            assert!(
+                close(under[0], a) && close(under[1], b),
+                "{i}: {under:?} vs {a:?} {b:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn one_event_moves_both_fingers_at_once() {
+        // 对称捏开：一次事件两根手指一起走，一次缩放，中心不动（逐根交的话中心会来回跳）
+        let mut s = g();
+        s.touch(&t(1, Phase::Down, 400.0, 300.0, 0));
+        s.touch(&t(2, Phase::Down, 600.0, 300.0, 10));
+        assert!(both(&mut s, (395.0, 300.0), (605.0, 300.0), 20).is_empty());
+        let out = both(&mut s, (380.0, 300.0), (620.0, 300.0), 30);
+        assert_eq!(
+            out,
+            vec![Action::Zoom {
+                factor: 240.0 / 210.0,
+                cx: 500.0,
+                cy: 300.0
+            }]
+        );
+        // 不是移动的触点、别的手指：不管
+        assert!(s
+            .moves(&[
+                t(1, Phase::Up, 0.0, 0.0, 40),
+                t(9, Phase::Move, 0.0, 0.0, 40)
+            ])
+            .is_empty());
+        // 一根手指时逐个处理（单指滑动是平移）
+        let mut s = g();
+        s.touch(&t(1, Phase::Down, 100.0, 300.0, 0));
+        let out = s.moves(&[t(1, Phase::Move, 150.0, 300.0, 20)]);
+        assert_eq!(out, vec![Action::Pan { dx: 50.0, dy: 0.0 }]);
     }
 
     #[test]

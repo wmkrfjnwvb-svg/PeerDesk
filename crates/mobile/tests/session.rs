@@ -260,11 +260,16 @@ fn view_changes_go_back_to_the_ui_and_inputs_go_out() {
                 Action::Input(InputEvent::ReleaseAll),
                 Action::Pan { dx: -3.0, dy: 4.0 },
                 Action::Haptic,
+                Action::Tap {
+                    x: 7.5,
+                    y: 8.0,
+                    button: 1,
+                },
             ]
         )
         .as_deref(),
         Some(
-            r#"[{"type":"zoom","factor":1.5,"cx":10,"cy":20.5},{"type":"pan","dx":-3,"dy":4},{"type":"haptic"}]"#
+            r#"[{"type":"zoom","factor":1.5,"cx":10,"cy":20.5},{"type":"pan","dx":-3,"dy":4},{"type":"haptic"},{"type":"tap","x":7.5,"y":8,"button":1}]"#
         )
     );
 }
