@@ -345,7 +345,10 @@ pub async fn serve(
                 // 让拒绝消息送达后再关闭。
                 let _ = tokio::time::timeout(Duration::from_secs(1), link.closed()).await;
                 link.close("rejected");
-                return Err(NetError::Connect(format!("会话未建立：{reason:?}")));
+                return Err(NetError::Connect(format!(
+                    "会话未建立：{}",
+                    crate::reason::reject_text(*reason)
+                )));
             }
             State::Closed => {
                 link.close("closed");
@@ -601,9 +604,9 @@ pub async fn serve(
                     let pong = write_control(&mut ctrl_send, &Control::Pong { nonce }).await;
              if let Err(e) = pong { break e.to_string(); }
                 }
-                Some(Control::Bye) => break "对端结束会话".to_owned(),
+                Some(Control::Bye) => break crate::reason::PEER_ENDED.to_owned(),
                 // 控制流断了：网络断开时报网络原因（控制端据此换通道重连），否则是对端结束。
-                None => break link.lost_reason().unwrap_or_else(|| "对端结束会话".to_owned()),
+                None => break link.lost_reason().unwrap_or_else(|| crate::reason::PEER_ENDED.to_owned()),
                 Some(
                     Control::Hello { .. }
                     | Control::Accept { .. }

@@ -14,6 +14,7 @@ use peerdesk_net::controller::{self, ControllerOptions, ScreenSink, Upload};
 use peerdesk_net::demo::DemoDesktop;
 use peerdesk_net::files::{receive_files, send_files};
 use peerdesk_net::host::{self, HostOptions, InputSink};
+use peerdesk_net::reason::Reason;
 use peerdesk_net::stream::{
     read_control, read_file_msgs, read_kind, write_control, write_file_msg, write_kind, StreamKind,
 };
@@ -282,15 +283,21 @@ async fn controller_handles_bad_handshake_answers_and_vanishing_host() {
     );
 
     // 被控端说我们的版本太旧（或它支持的最低版本比我们新）：用户看到要升级的说明
-    for (reason, expect) in [
-        (peerdesk_core::proto::RejectReason::Version, "版本太旧"),
+    for (reason, expect, kind) in [
+        (
+            peerdesk_core::proto::RejectReason::Version,
+            "版本太旧",
+            Reason::Version,
+        ),
         (
             peerdesk_core::proto::RejectReason::Busy,
             "正在被其他设备控制",
+            Reason::Busy,
         ),
         (
             peerdesk_core::proto::RejectReason::NoCommonSuite,
             "NoCommonSuite",
+            Reason::Version,
         ),
     ] {
         let (_n, raw, ctrl_link) = links().await;
@@ -316,7 +323,10 @@ async fn controller_handles_bad_handshake_answers_and_vanishing_host() {
         ));
         let _streams = raw_host_handshake(&raw, &Control::Reject { reason }).await;
         match task.await.unwrap() {
-            Err(NetError::Connect(why)) => assert!(why.contains(expect), "{why}"),
+            Err(e @ NetError::Connect(_)) => {
+                assert!(e.to_string().contains(expect), "{e}");
+                assert_eq!(Reason::of_error(&e), kind, "{e}");
+            }
             other => panic!("{other:?}"),
         }
     }

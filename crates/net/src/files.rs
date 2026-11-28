@@ -81,16 +81,50 @@ pub async fn send_files(
     send_on(send, recv, root, files, &Progress::default(), kind).await
 }
 
+/// 对方中止传输时，错误原文的开头（后面跟对方给的原因，见 [`finished`]）。
+pub const PEER_ABORTED: &str = "对方中止了传输";
+
+/// 一次传输收尾：对方中止了、还有文件没有结果时报错，带上对方给的原因（例如对方磁盘满了、
+/// 不允许传文件），界面据此说清楚为什么没传完；否则交出每个文件的结果。
+///
+/// # Errors
+/// 对方中止了传输，而且有文件没传完。
+pub fn finished(
+    results: Vec<FileResult>,
+    peer_aborted: Option<String>,
+) -> Result<Vec<FileResult>, NetError> {
+    match peer_aborted {
+        Some(why) if results.iter().any(|r| r.outcome.is_none()) => {
+            Err(NetError::Closed(format!("{PEER_ABORTED}：{why}")))
+        }
+        Some(_) | None => Ok(results),
+    }
+}
+
 /// 在一条已经打开的流上把 `root` 下的 `files` 发给对端（文件管理的上传、被控端的下载也用它）。
 /// `wrote` 是之前写流头的结果：写失败时仍读对端的答复，拿到拒绝原因。
 pub async fn send_on(
+    send: SendStream,
+    recv: RecvStream,
+    root: &Path,
+    files: Vec<FileMeta>,
+    progress: &Progress,
+    wrote: Result<(), NetError>,
+) -> Result<(Vec<FileResult>, u64), NetError> {
+    send_checked(send, recv, root, files, progress, wrote)
+        .await
+        .map(|(results, bytes, _)| (results, bytes))
+}
+
+/// 同 [`send_on`]，另外交出对方中止传输时给的原因（交给 [`finished`]）。
+pub async fn send_checked(
     mut send: SendStream,
     mut recv: RecvStream,
     root: &Path,
     files: Vec<FileMeta>,
     progress: &Progress,
     wrote: Result<(), NetError>,
-) -> Result<(Vec<FileResult>, u64), NetError> {
+) -> Result<(Vec<FileResult>, u64, Option<String>), NetError> {
     let mut store = FsStore::new(root);
     let mut sender = FileSender::new(files.clone())?;
     let offer = sender.offer()?;
@@ -146,7 +180,11 @@ pub async fn send_on(
             sender.on_msg(msg, &mut store)?;
         }
     }
-    Ok((results(&files, sender.outcomes()), sender.bytes_sent()))
+    Ok((
+        results(&files, sender.outcomes()),
+        sender.bytes_sent(),
+        sender.peer_aborted().map(str::to_owned),
+    ))
 }
 
 /// 处理对端发起的一次文件传输，文件写到 `root` 下。
@@ -160,11 +198,23 @@ pub async fn receive_files(
 
 /// 同 [`receive_files`]，并记下收到的字节数（文件管理的下载、被控端的上传用）。
 pub async fn receive_on(
+    send: SendStream,
+    recv: RecvStream,
+    root: &Path,
+    progress: &Progress,
+) -> Result<Vec<FileResult>, NetError> {
+    receive_checked(send, recv, root, progress)
+        .await
+        .map(|(results, _)| results)
+}
+
+/// 同 [`receive_on`]，另外交出对方中止传输时给的原因（交给 [`finished`]）。
+pub async fn receive_checked(
     mut send: SendStream,
     mut recv: RecvStream,
     root: &Path,
     progress: &Progress,
-) -> Result<Vec<FileResult>, NetError> {
+) -> Result<(Vec<FileResult>, Option<String>), NetError> {
     let mut store = FsStore::new(root);
     let mut receiver = FileReceiver::new();
     let mut deframer = Deframer::new();
@@ -195,5 +245,41 @@ pub async fn receive_on(
         }
     }
     let _ = send.finish();
-    Ok(results(&files, receiver.outcomes()))
+    Ok((
+        results(&files, receiver.outcomes()),
+        receiver.aborted().map(str::to_owned),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_peer_abort_with_missing_results_is_an_error() {
+        let done = FileResult {
+            path: "a".into(),
+            outcome: Some(Outcome::Done),
+        };
+        let missing = FileResult {
+            path: "b".into(),
+            outcome: None,
+        };
+        // 对方中止、有文件没传完：说出对方的原因
+        assert_eq!(
+            finished(
+                vec![done.clone(), missing.clone()],
+                Some("磁盘空间不足：写入".into())
+            ),
+            Err(NetError::Closed(
+                "对方中止了传输：磁盘空间不足：写入".into()
+            ))
+        );
+        // 都有结果，或者对方没中止：照常交出结果
+        assert_eq!(
+            finished(vec![done.clone()], Some("晚到的中止".into())),
+            Ok(vec![done.clone()])
+        );
+        assert_eq!(finished(vec![missing.clone()], None), Ok(vec![missing]));
+    }
 }

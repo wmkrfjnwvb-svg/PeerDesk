@@ -28,8 +28,9 @@ use peerdesk_core::session::SessionConfig;
 use peerdesk_core::signal::parse_code;
 use peerdesk_net::clipsync::ClipboardHandle;
 use peerdesk_net::controller::{LinkHook, LinkQuality};
+use peerdesk_net::reason::{Failure, Reason};
 use peerdesk_net::recorder::{RecordSetup, Retention};
-use peerdesk_net::rendezvous::{Lookup, PathPolicy, Server};
+use peerdesk_net::rendezvous::{Lookup, PathPolicy, Server, OFFICIAL_SERVER};
 use peerdesk_net::viewer::{self, ViewEnv, ViewTarget};
 use peerdesk_net::{Identity, NetError, Node};
 use tokio::sync::watch;
@@ -68,17 +69,26 @@ pub enum Event {
     Reconnecting {
         /// 第几次。
         attempt: u32,
-        /// 原因。
+        /// 原因的原文（界面放进详情）。
         why: String,
+        /// 为什么在重连（界面按它说人话）。
+        reason: Reason,
     },
     /// 服务器的通知（例如免费额度用完），访问随之结束。
-    Notice(String),
-    /// 访问结束。`ok` 为假时 `text` 是失败的原因（白话），为真时是结束的原因。
+    Notice {
+        /// 原文。
+        text: String,
+        /// 原因（界面按它说人话）。
+        reason: Reason,
+    },
+    /// 访问结束。`ok` 为假时是失败，为真时是正常结束（包括自己断开）。
     Ended {
         /// 是不是正常结束（包括自己断开）。
         ok: bool,
-        /// 原因。
+        /// 核心的原文（界面放进可以复制的详情；老版本的界面直接显示它）。
         text: String,
+        /// 原因（界面按它用本地语言说一句原因、一句办法）。
+        reason: Reason,
     },
 }
 
@@ -114,25 +124,36 @@ impl Event {
                 json_string(&q.decoder),
                 json_string(q.fec)
             ),
-            Self::Reconnecting { attempt, why } => format!(
-                "{{\"type\":\"reconnecting\",\"attempt\":{attempt},\"why\":{}}}",
-                json_string(why)
+            // 原来的字段不变，新加 `reason`（原因代号，见 `peerdesk_net::reason::Reason::code`）
+            Self::Reconnecting {
+                attempt,
+                why,
+                reason,
+            } => format!(
+                "{{\"type\":\"reconnecting\",\"attempt\":{attempt},\"why\":{},\"reason\":{}}}",
+                json_string(why),
+                json_string(reason.code())
             ),
-            Self::Notice(text) => format!(
-                "{{\"type\":\"notice\",\"text\":{}}}",
-                json_string(text)
+            Self::Notice { text, reason } => format!(
+                "{{\"type\":\"notice\",\"text\":{},\"reason\":{}}}",
+                json_string(text),
+                json_string(reason.code())
             ),
-            Self::Ended { ok, text } => format!(
-                "{{\"type\":\"ended\",\"ok\":{ok},\"text\":{}}}",
-                json_string(text)
+            Self::Ended { ok, text, reason } => format!(
+                "{{\"type\":\"ended\",\"ok\":{ok},\"text\":{},\"reason\":{}}}",
+                json_string(text),
+                json_string(reason.code())
             ),
         }
     }
 }
 
-impl From<viewer::ViewEvent> for Event {
-    fn from(event: viewer::ViewEvent) -> Self {
-        match event {
+impl Event {
+    /// 访问驱动的事件换成给界面的事件。剪贴板事件没有对应的（手机端第一版不同步剪贴板，
+    /// `ViewEnv::clipboard` 给的是 `None`，不会有这个事件），为 `None`。
+    #[must_use]
+    pub fn from_view(event: viewer::ViewEvent) -> Option<Self> {
+        Some(match event {
             viewer::ViewEvent::Connected { route, detail, .. } => Self::Connected {
                 route: format!("{route:?}"),
                 detail,
@@ -142,11 +163,31 @@ impl From<viewer::ViewEvent> for Event {
                 name,
             },
             viewer::ViewEvent::Quality(q) => Self::Quality(q),
-            viewer::ViewEvent::Reconnecting { attempt, why } => Self::Reconnecting { attempt, why },
-            viewer::ViewEvent::Notice(text) => Self::Notice(text),
-            // 手机端第一版不同步剪贴板（ViewEnv::clipboard 给的是 None），不会有这个事件；
-            // 真来了也只是提示，按通知处理
-            viewer::ViewEvent::Clipboard(note) => Self::Notice(format!("{note:?}")),
+            viewer::ViewEvent::Reconnecting {
+                attempt,
+                why,
+                reason,
+            } => Self::Reconnecting {
+                attempt,
+                why,
+                reason,
+            },
+            viewer::ViewEvent::Notice(text) => Self::Notice {
+                reason: Reason::of_text(&text),
+                text,
+            },
+            viewer::ViewEvent::Clipboard(_) => return None,
+        })
+    }
+
+    /// 还没开始就失败（例如设备码填错、服务器名查不到）的结束事件。
+    #[must_use]
+    pub fn failed(text: String) -> Self {
+        let failure = Failure::of_text(&text);
+        Self::Ended {
+            ok: false,
+            text: failure.details,
+            reason: failure.reason,
         }
     }
 }
@@ -167,7 +208,8 @@ fn json_string(s: &str) -> String {
     out
 }
 
-/// 按用户填的服务器地址和设备码，得到要连的目标。服务器可以写域名，没写端口用 [`DEFAULT_PORT`]。
+/// 按用户填的服务器地址和设备码，得到要连的目标。服务器空着用官方服务器（[`OFFICIAL_SERVER`]）；
+/// 填了自己的服务器就用它，可以写域名，没写端口用 [`DEFAULT_PORT`]。
 ///
 /// # Errors
 /// 设备码不是 9 位数字、服务器地址解析不了（原因写成白话）。
@@ -175,7 +217,12 @@ pub fn device_target(server: &str, code: &str) -> Result<ViewTarget, String> {
     let code = parse_code(code).ok_or_else(|| "设备码应为 9 位数字".to_owned())?;
     let server = server.trim();
     if server.is_empty() {
-        return Err("请填写服务器地址".to_owned());
+        return Ok(ViewTarget::Device {
+            server: OFFICIAL_SERVER,
+            device: Lookup::Code(code),
+            policy: PathPolicy::Auto,
+            account: String::new(),
+        });
     }
     let with_port = if server.parse::<SocketAddr>().is_ok()
         || server
@@ -226,7 +273,9 @@ fn caps() -> Caps {
 
 impl ViewEnv for MobileEnv {
     fn event(&self, event: viewer::ViewEvent) {
-        let _ = self.events.send(Event::from(event));
+        if let Some(event) = Event::from_view(event) {
+            let _ = self.events.send(event);
+        }
     }
 
     fn sink(&self) -> Box<dyn ScreenSink> {
@@ -359,10 +408,14 @@ impl Session {
                         peerdesk_net::note!(info, "手机端会话开始：{}", describe_target(&target));
                         ended(run(target, auth, env, input_rx, stop_rx))
                     }
-                    Err(text) => Event::Ended { ok: false, text },
+                    Err(text) => Event::failed(text),
                 };
-                if let Event::Ended { ok, text } = &event {
-                    peerdesk_net::note!(info, "手机端会话结束：成功={ok}，原因={text}");
+                if let Event::Ended { ok, text, reason } = &event {
+                    peerdesk_net::note!(
+                        info,
+                        "手机端会话结束：成功={ok}，原因={text}（{}）",
+                        reason.code()
+                    );
                 }
                 let _ = tx.send(event);
             });
@@ -383,7 +436,7 @@ impl Session {
     #[must_use]
     pub fn failed(text: String) -> Self {
         let (tx, events) = mpsc::channel();
-        let _ = tx.send(Event::Ended { ok: false, text });
+        let _ = tx.send(Event::failed(text));
         let (input, _) = tokio::sync::mpsc::channel(1);
         let (stop, _) = watch::channel(false);
         let (view, _) = watch::channel((0, 0));
@@ -472,6 +525,7 @@ pub fn apply(session: &Session, actions: Vec<gesture::Action>) -> Option<String>
 }
 
 fn ended(result: Result<Summary, NetError>) -> Event {
+    let failure = viewer::visit_failure(&result);
     match result {
         Ok(summary) => Event::Ended {
             ok: true,
@@ -480,10 +534,12 @@ fn ended(result: Result<Summary, NetError>) -> Event {
             } else {
                 summary.end
             },
+            reason: failure.reason,
         },
-        Err(e) => Event::Ended {
+        Err(_) => Event::Ended {
             ok: false,
-            text: e.to_string(),
+            text: failure.details,
+            reason: failure.reason,
         },
     }
 }

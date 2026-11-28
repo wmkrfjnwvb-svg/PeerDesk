@@ -21,10 +21,12 @@ sealed interface CoreEvent {
         val decoder: String,
         val fec: String,
     ) : CoreEvent
-    data class Reconnecting(val attempt: Int, val why: String) : CoreEvent
-    data class Notice(val text: String) : CoreEvent
-    /** 会话结束。之后不再有事件。 */
-    data class Ended(val ok: Boolean, val text: String) : CoreEvent
+    /** 正在重连：第几次，核心的原文（详情），为什么在重连。 */
+    data class Reconnecting(val attempt: Int, val why: String, val reason: Reason = Reason.NetworkLost) : CoreEvent
+    /** 服务器的通知（例如免费中继额度用完）：原文和原因。 */
+    data class Notice(val text: String, val reason: Reason = Reason.Other) : CoreEvent
+    /** 会话结束。之后不再有事件。`text` 是核心的原文（放进详情），界面按 [reason] 说人话。 */
+    data class Ended(val ok: Boolean, val text: String, val reason: Reason = Reason.Other) : CoreEvent
 }
 
 enum class Route { Direct, Relay, Unknown }
@@ -66,9 +68,12 @@ fun parseEvent(line: String?): CoreEvent? {
                 decoder = o.optString("decoder"),
                 fec = o.optString("fec"),
             )
-            "reconnecting" -> CoreEvent.Reconnecting(o.optInt("attempt"), o.optString("why"))
-            "notice" -> CoreEvent.Notice(o.optString("text"))
-            "ended" -> CoreEvent.Ended(o.optBoolean("ok"), o.optString("text"))
+            // 老核心没有 reason：重连当作网络断了，其他当作“其他原因”（原文仍在）
+            "reconnecting" -> CoreEvent.Reconnecting(
+                o.optInt("attempt"), o.optString("why"), Reason.of(o.optString("reason", Reason.NetworkLost.code)),
+            )
+            "notice" -> CoreEvent.Notice(o.optString("text"), Reason.of(o.optString("reason")))
+            "ended" -> CoreEvent.Ended(o.optBoolean("ok"), o.optString("text"), Reason.of(o.optString("reason")))
             else -> null
         }
     } catch (_: org.json.JSONException) {

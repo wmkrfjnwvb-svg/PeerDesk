@@ -366,11 +366,13 @@ pub fn run_agent(base: &Path, agent: &Path, port: u16, stop: &AtomicBool) -> Res
         }
     };
     let password = load_password(agent).inspect_err(|e| report(&Status::failed(e)))?;
+    // 没填自己的服务器时用官方服务器；填错了也退回官方服务器（代理没有界面可以报错），并写进日志
     let server = ServerSettings::load(agent)
         .server(&crate::gui::i18n::ZH)
-        .ok()
-        .flatten()
-        .unwrap_or_else(crate::crashreport::default_server);
+        .unwrap_or_else(|e| {
+            log::warn!("无人值守：服务器设置有误（{e}），改用官方服务器");
+            peerdesk_net::rendezvous::OFFICIAL_SERVER
+        });
     let config = HostConfig {
         port,
         data_dir: agent.to_path_buf(),
@@ -462,9 +464,9 @@ fn service_with(
         Some("install") => {
             std::fs::create_dir_all(&agent)
                 .map_err(|e| format!("建目录失败（需要管理员身份）：{e}"))?;
-            // 沿用安装者的服务器设置（没有时代理用默认服务器）
+            // 沿用安装者自己的服务器（没有时代理用官方服务器）
             let theirs = ServerSettings::load(user_dir);
-            if theirs.is_set() && !ServerSettings::load(&agent).is_set() {
+            if theirs.is_custom() && !ServerSettings::load(&agent).is_custom() {
                 theirs
                     .save(&agent)
                     .map_err(|e| format!("保存服务器设置失败：{e}"))?;

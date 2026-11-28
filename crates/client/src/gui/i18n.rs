@@ -95,6 +95,8 @@ pub const fn strings(lang: Lang) -> &'static Strings {
 #[allow(missing_docs)]
 #[derive(Debug)]
 pub struct Strings {
+    /// 这套文字是哪种语言（失败原因的文字按它取，见 `reasons.rs`）。
+    pub lang: Lang,
     pub app_title: &'static str,
     pub this_device: &'static str,
     pub allow_control: &'static str,
@@ -148,10 +150,7 @@ pub struct Strings {
     pub net_bandwidth: &'static str,
     /// 带宽不够时的说明。
     pub net_bandwidth_hint: &'static str,
-    pub session_ended: &'static str,
     pub you_disconnected: &'static str,
-    /// 对端退出了 PeerDesk（对端点了退出）：不是网络问题，不会重连。
-    pub peer_quit: &'static str,
     pub stats: &'static str,
     /// 详情面板。
     pub d_title: &'static str,
@@ -227,8 +226,6 @@ pub struct Strings {
     pub err_bad_pin: &'static str,
     pub err_bad_server: &'static str,
     pub err_need_target: &'static str,
-    /// 用设备码连接但没填服务器。
-    pub err_need_server: &'static str,
     /// 设备码。
     pub device_code: &'static str,
     /// 保存。
@@ -256,7 +253,7 @@ pub struct Strings {
     /// 说明：正在开启。
     pub hint_starting: &'static str,
     /// 说明：没设置服务器，没有设备码。
-    pub hint_no_server: &'static str,
+    pub hint_bad_server: &'static str,
     /// 说明：系统权限不齐，开不了。
     pub hint_need_permission: &'static str,
     /// 说明：对方正在验证密码。
@@ -408,9 +405,24 @@ pub struct Strings {
     /// 服务器未连接
     pub server_offline: &'static str,
     /// 未设置服务器
-    pub server_unset: &'static str,
+    pub server_invalid: &'static str,
     /// 服务器
     pub section_server: &'static str,
+    /// 设置页：用的是官方服务器。
+    pub server_official: &'static str,
+    /// 设置页：用的是自己的服务器（后面跟地址）。
+    pub server_custom: &'static str,
+    /// 设置页折叠起来的“高级”。
+    pub section_advanced: &'static str,
+    /// “高级”里自建服务器那一组的标题和说明。
+    pub own_server: &'static str,
+    pub own_server_hint: &'static str,
+    /// 清空自己的服务器，改回官方服务器。
+    pub use_official: &'static str,
+    /// 失败提示里的按钮：去服务器设置、复制详情；可展开的原文。
+    pub server_settings: &'static str,
+    pub copy_details: &'static str,
+    pub details: &'static str,
     /// 网络
     pub section_network: &'static str,
     /// 通用
@@ -544,17 +556,7 @@ pub struct Strings {
     /// 原始大小（1:1）的提示。
     pub original_size: &'static str,
 
-    pub err_port_in_use: &'static str,
-    pub err_timeout: &'static str,
-    pub err_refused: &'static str,
-    pub err_wrong_password: &'static str,
-    pub err_locked: &'static str,
-    pub err_busy: &'static str,
-    pub err_pin_mismatch: &'static str,
-    pub err_offline: &'static str,
-    pub err_closed: &'static str,
     pub err_identity: &'static str,
-    pub err_other: &'static str,
     pub warn_unpinned: &'static str,
     pub tray_open: &'static str,
     pub tray_disconnect: &'static str,
@@ -573,6 +575,7 @@ pub struct Strings {
 
 /// 中文。
 pub const ZH: Strings = Strings {
+    lang: Lang::Zh,
     app_title: "PeerDesk 测试版",
     this_device: "本机",
     allow_control: "允许远程控制",
@@ -598,7 +601,7 @@ pub const ZH: Strings = Strings {
     disconnect: "断开",
     inputs_received: "收到的输入",
     register_server: "服务器（用设备码连接）",
-    server_addr: "服务器地址:端口",
+    server_addr: "服务器地址（IP:端口）",
     server_pin: "服务器指纹（可选）",
     registered: "已在服务器登记，设备码",
     connect_title: "连接",
@@ -606,7 +609,7 @@ pub const ZH: Strings = Strings {
     pin: "核对指纹（可选）",
     connect: "连接",
     recent: "最近连接",
-    via_server: "填一次就行。本机会在服务器上登记、得到设备码；连接别人时也用它按设备码查找。",
+    via_server: "本机在服务器上登记、得到设备码；连接别人时也用它按设备码查找。默认用官方服务器，什么都不用填。",
     device: "被控端指纹",
     connect_self: "连接本机（自测）",
     ready: "就绪",
@@ -618,9 +621,7 @@ pub const ZH: Strings = Strings {
     net_latency_hint: "网络延迟较高，操作会慢半拍。对方离得远、网络拥堵，或者没能直连（走中继）。",
     net_bandwidth: "带宽不足",
     net_bandwidth_hint: "网络带宽不够，画面已自动降低清晰度和帧率。关掉占用网络的下载、视频可以改善。",
-    session_ended: "会话已结束",
     you_disconnected: "你断开了连接",
-    peer_quit: "连接已断开：对方退出了 PeerDesk",
     stats: "详情 (F12)",
     d_title: "连接详情",
     d_local: "本机（控制端）",
@@ -668,7 +669,6 @@ pub const ZH: Strings = Strings {
     err_bad_pin: "指纹应当是 64 个十六进制字符（可以从对方界面上复制）",
     err_bad_server: "服务器地址的格式应当是 IP:端口",
     err_need_target: "请填写对方的设备码或地址",
-    err_need_server: "用设备码连接，需要先在“服务器”里填写服务器地址",
     device_code: "设备码",
     save: "保存",
     saved: "服务器设置已保存",
@@ -683,7 +683,7 @@ pub const ZH: Strings = Strings {
     hint_waiting: "把设备码和密码告诉对方。每次会话结束后可以换一个密码。",
     hint_host_off: "现在别人连不进来。打开右上角的开关就能恢复。",
     hint_starting: "正在准备，几秒钟就好。",
-    hint_no_server: "还没设置服务器，所以没有设备码。同一网络里的电脑可以用 IP 地址连过来。",
+    hint_bad_server: "自己的服务器地址填得不对，所以没有设备码。同一网络里的电脑可以用 IP 地址连过来。",
     hint_need_permission: "系统还没授权屏幕和输入，开不了。按上面的提示完成授权。",
     hint_handshaking: "有人正在输入密码。",
     hint_controlled: "对方现在能看到屏幕、操作键盘和鼠标。",
@@ -758,8 +758,17 @@ pub const ZH: Strings = Strings {
     hide_password: "隐藏密码",
     server_online: "服务器已连接",
     server_offline: "服务器未连接",
-    server_unset: "未设置服务器",
+    server_invalid: "服务器地址有误",
     section_server: "服务器",
+    server_official: "官方服务器（默认）",
+    server_custom: "自己的服务器",
+    section_advanced: "高级",
+    own_server: "使用自己的服务器",
+    own_server_hint: "只有自建了 PeerDesk 服务器才需要填。地址留空就用官方服务器。",
+    use_official: "改回官方服务器",
+    server_settings: "服务器设置",
+    copy_details: "复制详情",
+    details: "详情",
     section_network: "网络",
     section_general: "通用",
     section_about: "关于",
@@ -827,17 +836,7 @@ pub const ZH: Strings = Strings {
     clipboard_sync: "剪贴板同步",
     fullscreen: "全屏",
     original_size: "原始大小（1:1，最清楚）；再点一下铺满窗口",
-    err_port_in_use: "端口已被占用（也许另一个 PeerDesk 正在运行），换一个端口试试",
-    err_timeout: "对方没有响应。请检查地址和端口、防火墙，以及对方是否打开了“允许远程控制”",
-    err_refused: "连接失败",
-    err_wrong_password: "密码不对",
-    err_locked: "对方因为多次密码错误暂时锁定了，请稍后再试",
-    err_busy: "对方正在被其他设备控制",
-    err_pin_mismatch: "对方的指纹和填写的不一致：可能连错了设备，也可能有人冒充",
-    err_offline: "这台设备现在不在服务器上",
-    err_closed: "连接已断开",
     err_identity: "无法读取或创建本机身份",
-    err_other: "出错了",
     warn_unpinned: "没有核对指纹：无法确认连到的是你的设备",
     tray_open: "打开 PeerDesk",
     tray_disconnect: "断开连接",
@@ -856,6 +855,7 @@ pub const ZH: Strings = Strings {
 
 /// 英文。
 pub const EN: Strings = Strings {
+    lang: Lang::En,
     app_title: "PeerDesk (test build)",
     this_device: "This device",
     allow_control: "Allow remote control",
@@ -882,7 +882,7 @@ pub const EN: Strings = Strings {
     disconnect: "Disconnect",
     inputs_received: "Input received",
     register_server: "Server (connect by device code)",
-    server_addr: "Server address:port",
+    server_addr: "Server address (IP:port)",
     server_pin: "Server fingerprint (optional)",
     registered: "Registered on the server, device code",
     connect_title: "Connect",
@@ -890,7 +890,7 @@ pub const EN: Strings = Strings {
     pin: "Pin fingerprint (optional)",
     connect: "Connect",
     recent: "Recent",
-    via_server: "Set once. This device registers on the server and gets a device code; it is also used to look up others by code.",
+    via_server: "This device registers on the server to get a device code, and looks up other devices by code there. The official server is used by default; nothing to fill in.",
     device: "Device fingerprint",
     connect_self: "Connect to this device (self-test)",
     ready: "Ready",
@@ -902,9 +902,7 @@ pub const EN: Strings = Strings {
     net_latency_hint: "High network delay, so actions lag a little. The other computer is far away, the network is congested, or the connection is relayed.",
     net_bandwidth: "Low bandwidth",
     net_bandwidth_hint: "Not enough bandwidth: picture quality and frame rate were lowered automatically. Pausing downloads or videos helps.",
-    session_ended: "Session ended",
     you_disconnected: "You disconnected",
-    peer_quit: "Disconnected: the other side quit PeerDesk",
     stats: "Details (F12)",
     d_title: "Connection details",
     d_local: "This computer (controller)",
@@ -952,7 +950,6 @@ pub const EN: Strings = Strings {
     err_bad_pin: "A fingerprint is 64 hex characters (copy it from the other device)",
     err_bad_server: "Use the form IP:port for the server",
     err_need_target: "Enter the other device's code or address",
-    err_need_server: "Connecting by device code needs a server; fill it in under Server",
     device_code: "Device code",
     save: "Save",
     saved: "Server settings saved",
@@ -967,7 +964,7 @@ pub const EN: Strings = Strings {
     hint_waiting: "Share the code and password with the other person. You can change the password after each session.",
     hint_host_off: "Nobody can connect right now. Turn the switch back on to allow it.",
     hint_starting: "Getting ready. This takes a few seconds.",
-    hint_no_server: "No server is set, so there is no device code. Computers on the same network can connect by IP address.",
+    hint_bad_server: "Your own server address is not valid, so there is no device code. Computers on the same network can connect by IP address.",
     hint_need_permission: "The system has not granted screen and input access yet. Follow the steps above.",
     hint_handshaking: "Someone is entering the password.",
     hint_controlled: "The other person can see the screen and use the keyboard and mouse.",
@@ -1042,8 +1039,17 @@ pub const EN: Strings = Strings {
     hide_password: "Hide password",
     server_online: "Server connected",
     server_offline: "Server not connected",
-    server_unset: "No server set",
+    server_invalid: "Server address is invalid",
     section_server: "Server",
+    server_official: "Official server (default)",
+    server_custom: "Your own server",
+    section_advanced: "Advanced",
+    own_server: "Use your own server",
+    own_server_hint: "Only needed if you run your own PeerDesk server. Leave the address empty to use the official server.",
+    use_official: "Use the official server",
+    server_settings: "Server settings",
+    copy_details: "Copy details",
+    details: "Details",
     section_network: "Network",
     section_general: "General",
     section_about: "About",
@@ -1111,20 +1117,7 @@ pub const EN: Strings = Strings {
     clipboard_sync: "Clipboard sync",
     fullscreen: "Full screen",
     original_size: "Original size (1:1, sharpest); click again to fill the window",
-    err_port_in_use:
-        "The port is already in use (maybe another PeerDesk is running). Try another port",
-    err_timeout: "No response. Check the address, the port, the firewall, and that \
-                  \"Allow remote control\" is on at the other side",
-    err_refused: "Could not connect",
-    err_wrong_password: "Wrong password",
-    err_locked: "The other device is locked for a while after too many wrong passwords",
-    err_busy: "The other device is being controlled by someone else",
-    err_pin_mismatch:
-        "The fingerprint does not match: wrong device, or someone is impersonating it",
-    err_offline: "That device is not online on the server",
-    err_closed: "The connection was closed",
     err_identity: "Cannot read or create this device's identity",
-    err_other: "Something went wrong",
     warn_unpinned: "Fingerprint not pinned: cannot confirm this is your device",
     tray_open: "Open PeerDesk",
     tray_disconnect: "Disconnect",

@@ -179,6 +179,8 @@ struct App {
     port: String,
     server: ServerSettings,
     device_code: Option<u32>,
+    /// 这次开启被控时在服务器上登记失败了（连不上服务器）：不再显示“正在获取设备码”，原因在状态栏。
+    register_failed: bool,
     net: Option<NetReport>,
     os: Os,
     guide: Guide,
@@ -292,9 +294,9 @@ impl App {
             Ok(p) => (p, Status::info(s.ready)),
             Err(e) => (String::new(), Status::error(e)),
         };
-        // 上次崩溃了：后台把日志传给服务器（配置了服务器就传给它，否则传给测试版默认服务器）
+        // 上次崩溃了：后台把日志传给服务器（填了自己的服务器就传给它，否则传给官方服务器）
         let server = ServerSettings::load(&data_dir);
-        crate::crashreport::upload_in_background(&data_dir, server.server(s).ok().flatten());
+        crate::crashreport::upload_in_background(&data_dir, server.server(s).ok());
         let ctx2 = ctx.clone();
         let (bg, tray_status) = Background::new(ctx, s, &data_dir, lock);
         let status = tray_status.unwrap_or(status);
@@ -334,6 +336,7 @@ impl App {
             focus_password: false,
             server: ServerSettings::load(&data_dir),
             device_code: None,
+            register_failed: false,
             net: None,
             os,
             guide: guide(os, perms),
@@ -352,7 +355,7 @@ impl App {
             views: Vec::new(),
             files: {
                 // PEERDESK_GUI_FILES=1：启动就打开文件管理（截图用）
-                let mut w = super::files_window::FilesWindow::new(default_data_dir());
+                let mut w = super::files_window::FilesWindow::new(default_data_dir(), s);
                 w.open = std::env::var_os("PEERDESK_GUI_FILES").is_some();
                 w
             },
@@ -393,11 +396,13 @@ impl App {
             Ok(port) => port,
             Err(e) => return self.status = Status::error(e),
         };
-        let server = match self.server.server(s) {
-            Ok(server) => server,
-            Err(e) => return self.status = Status::error(e),
+        // 自己的服务器填错了：照常开启（同一网络里能用 IP 连），说清楚没有设备码的原因
+        let (server, problem) = match self.server.server(s) {
+            Ok(server) => (Some(server), None),
+            Err(e) => (None, Some(e)),
         };
         self.device_code = None;
+        self.register_failed = false;
         let config = HostConfig {
             port,
             data_dir: self.data_dir.clone(),
@@ -410,7 +415,7 @@ impl App {
             Arc::clone(&self.repaint),
         ));
         self.phase = HostPhase::Starting;
-        self.status = Status::info(s.host_starting);
+        self.status = problem.map_or_else(|| Status::info(s.host_starting), Status::error);
         self.addrs = lan_addresses();
     }
 
@@ -498,6 +503,9 @@ impl App {
         for event in events {
             if let HostEvent::Registered { code, .. } = event {
                 self.device_code = Some(code);
+            }
+            if let HostEvent::RegisterFailed(_) = &event {
+                self.register_failed = true;
             }
             if let HostEvent::Network(report) = &event {
                 self.net = Some(report.clone());
@@ -779,7 +787,7 @@ impl App {
                 egui::Label::new(text(badge.hint, font::SMALL, Weight::Regular).color(p.muted))
                     .wrap(),
             );
-            if !self.server.is_set()
+            if self.server.server(s).is_err()
                 && self.service.is_none()
                 && link_button(ui, p, s.go_settings).clicked()
             {
@@ -838,10 +846,16 @@ impl App {
                 signal: Signal::Direct,
                 hint: s.unattended_hint,
             },
-            None => host_badge(&self.phase, self.server.is_set(), self.guide.ready, s),
+            None => host_badge(
+                &self.phase,
+                self.server.server(s).is_ok(),
+                self.guide.ready,
+                s,
+            ),
         };
         let code = service.unwrap_or(self.device_code);
-        let waiting = service.is_some() || (self.phase.is_on() && self.server.is_set());
+        let waiting = service.is_some()
+            || (self.phase.is_on() && self.server.server(s).is_ok() && !self.register_failed);
         panel(ui, p, |ui| {
             let wide = ui.available_width() >= THIS_PC_WIDE;
             ui.horizontal(|ui| {
@@ -879,38 +893,66 @@ impl App {
             return;
         };
         let colors = p.signal(line.signal);
-        let mut clicked = false;
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = space::S10;
-            match line.action {
-                LineAction::Cancel => {
-                    ui.add(egui::Spinner::new().size(font::SUBTITLE).color(p.ink));
-                    ui.label(RichText::new(&line.text).color(p.ink));
-                    clicked = link_button(ui, p, s.cancel).clicked();
+        let mut clicked = None;
+        if line.actions.contains(&LineAction::Cancel) {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = space::S10;
+                ui.add(egui::Spinner::new().size(font::SUBTITLE).color(p.ink));
+                let shown = ui.label(RichText::new(&line.text).color(p.ink));
+                if !line.details.is_empty() {
+                    let _ = shown.on_hover_text(&line.details);
                 }
-                LineAction::Retry => {
-                    ui.label(RichText::new(icon::WARNING).color(colors.solid));
-                    // 先放右边的按钮，原因用剩下的宽度，放不下就换行
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        clicked = link_button(ui, p, s.retry).clicked();
-                        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                            ui.add(
-                                egui::Label::new(RichText::new(&line.text).color(colors.text))
-                                    .wrap(),
-                            );
-                        });
+                if link_button(ui, p, s.cancel).clicked() {
+                    clicked = Some(LineAction::Cancel);
+                }
+            });
+        } else {
+            // 一句原因（红），一句办法（灰），按钮；原文收在“详情”里，可以复制
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = space::S10;
+                ui.label(RichText::new(icon::WARNING).color(colors.solid));
+                ui.add(egui::Label::new(RichText::new(&line.text).color(colors.text)).wrap());
+            });
+            if !line.fix.is_empty() {
+                ui.add(egui::Label::new(RichText::new(&line.fix).color(p.muted)).wrap());
+            }
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = space::S14;
+                for action in &line.actions {
+                    if link_button(ui, p, action.label(s)).clicked() {
+                        clicked = Some(*action);
+                    }
+                }
+            });
+            if !line.details.is_empty() {
+                egui::CollapsingHeader::new(RichText::new(s.details).color(p.muted))
+                    .id_salt("connect-details")
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(&line.details).monospace().color(p.muted),
+                            )
+                            .wrap(),
+                        );
                     });
+            }
+        }
+        match clicked {
+            Some(LineAction::Cancel) => {
+                if let Some(view) = self.views.get_mut(index) {
+                    view.0.stop();
                 }
             }
-        });
-        if clicked {
-            if let Some(view) = self.views.get_mut(index) {
-                view.0.stop();
-            }
-            if line.action == LineAction::Retry {
+            Some(LineAction::Retry) => {
+                if let Some(view) = self.views.get_mut(index) {
+                    view.0.stop();
+                }
                 self.views.remove(index);
                 self.connect_from_form();
             }
+            Some(LineAction::ServerSettings) => self.page = Page::Settings,
+            Some(LineAction::CopyDetails) => self.copy(ui, &line.details),
+            None => {}
         }
     }
 
@@ -1554,20 +1596,65 @@ impl App {
         panel(ui, p, |ui| {
             section_title(ui, s.section_server, |_| {});
             let _ = muted(ui, p, s.via_server);
-            ui.add_space(space::S6);
-            let mut save = false;
-            for (label, value, secret) in [
-                (s.server_addr, &mut self.server.addr, false),
-                (s.server_pin, &mut self.server.pin, false),
-                (s.account_token, &mut self.server.account, true),
-            ] {
-                ui.add_space(space::S4);
-                let _ = muted(ui, p, label);
-                let r = big_input(ui, p, value, "", secret);
-                save |= r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            }
             ui.add_space(space::S8);
-            save |= primary_button(ui, p, s.save, ControlSize::Medium, true).clicked();
+            // 现在用的是哪个服务器、连上没有（默认官方服务器，什么都不用填）
+            let registered = self.device_code.is_some()
+                || self
+                    .service
+                    .as_ref()
+                    .is_some_and(|st| st.running && st.code.is_some());
+            let (state, signal) = server_badge(self.server.server(s).is_ok(), registered, s);
+            let in_use = if self.server.is_custom() {
+                format!("{}：{}", s.server_custom, self.server.addr.trim())
+            } else {
+                s.server_official.to_owned()
+            };
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = space::S8;
+                let _ = dot(ui, p, signal);
+                ui.label(text(&in_use, font::BODY, Weight::Semibold));
+                ui.label(text(state, font::SMALL, Weight::Regular).color(p.muted));
+            });
+            ui.add_space(space::S10);
+            // 自建服务器、指纹、会员令牌收在“高级”里；填了自己的服务器时默认展开
+            let mut save = false;
+            let mut official = false;
+            egui::CollapsingHeader::new(text(s.section_advanced, font::BODY, Weight::Semibold))
+                .id_salt("server-advanced")
+                .default_open(self.server.is_custom())
+                .show(ui, |ui| {
+                    ui.label(text(s.own_server, font::BODY, Weight::Semibold));
+                    ui.add(
+                        egui::Label::new(
+                            text(s.own_server_hint, font::SMALL, Weight::Regular).color(p.muted),
+                        )
+                        .wrap(),
+                    );
+                    for (label, value, secret) in [
+                        (s.server_addr, &mut self.server.addr, false),
+                        (s.server_pin, &mut self.server.pin, false),
+                        (s.account_token, &mut self.server.account, true),
+                    ] {
+                        ui.add_space(space::S4);
+                        let _ = muted(ui, p, label);
+                        let r = big_input(ui, p, value, "", secret);
+                        save |= r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    }
+                    ui.add_space(space::S8);
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = space::S10;
+                        save |= primary_button(ui, p, s.save, ControlSize::Medium, true).clicked();
+                        if self.server.is_custom() {
+                            official =
+                                secondary_button(ui, p, s.use_official, ControlSize::Medium, true)
+                                    .clicked();
+                        }
+                    });
+                });
+            if official {
+                self.server.use_official();
+                save = true;
+            }
             if save {
                 self.status = match self.server.server(s) {
                     Err(e) => Status::error(e),
@@ -1984,7 +2071,7 @@ impl App {
                     .service
                     .as_ref()
                     .is_some_and(|st| st.running && st.code.is_some());
-            let (label, signal) = server_badge(self.server.is_set(), registered, s);
+            let (label, signal) = server_badge(self.server.server(s).is_ok(), registered, s);
             indent(ui, &mut |ui| {
                 ui.spacing_mut().item_spacing.x = space::S8;
                 let _ = dot(ui, p, signal);
@@ -2012,13 +2099,18 @@ impl App {
         } else {
             (icon::INFO, p.muted)
         };
+        let line = self.status.line(self.s);
+        let details = self.status.details().to_owned();
         ui.horizontal(|ui| {
             ui.label(RichText::new(glyph).color(color));
-            ui.label(
-                RichText::new(&self.status.text)
-                    .size(font::SMALL)
-                    .color(color),
-            );
+            let shown = ui.label(RichText::new(&line).size(font::SMALL).color(color));
+            // 原文（常常是英文的系统错误）不直接显示：悬停可见，可以复制给开发者
+            if !details.is_empty() {
+                let _ = shown.on_hover_text(&details);
+                if link_button(ui, p, self.s.copy_details).clicked() {
+                    self.copy(ui, &details);
+                }
+            }
         });
     }
 }

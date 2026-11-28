@@ -496,6 +496,8 @@ pub struct FileSender {
     next_index: usize,
     outcomes: Vec<Option<Outcome>>,
     bytes_sent: u64,
+    /// 对方中止传输时给的原因。
+    peer_abort: Option<String>,
 }
 
 impl FileSender {
@@ -519,6 +521,7 @@ impl FileSender {
             next_index: 0,
             outcomes: vec![None; n],
             bytes_sent: 0,
+            peer_abort: None,
         })
     }
 
@@ -585,8 +588,9 @@ impl FileSender {
                 *slot = Some(if *ok { Outcome::Done } else { Outcome::Failed });
                 Ok(())
             }
-            (FileMsg::Abort { .. }, _) => {
+            (FileMsg::Abort { reason }, _) => {
                 self.state = SendState::Aborted;
+                self.peer_abort = Some(reason.clone());
                 Ok(())
             }
             (
@@ -677,6 +681,12 @@ impl FileSender {
     #[must_use]
     pub const fn is_aborted(&self) -> bool {
         matches!(self.state, SendState::Aborted)
+    }
+
+    /// 对方中止传输时给的原因（例如对方磁盘满了、不允许传文件）；对方没有中止时为 `None`。
+    #[must_use]
+    pub fn peer_aborted(&self) -> Option<&str> {
+        self.peer_abort.as_deref()
     }
 
     /// 本次实际发送的字节数（续传时不含对方已有的部分）。

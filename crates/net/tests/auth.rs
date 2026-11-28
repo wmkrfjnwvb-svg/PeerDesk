@@ -14,6 +14,7 @@ use peerdesk_core::session::SessionConfig;
 use peerdesk_net::controller::{self, ControllerOptions, ControllerReport, ScreenSink, Upload};
 use peerdesk_net::demo::DemoDesktop;
 use peerdesk_net::host::{self, HostOptions, HostReport, InputSink, Permissions};
+use peerdesk_net::reason::Reason;
 use peerdesk_net::{Identity, NetError, Node};
 use tokio::sync::mpsc;
 
@@ -159,7 +160,11 @@ async fn correct_password_gets_in_wrong_password_does_not() {
 
     let (c, h, injected) = attempt(&w, pw("correct horse"), pw("wrong guess"), |_| {}, None).await;
     match c {
-        Err(NetError::Connect(why)) => assert!(why.contains("密码错误"), "{why}"),
+        Err(e @ NetError::Connect(_)) => {
+            assert!(e.to_string().contains("密码错误"), "{e}");
+            // 界面按原因说人话：真实的错误认得出是密码错
+            assert_eq!(Reason::of_error(&e), Reason::WrongPassword);
+        }
         other => panic!("{other:?}"),
     }
     assert!(matches!(h, Err(NetError::Connect(_))));
@@ -182,7 +187,10 @@ async fn repeated_failures_lock_out_even_the_right_password() {
     let (c, h, injected) =
         attempt(&w, pw("correct horse"), pw("correct horse"), |_| {}, None).await;
     match c {
-        Err(NetError::Connect(why)) => assert!(why.contains("锁定"), "{why}"),
+        Err(e @ NetError::Connect(_)) => {
+            assert!(e.to_string().contains("锁定"), "{e}");
+            assert_eq!(Reason::of_error(&e), Reason::Locked);
+        }
         other => panic!("{other:?}"),
     }
     match h {

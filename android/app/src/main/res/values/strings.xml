@@ -4,21 +4,17 @@
 
     <!-- 连接页 -->
     <string name="connect_title">Connect to a computer</string>
-    <string name="connect_server">Server</string>
     <string name="connect_server_hint">host:port</string>
     <string name="connect_code">Device code</string>
     <string name="connect_password">Password</string>
     <string name="connect_button">Connect</string>
     <string name="connect_bad_code">The device code has 9 digits.</string>
     <string name="connect_background_note">PeerDesk disconnects when you leave the app. Come back and connect again.</string>
-    <string name="connect_failed">Could not connect: %1$s</string>
-    <string name="connect_ended">Session ended: %1$s</string>
     <string name="connect_ended_background">Disconnected because the app went to the background. Connect again to continue.</string>
     <string name="connect_no_surface">The display surface is not available. Close the app and open it again.</string>
 
     <!-- 会话页 -->
     <string name="session_connecting">Connecting…</string>
-    <string name="session_reconnecting">Connection lost, reconnecting (attempt %1$d): %2$s</string>
     <string name="toolbar_disconnect">Disconnect</string>
     <string name="toolbar_keyboard">Keyboard</string>
     <string name="toolbar_hide">Hide toolbar</string>
@@ -53,4 +49,55 @@
     <string name="key_cmd">Cmd</string>
     <string name="connect_show_password">Show password</string>
     <string name="connect_hide_password">Hide password</string>
+
+    <!-- 连接页：服务器默认官方的，自己的服务器收在“高级”里；失败提示的按钮和详情 -->
+    <string name="connect_server">Server address</string>
+    <string name="connect_server_note">Leave empty to use the official server. Only needed if you run your own PeerDesk server.</string>
+    <string name="connect_server_official">Server: official server (default)</string>
+    <string name="connect_server_custom">Server: your own server %1$s</string>
+    <string name="connect_advanced">Advanced: use your own server</string>
+    <string name="connect_advanced_hide">Hide advanced settings</string>
+    <string name="action_retry">Try again</string>
+    <string name="action_server_settings">Server settings</string>
+    <string name="details_show">Details</string>
+    <string name="details_hide">Hide details</string>
+    <string name="details_copy">Copy details</string>
+    <string name="session_reconnecting">Connection lost, reconnecting (attempt %1$d)</string>
+    <string name="session_reconnecting_why">Connection lost, reconnecting (attempt %1$d): %2$s</string>
+
+    <!-- 失败、结束的原因：一句原因、一句办法。代号见 crates/net/src/reason.rs，文字和桌面端 reasons.rs 相同 -->
+    <string name="reason_no_route_cause">Could not reach the other computer: no response, and no usable route.</string>
+    <string name="reason_no_route_fix">Make sure it is on and “Allow incoming connections” is turned on, then try again. If it still fails, send us the details.</string>
+    <string name="reason_device_offline_cause">The other device is offline, or the device code is wrong.</string>
+    <string name="reason_device_offline_fix">Check the code. Ask them to open PeerDesk and keep the computer online and awake.</string>
+    <string name="reason_server_unreachable_cause">Could not reach the server.</string>
+    <string name="reason_server_unreachable_fix">Check your network. If you use your own server, check its address.</string>
+    <string name="reason_wrong_password_cause">The password is wrong.</string>
+    <string name="reason_wrong_password_fix">Ask for the current password (an old one stops working once it is changed), enter it and try again.</string>
+    <string name="reason_locked_cause">Too many wrong passwords, so the other device is not accepting connections for now.</string>
+    <string name="reason_locked_fix">Wait a few minutes, check the password and try again.</string>
+    <string name="reason_busy_cause">The other device is being controlled by someone else.</string>
+    <string name="reason_busy_fix">Try again after that session ends.</string>
+    <string name="reason_declined_cause">The other device declined the connection.</string>
+    <string name="reason_declined_fix">Ask them to allow the connection and try again. The details say why.</string>
+    <string name="reason_host_permission_cause">The other computer cannot share its screen or keyboard and mouse right now: a permission (screen recording, accessibility) may be missing, or it is locked.</string>
+    <string name="reason_host_permission_fix">Ask them to grant the permissions in PeerDesk or unlock the screen, then try again.</string>
+    <string name="reason_version_cause">The two PeerDesk versions are not compatible.</string>
+    <string name="reason_version_fix">Update PeerDesk on both devices to the latest version.</string>
+    <string name="reason_identity_mismatch_cause">The other device\'s identity does not match the one on record: it may be the wrong device, or someone may be impersonating it.</string>
+    <string name="reason_identity_mismatch_fix">Do not continue. Check the device code or fingerprint with them.</string>
+    <string name="reason_peer_closed_cause">The other side ended the session.</string>
+    <string name="reason_peer_closed_fix">You can connect again when needed.</string>
+    <string name="reason_peer_quit_cause">The other side quit PeerDesk.</string>
+    <string name="reason_peer_quit_fix">Ask them to open PeerDesk again, then reconnect.</string>
+    <string name="reason_network_lost_cause">The network connection dropped (the network may have changed, or Wi-Fi disconnected).</string>
+    <string name="reason_network_lost_fix">Check the network and try again. PeerDesk reconnects automatically a few times first.</string>
+    <string name="reason_relay_quota_cause">The free relay traffic allowance is used up for now.</string>
+    <string name="reason_relay_quota_fix">Try again in a few minutes. Direct connections are not limited.</string>
+    <string name="reason_port_in_use_cause">The port on this computer is in use (maybe another PeerDesk is running).</string>
+    <string name="reason_port_in_use_fix">Close the other PeerDesk, or pick another port in Settings.</string>
+    <string name="reason_cancelled_cause">You disconnected.</string>
+    <string name="reason_cancelled_fix">You can connect again when needed.</string>
+    <string name="reason_other_cause">Something unexpected went wrong.</string>
+    <string name="reason_other_fix">Try again. If it keeps happening, send us the details.</string>
 </resources>

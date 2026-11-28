@@ -609,8 +609,10 @@ pub enum ViewEvent {
     Reconnecting {
         /// 第几次重连。
         attempt: u32,
-        /// 断开的原因。
+        /// 断开的原因（原文）。
         why: String,
+        /// 为什么在重连（网络断了，或者重拨失败的原因）。
+        reason: peerdesk_net::reason::Reason,
     },
     /// 服务器的通知（例如免费额度用完），会话随之结束。
     Notice(String),
@@ -637,7 +639,15 @@ impl From<viewer::ViewEvent> for ViewEvent {
                 route,
                 detail,
             },
-            viewer::ViewEvent::Reconnecting { attempt, why } => Self::Reconnecting { attempt, why },
+            viewer::ViewEvent::Reconnecting {
+                attempt,
+                why,
+                reason,
+            } => Self::Reconnecting {
+                attempt,
+                why,
+                reason,
+            },
             viewer::ViewEvent::Notice(text) => Self::Notice(text),
             viewer::ViewEvent::Clipboard(note) => Self::Clipboard(note),
             viewer::ViewEvent::Quality(q) => Self::Quality(q),

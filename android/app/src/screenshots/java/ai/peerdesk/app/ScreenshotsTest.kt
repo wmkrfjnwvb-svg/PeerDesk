@@ -121,18 +121,33 @@ class ScreenshotsTest {
     private fun shots(): List<Shot> = buildList {
         // ---- 连接页 ----
         add(Shot("empty", "connect") { e -> ConnectScreen(connect(), e.vm) })
+        // 服务器默认官方的：只填设备码和密码
         add(Shot("filled", "connect") { e ->
-            ConnectScreen(connect(UiState(server = "203.0.113.10:4433", code = "123456789", password = "hunter2")), e.vm)
+            ConnectScreen(connect(UiState(code = "123456789", password = "hunter2")), e.vm)
+        })
+        // 自建服务器的用户：在“高级”里填了自己的服务器
+        add(Shot("own-server", "connect") { e ->
+            ConnectScreen(connect(UiState(server = "203.0.113.10:4433", code = "123456789", password = "hunter2", advancedOpen = true)), e.vm)
         })
         add(Shot("invalid-code", "connect") { e ->
-            ConnectScreen(connect(UiState(server = "203.0.113.10:4433", code = "1234", password = "hunter2")), e.vm)
+            ConnectScreen(connect(UiState(code = "1234", password = "hunter2")), e.vm)
         })
-        val filled = UiState(server = "203.0.113.10:4433", code = "123456789", password = "hunter2")
+        val filled = UiState(code = "123456789", password = "hunter2")
+        // 失败、结束的原文用核心真实会给的（详情里），界面只按原因说人话
         add(Shot("ended-connect-failed", "connect") { e ->
-            ConnectScreen(connect(filled.copy(notice = EndNotice.ConnectFailed("connection timed out after 10 s: no route to the device"))), e.vm)
+            ConnectScreen(connect(filled.copy(notice = EndNotice.ConnectFailed(Reason.NoRoute, "超时：握手"))), e.vm)
         })
         add(Shot("ended-disconnected-by-peer", "connect") { e ->
-            ConnectScreen(connect(filled.copy(notice = EndNotice.Ended("the other side closed the session"))), e.vm)
+            ConnectScreen(connect(filled.copy(notice = EndNotice.Ended(Reason.PeerClosed, "对端结束会话"))), e.vm)
+        })
+        add(Shot("ended-wrong-password", "connect") { e ->
+            ConnectScreen(connect(filled.copy(notice = EndNotice.ConnectFailed(Reason.WrongPassword, "连接失败：密码错误，或被控端需要密码"))), e.vm)
+        })
+        add(Shot("ended-device-offline", "connect") { e ->
+            ConnectScreen(connect(filled.copy(notice = EndNotice.ConnectFailed(Reason.DeviceOffline, "连接失败：设备码 123 456 789 不存在或设备不在线"))), e.vm)
+        })
+        add(Shot("ended-server-unreachable", "connect") { e ->
+            ConnectScreen(connect(filled.copy(notice = EndNotice.ConnectFailed(Reason.ServerUnreachable, "连不上服务器：超时：握手"))), e.vm)
         })
         add(Shot("ended-background", "connect") { e ->
             ConnectScreen(connect(filled.copy(notice = EndNotice.Background)), e.vm)
@@ -143,7 +158,7 @@ class ScreenshotsTest {
         add(Shot("with-export-button", "connect") { e ->
             // 导出按钮在有手势记录（或日志）时显示：往 vm 的记录里放一条
             e.vm.trace.addMotion(1L, 0, 0, intArrayOf(0), floatArrayOf(1f), floatArrayOf(1f))
-            ConnectScreen(connect(filled.copy(notice = EndNotice.Ended("the other side closed the session"))), e.vm)
+            ConnectScreen(connect(filled.copy(notice = EndNotice.Ended(Reason.PeerClosed, "对端结束会话"))), e.vm)
         })
 
         // ---- 会话页 ----
@@ -159,7 +174,10 @@ class ScreenshotsTest {
         })
         add(Shot("toolbar-hidden", "session") { e -> Remote(e, session(e) { copy(toolbarVisible = false) }) })
         add(Shot("reconnecting", "session") { e ->
-            Remote(e, session(e) { copy(reconnecting = CoreEvent.Reconnecting(2, "network changed (Wi-Fi to mobile data)")) })
+            Remote(e, session(e) { copy(reconnecting = CoreEvent.Reconnecting(2, "connection lost：10 秒没有收到对端的数据", Reason.NetworkLost)) })
+        })
+        add(Shot("reconnecting-device-offline", "session") { e ->
+            Remote(e, session(e) { copy(reconnecting = CoreEvent.Reconnecting(3, "连接失败：设备不在线", Reason.DeviceOffline)) })
         })
         add(Shot("connecting-no-picture", "session") { e ->
             Remote(e, session(e) { copy(connected = false, quality = null, peer = null, route = Route.Unknown) }, placeholder = false)

@@ -199,6 +199,10 @@ async fn full_session_video_input_and_files() {
     assert!(host_report.trace.contains("accept_sent"));
     assert_eq!(report.end, "到达时长上限");
     assert_eq!(host_report.end, "对端结束会话");
+    assert_eq!(
+        peerdesk_net::reason::Reason::of_text(&host_report.end),
+        peerdesk_net::reason::Reason::PeerClosed
+    );
 
     // 画面：H.264 是有损的，观看端最终看到的与被控端的桌面在亮度上足够接近
     let seen = report.screen.clone().unwrap_or_else(|| {

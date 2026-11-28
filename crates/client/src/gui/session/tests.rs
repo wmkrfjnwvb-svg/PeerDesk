@@ -1,7 +1,8 @@
 //! 会话线程的端到端测试：同一进程里一个被控端、一个或几个控制端，走真实的 QUIC。
 
 use super::*;
-use crate::gui::form::end_text;
+use crate::gui::state::Status;
+use peerdesk_net::reason::{Failure, Reason};
 use peerdesk_net::rendezvous::{Lookup, PathPolicy};
 use peerdesk_net::service::{RelayService, SignalService};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -842,18 +843,21 @@ fn quit_test(host_quits: bool) {
     };
     assert_eq!(end, peerdesk_net::node::END_PEER_QUIT);
     // 界面上显示人话，不是 closed by peer
-    assert_eq!(end_text(&end, &ZH), "连接已断开：对方退出了 PeerDesk");
+    let shown = Status::ended(Failure::of_text(&end), &ZH);
+    assert_eq!(shown.text, "对方退出了 PeerDesk。");
     assert_eq!(
-        end_text(&end, &EN),
-        "Disconnected: the other side quit PeerDesk"
+        Status::ended(Failure::of_text(&end), &EN).text,
+        "The other side quit PeerDesk."
     );
     // 握手阶段或别处报成连接错误时也一样
     let closed = NetError::Closed(format!(
         "closed by peer: {}",
         peerdesk_net::node::QUIT_REASON
     ));
-    assert_eq!(crate::gui::form::explain(&closed, &ZH), ZH.peer_quit);
-    assert!(!ZH.peer_quit.contains("closed by peer"));
+    assert_eq!(Reason::of_error(&closed), Reason::PeerQuit);
+    assert!(!Status::failed(Failure::of_error(&closed), &ZH)
+        .text
+        .contains("closed by peer"));
 }
 
 /// 在 `started` 之后 1 秒内等到想要的事件。

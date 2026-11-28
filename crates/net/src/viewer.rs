@@ -25,6 +25,7 @@ use crate::audio::AudioOut;
 use crate::clipsync::{ClipNote, ClipboardHandle};
 use crate::controller::{self, ControllerOptions, LinkHook, LinkQuality, ScreenSink};
 use crate::identity::to_hex;
+use crate::reason::{Failure, Reason};
 use crate::recorder::{new_visit_id, RecordSetup, ViewRecordSetup};
 use crate::rendezvous::{
     dial_via, fetch_nodes, Dialed, Lookup, Path as Route, PathPolicy, Server, Shim,
@@ -108,8 +109,10 @@ pub enum ViewEvent {
     Reconnecting {
         /// 第几次重连。
         attempt: u32,
-        /// 断开的原因。
+        /// 断开的原因（原文，界面放进详情）。
         why: String,
+        /// 为什么在重连：网络断了；重拨也失败时是重拨失败的原因（例如对方不在线了）。
+        reason: Reason,
     },
     /// 服务器的通知（例如免费额度用完），访问随之结束。
     Notice(String),
@@ -147,26 +150,30 @@ pub trait ViewEnv: Send + Sync {
     }
 }
 
-/// 会话结束的原因是不是网络断了（应当换通道重连），而不是对方或自己结束的。
+/// 会话结束的原因是不是网络断了（应当换通道重连），而不是对方或自己结束的（见 [`crate::reason`]）。
+pub use crate::reason::network_lost;
+
+/// 一次访问的结果给界面看的原因：自己断开的是 [`Reason::Cancelled`]，正常结束看结束原因，出错看错误。
 #[must_use]
-pub fn network_lost(end: &str) -> bool {
-    [
-        "timed out",
-        "超时",
-        "connection lost",
-        "reset",
-        "closed by peer: 0",
-    ]
-    .iter()
-    .any(|k| end.contains(k))
-        && !end.contains("对端结束会话")
+pub fn visit_failure(result: &Result<Summary, NetError>) -> Failure {
+    match result {
+        Ok(summary) if summary.cancelled => Failure {
+            reason: Reason::Cancelled,
+            details: summary.end.clone(),
+        },
+        Ok(summary) => Failure::of_text(&summary.end),
+        Err(e) => Failure::of_error(e),
+    }
 }
 
 /// 免费额度用完时给用户看的话。
 #[must_use]
 pub fn free_limit_text(retry_secs: u32) -> String {
     let minutes = retry_secs.div_ceil(60).max(1);
-    format!("免费服务器拥挤，请约 {minutes} 分钟后重试（免费用户每 10 分钟的中继流量有限额）")
+    format!(
+        "{}，请约 {minutes} 分钟后重试（免费用户每 10 分钟的中继流量有限额）",
+        crate::reason::FREE_LIMIT
+    )
 }
 
 /// 要试的服务器：用户配置的那个在前，然后是缓存的其他节点（去重）。
@@ -396,7 +403,11 @@ pub async fn drive(
                     .unwrap_or_else(PoisonError::into_inner)
                     .note_lost();
                 crate::note!(warn, "控制：网络断开（{why}），第 {attempt} 次重连");
-                env.event(ViewEvent::Reconnecting { attempt, why });
+                env.event(ViewEvent::Reconnecting {
+                    attempt,
+                    why,
+                    reason: Reason::NetworkLost,
+                });
                 tokio::time::sleep(RECONNECT_GAP).await;
             }
             Ok(Outcome::Lost(why)) => break Err(NetError::Closed(why)),
@@ -406,6 +417,7 @@ pub async fn drive(
                 env.event(ViewEvent::Reconnecting {
                     attempt,
                     why: e.to_string(),
+                    reason: Reason::of_error(&e),
                 });
                 tokio::time::sleep(RECONNECT_GAP).await;
             }
@@ -628,6 +640,22 @@ mod tests {
         assert!(network_lost("timed out") && network_lost("connection lost"));
         assert!(!network_lost("对端结束会话：timed out") && !network_lost("用户结束"));
         assert!(free_limit_text(0).contains("约 1 分钟"));
+        assert_eq!(Reason::of_text(&free_limit_text(30)), Reason::RelayQuota);
+        let cancelled = Summary {
+            cancelled: true,
+            ..Summary::default()
+        };
+        assert_eq!(visit_failure(&Ok(cancelled)).reason, Reason::Cancelled);
+        let ended = Summary {
+            end: crate::reason::PEER_ENDED.into(),
+            ..Summary::default()
+        };
+        assert_eq!(visit_failure(&Ok(ended)).reason, Reason::PeerClosed);
+        let failed = visit_failure(&Err(NetError::Timeout("握手")));
+        assert_eq!(
+            (failed.reason, failed.details.as_str()),
+            (Reason::NoRoute, "超时：握手")
+        );
         assert!(free_limit_text(61).contains("约 2 分钟"));
         let s = |port: u16| Server {
             addr: SocketAddr::from(([1, 2, 3, 4], port)),

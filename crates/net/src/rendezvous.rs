@@ -3,7 +3,7 @@
 //! 标准的 QUIC 库不能给一条已有的连接换对端地址，所以直连和中继是两条独立的连接尝试，
 //! 这里选能用的那条。会话建立之后从中继切换到直连在应用层做（另建连接后把会话搬过去）。
 
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -56,6 +56,31 @@ pub struct Server {
     pub addr: SocketAddr,
     /// 服务器的证书指纹；给了就必须一致。
     pub pin: Option<Fingerprint>,
+}
+
+/// 官方服务器：桌面端、手机端没有填自己的服务器时用它（登记拿设备码、按设备码找设备），
+/// 崩溃报告、无人值守代理没有配置时也用它。地址只写在这里一处。
+///
+/// 只有地址：连接时不额外发送任何用户信息（登记只带本机的候选地址，和自建服务器一样）。
+/// 不核对证书指纹：测试版服务器的证书还会更换；会话本身仍按设备指纹核对对方身份。
+pub const OFFICIAL_SERVER: Server = Server {
+    addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(47, 95, 203, 214), 4433)),
+    pin: None,
+};
+
+/// 连服务器失败：说成“连不上服务器”（[`NetError::Unreachable`]），界面据此提示检查网络和服务器地址。
+/// 指纹不符不改：那是服务器身份的问题，不能说成网络问题。
+fn unreachable(e: NetError) -> NetError {
+    match e {
+        e @ (NetError::PinMismatch { .. } | NetError::Unreachable(_)) => e,
+        e @ (NetError::Core(_)
+        | NetError::Io(_)
+        | NetError::Tls(_)
+        | NetError::Connect(_)
+        | NetError::Closed(_)
+        | NetError::Protocol(_)
+        | NetError::Timeout(_)) => NetError::Unreachable(e.to_string()),
+    }
 }
 
 /// 连接走的是哪条路。
@@ -258,7 +283,11 @@ pub async fn register_with(
     server: &Server,
     extra: Vec<Candidate>,
 ) -> Result<Registration, NetError> {
-    let link = Arc::new(node.connect(server.addr, server.pin.as_ref()).await?);
+    let link = Arc::new(
+        node.connect(server.addr, server.pin.as_ref())
+            .await
+            .map_err(unreachable)?,
+    );
     let (mut send, mut recv) = link.open_stream().await?;
     write_kind(&mut send, StreamKind::Signal).await?;
     let mut locals = extra;
@@ -493,7 +522,7 @@ pub async fn dial_via(
             }
         }
     }
-    Err(last)
+    Err(unreachable(last))
 }
 
 /// 问一个服务器集群里有哪些节点（用于故障切换）。节点的指纹来自这个已经核对过身份的服务器。

@@ -15,6 +15,8 @@ use peerdesk_core::browse::{Reply, Request};
 use peerdesk_net::Link;
 
 use super::files::{child, duration_text, parent, size_text, time_text, Pane};
+use super::i18n::Strings;
+use super::reasons::transfer_failed;
 use super::theme::{font, icon, space, Palette};
 use super::transfers::{Direction, Queue, Runner, State};
 
@@ -68,6 +70,8 @@ pub struct FilesWindow {
     naming: Option<(Side, bool, String)>,
     expanded: BTreeSet<u64>,
     note: Option<String>,
+    /// 界面文字（传输失败的原因按语言说）。
+    s: &'static Strings,
 }
 
 impl std::fmt::Debug for FilesWindow {
@@ -85,7 +89,7 @@ fn local_list(pane: &mut Pane, path: &str) {
 impl FilesWindow {
     /// 创建（读回上次的传输记录，本机栏打开主目录）。
     #[must_use]
-    pub fn new(data_dir: PathBuf) -> Self {
+    pub fn new(data_dir: PathBuf, s: &'static Strings) -> Self {
         let mut local = Pane {
             places: peerdesk_net::browse::places(),
             ..Pane::default()
@@ -107,6 +111,7 @@ impl FilesWindow {
             naming: None,
             expanded: BTreeSet::new(),
             note: None,
+            s,
         }
     }
 
@@ -605,11 +610,22 @@ impl FilesWindow {
                                 format!("完成：{n} 个文件，{}", size_text(total)),
                                 p.direct.text,
                             ),
-                            State::Failed(why) => (format!("失败：{why}"), p.problem.text),
+                            State::Failed(f) => (transfer_failed(f, self.s), p.problem.text),
                             State::Cancelled => ("已取消".to_owned(), p.muted),
                         };
                         ui.add(egui::ProgressBar::new(frac).desired_width(220.0));
-                        ui.label(RichText::new(text).color(color));
+                        let row = ui.label(RichText::new(text).color(color));
+                        // 失败：原文悬停可见，可以复制给开发者（行里只说原因和办法）
+                        if let State::Failed(f) = &t.state {
+                            let _ = row.on_hover_text(&f.details);
+                            if ui
+                                .small_button(icon::COPY)
+                                .on_hover_text(self.s.copy_details)
+                                .clicked()
+                            {
+                                ui.ctx().copy_text(f.details.clone());
+                            }
+                        }
                         match t.state {
                             State::Queued => {
                                 if ui

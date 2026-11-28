@@ -42,10 +42,30 @@ class EventsTest {
     }
 
     @Test fun reconnectingNoticeEnded() {
-        assertEquals(CoreEvent.Reconnecting(2, "wifi"), parseEvent("""{"type":"reconnecting","attempt":2,"why":"wifi"}"""))
-        assertEquals(CoreEvent.Notice("hi"), parseEvent("""{"type":"notice","text":"hi"}"""))
-        assertEquals(CoreEvent.Ended(false, "bad password"), parseEvent("""{"type":"ended","ok":false,"text":"bad password"}"""))
-        assertEquals(CoreEvent.Ended(true, ""), parseEvent("""{"type":"ended","ok":true,"text":""}"""))
+        assertEquals(
+            CoreEvent.Reconnecting(2, "wifi", Reason.DeviceOffline),
+            parseEvent("""{"type":"reconnecting","attempt":2,"why":"wifi","reason":"device_offline"}"""),
+        )
+        assertEquals(
+            CoreEvent.Notice("hi", Reason.RelayQuota),
+            parseEvent("""{"type":"notice","text":"hi","reason":"relay_quota"}"""),
+        )
+        assertEquals(
+            CoreEvent.Ended(false, "密码错误", Reason.WrongPassword),
+            parseEvent("""{"type":"ended","ok":false,"text":"密码错误","reason":"wrong_password"}"""),
+        )
+        assertEquals(
+            CoreEvent.Ended(true, "已断开", Reason.Cancelled),
+            parseEvent("""{"type":"ended","ok":true,"text":"已断开","reason":"cancelled"}"""),
+        )
+    }
+
+    /** 老核心发的事件没有 reason：照常解析，重连当作网络断了，其他当作“其他原因”。 */
+    @Test fun eventsWithoutReasonStillParse() {
+        assertEquals(CoreEvent.Reconnecting(2, "wifi", Reason.NetworkLost), parseEvent("""{"type":"reconnecting","attempt":2,"why":"wifi"}"""))
+        assertEquals(CoreEvent.Notice("hi", Reason.Other), parseEvent("""{"type":"notice","text":"hi"}"""))
+        assertEquals(CoreEvent.Ended(false, "x", Reason.Other), parseEvent("""{"type":"ended","ok":false,"text":"x"}"""))
+        assertEquals(CoreEvent.Ended(false, "x", Reason.Other), parseEvent("""{"type":"ended","ok":false,"text":"x","reason":"from_the_future"}"""))
     }
 
     @Test fun badInputIsNull() {

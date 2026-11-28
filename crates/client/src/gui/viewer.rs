@@ -307,6 +307,11 @@ impl Viewer {
                         let shown = pill(ui, &p, &state, color);
                         if let Some(hint) = net_hint {
                             let _ = shown.on_hover_text(hint);
+                        } else if let ViewPhase::Ended { status, .. } = &self.phase {
+                            // 结束的原文（详情）悬停可见
+                            if !status.details().is_empty() {
+                                let _ = shown.on_hover_text(status.details());
+                            }
                         }
                         ui.separator();
                         // 快捷键菜单（按被控端系统选键）
@@ -459,7 +464,16 @@ impl Viewer {
                     painter.image(texture.id(), rect, uv, Color32::WHITE);
                     picture = Some(rect);
                 } else {
-                    let headline = self.phase.headline(s);
+                    // 结束了：一句原因，下面一句办法
+                    let headline = match &self.phase {
+                        ViewPhase::Ended { status, .. } => match status.fix(s) {
+                            Some(fix) => format!("{}\n{fix}", status.text),
+                            None => status.text.clone(),
+                        },
+                        ViewPhase::Reconnecting { .. }
+                        | ViewPhase::Connecting
+                        | ViewPhase::Connected { .. } => self.phase.headline(s),
+                    };
                     let text = match &self.phase {
                         ViewPhase::Ended { .. } | ViewPhase::Reconnecting { .. } => {
                             headline.as_str()
@@ -491,10 +505,18 @@ impl Viewer {
 
         // 服务器通知（免费额度用完）：弹框，附升级会员的入口。
         if let ViewPhase::Ended {
-            notice: Some(text), ..
+            notice: Some(_),
+            status,
+            ..
         } = &self.phase
         {
-            let text = text.clone();
+            // 原因和办法按界面语言说；服务器的原文（带要等几分钟）放在下面一行
+            let text = format!(
+                "{}\n{}\n{}",
+                status.text,
+                status.fix(s).unwrap_or_default(),
+                status.details()
+            );
             egui::Window::new(s.busy_title)
                 .collapsible(false)
                 .resizable(false)

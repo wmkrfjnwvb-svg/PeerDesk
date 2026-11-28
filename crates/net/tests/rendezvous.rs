@@ -9,6 +9,7 @@ use peerdesk_core::crypto::Policy;
 use peerdesk_core::paths::{Candidate, PathKind};
 use peerdesk_core::proto::Channel;
 use peerdesk_core::signal::{Nat, PunchInfo, SignalMsg};
+use peerdesk_net::reason::Reason;
 use peerdesk_net::rendezvous::{answer, dial, register, Dialed, Lookup, Path, PathPolicy, Server};
 use peerdesk_net::service::{RelayService, SignalService};
 use peerdesk_net::stream::{read_kind, read_signal, write_kind, write_signal, StreamKind};
@@ -197,7 +198,10 @@ async fn offline_device_and_missing_relay_are_reported() {
     )
     .await
     {
-        Err(NetError::Connect(why)) => assert_eq!(why, "设备不在线"),
+        Err(e @ NetError::Connect(_)) => {
+            assert_eq!(e, NetError::Connect("设备不在线".into()));
+            assert_eq!(Reason::of_error(&e), Reason::DeviceOffline);
+        }
         other => panic!("{other:?}"),
     }
     // 设备在线，但服务器没有中继，又要求只走中继
@@ -248,6 +252,26 @@ async fn wrong_server_or_wrong_device_identity_is_refused() {
         register(&w.ctrl, &fake).await,
         Err(NetError::PinMismatch { .. })
     ));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_server_that_does_not_answer_is_called_unreachable() {
+    let w = world(false).await;
+    // 一个占着端口但从不回答的 UDP 套接字：像服务器停了、包被防火墙吞了
+    let silent = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let dead = Server {
+        addr: silent.local_addr().unwrap(),
+        pin: None,
+    };
+    let e = dial(&w.ctrl, &dead, &Lookup::Code(123_456_789), PathPolicy::Auto)
+        .await
+        .err()
+        .unwrap();
+    assert!(matches!(e, NetError::Unreachable(_)), "{e:?}");
+    assert!(e.to_string().starts_with("连不上服务器："), "{e}");
+    assert_eq!(Reason::of_error(&e), Reason::ServerUnreachable);
+    let e = register(&w.host, &dead).await.err().unwrap();
+    assert_eq!(Reason::of_error(&e), Reason::ServerUnreachable, "{e:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -546,7 +570,10 @@ async fn device_code_finds_the_registered_device() {
         code + 1
     };
     match dial(&w.ctrl, &w.server, &Lookup::Code(wrong), PathPolicy::Auto).await {
-        Err(NetError::Connect(why)) => assert!(why.contains("不存在"), "{why}"),
+        Err(e @ NetError::Connect(_)) => {
+            assert!(e.to_string().contains("不存在"), "{e}");
+            assert_eq!(Reason::of_error(&e), Reason::DeviceOffline);
+        }
         other => panic!("{other:?}"),
     }
 }

@@ -20,8 +20,21 @@ pub struct FsStore {
     root: PathBuf,
 }
 
+/// 磁盘满了时，存储错误原文的开头（放在最前面：中止传输时原因只送前 60 个字给对方）。
+pub const DISK_FULL: &str = "磁盘空间不足";
+/// 没有权限时，存储错误原文的开头。
+pub const NO_PERMISSION: &str = "没有权限";
+
 fn storage(what: &str, path: &Path, e: &std::io::Error) -> Error {
-    Error::Storage(format!("{what} {}：{e}", path.display()))
+    let kind = e.kind();
+    let tag = if kind == std::io::ErrorKind::StorageFull {
+        format!("{DISK_FULL}：")
+    } else if kind == std::io::ErrorKind::PermissionDenied {
+        format!("{NO_PERMISSION}：")
+    } else {
+        String::new()
+    };
+    Error::Storage(format!("{tag}{what} {}：{e}", path.display()))
 }
 
 fn read_at(path: &Path, offset: u64, len: usize) -> Result<Vec<u8>, Error> {
@@ -177,6 +190,28 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn storage_errors_lead_with_the_kind() {
+        use std::io::{Error as IoError, ErrorKind};
+        let path = Path::new("/x/a.part");
+        let full = storage("写入", path, &IoError::from(ErrorKind::StorageFull)).to_string();
+        let denied = storage("打开", path, &IoError::from(ErrorKind::PermissionDenied)).to_string();
+        let other = storage("读取", path, &IoError::other("坏了")).to_string();
+        // 原因在最前面：只送前 60 个字给对方时也认得出来
+        assert!(
+            full.contains(&format!("{DISK_FULL}：写入 /x/a.part")),
+            "{full}"
+        );
+        assert!(
+            denied.contains(&format!("{NO_PERMISSION}：打开")),
+            "{denied}"
+        );
+        assert!(
+            !other.contains(DISK_FULL) && !other.contains(NO_PERMISSION),
+            "{other}"
+        );
     }
 
     #[test]

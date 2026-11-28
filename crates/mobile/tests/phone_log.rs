@@ -104,7 +104,7 @@ fn a_session_leaves_a_log_with_stages_and_stats_but_no_secrets() {
         "{text}"
     );
     assert!(
-        text.contains("手机端会话结束：成功=true，原因=已断开"),
+        text.contains("手机端会话结束：成功=true，原因=已断开（cancelled）"),
         "{text}"
     );
     assert!(text.lines().count() >= 4, "{text}");

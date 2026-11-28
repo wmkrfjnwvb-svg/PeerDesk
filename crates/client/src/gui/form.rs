@@ -1,11 +1,11 @@
-//! 表单的解析和错误的白话说明。
+//! 连接表单和服务器设置的解析。连接失败、会话结束怎么说见 `reasons.rs`。
 
 use std::net::{IpAddr, SocketAddr};
 
 use peerdesk_core::signal::parse_code;
 use peerdesk_net::identity::parse_hex;
 use peerdesk_net::rendezvous::{Lookup, PathPolicy, Server};
-use peerdesk_net::{Fingerprint, NetError};
+use peerdesk_net::Fingerprint;
 
 use super::i18n::Strings;
 
@@ -58,12 +58,9 @@ pub struct ConnectForm {
 }
 
 impl ConnectForm {
-    /// 解析成连接目标。设备码和指纹要通过 `server` 查找。
-    pub fn target(
-        &self,
-        s: &Strings,
-        server: Result<Option<Server>, String>,
-    ) -> Result<Target, String> {
+    /// 解析成连接目标。设备码和指纹要通过 `server` 查找（没填自己的服务器时是官方服务器；
+    /// 自己的服务器填错了是错误说明，只有按设备码连接时才报，直接连 IP 不受影响）。
+    pub fn target(&self, s: &Strings, server: Result<Server, String>) -> Result<Target, String> {
         let text = self.addr.trim();
         if text.is_empty() {
             return Err(s.err_need_target.to_owned());
@@ -80,7 +77,7 @@ impl ConnectForm {
         });
         match lookup {
             Some(device) => Ok(Target::Device {
-                server: server?.ok_or_else(|| s.err_need_server.to_owned())?,
+                server: server?,
                 device,
                 policy: PathPolicy::Auto,
                 account: String::new(),
@@ -98,41 +95,6 @@ impl ConnectForm {
         let text = self.addr.trim();
         parse_code(text).map_or_else(|| text.to_owned(), |c| c.to_string())
     }
-}
-
-/// 会话结束时给用户看的一句话：对端退出了就说“连接已断开：对方退出了 PeerDesk”，其他是“会话已结束：原因”。
-#[must_use]
-pub fn end_text(end: &str, s: &Strings) -> String {
-    if end == peerdesk_net::node::END_PEER_QUIT {
-        s.peer_quit.to_owned()
-    } else {
-        format!("{}：{end}", s.session_ended)
-    }
-}
-
-/// 把网络层的错误说成用户看得懂的话，后面附上原始信息便于排查。
-#[must_use]
-pub fn explain(e: &NetError, s: &Strings) -> String {
-    let detail = e.to_string();
-    // 对端点了退出：说人话，不显示 closed by peer 这类原文
-    if detail.contains(peerdesk_net::node::QUIT_REASON) {
-        return s.peer_quit.to_owned();
-    }
-    let summary = match e {
-        NetError::Io(why) if why.contains("绑定") => s.err_port_in_use,
-        NetError::Timeout(_) => s.err_timeout,
-        NetError::Connect(why) if why.contains("密码") => s.err_wrong_password,
-        NetError::Connect(why) if why.contains("锁定") => s.err_locked,
-        NetError::Connect(why) if why.contains("其他设备") => s.err_busy,
-        NetError::Connect(why) if why.contains("不在线") => s.err_offline,
-        NetError::Connect(_) => s.err_refused,
-        NetError::PinMismatch { .. } => s.err_pin_mismatch,
-        NetError::Closed(_) => s.err_closed,
-        NetError::Io(_) | NetError::Core(_) | NetError::Tls(_) | NetError::Protocol(_) => {
-            s.err_other
-        }
-    };
-    format!("{summary}（{detail}）")
 }
 
 #[cfg(test)]
@@ -199,33 +161,33 @@ mod tests {
         };
         let mut form = ConnectForm::default();
         assert_eq!(
-            form.target(&EN, Ok(None)),
+            form.target(&EN, Ok(server)),
             Err(EN.err_need_target.to_owned())
         );
         form.addr = "10.0.0.2".into();
+        // 直接连 IP：自己的服务器填错了也不影响
         assert_eq!(
-            form.target(&EN, Ok(None)),
+            form.target(&EN, Err("bad".into())),
             Ok(Target::Addr {
                 addr: "10.0.0.2:4433".parse().unwrap(),
                 pin: None
             })
         );
         form.pin = "nope".into();
-        assert!(form.target(&EN, Ok(None)).is_err());
+        assert!(form.target(&EN, Ok(server)).is_err());
         form.pin = String::new();
         form.addr = "nope".into();
-        assert_eq!(form.target(&EN, Ok(None)), Err(EN.err_bad_addr.to_owned()));
+        assert_eq!(
+            form.target(&EN, Ok(server)),
+            Err(EN.err_bad_addr.to_owned())
+        );
 
-        // 设备码：需要服务器
+        // 设备码：通过服务器找；自己的服务器填错了就说出来
         form.addr = " 123 456 789 ".into();
         assert_eq!(form.remembered(), "123456789");
-        assert_eq!(
-            form.target(&EN, Ok(None)),
-            Err(EN.err_need_server.to_owned())
-        );
         assert_eq!(form.target(&EN, Err("bad".into())), Err("bad".to_owned()));
         assert_eq!(
-            form.target(&EN, Ok(Some(server))),
+            form.target(&EN, Ok(server)),
             Ok(Target::Device {
                 server,
                 device: Lookup::Code(123_456_789),
@@ -237,7 +199,7 @@ mod tests {
         form.addr = fp.to_uppercase();
         assert_eq!(form.remembered(), fp.to_uppercase());
         assert_eq!(
-            form.target(&EN, Ok(Some(server))),
+            form.target(&EN, Ok(server)),
             Ok(Target::Device {
                 server,
                 device: Lookup::Device([0xCD; 32]),
@@ -245,47 +207,5 @@ mod tests {
                 account: String::new(),
             })
         );
-    }
-
-    #[test]
-    fn errors_in_plain_language() {
-        let cases = [
-            (
-                NetError::Io("绑定 0.0.0.0:1 失败：in use".into()),
-                EN.err_port_in_use,
-            ),
-            (NetError::Io("disk".into()), EN.err_other),
-            (NetError::Timeout("握手"), EN.err_timeout),
-            (
-                NetError::Connect("密码错误，或被控端需要密码".into()),
-                EN.err_wrong_password,
-            ),
-            (
-                NetError::Connect("被控端因多次认证失败暂时锁定".into()),
-                EN.err_locked,
-            ),
-            (
-                NetError::Connect("被控端正在被其他设备控制".into()),
-                EN.err_busy,
-            ),
-            (NetError::Connect("设备不在线".into()), EN.err_offline),
-            (NetError::Connect("refused".into()), EN.err_refused),
-            (
-                NetError::PinMismatch {
-                    expected: "a".into(),
-                    actual: "b".into(),
-                },
-                EN.err_pin_mismatch,
-            ),
-            (NetError::Closed("x".into()), EN.err_closed),
-            (NetError::Protocol("x"), EN.err_other),
-            (NetError::Tls("x".into()), EN.err_other),
-            (NetError::Core(peerdesk_core::Error::BadUtf8), EN.err_other),
-        ];
-        for (e, summary) in cases {
-            let text = explain(&e, &EN);
-            assert!(text.starts_with(summary), "{text}");
-            assert!(text.contains(&e.to_string()), "{text}");
-        }
     }
 }

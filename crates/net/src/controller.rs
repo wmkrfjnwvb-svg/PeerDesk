@@ -9,7 +9,7 @@ use peerdesk_core::file::FileMeta;
 use peerdesk_core::frame::Picture;
 use peerdesk_core::input::{InputEvent, InputSender};
 use peerdesk_core::media::{DecodeJob, DecodeWorker, MediaReceiver};
-use peerdesk_core::proto::{Caps, Channel, Control, RejectReason};
+use peerdesk_core::proto::{Caps, Channel, Control};
 use peerdesk_core::reaction::{FrameStamp, ReactionTracker, ReactionWindow, Shown};
 use peerdesk_core::record::ViewResult;
 use peerdesk_core::screen::Screen;
@@ -365,17 +365,9 @@ pub async fn run(
             State::HelloSent | State::AwaitAuth => {}
             State::Rejected(reason) => {
                 link.close("rejected");
-                return Err(NetError::Connect(match reason {
-                    RejectReason::Unauthorized => "密码错误，或被控端需要密码".to_owned(),
-                    RejectReason::Locked => "被控端因多次认证失败暂时锁定".to_owned(),
-                    RejectReason::Busy => "被控端正在被其他设备控制".to_owned(),
-                    RejectReason::Version => {
-                        "对方的 PeerDesk 版本太旧，不能连接，请先升级对方".to_owned()
-                    }
-                    RejectReason::NoCommonSuite => {
-                        format!("被控端拒绝：{reason:?}")
-                    }
-                }));
+                return Err(NetError::Connect(
+                    crate::reason::reject_text(*reason).to_owned(),
+                ));
             }
             State::Idle | State::Closed => {
                 link.close("protocol");
@@ -831,9 +823,9 @@ pub async fn run(
                 }
             }
             msg = ctrl_rx.recv() => match msg {
-                Some(Control::Bye) => break "对端结束会话".to_owned(),
+                Some(Control::Bye) => break crate::reason::PEER_ENDED.to_owned(),
                 // 控制流断了：网络断开时报网络原因（控制端据此换通道重连），否则是对端结束。
-                None => break link.lost_reason().unwrap_or_else(|| "对端结束会话".to_owned()),
+                None => break link.lost_reason().unwrap_or_else(|| crate::reason::PEER_ENDED.to_owned()),
                 Some(
                     Control::Hello { .. }
                     | Control::Accept { .. }

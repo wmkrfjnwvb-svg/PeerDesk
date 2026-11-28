@@ -3,20 +3,16 @@
     <string name="app_name">PeerDesk</string>
 
     <string name="connect_title">连接到电脑</string>
-    <string name="connect_server">服务器</string>
     <string name="connect_server_hint">主机:端口</string>
     <string name="connect_code">设备码</string>
     <string name="connect_password">密码</string>
     <string name="connect_button">连接</string>
     <string name="connect_bad_code">设备码是 9 位数字。</string>
     <string name="connect_background_note">离开应用后会断开连接，回来需要重新连接。</string>
-    <string name="connect_failed">连接失败：%1$s</string>
-    <string name="connect_ended">会话已结束：%1$s</string>
     <string name="connect_ended_background">应用切到了后台，连接已断开。请重新连接。</string>
     <string name="connect_no_surface">显示面不可用。请关闭应用后重新打开。</string>
 
     <string name="session_connecting">正在连接…</string>
-    <string name="session_reconnecting">连接中断，正在重连（第 %1$d 次）：%2$s</string>
     <string name="toolbar_disconnect">断开</string>
     <string name="toolbar_keyboard">键盘</string>
     <string name="toolbar_hide">收起工具条</string>
@@ -49,4 +45,55 @@
     <string name="key_cmd">Cmd</string>
     <string name="connect_show_password">显示密码</string>
     <string name="connect_hide_password">隐藏密码</string>
+
+    <!-- 连接页：服务器默认官方的，自己的服务器收在“高级”里；失败提示的按钮和详情 -->
+    <string name="connect_server">服务器地址</string>
+    <string name="connect_server_note">留空就用官方服务器。只有自建了 PeerDesk 服务器才需要填。</string>
+    <string name="connect_server_official">服务器：官方服务器（默认）</string>
+    <string name="connect_server_custom">服务器：自己的服务器 %1$s</string>
+    <string name="connect_advanced">高级：使用自己的服务器</string>
+    <string name="connect_advanced_hide">收起高级设置</string>
+    <string name="action_retry">重试</string>
+    <string name="action_server_settings">服务器设置</string>
+    <string name="details_show">详情</string>
+    <string name="details_hide">收起详情</string>
+    <string name="details_copy">复制详情</string>
+    <string name="session_reconnecting">连接中断，正在重连（第 %1$d 次）</string>
+    <string name="session_reconnecting_why">连接中断，正在重连（第 %1$d 次）：%2$s</string>
+
+    <!-- 失败、结束的原因：一句原因、一句办法。代号见 crates/net/src/reason.rs，文字和桌面端 reasons.rs 相同 -->
+    <string name="reason_no_route_cause">连不到对方：等了很久没有回应，也没有找到能走的线路。</string>
+    <string name="reason_no_route_fix">确认对方电脑开着、打开了“允许别人连接”，再重试；还不行就把详情发给我们。</string>
+    <string name="reason_device_offline_cause">对方现在不在线，或者设备码不对。</string>
+    <string name="reason_device_offline_fix">核对设备码；请对方打开 PeerDesk，并确认电脑联网、没有睡眠。</string>
+    <string name="reason_server_unreachable_cause">连不上服务器。</string>
+    <string name="reason_server_unreachable_fix">检查本机的网络；用自己的服务器时，核对服务器地址。</string>
+    <string name="reason_wrong_password_cause">密码不对。</string>
+    <string name="reason_wrong_password_fix">向对方要现在的密码（对方换过密码后旧的就失效了），重新输入后再试。</string>
+    <string name="reason_locked_cause">密码错的次数太多，对方暂时不接受连接。</string>
+    <string name="reason_locked_fix">过几分钟、核对密码后再试。</string>
+    <string name="reason_busy_cause">对方正在被别的设备控制。</string>
+    <string name="reason_busy_fix">等那边的会话结束后再试。</string>
+    <string name="reason_declined_cause">对方拒绝了这次连接。</string>
+    <string name="reason_declined_fix">请对方确认允许连接后再试，具体原因见详情。</string>
+    <string name="reason_host_permission_cause">对方电脑现在打不开屏幕或键鼠：可能缺少屏幕录制、辅助功能权限，或者正在锁屏。</string>
+    <string name="reason_host_permission_fix">请对方在 PeerDesk 里按提示开启权限，或者先解锁屏幕，再重试。</string>
+    <string name="reason_version_cause">双方的 PeerDesk 版本不兼容。</string>
+    <string name="reason_version_fix">把两边都升级到最新版本。</string>
+    <string name="reason_identity_mismatch_cause">对方的身份和记录的不一致：可能连错了设备，也可能有人冒充。</string>
+    <string name="reason_identity_mismatch_fix">先不要继续，和对方核对设备码或指纹。</string>
+    <string name="reason_peer_closed_cause">对方结束了这次会话。</string>
+    <string name="reason_peer_closed_fix">需要时可以重新连接。</string>
+    <string name="reason_peer_quit_cause">对方退出了 PeerDesk。</string>
+    <string name="reason_peer_quit_fix">请对方重新打开 PeerDesk 后再连接。</string>
+    <string name="reason_network_lost_cause">网络断了（可能换了网络，或者 Wi-Fi 断开）。</string>
+    <string name="reason_network_lost_fix">检查网络后重试；PeerDesk 会先自动重连几次。</string>
+    <string name="reason_relay_quota_cause">免费中继的流量额度暂时用完了。</string>
+    <string name="reason_relay_quota_fix">过几分钟再试；直连不受这个限制。</string>
+    <string name="reason_port_in_use_cause">本机的端口被占用了（也许另一个 PeerDesk 正在运行）。</string>
+    <string name="reason_port_in_use_fix">关掉另一个 PeerDesk，或者在设置里换一个端口。</string>
+    <string name="reason_cancelled_cause">你断开了连接。</string>
+    <string name="reason_cancelled_fix">需要时可以重新连接。</string>
+    <string name="reason_other_cause">出了意料之外的问题。</string>
+    <string name="reason_other_fix">再试一次；还不行就把详情发给我们。</string>
 </resources>

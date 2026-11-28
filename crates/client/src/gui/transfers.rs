@@ -33,8 +33,8 @@ pub enum State {
     Running,
     /// 传完了（文件数）。
     Done(usize),
-    /// 失败（原因）。
-    Failed(String),
+    /// 失败（哪个文件、什么原因）。
+    Failed(TransferFailure),
     /// 被取消。
     Cancelled,
 }
@@ -44,6 +44,134 @@ impl State {
     #[must_use]
     pub const fn finished(&self) -> bool {
         matches!(self, State::Done(_) | State::Failed(_) | State::Cancelled)
+    }
+}
+
+/// 文件传输为什么失败。界面按它说一句原因、一句办法（见 `reasons.rs`），核心的原文放进详情。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileProblem {
+    /// 接收的一方磁盘满了。
+    DiskFull,
+    /// 没有权限读写这个文件或文件夹。
+    NoPermission,
+    /// 校验没通过（数据出错，或者源文件在传输中被改了）。
+    Checksum,
+    /// 源文件在传输中被改动、移走或删除。
+    SourceChanged,
+    /// 对方关了文件传输权限。
+    AccessOff,
+    /// 传输中断（连接断了，或者对方中止了传输）。
+    Interrupted,
+    /// 文件或目标文件夹不存在。
+    Missing,
+    /// 其他原因。
+    Other,
+}
+
+impl FileProblem {
+    /// 全部原因（界面文字逐个核对用）。
+    pub const ALL: [Self; 8] = [
+        Self::DiskFull,
+        Self::NoPermission,
+        Self::Checksum,
+        Self::SourceChanged,
+        Self::AccessOff,
+        Self::Interrupted,
+        Self::Missing,
+        Self::Other,
+    ];
+
+    /// 存进记录的代号。
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::DiskFull => "disk_full",
+            Self::NoPermission => "no_permission",
+            Self::Checksum => "checksum",
+            Self::SourceChanged => "source_changed",
+            Self::AccessOff => "access_off",
+            Self::Interrupted => "interrupted",
+            Self::Missing => "missing",
+            Self::Other => "other",
+        }
+    }
+
+    fn from_code(code: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|p| p.code() == code)
+    }
+
+    /// 从核心的原文认原因（两端的说明都出自本仓库的代码，系统错误按常见的写法认）。
+    #[must_use]
+    pub fn of_text(text: &str) -> Self {
+        use peerdesk_net::fs_store::{DISK_FULL, NO_PERMISSION};
+        let has = |words: &[&str]| words.iter().any(|w| text.contains(w));
+        if has(&["对方没有允许文件管理", "没有文件传输权限", "not permitted"]) {
+            Self::AccessOff
+        } else if has(&[
+            DISK_FULL,
+            "No space left",
+            "not enough space",
+            "os error 28)",
+            "os error 112)",
+        ]) {
+            Self::DiskFull
+        } else if has(&[
+            NO_PERMISSION,
+            "Permission denied",
+            "Access is denied",
+            "拒绝访问",
+        ]) {
+            Self::NoPermission
+        } else if has(&["源文件"]) {
+            Self::SourceChanged
+        } else if has(&["校验"]) {
+            Self::Checksum
+        } else if has(&[
+            "不存在",
+            "找不到",
+            "No such file",
+            "not found",
+            "os error 2)",
+            "os error 3)",
+        ]) {
+            Self::Missing
+        } else if has(&[
+            peerdesk_net::files::PEER_ABORTED,
+            "没有结果",
+            "连接已关闭",
+            "connection",
+            "closed",
+            "timed out",
+            "reset",
+        ]) {
+            Self::Interrupted
+        } else {
+            Self::Other
+        }
+    }
+}
+
+/// 一次传输失败：哪个文件、什么原因、核心的原文（详情）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransferFailure {
+    /// 出问题的文件（不知道具体是哪个时是任务里的条目）。
+    pub file: String,
+    /// 原因。
+    pub problem: FileProblem,
+    /// 核心的原文。
+    pub details: String,
+}
+
+impl TransferFailure {
+    /// 按原文认原因。
+    #[must_use]
+    pub fn new(file: impl Into<String>, details: impl Into<String>) -> Self {
+        let details = details.into();
+        Self {
+            file: file.into(),
+            problem: FileProblem::of_text(&details),
+            details,
+        }
     }
 }
 
@@ -75,6 +203,12 @@ impl Task {
     #[must_use]
     pub fn bytes(&self) -> (u64, u64) {
         self.progress.get()
+    }
+
+    /// 任务里的条目（失败时不知道具体是哪个文件，就说这个）。
+    #[must_use]
+    pub fn label(&self) -> String {
+        self.names.join(", ")
     }
 
     /// 平均速度（字节/秒）；还没开始或刚开始时为 `None`。
@@ -281,7 +415,7 @@ impl Queue {
 /// 后台执行器：自己的 tokio 运行时，一次跑一个任务（在会话的连接上开文件浏览流）。
 pub struct Runner {
     rt: tokio::runtime::Runtime,
-    current: Option<(u64, tokio::task::JoinHandle<Result<usize, String>>)>,
+    current: Option<(u64, tokio::task::JoinHandle<Result<usize, TransferFailure>>)>,
 }
 
 impl std::fmt::Debug for Runner {
@@ -292,16 +426,23 @@ impl std::fmt::Debug for Runner {
     }
 }
 
-/// 一组文件结果的汇总：都成功时为文件数，否则是第一个失败的原因。
-fn summarize(results: &[peerdesk_net::files::FileResult]) -> Result<usize, String> {
+/// 一组文件结果的汇总：都成功时为文件数，否则是第一个失败的文件和原因。
+fn summarize(results: &[peerdesk_net::files::FileResult]) -> Result<usize, TransferFailure> {
     use peerdesk_core::file::Outcome;
-    match results
-        .iter()
-        .find(|r| !matches!(r.outcome, Some(Outcome::Done | Outcome::Skipped)))
-    {
-        None => Ok(results.len()),
-        Some(r) => Err(format!("{} 没有传完（{:?}）", r.path, r.outcome)),
-    }
+    let failed = results.iter().find_map(|r| match r.outcome {
+        Some(Outcome::Done | Outcome::Skipped) => None,
+        Some(Outcome::Failed) => Some(TransferFailure {
+            file: r.path.clone(),
+            problem: FileProblem::Checksum,
+            details: format!("{}：校验失败", r.path),
+        }),
+        None => Some(TransferFailure {
+            file: r.path.clone(),
+            problem: FileProblem::Interrupted,
+            details: format!("{}：没有结果（连接断开，或者对方中止了传输）", r.path),
+        }),
+    });
+    failed.map_or(Ok(results.len()), Err)
 }
 
 impl Runner {
@@ -327,10 +468,16 @@ impl Runner {
     pub fn tick(&mut self, queue: &mut Queue, link: Option<&Arc<peerdesk_net::Link>>) -> bool {
         let mut ended = false;
         if let Some((id, handle)) = self.current.take_if(|(_, h)| h.is_finished()) {
+            let label = queue
+                .tasks()
+                .iter()
+                .find(|t| t.id == id)
+                .map(Task::label)
+                .unwrap_or_default();
             let state = match self.rt.block_on(handle) {
                 Ok(Ok(files)) => State::Done(files),
-                Ok(Err(why)) => State::Failed(why),
-                Err(e) => State::Failed(e.to_string()),
+                Ok(Err(failure)) => State::Failed(failure),
+                Err(e) => State::Failed(TransferFailure::new(label, e.to_string())),
             };
             queue.finish(id, state);
             ended = true;
@@ -363,7 +510,7 @@ impl Runner {
                             }
                         };
                         results
-                            .map_err(|e| e.to_string())
+                            .map_err(|e| TransferFailure::new(task.label(), e.to_string()))
                             .and_then(|r| summarize(&r))
                     });
                     self.current = Some((id, handle));
@@ -422,7 +569,10 @@ fn encode(t: &Task) -> String {
     let (done, total) = t.bytes();
     let (state, note) = match &t.state {
         State::Done(n) => ("done", n.to_string()),
-        State::Failed(why) => ("failed", why.clone()),
+        State::Failed(f) => (
+            "failed",
+            [f.problem.code(), &f.file, &f.details].join("\u{1f}"),
+        ),
         State::Cancelled => ("cancelled", String::new()),
         State::Queued | State::Running => ("cancelled", String::new()),
     };
@@ -451,9 +601,10 @@ fn decode(line: &str) -> Option<Task> {
         return None;
     };
     let note = unescape(note);
+    let names: Vec<String> = names.split('\u{1f}').map(unescape).collect();
     let state = match *state {
         "done" => State::Done(note.parse().ok()?),
-        "failed" => State::Failed(note),
+        "failed" => State::Failed(decode_failure(&note, &names)),
         "cancelled" => State::Cancelled,
         _ => return None,
     };
@@ -473,12 +624,25 @@ fn decode(line: &str) -> Option<Task> {
         },
         local_dir: PathBuf::from(unescape(local)),
         remote_dir: unescape(remote),
-        names: names.split('\u{1f}').map(unescape).collect(),
+        names,
         state,
         progress: Arc::new(progress),
         started: None,
         finished_at: at.parse().ok()?,
     })
+}
+
+/// 记录里的失败：`代号 \x1f 文件 \x1f 原文`；老版本的记录只有一句原文，按原文认原因。
+fn decode_failure(note: &str, names: &[String]) -> TransferFailure {
+    let parts: Vec<&str> = note.split('\u{1f}').collect();
+    match parts.as_slice() {
+        [code, file, details] => TransferFailure {
+            file: (*file).to_owned(),
+            problem: FileProblem::from_code(code).unwrap_or_else(|| FileProblem::of_text(details)),
+            details: (*details).to_owned(),
+        },
+        _ => TransferFailure::new(names.join(", "), note),
+    }
 }
 
 #[cfg(test)]
@@ -535,7 +699,10 @@ mod tests {
         assert_eq!(q.next(), Some(a));
         // 失败的重试：重新排队（新编号）
         q.start(a, t0);
-        q.finish(a, State::Failed("断开".into()));
+        q.finish(
+            a,
+            State::Failed(TransferFailure::new("a", "connection lost")),
+        );
         q.retry(a);
         assert!(q
             .tasks()
@@ -609,7 +776,13 @@ mod tests {
             vec!["z".into()],
         );
         q.finish(a, State::Done(2));
-        q.finish(b, State::Failed("没有权限".into()));
+        q.finish(
+            b,
+            State::Failed(TransferFailure::new(
+                "y",
+                "存储错误：没有权限：写入 /r/y.part",
+            )),
+        );
         q.finish(c, State::Cancelled);
         q.save(&dir).unwrap();
         let back = Queue::load(&dir);
@@ -618,10 +791,12 @@ mod tests {
         assert_eq!(got.names, [weird, "b".to_owned()]);
         assert_eq!(got.remote_dir, "C:\\对方");
         assert_eq!(got.state, State::Done(2));
-        assert!(back
-            .tasks()
-            .iter()
-            .any(|t| t.state == State::Failed("没有权限".into())));
+        assert!(back.tasks().iter().any(|t| t.state
+            == State::Failed(TransferFailure {
+                file: "y".into(),
+                problem: FileProblem::NoPermission,
+                details: "存储错误：没有权限：写入 /r/y.part".into(),
+            })));
         // 新任务的编号接着往下
         let mut back = back;
         assert!(back.add(Direction::Upload, "/".into(), "/".into(), vec![]) > c);
@@ -731,7 +906,15 @@ mod tests {
         let state = |q: &Queue, id| q.tasks().iter().find(|t| t.id == id).unwrap().state.clone();
         assert_eq!(state(&q, up), State::Done(2));
         assert_eq!(state(&q, down), State::Done(1));
-        assert!(matches!(state(&q, missing), State::Failed(_)));
+        // 下载不存在的条目：说出是哪一项、原因是不存在
+        let State::Failed(failure) = state(&q, missing) else {
+            panic!("应该失败");
+        };
+        assert_eq!(
+            (failure.file.as_str(), failure.problem),
+            ("没有", FileProblem::Missing),
+            "{failure:?}"
+        );
         assert_eq!(std::fs::read(back.join("夹/a.txt")).unwrap(), b"hello");
         assert_eq!(
             std::fs::metadata(remote.join("big.bin")).unwrap().len(),
@@ -783,6 +966,80 @@ mod tests {
             path: "c".into(),
             outcome: None,
         };
-        assert!(summarize(&[ok("a"), bad]).unwrap_err().contains("c"));
+        let failure = summarize(&[ok("a"), bad]).unwrap_err();
+        assert_eq!(
+            (failure.file.as_str(), failure.problem),
+            ("c", FileProblem::Interrupted)
+        );
+        // 不是调试输出（Some(Failed) 之类）
+        assert!(!failure.details.contains("None") && !failure.details.contains("Some"));
+        let broken = FileResult {
+            path: "d".into(),
+            outcome: Some(Outcome::Failed),
+        };
+        let failure = summarize(&[broken]).unwrap_err();
+        assert_eq!(
+            (failure.file.as_str(), failure.problem),
+            ("d", FileProblem::Checksum)
+        );
+        assert!(!failure.details.contains("Failed"), "{}", failure.details);
+    }
+
+    #[test]
+    fn file_problems_are_recognized_from_both_sides() {
+        let cases = [
+            ("对方没有允许文件管理", FileProblem::AccessOff),
+            (
+                "对方中止了传输：file transfer not permitted",
+                FileProblem::AccessOff,
+            ),
+            (
+                "对方中止了传输：存储错误：磁盘空间不足：写入 /x",
+                FileProblem::DiskFull,
+            ),
+            (
+                "写入 /x：No space left on device (os error 28)",
+                FileProblem::DiskFull,
+            ),
+            (
+                "There is not enough space on the disk. (os error 112)",
+                FileProblem::DiskFull,
+            ),
+            ("存储错误：没有权限：打开 /x", FileProblem::NoPermission),
+            (
+                "打开 /x：Permission denied (os error 13)",
+                FileProblem::NoPermission,
+            ),
+            (
+                "对方中止了传输：源文件在传输过程中被修改",
+                FileProblem::SourceChanged,
+            ),
+            ("源文件不存在：a.txt", FileProblem::SourceChanged),
+            ("a：校验失败", FileProblem::Checksum),
+            ("目标文件夹不存在：/x", FileProblem::Missing),
+            ("对方中止了传输：别的原因", FileProblem::Interrupted),
+            ("连接已关闭：timed out", FileProblem::Interrupted),
+            ("怪事", FileProblem::Other),
+        ];
+        for (text, problem) in cases {
+            assert_eq!(FileProblem::of_text(text), problem, "{text}");
+        }
+        for p in FileProblem::ALL {
+            assert_eq!(FileProblem::from_code(p.code()), Some(p));
+        }
+        // 老版本记录里只有一句原文：按原文认；新记录的代号认不出时也按原文认
+        let names = ["a".to_owned(), "b".to_owned()];
+        assert_eq!(
+            decode_failure("a 没有传完（None）", &names),
+            TransferFailure {
+                file: "a, b".into(),
+                problem: FileProblem::Other,
+                details: "a 没有传完（None）".into(),
+            }
+        );
+        assert_eq!(
+            decode_failure("from_future\u{1f}a\u{1f}校验失败", &names).problem,
+            FileProblem::Checksum
+        );
     }
 }

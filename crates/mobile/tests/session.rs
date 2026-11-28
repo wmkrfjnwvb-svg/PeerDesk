@@ -21,6 +21,8 @@ use peerdesk_mobile::gesture::{Action, Gestures, Phase, Touch, View};
 use peerdesk_mobile::{device_target, Event, ScreenSink, Session, SinkFactory};
 use peerdesk_net::demo::DemoDesktop;
 use peerdesk_net::host::{self, HostOptions, InputSink};
+use peerdesk_net::reason::Reason;
+use peerdesk_net::rendezvous::{Lookup, PathPolicy, OFFICIAL_SERVER};
 use peerdesk_net::viewer::ViewTarget;
 use peerdesk_net::{Identity, Node};
 
@@ -205,7 +207,8 @@ fn a_phone_session_sees_frames_and_its_taps_reach_the_host() {
         seen.last(),
         Some(&Event::Ended {
             ok: true,
-            text: "已断开".to_owned()
+            text: "已断开".to_owned(),
+            reason: Reason::Cancelled,
         })
     );
     assert!(seen.iter().all(|e| !e.to_json().is_empty()));
@@ -230,10 +233,17 @@ fn a_wrong_password_ends_with_the_reason() {
     wait(&session, &mut seen, |s| {
         s.iter().any(|e| matches!(e, Event::Ended { .. }))
     });
-    let Some(Event::Ended { ok, text }) = seen.last() else {
+    let Some(Event::Ended { ok, text, reason }) = seen.last() else {
         panic!("最后不是结束：{seen:?}");
     };
     assert!(!ok && text.contains("密码"), "{text}");
+    // 界面按原因代号说人话（手机端事件里的 reason 字段）
+    assert_eq!(*reason, Reason::WrongPassword);
+    assert!(seen
+        .last()
+        .unwrap()
+        .to_json()
+        .ends_with(r#","reason":"wrong_password"}"#));
     assert_eq!(frames.load(Ordering::Relaxed), 0);
     assert!(inputs.0.lock().unwrap().is_empty());
     // 结束之后：发输入失败，不再有事件
@@ -281,7 +291,8 @@ fn a_session_that_failed_before_starting_says_why() {
         s.next_event(Duration::from_millis(10)),
         Some(Event::Ended {
             ok: false,
-            text: "设备码应为 9 位数字".to_owned()
+            text: "设备码应为 9 位数字".to_owned(),
+            reason: Reason::Other,
         })
     );
     assert!(s.next_event(Duration::from_millis(10)).is_none());
@@ -308,8 +319,33 @@ fn a_target_that_cannot_be_resolved_ends_with_the_reason() {
         seen,
         vec![Event::Ended {
             ok: false,
-            text: "设备码应为 9 位数字".to_owned()
+            text: "设备码应为 9 位数字".to_owned(),
+            reason: Reason::Other,
         }]
+    );
+    // 服务器名查不到：说成连不上服务器
+    let (sink, _) = counting();
+    let s = Session::start_with(
+        temp_dir("resolve-dns"),
+        || device_target("no-such-host.invalid", "123456789"),
+        "",
+        sink,
+        None,
+    );
+    let mut seen = Vec::new();
+    wait(&s, &mut seen, |e| {
+        e.iter().any(|e| matches!(e, Event::Ended { .. }))
+    });
+    assert!(
+        matches!(
+            seen.last(),
+            Some(Event::Ended {
+                ok: false,
+                reason: Reason::ServerUnreachable,
+                ..
+            })
+        ),
+        "{seen:?}"
     );
 }
 
@@ -352,9 +388,23 @@ fn device_targets_are_parsed_with_reasons() {
     assert!(device_target("127.0.0.1", "12345")
         .unwrap_err()
         .contains("9 位"));
-    assert!(device_target("  ", "123456789")
-        .unwrap_err()
-        .contains("服务器"));
+    // 没填服务器：用官方服务器（新安装只填设备码和密码就能连）
+    assert_eq!(
+        device_target("  ", "123 456 789"),
+        Ok(ViewTarget::Device {
+            server: OFFICIAL_SERVER,
+            device: Lookup::Code(123_456_789),
+            policy: PathPolicy::Auto,
+            account: String::new(),
+        })
+    );
+    // 填了自己的服务器：用自己的
+    let ViewTarget::Device { server, .. } =
+        device_target("198.51.100.7:5000", "123456789").unwrap()
+    else {
+        panic!("不是按设备码");
+    };
+    assert_ne!(server, OFFICIAL_SERVER);
     assert!(device_target("no-such-host.invalid", "123456789")
         .unwrap_err()
         .contains("找不到服务器"));
@@ -377,23 +427,29 @@ fn events_become_one_line_of_json() {
             },
             r#"{"type":"peer","os":"MacOs","name":"a\\b"}"#,
         ),
+        // 原来的字段不变（老版本的界面照常能读），新加原因代号
         (
             Event::Reconnecting {
                 attempt: 2,
                 why: "timed out".into(),
+                reason: Reason::NetworkLost,
             },
-            r#"{"type":"reconnecting","attempt":2,"why":"timed out"}"#,
+            r#"{"type":"reconnecting","attempt":2,"why":"timed out","reason":"network_lost"}"#,
         ),
         (
-            Event::Notice("额度".into()),
-            r#"{"type":"notice","text":"额度"}"#,
+            Event::Notice {
+                text: "额度".into(),
+                reason: Reason::RelayQuota,
+            },
+            r#"{"type":"notice","text":"额度","reason":"relay_quota"}"#,
         ),
         (
             Event::Ended {
                 ok: false,
                 text: "拒绝".into(),
+                reason: Reason::Declined,
             },
-            r#"{"type":"ended","ok":false,"text":"拒绝"}"#,
+            r#"{"type":"ended","ok":false,"text":"拒绝","reason":"declined"}"#,
         ),
     ];
     for (e, want) in cases {
@@ -415,4 +471,37 @@ fn events_become_one_line_of_json() {
     );
     let none = Event::Quality(peerdesk_net::controller::LinkQuality::default()).to_json();
     assert!(none.contains(r#""router_ms":null,"#), "{none}");
+}
+
+#[test]
+fn view_events_become_ui_events() {
+    use peerdesk_net::viewer::ViewEvent;
+    // 免费额度的通知：带上原因代号
+    let notice = Event::from_view(ViewEvent::Notice(peerdesk_net::viewer::free_limit_text(60)));
+    assert!(matches!(
+        notice,
+        Some(Event::Notice {
+            reason: Reason::RelayQuota,
+            ..
+        })
+    ));
+    // 剪贴板事件手机端不用：不发给界面（不再把调试输出当通知）
+    assert_eq!(
+        Event::from_view(ViewEvent::Clipboard(
+            peerdesk_net::clipsync::ClipNote::FilesUnsupported
+        )),
+        None
+    );
+    assert_eq!(
+        Event::from_view(ViewEvent::Reconnecting {
+            attempt: 1,
+            why: "timed out".into(),
+            reason: Reason::NetworkLost,
+        }),
+        Some(Event::Reconnecting {
+            attempt: 1,
+            why: "timed out".into(),
+            reason: Reason::NetworkLost,
+        })
+    );
 }

@@ -375,6 +375,7 @@ mod tests {
         let (defs, _) = definitions_from(None);
         let copy = [
             include_str!("i18n.rs"),
+            include_str!("reasons.rs"),
             include_str!("../../../platform/src/guide.rs"),
         ]
         .concat();

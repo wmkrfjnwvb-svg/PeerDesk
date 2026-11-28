@@ -54,6 +54,7 @@ pub mod node;
 #[cfg(feature = "portmap")]
 pub mod portmap;
 pub mod punch;
+pub mod reason;
 pub mod recorder;
 pub mod rendezvous;
 pub mod safety;

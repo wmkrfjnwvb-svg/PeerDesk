@@ -4,18 +4,21 @@ use std::net::SocketAddr;
 
 use peerdesk_core::signal::format_code;
 
-use super::form::{end_text, explain};
 use super::i18n::Strings;
+use super::reasons;
 use super::session::{HostEvent, Summary, ViewEvent};
+use peerdesk_net::reason::{Failure, Reason};
 use peerdesk_net::rendezvous::Path as Route;
 
 /// 状态栏的一条消息。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Status {
-    /// 文字。
+    /// 文字（有结构化原因时是原因那一句）。
     pub text: String,
     /// 是否是错误。
     pub error: bool,
+    /// 连接失败、会话结束时的原因和核心的原文；界面据此加一句办法、按钮和可复制的详情。
+    pub failure: Option<Failure>,
 }
 
 impl Status {
@@ -25,6 +28,7 @@ impl Status {
         Self {
             text: text.into(),
             error: false,
+            failure: None,
         }
     }
 
@@ -34,6 +38,47 @@ impl Status {
         Self {
             text: text.into(),
             error: true,
+            failure: None,
+        }
+    }
+
+    /// 连接失败、会话出错：红色，说原因。
+    #[must_use]
+    pub fn failed(failure: Failure, s: &Strings) -> Self {
+        Self {
+            text: reasons::cause(&failure, s).to_owned(),
+            error: true,
+            failure: Some(failure),
+        }
+    }
+
+    /// 会话正常结束（对方结束、自己断开）：不是错误，也说原因。
+    #[must_use]
+    pub fn ended(failure: Failure, s: &Strings) -> Self {
+        Self {
+            error: false,
+            ..Self::failed(failure, s)
+        }
+    }
+
+    /// 怎么办（一句）；没有结构化原因时为 `None`。
+    #[must_use]
+    pub fn fix(&self, s: &Strings) -> Option<&'static str> {
+        self.failure.as_ref().map(|f| reasons::fix(f, s))
+    }
+
+    /// 核心的原文（详情）；没有时为空。
+    #[must_use]
+    pub fn details(&self) -> &str {
+        self.failure.as_ref().map_or("", |f| f.details.as_str())
+    }
+
+    /// 状态栏的一行：原因加办法。
+    #[must_use]
+    pub fn line(&self, s: &Strings) -> String {
+        match self.fix(s) {
+            Some(fix) => format!("{} {fix}", self.text),
+            None => self.text.clone(),
         }
     }
 }
@@ -115,7 +160,7 @@ impl HostPhase {
                 ))),
             ),
             HostEvent::RegisterFailed(e) | HostEvent::HandshakeFailed(e) => {
-                (self.clone(), Some(Status::error(explain(e, s))))
+                (self.clone(), Some(Status::failed(Failure::of_error(e), s)))
             }
             HostEvent::Peer { addr, fingerprint } => match self.port() {
                 Some((port, ipv6)) => (
@@ -158,14 +203,21 @@ impl HostPhase {
             ),
             // 只拒绝了这一次，仍在等待连接
             HostEvent::Refused(why) => (self.clone(), Some(Status::error(why.clone()))),
-            HostEvent::SessionEnded(Ok(end)) => (listening(), Some(Status::info(end_text(end, s)))),
-            HostEvent::SessionEnded(Err(e)) => (listening(), Some(Status::error(explain(e, s)))),
+            HostEvent::SessionEnded(Ok(end)) => {
+                (listening(), Some(Status::ended(Failure::of_text(end), s)))
+            }
+            HostEvent::SessionEnded(Err(e)) => {
+                (listening(), Some(Status::failed(Failure::of_error(e), s)))
+            }
             // 已经关了（例如因为没有权限）：保留之前的说明，不用“已关闭”盖掉它。
             HostEvent::Stopped(None) => (
                 HostPhase::Off,
                 (*self != HostPhase::Off).then(|| Status::info(s.host_off)),
             ),
-            HostEvent::Stopped(Some(e)) => (HostPhase::Off, Some(Status::error(explain(e, s)))),
+            HostEvent::Stopped(Some(e)) => (
+                HostPhase::Off,
+                Some(Status::failed(Failure::of_error(e), s)),
+            ),
         }
     }
 }
@@ -190,8 +242,10 @@ pub enum ViewPhase {
     Reconnecting {
         /// 第几次重连。
         attempt: u32,
-        /// 断开的原因。
+        /// 断开的原因（原文，放进详情）。
         why: String,
+        /// 为什么在重连（网络断了，或者重拨失败的原因）。
+        reason: Reason,
     },
     /// 结束了。
     Ended {
@@ -259,10 +313,11 @@ impl ViewPhase {
                 detail: detail.clone(),
             },
             ViewEvent::Ended(result) => {
+                let failure = peerdesk_net::viewer::visit_failure(result);
                 let status = match result {
                     Ok(summary) if summary.cancelled => Status::info(s.you_disconnected),
-                    Ok(summary) => Status::info(end_text(&summary.end, s)),
-                    Err(e) => Status::error(explain(e, s)),
+                    Ok(_) => Status::ended(failure, s),
+                    Err(_) => Status::failed(failure, s),
                 };
                 ViewPhase::Ended {
                     status,
@@ -271,13 +326,18 @@ impl ViewPhase {
                     notice: None,
                 }
             }
-            ViewEvent::Reconnecting { attempt, why } => ViewPhase::Reconnecting {
+            ViewEvent::Reconnecting {
+                attempt,
+                why,
+                reason,
+            } => ViewPhase::Reconnecting {
                 attempt: *attempt,
                 why: why.clone(),
+                reason: *reason,
             },
             ViewEvent::Clipboard(_) | ViewEvent::Peer(..) | ViewEvent::Quality(_) => self.clone(),
             ViewEvent::Notice(text) => ViewPhase::Ended {
-                status: Status::error(text.clone()),
+                status: Status::failed(Failure::of_text(text), s),
                 summary: None,
                 route: self.route(),
                 notice: Some(text.clone()),
@@ -291,12 +351,21 @@ impl ViewPhase {
         match self {
             ViewPhase::Connecting => s.connecting.to_owned(),
             ViewPhase::Connected { .. } => String::new(),
-            ViewPhase::Reconnecting { attempt, why } => {
-                format!(
-                    "{}（{attempt}/{}）：{why}",
+            // 网络断了是常态，不再重复原因；重拨失败（例如对方不在线了）才说为什么。原文在详情里。
+            // 认不出的原因也不说（“出了意料之外的问题”对重连没有帮助），和手机端一样。
+            ViewPhase::Reconnecting {
+                attempt, reason, ..
+            } => {
+                let base = format!(
+                    "{}（{attempt}/{}）",
                     s.reconnecting,
                     crate::gui::session::RECONNECT_TRIES
-                )
+                );
+                if matches!(reason, Reason::NetworkLost | Reason::Other) {
+                    base
+                } else {
+                    format!("{base}：{}", reasons::reason_text(*reason, s.lang).cause)
+                }
             }
             ViewPhase::Ended { status, .. } => status.text.clone(),
         }
@@ -651,7 +720,7 @@ mod tests {
     fn clipboard_notes() {
         use peerdesk_core::clipboard::ClipKind;
         use peerdesk_net::clipsync::ClipNote;
-        let s = &crate::gui::i18n::ZH;
+        let s = &ZH;
         let big = ClipNote::LocalTooLarge {
             kind: ClipKind::Png,
             size: 20 * 1_048_576,
@@ -682,7 +751,7 @@ mod tests {
         };
         assert_eq!(connected.headline(s), "");
     }
-    use crate::gui::i18n::EN;
+    use crate::gui::i18n::{EN, ZH};
     use peerdesk_net::NetError;
 
     fn addr() -> SocketAddr {
@@ -753,15 +822,22 @@ mod tests {
         ));
         assert!(status.unwrap().text.contains("10.0.0.5:5000"));
 
-        let (back, status) = busy.apply(&HostEvent::SessionEnded(Ok("bye".into())), s);
+        let (back, status) = busy.apply(&HostEvent::SessionEnded(Ok("对端结束会话".into())), s);
         assert_eq!(back, listening);
-        assert!(!status.unwrap().error);
+        let status = status.unwrap();
+        assert!(!status.error);
+        assert_eq!(status.text, "The other side ended the session.");
+        assert_eq!(status.details(), "对端结束会话");
         let (back, status) = busy.apply(
             &HostEvent::SessionEnded(Err(NetError::Connect("密码错误".into()))),
             s,
         );
         assert_eq!(back, listening);
-        assert!(status.unwrap().text.starts_with(EN.err_wrong_password));
+        let status = status.unwrap();
+        assert!(status.error);
+        assert_eq!(status.text, "The password is wrong.");
+        assert!(status.line(s).starts_with("The password is wrong. Ask for"));
+        assert_eq!(status.details(), "连接失败：密码错误");
         // 关闭中收到会话结束：保持关闭中
         assert_eq!(
             HostPhase::Stopping
@@ -788,13 +864,18 @@ mod tests {
         assert_eq!(same, listening);
         assert!(!status.unwrap().error);
         for e in [
-            HostEvent::RegisterFailed(NetError::Timeout("x")),
+            HostEvent::RegisterFailed(NetError::Unreachable("超时：握手".into())),
             HostEvent::HandshakeFailed(NetError::Timeout("x")),
         ] {
             let (same, status) = listening.apply(&e, s);
             assert_eq!(same, listening);
             assert!(status.unwrap().error);
         }
+        let (_, status) = listening.apply(
+            &HostEvent::RegisterFailed(NetError::Unreachable("超时：握手".into())),
+            &ZH,
+        );
+        assert_eq!(status.unwrap().text, "连不上服务器。");
         let (off, status) = listening.apply(&HostEvent::Stopped(None), s);
         assert_eq!(off, HostPhase::Off);
         assert!(!status.unwrap().error);
@@ -803,7 +884,10 @@ mod tests {
             s,
         );
         assert_eq!(off, HostPhase::Off);
-        assert!(status.unwrap().text.starts_with(EN.err_port_in_use));
+        assert!(status
+            .unwrap()
+            .text
+            .starts_with("The port on this computer is in use"));
     }
 
     #[test]
@@ -848,14 +932,14 @@ mod tests {
         assert_eq!(connected.detail(), "中继 30.0 ms");
         assert_eq!(ViewPhase::Connecting.detail(), "");
         let summary = Summary {
-            end: "peer left".into(),
+            end: peerdesk_net::node::END_PEER_QUIT.into(),
             ..Summary::default()
         };
         let ended = connected.apply(&ViewEvent::Ended(Ok(summary.clone())), s);
         assert!(ended.is_ended());
         assert_eq!(ended.route(), Some(Route::Relay));
         assert!(
-            matches!(ended, ViewPhase::Ended { ref status, summary: Some(_), .. } if status.text.contains("peer left"))
+            matches!(ended, ViewPhase::Ended { ref status, summary: Some(_), .. } if status.text == "The other side quit PeerDesk." && !status.error)
         );
         let cancelled = connected.apply(
             &ViewEvent::Ended(Ok(Summary {
@@ -871,23 +955,54 @@ mod tests {
         assert!(
             matches!(failed, ViewPhase::Ended { ref status, summary: None, route: None, notice: None } if status.error)
         );
-        // 网络断了：重连中；服务器通知：结束并带通知
+        // 失败的说明：一句原因、一句办法，原文在详情里（中文界面里没有英文原文）
+        let ViewPhase::Ended { status, .. } = connecting.apply(
+            &ViewEvent::Ended(Err(NetError::Closed("timed out".into()))),
+            &ZH,
+        ) else {
+            panic!("没有结束");
+        };
+        assert_eq!(status.text, "网络断了（可能换了网络，或者 Wi-Fi 断开）。");
+        assert_eq!(
+            status.fix(&ZH),
+            Some("检查网络后重试；PeerDesk 会先自动重连几次。")
+        );
+        assert_eq!(status.details(), "连接已关闭：timed out");
+        assert_eq!(Status::info("x").fix(&ZH), None);
+        assert_eq!(Status::info("x").details(), "");
+        assert_eq!(Status::info("x").line(&ZH), "x");
+        // 网络断了：重连中（原因是常态，不重复说）；重拨失败：说为什么
         let again = connecting.apply(
             &ViewEvent::Reconnecting {
                 attempt: 2,
                 why: "timed out".into(),
+                reason: Reason::NetworkLost,
             },
             s,
         );
-        assert!(again.headline(s).contains("(2/3)") || again.headline(s).contains("（2/3）"));
+        assert!(again.headline(s).ends_with("(2/3)") || again.headline(s).ends_with("（2/3）"));
+        assert!(!again.headline(s).contains("timed out"));
+        let offline = connecting.apply(
+            &ViewEvent::Reconnecting {
+                attempt: 3,
+                why: "连接失败：设备不在线".into(),
+                reason: Reason::DeviceOffline,
+            },
+            &ZH,
+        );
+        assert!(offline
+            .headline(&ZH)
+            .ends_with("：对方现在不在线，或者设备码不对。"));
         assert_eq!(again.route(), None);
         assert_eq!(again.detail(), "");
         assert!(!again.is_ended());
-        let busy = again.apply(&ViewEvent::Notice("免费服务器拥挤".into()), s);
-        assert!(
-            matches!(busy, ViewPhase::Ended { notice: Some(ref t), .. } if t == "免费服务器拥挤")
+        let text = peerdesk_net::viewer::free_limit_text(120);
+        let busy = again.apply(&ViewEvent::Notice(text.clone()), s);
+        assert!(matches!(busy, ViewPhase::Ended { notice: Some(ref t), .. } if *t == text));
+        assert_eq!(
+            busy.headline(s),
+            "The free relay traffic allowance is used up for now."
         );
-        assert_eq!(busy.headline(s), "免费服务器拥挤");
         assert_eq!(ViewPhase::Connecting.headline(s), EN.connecting);
 
         assert_eq!(route_name(Some(Route::Direct), s), "direct");
@@ -897,7 +1012,8 @@ mod tests {
             Status::info("x"),
             Status {
                 text: "x".into(),
-                error: false
+                error: false,
+                failure: None,
             }
         );
     }

@@ -82,6 +82,7 @@ fn several_files_including_empty_and_multi_chunk() {
 
     assert!(sender.is_finished() && receiver.is_finished());
     assert!(!sender.is_aborted());
+    assert_eq!(sender.peer_aborted(), None);
     assert_eq!(sender.outcomes(), &[Some(Outcome::Done); 4]);
     assert_eq!(receiver.outcomes(), &[Some(Outcome::Done); 4]);
     for (path, data) in &files {
@@ -525,9 +526,15 @@ fn sender_rejects_out_of_order_and_inconsistent_messages() {
     ] {
         assert!(s.on_msg(&wrong, &mut src).is_err(), "{}", wrong.name());
     }
+    assert_eq!(s.peer_aborted(), None);
     s.on_msg(&FileMsg::Abort { reason: "x".into() }, &mut src)
         .unwrap();
     assert!(s.is_aborted());
+    assert_eq!(
+        s.peer_aborted(),
+        Some("x"),
+        "对方中止的原因留着，界面要说为什么"
+    );
     assert!(s.offer().is_err());
     // 文件数超过上限
     let many = (0..=MAX_FILES)

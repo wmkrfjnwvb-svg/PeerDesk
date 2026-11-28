@@ -9,8 +9,6 @@ use peerdesk_core::crash::Report;
 pub const MARKER: &str = "crash-pending.txt";
 /// 传失败这么多次就放弃（删掉标记），不一直重试。
 pub const MAX_ATTEMPTS: u32 = 3;
-/// 没有配置服务器时传到这里（测试版的默认服务器）。
-pub const DEFAULT_SERVER: &str = "47.95.203.214:4433";
 
 /// 程序版本、提交号、系统。
 #[must_use]
@@ -22,13 +20,6 @@ pub fn build_info() -> String {
         std::env::consts::OS,
         std::env::consts::ARCH
     )
-}
-
-/// 测试版的默认服务器（不核对证书指纹）。
-#[must_use]
-pub fn default_server() -> peerdesk_net::rendezvous::Server {
-    let addr = std::net::SocketAddr::from(([47, 95, 203, 214], 4433));
-    peerdesk_net::rendezvous::Server { addr, pin: None }
 }
 
 /// 发布版遇到 panic 直接退出（`panic = "abort"`）：退出前把原因写进日志、留下崩溃标记，
@@ -71,14 +62,15 @@ pub fn finish(logs: &Path, attempts: u32, ok: bool) {
     }
 }
 
-/// 在后台线程里把待上报的崩溃传给 `server`（没有配置服务器时传给 [`DEFAULT_SERVER`]）。
+/// 在后台线程里把待上报的崩溃传给 `server`（自己的服务器填错了、读不出来时传给官方服务器
+/// [`peerdesk_net::rendezvous::OFFICIAL_SERVER`]）。
 /// 关掉 `crash-upload` 特性时什么都不做。
 pub fn upload_in_background(data_dir: &Path, server: Option<peerdesk_net::rendezvous::Server>) {
     let logs = data_dir.join("logs");
     let Some((attempts, report)) = pending(&logs).filter(|_| cfg!(feature = "crash-upload")) else {
         return;
     };
-    let server = server.unwrap_or_else(default_server);
+    let server = server.unwrap_or(peerdesk_net::rendezvous::OFFICIAL_SERVER);
     let data_dir = data_dir.to_path_buf();
     let _ = std::thread::Builder::new()
         .name("peerdesk-crash-upload".into())
@@ -203,7 +195,6 @@ mod tests {
     #[test]
     fn build_info_has_commit() {
         assert!(build_info().contains(env!("PEERDESK_COMMIT")));
-        assert_eq!(default_server().addr.to_string(), DEFAULT_SERVER);
         // 没有待上报的崩溃时直接返回
         upload_in_background(&std::env::temp_dir().join("peerdesk-no-such-dir"), None);
     }

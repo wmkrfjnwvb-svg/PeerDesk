@@ -10,8 +10,8 @@
   egui 不做 OpenType 特性替换，而设计要求数字等宽）。
 - noto-sans-sc-regular.otf：思源黑体（Noto Sans CJK SC 2.004）Regular。GB 2312 全部
   （一级、二级共 6763 个汉字和符号区）、中日韩标点、全角字符，加上界面文案里出现的字。
-- noto-sans-sc-{medium,semibold}.ttf：Noto Sans SC 500、600。只含界面文案（i18n.rs 和
-  平台层的授权引导）里出现的字：标题和按钮才用这两个字重，它们的文字都来自文案。
+- noto-sans-sc-{medium,semibold}.ttf：Noto Sans SC 500、600。只含界面文案（i18n.rs、失败原因的
+  reasons.rs 和平台层的授权引导）里出现的字：标题和按钮才用这两个字重，它们的文字都来自文案。
   用户数据（设备名、文件名）里文案之外的字退回 Regular。
 - phosphor-subset.ttf：Phosphor Regular，只含 theme.rs 的 icons! 清单里点名的图标。
 
@@ -46,6 +46,7 @@ OUT = ROOT / "crates/client/assets/fonts"
 # 界面文案所在的文件：中文的中等、半粗字重只收这些文件里出现的字。
 COPY_SOURCES = [
     ROOT / "crates/client/src/gui/i18n.rs",
+    ROOT / "crates/client/src/gui/reasons.rs",
     ROOT / "crates/platform/src/guide.rs",
 ]
 ICON_LIST = ROOT / "crates/client/src/gui/theme.rs"

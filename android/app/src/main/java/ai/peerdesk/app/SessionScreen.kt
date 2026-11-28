@@ -302,7 +302,10 @@ private fun StatusLine(ui: UiState) {
     val r = ui.reconnecting
     val q = ui.quality
     val line: String = when {
-        r != null -> stringResource(R.string.session_reconnecting, r.attempt, r.why)
+        // 网络断了是常态，不重复原因；重拨失败（例如对方不在线了）才说为什么。核心的原文不显示
+        r != null && (r.reason == Reason.NetworkLost || r.reason == Reason.Other) ->
+            stringResource(R.string.session_reconnecting, r.attempt)
+        r != null -> stringResource(R.string.session_reconnecting_why, r.attempt, stringResource(r.reason.cause))
         q == null -> stringResource(R.string.status_waiting)
         else -> {
             val (v, mbps) = splitBitrate(q.recvKbps)
@@ -325,7 +328,12 @@ private fun StatusLine(ui: UiState) {
         }
         Text(why, color = Color(0xFFFFC857), style = MaterialTheme.typography.bodySmall)
     }
-    ui.coreNotice?.let { Text(it, color = Color.White.copy(alpha = 0.8f), style = MaterialTheme.typography.bodySmall) }
+    // 服务器的通知（例如免费中继额度用完）：按原因说；认不出原因时才用服务器的原文
+    ui.coreNotice?.let { n ->
+        val text = if (n.reason == Reason.Other) n.text
+        else stringResource(n.reason.cause) + " " + stringResource(n.reason.fix)
+        Text(text, color = Color.White.copy(alpha = 0.8f), style = MaterialTheme.typography.bodySmall)
+    }
 }
 
 @Composable

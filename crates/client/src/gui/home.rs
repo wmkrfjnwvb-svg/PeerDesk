@@ -4,6 +4,7 @@
 use peerdesk_core::proto::PeerOs;
 use peerdesk_core::signal::Nat;
 use peerdesk_net::netcheck::NetReport;
+use peerdesk_net::reason::Action;
 
 use super::book::{BookError, MAX_DEPTH, MAX_NAME};
 use super::i18n::Strings;
@@ -75,7 +76,7 @@ pub const fn host_badge(
         HostPhase::Off => (s.host_off, Signal::Idle, s.hint_host_off),
         HostPhase::Starting => (s.host_starting, Signal::Idle, s.hint_starting),
         HostPhase::Listening { .. } if !has_server => {
-            (s.badge_waiting, Signal::Direct, s.hint_no_server)
+            (s.badge_waiting, Signal::Direct, s.hint_bad_server)
         }
         HostPhase::Listening { .. } => (s.badge_waiting, Signal::Direct, s.hint_waiting),
         HostPhase::Busy {
@@ -101,7 +102,7 @@ pub const fn server_badge(
     s: &Strings,
 ) -> (&'static str, Signal) {
     if !has_server {
-        (s.server_unset, Signal::Idle)
+        (s.server_invalid, Signal::Idle)
     } else if registered {
         (s.server_online, Signal::Direct)
     } else {
@@ -122,21 +123,52 @@ pub fn nat_hint(report: Option<&NetReport>, s: &Strings) -> Option<&'static str>
 /// 连接表单下面那一行：正在做什么，或者为什么没连上、怎么办。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectLine {
-    /// 一句话。
+    /// 一句话（失败时是原因）。
     pub text: String,
+    /// 怎么办（一句）；进行中为空。
+    pub fix: String,
+    /// 核心的原文，放在可展开的“详情”里、可以复制；没有时为空。
+    pub details: String,
     /// 颜色：进行中是灰的，走中继重连是琥珀，失败是红的。
     pub signal: Signal,
-    /// 右边放什么按钮。
-    pub action: LineAction,
+    /// 按钮（最多两个，主要的在前）。
+    pub actions: Vec<LineAction>,
 }
 
-/// 连接状态那一行右边的按钮。
+/// 连接状态那一行的按钮。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LineAction {
     /// 取消正在进行的连接。
     Cancel,
     /// 失败了，再试一次。
     Retry,
+    /// 去设置页看服务器。
+    ServerSettings,
+    /// 把详情复制下来（发给开发者）。
+    CopyDetails,
+}
+
+impl LineAction {
+    /// 失败原因建议的按钮换成这一行的按钮。
+    #[must_use]
+    pub const fn of(action: Action) -> Self {
+        match action {
+            Action::Retry => Self::Retry,
+            Action::ServerSettings => Self::ServerSettings,
+            Action::Diagnostics => Self::CopyDetails,
+        }
+    }
+
+    /// 按钮上的字。
+    #[must_use]
+    pub const fn label(self, s: &Strings) -> &'static str {
+        match self {
+            Self::Cancel => s.cancel,
+            Self::Retry => s.retry,
+            Self::ServerSettings => s.server_settings,
+            Self::CopyDetails => s.copy_details,
+        }
+    }
 }
 
 /// 一次连接在主窗口里要不要说、怎么说。连上以后不说（远程窗口自己显示）；
@@ -146,13 +178,17 @@ pub fn connect_line(phase: &ViewPhase, target: &str, s: &Strings) -> Option<Conn
     match phase {
         ViewPhase::Connecting => Some(ConnectLine {
             text: s.connecting_to.replace("{target}", target),
+            fix: String::new(),
+            details: String::new(),
             signal: Signal::Idle,
-            action: LineAction::Cancel,
+            actions: vec![LineAction::Cancel],
         }),
-        ViewPhase::Reconnecting { .. } => Some(ConnectLine {
+        ViewPhase::Reconnecting { why, .. } => Some(ConnectLine {
             text: format!("{target}：{}", phase.headline(s)),
+            fix: String::new(),
+            details: why.clone(),
             signal: Signal::Relay,
-            action: LineAction::Cancel,
+            actions: vec![LineAction::Cancel],
         }),
         ViewPhase::Ended { status, .. } if status.error => Some(ConnectLine {
             text: format!(
@@ -160,8 +196,19 @@ pub fn connect_line(phase: &ViewPhase, target: &str, s: &Strings) -> Option<Conn
                 s.connect_failed.replace("{target}", target),
                 status.text
             ),
+            fix: status.fix(s).unwrap_or_default().to_owned(),
+            details: status.details().to_owned(),
             signal: Signal::Problem,
-            action: LineAction::Retry,
+            actions: status.failure.as_ref().map_or_else(
+                || vec![LineAction::Retry],
+                |f| {
+                    f.reason
+                        .actions()
+                        .iter()
+                        .map(|a| LineAction::of(*a))
+                        .collect()
+                },
+            ),
         }),
         ViewPhase::Connected { .. } | ViewPhase::Ended { .. } => None,
     }
@@ -235,6 +282,8 @@ mod tests {
     use super::*;
     use crate::gui::i18n::{EN, ZH};
     use crate::gui::state::Status;
+    use peerdesk_net::reason::{Failure, Reason};
+    use peerdesk_net::NetError;
     use std::net::SocketAddr;
 
     #[test]
@@ -303,7 +352,7 @@ mod tests {
                 true,
                 s.badge_waiting,
                 Signal::Direct,
-                s.hint_no_server,
+                s.hint_bad_server,
             ),
             (
                 busy(false),
@@ -350,7 +399,7 @@ mod tests {
         let s = &ZH;
         assert_eq!(
             server_badge(false, false, s),
-            (s.server_unset, Signal::Idle)
+            (s.server_invalid, Signal::Idle)
         );
         assert_eq!(
             server_badge(true, true, s),
@@ -377,18 +426,21 @@ mod tests {
         let line = connect_line(&ViewPhase::Connecting, "731 054 268", s).unwrap();
         assert_eq!(line.text, "正在连接 731 054 268");
         assert_eq!(
-            (line.signal, line.action),
-            (Signal::Idle, LineAction::Cancel)
+            (line.signal, line.actions),
+            (Signal::Idle, vec![LineAction::Cancel])
         );
         let again = ViewPhase::Reconnecting {
             attempt: 2,
-            why: "网络断了".into(),
+            why: "timed out".into(),
+            reason: Reason::NetworkLost,
         };
         let line = connect_line(&again, "办公室 PC", s).unwrap();
-        assert!(line.text.starts_with("办公室 PC：") && line.text.contains("网络断了"));
+        assert!(line.text.starts_with("办公室 PC：") && line.text.contains("2/3"));
+        assert!(!line.text.contains("timed out"), "原文只在详情里");
+        assert_eq!(line.details, "timed out");
         assert_eq!(
-            (line.signal, line.action),
-            (Signal::Relay, LineAction::Cancel)
+            (line.signal, line.actions),
+            (Signal::Relay, vec![LineAction::Cancel])
         );
         let ended = |status| ViewPhase::Ended {
             status,
@@ -399,8 +451,40 @@ mod tests {
         let line = connect_line(&ended(Status::error("密码不对")), "731 054 268", s).unwrap();
         assert_eq!(line.text, "没连上 731 054 268：密码不对");
         assert_eq!(
-            (line.signal, line.action),
-            (Signal::Problem, LineAction::Retry)
+            (line.signal, line.actions),
+            (Signal::Problem, vec![LineAction::Retry])
+        );
+        // 有结构化原因：原因、办法、详情和建议的按钮
+        let unreachable = Failure::of_error(&NetError::Unreachable("超时：握手".into()));
+        let line = connect_line(&ended(Status::failed(unreachable, s)), "731 054 268", s).unwrap();
+        assert_eq!(line.text, "没连上 731 054 268：连不上服务器。");
+        assert_eq!(
+            line.fix,
+            "检查本机的网络；用自己的服务器时，核对服务器地址。"
+        );
+        assert_eq!(line.details, "连不上服务器：超时：握手");
+        assert_eq!(
+            line.actions,
+            vec![LineAction::Retry, LineAction::ServerSettings]
+        );
+        let lost = Failure::of_error(&NetError::Timeout("握手"));
+        let line = connect_line(&ended(Status::failed(lost, &EN)), "x", &EN).unwrap();
+        assert_eq!(
+            line.actions,
+            vec![LineAction::Retry, LineAction::CopyDetails]
+        );
+        let labels: Vec<_> = [
+            LineAction::Cancel,
+            LineAction::Retry,
+            LineAction::ServerSettings,
+            LineAction::CopyDetails,
+        ]
+        .iter()
+        .map(|a| a.label(&EN))
+        .collect();
+        assert_eq!(
+            labels,
+            [EN.cancel, EN.retry, EN.server_settings, EN.copy_details]
         );
         // 自己断开、正常结束、已经连上：主窗口不说
         assert_eq!(connect_line(&ended(Status::info("已断开")), "x", s), None);

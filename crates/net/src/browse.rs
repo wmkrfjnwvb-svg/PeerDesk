@@ -7,7 +7,9 @@ use peerdesk_core::browse::{sort_entries, Entry, Place, Reply, Request, MAX_ENTR
 use peerdesk_core::file::FileMeta;
 use quinn::{RecvStream, SendStream};
 
-use crate::files::{receive_on, send_on, FileResult, Progress};
+use crate::files::{
+    finished, receive_checked, receive_on, send_checked, send_on, FileResult, Progress,
+};
 use crate::fs_store::scan;
 use crate::stream::{write_kind, StreamKind};
 use crate::{Link, NetError};
@@ -290,9 +292,9 @@ pub async fn upload(
     if reply != Reply::Ready {
         return Err(refused(reply));
     }
-    send_on(send, recv, local_dir, files, progress, Ok(()))
-        .await
-        .map(|(results, _)| results)
+    let (results, _, aborted) =
+        send_checked(send, recv, local_dir, files, progress, Ok(())).await?;
+    finished(results, aborted)
 }
 
 /// 把对方 `remote_dir` 下的 `names` 下载到本机的 `local_dir`。
@@ -314,7 +316,8 @@ pub async fn download(
     if reply != Reply::Ready {
         return Err(refused(reply));
     }
-    receive_on(send, recv, local_dir, progress).await
+    let (results, aborted) = receive_checked(send, recv, local_dir, progress).await?;
+    finished(results, aborted)
 }
 
 #[cfg(test)]

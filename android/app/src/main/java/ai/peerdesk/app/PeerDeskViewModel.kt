@@ -21,22 +21,25 @@ import kotlinx.coroutines.launch
 
 enum class Phase { Connect, Session }
 
-/** 回到连接页时要显示的原因。文字由界面按语言取，核心给的原因文字原样带上。 */
+/** 回到连接页时要显示的原因。文字由界面按 [Reason] 和语言取，核心的原文放进可以复制的详情。 */
 sealed interface EndNotice {
     /** 还没连上就结束了。 */
-    data class ConnectFailed(val text: String) : EndNotice
+    data class ConnectFailed(val reason: Reason, val details: String) : EndNotice
     /** 连上之后结束了。 */
-    data class Ended(val text: String) : EndNotice
+    data class Ended(val reason: Reason, val details: String) : EndNotice
     data object Background : EndNotice
     data object NoSurface : EndNotice
 }
 
 data class UiState(
     val phase: Phase = Phase.Connect,
+    /** 自己的服务器；空着用官方服务器（核心里的 OFFICIAL_SERVER）。 */
     val server: String = "",
     val code: String = "",
     val password: String = "",
     val notice: EndNotice? = null,
+    /** 连接页的“高级：使用自己的服务器”是否展开。 */
+    val advancedOpen: Boolean = false,
 
     // 会话
     val connected: Boolean = false,
@@ -44,7 +47,7 @@ data class UiState(
     val peer: CoreEvent.Peer? = null,
     val quality: CoreEvent.Quality? = null,
     val reconnecting: CoreEvent.Reconnecting? = null,
-    val coreNotice: String? = null,
+    val coreNotice: CoreEvent.Notice? = null,
     /** 屏幕上的鼠标是展开的大鼠标，还是收成了小鼠标（默认小鼠标）。 */
     val mouseExpanded: Boolean = false,
     val buttonsDown: Set<Int> = emptySet(),
@@ -133,10 +136,15 @@ class PeerDeskViewModel(app: Application) : AndroidViewModel(app) {
     // —— 连接页 ——
 
     fun setServer(v: String) = _ui.update { it.copy(server = v) }
+    fun toggleAdvanced() = _ui.update { it.copy(advancedOpen = !it.advancedOpen) }
+
+    /** 失败提示里的“服务器设置”：展开高级设置，让用户核对自己的服务器地址。 */
+    fun openAdvanced() = _ui.update { it.copy(advancedOpen = true) }
     fun setCode(v: String) = _ui.update { it.copy(code = sanitizeCode(v)) }
     fun setPassword(v: String) = _ui.update { it.copy(password = v) }
 
-    /** 点 Connect：记住服务器地址，进会话页（真正连接在 SurfaceView 创建后）。 */
+    /** 点 Connect（或失败提示里的“重试”）：记住服务器地址，进会话页（真正连接在 SurfaceView 创建后）。
+     *  服务器空着就用官方服务器；以前存过自己的服务器的用户照常用自己的。 */
     fun connect() {
         val s = _ui.value
         // 记住服务器、设备码和密码（密码加密后再存），下次不用重输
@@ -202,10 +210,10 @@ class PeerDeskViewModel(app: Application) : AndroidViewModel(app) {
         val notice: EndNotice? = when {
             backgroundEnd -> EndNotice.Background
             userDisconnect -> null
-            end == null -> EndNotice.Ended("")
+            end == null -> EndNotice.Ended(Reason.Other, "")
             end.text.isBlank() && end.ok -> null
-            _ui.value.connected -> EndNotice.Ended(end.text)
-            else -> EndNotice.ConnectFailed(end.text)
+            _ui.value.connected -> EndNotice.Ended(end.reason, end.text)
+            else -> EndNotice.ConnectFailed(end.reason, end.text)
         }
         _ui.update {
             it.copy(
@@ -233,7 +241,7 @@ class PeerDeskViewModel(app: Application) : AndroidViewModel(app) {
                 pushView()
             }
             is CoreEvent.Reconnecting -> _ui.update { it.copy(reconnecting = ev) }
-            is CoreEvent.Notice -> _ui.update { it.copy(coreNotice = ev.text) }
+            is CoreEvent.Notice -> _ui.update { it.copy(coreNotice = ev) }
             is CoreEvent.Ended -> Unit
         }
     }
