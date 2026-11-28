@@ -355,7 +355,7 @@ fn limit((mean, sd): (f64, f64), n: u64, count: bool) -> f64 {
     mean + GATE_Z * sd * (1.0 / base + 1.0 / n).sqrt()
 }
 
-/// 回归门槛（每次 CI 都跑）：三条有代表性的真实轨迹，每条 [`GATE_SEEDS`] 个随机种子，按均值和 [`limit`] 判断。
+/// 回归门槛（每次 CI 都跑）：四条有代表性的真实轨迹，每条 [`GATE_SEEDS`] 个随机种子，按均值和 [`limit`] 判断。
 ///
 /// 2026-11-26 以前是 3 个种子的合计加两成余量，这把尺子分不出好坏：同一份代码 12 个种子里任取 3 个，ms-05729 的
 /// 冻结合计在 17–36 之间，而门槛是 19（按种子 1–3 的 17 次定的，低于 12 个种子的均值 6.5 × 3 = 19.5）——
@@ -364,37 +364,45 @@ fn limit((mean, sd): (f64, f64), n: u64, count: bool) -> f64 {
 /// 详见 `docs/research/L-framework.md` 6.6。
 ///
 /// 规则（只升不降）：
-/// - 改进之后把基线换成新的实测（均值和标准差一起换）。
+/// - 改进之后把基线换成新的实测（均值和标准差一起换）；按新实测算出的线比旧线宽的那一项留旧的，线只收紧。
 /// - 没过时先跑完整的 12 条 × 12 个种子（上面的 `microsoft_traces`）和基线比。确实变差就改代码；144 次里看不出
 ///   变差（合计的差在两倍标准误之内）才可以按新实测重定这里的基线，并在提交信息里写上 144 次的数据。
-/// - 防基线漂移：144 次的比较一律对照固定的文件 `docs/research/data/ms-traces-baseline-2026-11-26.md`
+/// - 防基线漂移：144 次的比较一律对照固定的文件 `docs/research/data/ms-traces-baseline-2026-11-28.md`
 ///   （或者以后正式改进之后存下的新基线文件），不对照上一次“重定”的数字——否则一连串“看不出变差”的改动
 ///   每次把线往上推一点，累计起来就退步了。
 ///
-/// 用时见 [`GATE_SEEDS`]：发布构建和调试构建都和以前持平。
+/// 用时见 [`GATE_SEEDS`]：2026-11-28 加了第四条轨迹，两种构建都比以前多三分之一。
 #[test]
 fn microsoft_traces_do_not_regress() {
     // 发布构建（CI 的端到端任务，720p）和调试构建（覆盖率任务，画面 480×272，数字不一样）各有一套基线。
-    // 2026-11-26 在 ui-bugs 的码率控制上量的（种子 1–12，见 docs/research/L-framework.md 6.6）；首帧上限沿用以前的。
+    // 2026-11-26 在 ui-bugs 的码率控制上量的（种子 1–12，见 docs/research/L-framework.md 6.6）。
+    // 2026-11-28 在 #71（码率控制、画质优先的帧率调度）上重量，只收紧：新的均值和标准差算出的线比旧的紧才换，
+    // 否则留旧的（注释里写了新实测）；首帧上限换成新实测的最慢值；加 ms-02651（见 docs/research/P-fps-bitrate.md 第 10 节）。
     let baselines = if cfg!(debug_assertions) {
         [
             Baseline {
                 name: "ms-09401", // 0.5–1.5 Mbps 变化
                 freezes: (0.0, 0.0),
-                wait_ms: (127.1, 27.6),
-                first_ms: 98.0,
+                wait_ms: (135.3, 17.2), // 11-28；11-26 是 (127.1, 27.6)，线 163 → 158
+                first_ms: 82.0,         // 11-28；以前 98
             },
             Baseline {
-                name: "ms-02560", // 8 Mbps、12% 丢包
-                freezes: (0.833, 1.030),
-                wait_ms: (226.2, 124.6),
-                first_ms: 41.0,
+                name: "ms-02560",        // 8 Mbps、12% 丢包
+                freezes: (0.833, 1.030), // 11-26（11-28 实测 1.17 ± 1.12，按它定线会放宽）
+                wait_ms: (226.2, 124.6), // 11-26（11-28 实测 237 ± 117，同上）
+                first_ms: 34.0,          // 11-28；以前 41
             },
             Baseline {
-                name: "ms-05729", // 1 Mbps、20% 丢包
-                freezes: (4.0, 2.132),
-                wait_ms: (327.7, 106.8),
-                first_ms: 101.0,
+                name: "ms-05729",        // 1 Mbps、20% 丢包
+                freezes: (3.917, 1.730), // 11-28；11-26 是 (4.0, 2.132)，线 6.75 → 6.47
+                wait_ms: (335.3, 96.8),  // 11-28；11-26 是 (327.7, 106.8)，线 466 → 460
+                first_ms: 84.0,          // 11-28；以前 101
+            },
+            Baseline {
+                name: "ms-02651", // 0.9–1.3 Mbps 稳定、不丢包
+                freezes: (0.0, 0.0),
+                wait_ms: (109.8, 19.5),
+                first_ms: 90.0,
             },
         ]
     } else {
@@ -413,9 +421,9 @@ fn microsoft_traces_do_not_regress() {
             },
             Baseline {
                 name: "ms-05729",
-                freezes: (6.5, 2.646),   // 11-26（11-28 实测 7.00 ± 2.37，按它定线会放宽）
+                freezes: (6.5, 2.646), // 11-26（11-28 实测 7.00 ± 2.37，按它定线会放宽）
                 wait_ms: (411.2, 136.4), // 11-26（11-28 实测 429 ± 163，同上）
-                first_ms: 113.0,         // 11-28；以前 132
+                first_ms: 113.0,       // 11-28；以前 132
             },
             Baseline {
                 name: "ms-02651", // 0.9–1.3 Mbps 稳定、不丢包（#71 修帧率码率不稳时的主要对象）
@@ -441,7 +449,7 @@ fn microsoft_traces_do_not_regress() {
             failed.push(what);
         }
     };
-    // 三条轨迹合在一起再看一遍（均值相加，方差相加）：各条都差一点、单看都没过线的全面退步，合起来看得出
+    // 几条轨迹合在一起再看一遍（均值相加，方差相加）：各条都差一点、单看都没过线的全面退步，合起来看得出
     let (mut all_freezes, mut all_wait) = ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0));
     let mut states = StateShare::default();
     for (b, samples) in baselines.iter().zip(&results) {
@@ -479,13 +487,13 @@ fn microsoft_traces_do_not_regress() {
         all_wait.2 += (wait_limit - b.wait_ms.0).powi(2);
     }
     check(
-        "三条合计 冻结".to_owned(),
+        "合计 冻结".to_owned(),
         all_freezes.0,
         all_freezes.1,
         all_freezes.1 + all_freezes.2.sqrt(),
     );
     check(
-        "三条合计 最长等待 ms".to_owned(),
+        "合计 最长等待 ms".to_owned(),
         all_wait.0,
         all_wait.1,
         all_wait.1 + all_wait.2.sqrt(),
