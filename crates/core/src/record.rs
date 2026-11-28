@@ -2209,6 +2209,7 @@ mod tests {
             rtt_us: 25_000,
             in_flight: 12_000,
             limit: SendLimit::App,
+            backlog: false,
         };
         let f = Feedback::from_observation(&obs, 2_000_000, RateState::Startup);
         assert_eq!(
